@@ -152,6 +152,32 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
             'scheduler': scheduler,
         }
 
+        try:
+            return _train_and_evaluate(
+                trial, trial_start, cfg, target_class,
+                all_scaled, all_returns, tickers, ticker_boundaries,
+                input_dim, _state_cache,
+            )
+        except RuntimeError as e:
+            # CUDA OOM or other GPU errors — clean up and return 0
+            print(f"  [ERROR] Trial {trial.number}: {e}")
+            gc.collect()
+            torch.cuda.empty_cache()
+            return 0.0
+
+    def _train_and_evaluate(trial, trial_start, cfg, target_class,
+                            all_scaled, all_returns, tickers, ticker_boundaries,
+                            input_dim, _state_cache):
+        seq_len = cfg['seq_len']
+        hidden_dim = cfg['hidden_dim']
+        num_layers = cfg['num_layers']
+        dropout = cfg['dropout']
+        learning_rate = cfg['learning_rate']
+        batch_size = cfg['batch_size']
+        bull_threshold = cfg['bull_threshold']
+        weight_decay = cfg['weight_decay']
+        scheduler = cfg['scheduler']
+
         valid_indices, classes = get_indices_and_classes(
             all_returns, tickers, ticker_boundaries, bull_threshold, seq_len)
 
@@ -397,7 +423,8 @@ def main():
             print(f"Prior best {target}={best_state_holder['score']:.3f} — new trials must beat this")
 
     objective_fn = create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache)
-    study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback])
+    study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback],
+                   catch=(Exception,))
 
     # --- RESULTS ---
     total_time = time.time() - t0
