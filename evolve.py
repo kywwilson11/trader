@@ -1,16 +1,18 @@
 """
-Continuous improvement orchestrator — daily retrain + promotion gate.
+Continuous improvement orchestrator — 3-day retrain cycle + promotion gate.
 
-Runs as a long-lived process:
+Each cycle:
 1. Harvest fresh data
-2. Run bear hypersearch (250 trials)
-3. Run bull hypersearch (250 trials)
-4. Compare new models against current deployed models
-5. Promote only if new model beats current (validation accuracy)
-6. Version models in models/ directory, keep last 5
+2. Alternate bear/bull hypersearch in 50-trial batches (150 each = 300 total)
+3. Compare new models against current deployed models
+4. Promote only if new model beats current (validation accuracy)
+5. Version models in models/ directory, keep last 5
+
+With persistent Optuna SQLite studies, each cycle builds on prior Bayesian
+memory — 150 trials/cycle compounds over time without redundant exploration.
 
 Usage:
-    python evolve.py              # Full continuous loop
+    python evolve.py              # Full continuous loop (3-day cadence)
     python evolve.py --dry-run    # One cycle, no actual training
     python evolve.py --once       # One full cycle then exit
 """
@@ -37,7 +39,9 @@ from hw_monitor import wait_for_cool_gpu, get_gpu_temp, get_ram_usage
 MODELS_DIR = 'models'
 SCORES_FILE = os.path.join(MODELS_DIR, 'scores.json')
 MAX_VERSIONS = 5
-DAILY_INTERVAL_HOURS = 24
+CYCLE_INTERVAL_HOURS = 72  # 3 days between evolution cycles
+TRIALS_PER_MODEL = 150     # trials per model per cycle
+BATCH_SIZE_TRIALS = 50     # alternate bear/bull in batches of this size
 
 # Paths for active models (crypto_loop.py reads these)
 ACTIVE_BEAR = 'bear_model.pth'
@@ -54,8 +58,10 @@ def parse_args():
                         help='Simulate one cycle without training')
     parser.add_argument('--once', action='store_true',
                         help='Run one full cycle then exit')
-    parser.add_argument('--trials', type=int, default=250,
-                        help='Trials per hypersearch (default: 250)')
+    parser.add_argument('--trials', type=int, default=TRIALS_PER_MODEL,
+                        help=f'Total trials per model per cycle (default: {TRIALS_PER_MODEL})')
+    parser.add_argument('--batch', type=int, default=BATCH_SIZE_TRIALS,
+                        help=f'Trials per alternating batch (default: {BATCH_SIZE_TRIALS})')
     return parser.parse_args()
 
 
@@ -248,10 +254,11 @@ def cleanup_old_versions(scores, target):
     save_scores(scores)
 
 
-def run_cycle(trials, dry_run=False):
-    """Run one full evolution cycle."""
+def run_cycle(trials_per_model, batch_size, dry_run=False):
+    """Run one full evolution cycle with alternating bear/bull batches."""
     print(f"\n{'='*70}")
     print(f"[EVOLVE] CYCLE START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[EVOLVE] {trials_per_model} trials/model, alternating in batches of {batch_size}")
     print(f"{'='*70}")
 
     ensure_models_dir()
@@ -268,7 +275,6 @@ def run_cycle(trials, dry_run=False):
 
     if dry_run:
         print("[EVOLVE] DRY RUN — skipping data harvest and training")
-        # Still evaluate current models
         for target in ['bear', 'bull']:
             model_path = f'{target}_model.pth'
             config_path = f'{target}_config.pkl'
@@ -282,74 +288,58 @@ def run_cycle(trials, dry_run=False):
     # 2. Harvest fresh data
     harvest_data()
 
-    # 3. Run bear hypersearch
-    # Get current bear score for comparison
-    current_bear_score = 0.0
-    if os.path.exists(ACTIVE_BEAR):
-        current_bear_score = evaluate_model(ACTIVE_BEAR, ACTIVE_BEAR_CFG, 'bear')
-        print(f"[EVOLVE] Current bear score: {current_bear_score:.4f}")
+    # 3. Snapshot current scores for promotion comparison
+    current_scores = {}
+    for target in ['bear', 'bull']:
+        model_path = f'{target}_model.pth'
+        config_path = f'{target}_config.pkl'
+        if os.path.exists(model_path) and os.path.exists(config_path):
+            current_scores[target] = evaluate_model(model_path, config_path, target)
+            print(f"[EVOLVE] Current {target} score: {current_scores[target]:.4f}")
+        else:
+            current_scores[target] = 0.0
+            print(f"[EVOLVE] No current {target} model")
 
-    temp = wait_for_cool_gpu(70)
-    gc.collect()
-    torch.cuda.empty_cache()
+    # 4. Alternating bear/bull hypersearch
+    num_rounds = (trials_per_model + batch_size - 1) // batch_size  # ceil division
+    for round_num in range(1, num_rounds + 1):
+        remaining = trials_per_model - (round_num - 1) * batch_size
+        this_batch = min(batch_size, remaining)
 
-    run_hypersearch('bear', trials)
+        for target in ['bear', 'bull']:
+            print(f"\n[EVOLVE] Round {round_num}/{num_rounds}: {target} ({this_batch} trials)")
+            wait_for_cool_gpu(70)
+            gc.collect()
+            torch.cuda.empty_cache()
+            run_hypersearch(target, this_batch)
 
-    # Evaluate new bear model
-    new_bear_score = evaluate_model(ACTIVE_BEAR, ACTIVE_BEAR_CFG, 'bear')
-    print(f"[EVOLVE] New bear score: {new_bear_score:.4f} (was: {current_bear_score:.4f})")
+    # 5. Evaluate and promote
+    for target in ['bear', 'bull']:
+        model_path = f'{target}_model.pth'
+        config_path = f'{target}_config.pkl'
+        if not os.path.exists(model_path):
+            print(f"[EVOLVE] No {target} model produced")
+            continue
 
-    bear_version = get_next_version(scores, 'bear')
-    if new_bear_score > current_bear_score:
-        promote_model('bear', bear_version, new_bear_score, scores)
-    else:
-        # Still save the version but don't make it active
-        print(f"[EVOLVE] New bear model not better, keeping current")
-        # Save versioned copy anyway for analysis
-        if os.path.exists('bear_model.pth'):
-            dst = os.path.join(MODELS_DIR, f'bear_v{bear_version}.pth')
-            shutil.copy2('bear_model.pth', dst)
-            scores['bear'][str(bear_version)] = {
-                'score': new_bear_score,
+        new_score = evaluate_model(model_path, config_path, target)
+        old_score = current_scores[target]
+        print(f"[EVOLVE] {target}: {old_score:.4f} -> {new_score:.4f}")
+
+        version = get_next_version(scores, target)
+        if new_score > old_score:
+            promote_model(target, version, new_score, scores)
+        else:
+            print(f"[EVOLVE] {target} not improved, archiving as v{version}")
+            dst = os.path.join(MODELS_DIR, f'{target}_v{version}.pth')
+            shutil.copy2(model_path, dst)
+            scores[target][str(version)] = {
+                'score': new_score,
                 'timestamp': datetime.now().isoformat(),
                 'promoted': False,
             }
             save_scores(scores)
 
-    cleanup_old_versions(scores, 'bear')
-
-    # 4. Cool down between searches
-    gc.collect()
-    torch.cuda.empty_cache()
-    wait_for_cool_gpu(65)
-
-    # 5. Run bull hypersearch
-    current_bull_score = 0.0
-    if os.path.exists(ACTIVE_BULL):
-        current_bull_score = evaluate_model(ACTIVE_BULL, ACTIVE_BULL_CFG, 'bull')
-        print(f"[EVOLVE] Current bull score: {current_bull_score:.4f}")
-
-    run_hypersearch('bull', trials)
-
-    new_bull_score = evaluate_model(ACTIVE_BULL, ACTIVE_BULL_CFG, 'bull')
-    print(f"[EVOLVE] New bull score: {new_bull_score:.4f} (was: {current_bull_score:.4f})")
-
-    bull_version = get_next_version(scores, 'bull')
-    if new_bull_score > current_bull_score:
-        promote_model('bull', bull_version, new_bull_score, scores)
-    else:
-        print(f"[EVOLVE] New bull model not better, keeping current")
-        if os.path.exists('bull_model.pth'):
-            dst = os.path.join(MODELS_DIR, f'bull_v{bull_version}.pth')
-            shutil.copy2('bull_model.pth', dst)
-            scores['bull'][str(bull_version)] = {
-                'score': new_bull_score,
-                'timestamp': datetime.now().isoformat(),
-                'promoted': False,
-            }
-            save_scores(scores)
-
-    cleanup_old_versions(scores, 'bull')
+        cleanup_old_versions(scores, target)
 
     print(f"\n[EVOLVE] CYCLE COMPLETE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"[EVOLVE] Bear: v{scores.get('current_bear', '?')} | Bull: v{scores.get('current_bull', '?')}")
@@ -359,26 +349,26 @@ def main():
     args = parse_args()
 
     if args.dry_run:
-        run_cycle(args.trials, dry_run=True)
+        run_cycle(args.trials, args.batch, dry_run=True)
         return
 
     if args.once:
-        run_cycle(args.trials)
+        run_cycle(args.trials, args.batch)
         return
 
     # Continuous loop
     while True:
         try:
-            run_cycle(args.trials)
+            run_cycle(args.trials, args.batch)
         except Exception as e:
             print(f"\n[EVOLVE] ERROR in cycle: {e}")
             import traceback
             traceback.print_exc()
 
-        next_run = datetime.now() + timedelta(hours=DAILY_INTERVAL_HOURS)
+        next_run = datetime.now() + timedelta(hours=CYCLE_INTERVAL_HOURS)
         print(f"\n[EVOLVE] Next cycle at {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"[EVOLVE] Sleeping {DAILY_INTERVAL_HOURS}h...")
-        time.sleep(DAILY_INTERVAL_HOURS * 3600)
+        print(f"[EVOLVE] Sleeping {CYCLE_INTERVAL_HOURS}h...")
+        time.sleep(CYCLE_INTERVAL_HOURS * 3600)
 
 
 if __name__ == '__main__':

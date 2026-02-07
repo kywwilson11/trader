@@ -19,6 +19,7 @@ from sklearn.preprocessing import MinMaxScaler
 import joblib
 import gc
 import json
+import os
 import time
 import optuna
 from optuna.pruners import MedianPruner
@@ -59,6 +60,8 @@ def parse_args():
                         help='Which class to optimize: bear or bull')
     parser.add_argument('--trials', type=int, default=NUM_TRIALS,
                         help=f'Number of trials (default: {NUM_TRIALS})')
+    parser.add_argument('--fresh', action='store_true',
+                        help='Delete existing study DB and start fresh')
     return parser.parse_args()
 
 
@@ -257,8 +260,11 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         trial.set_user_attr('target_score', target_score)
         trial.set_user_attr('trading_score', trading_score)
         trial.set_user_attr('val_acc', best_val_acc)
-        trial.set_user_attr('best_state', best_state)
         trial.set_user_attr('cfg', cfg)
+
+        # Store model weights in memory (not in SQLite — too large)
+        # The callback will pick this up
+        trial._best_state_cache = best_state
 
         del model, train_ds, val_ds, train_loader, val_loader, weights_t
         gc.collect()
@@ -274,16 +280,34 @@ def main():
     target = args.target
     num_trials = args.trials
 
+    # Persistent SQLite storage — Bayesian memory survives across invocations
+    db_path = f'{target}_study.db'
+    study_name = f'{target}_search'
+
+    if args.fresh and os.path.exists(db_path):
+        os.remove(db_path)
+        print(f"Deleted existing study DB: {db_path}")
+
+    storage = f'sqlite:///{db_path}'
+
     all_scaled, all_returns, tickers, ticker_boundaries, scaler_X, feature_cols, input_dim = load_data()
+
+    # Track best model weights in memory (can't store in SQLite efficiently)
+    best_state_holder = {'state': None, 'score': 0.0, 'cfg': None, 'val_acc': 0.0, 'per_class': {}}
+
+    # Load existing best from disk if resuming
+    existing_model = f'{target}_model.pth'
+    if os.path.exists(existing_model) and not args.fresh:
+        # We have a previous best on disk — score will be compared against
+        pass
 
     # Callback state
     results_log = []
     t0 = time.time()
-    best_score_so_far = 0.0
     trials_since_improvement = 0
 
     def trial_callback(study, trial):
-        nonlocal best_score_so_far, trials_since_improvement
+        nonlocal trials_since_improvement
 
         elapsed = time.time() - t0
         n = trial.number + 1
@@ -296,10 +320,17 @@ def main():
         trials_since_improvement += 1
         if trial.state == optuna.trial.TrialState.PRUNED:
             tag = " [PRUNED]"
-        elif score > best_score_so_far and val_acc > 0.34:
-            best_score_so_far = score
-            trials_since_improvement = 0
-            tag = " ** BEST **"
+        elif score > best_state_holder['score'] and val_acc > 0.34:
+            # Grab model weights from the trial's in-memory cache
+            state = getattr(trial, '_best_state_cache', None)
+            if state is not None:
+                best_state_holder['state'] = state
+                best_state_holder['score'] = score
+                best_state_holder['cfg'] = cfg
+                best_state_holder['val_acc'] = val_acc
+                best_state_holder['per_class'] = pc
+                trials_since_improvement = 0
+                tag = " ** BEST **"
 
         print(f"[{n:3d}] acc={val_acc:.3f} {target}={score:.3f} "
               f"B:{pc.get('bear',0):.0%} N:{pc.get('neutral',0):.0%} U:{pc.get('bull',0):.0%} "
@@ -318,46 +349,58 @@ def main():
         if n % 10 == 0:
             with open(f'hypersearch_{target}_log.json', 'w') as f:
                 json.dump(results_log, f, indent=2, default=str)
-            print(f"  --- {elapsed/60:.1f}min elapsed, best {target}={best_score_so_far:.3f}, "
-                  f"{trials_since_improvement} trials since last improvement ---")
+            print(f"  --- {elapsed/60:.1f}min elapsed, best {target}={best_state_holder['score']:.3f}, "
+                  f"total trials in study={len(study.trials)}, "
+                  f"{trials_since_improvement} since last improvement ---")
 
     # --- MAIN SEARCH ---
-    print(f"\n{'='*70}")
-    print(f"OPTUNA {target.upper()} MODEL SEARCH: {num_trials} trials (TPE + pruning)")
-    print(f"Optimizing: {target} class accuracy")
-    print(f"{'='*70}\n")
-
+    # Load or create persistent study
     study = optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=True,
         direction='maximize',
         pruner=MedianPruner(n_startup_trials=10, n_warmup_steps=PRUNE_WARMUP_EPOCHS),
-        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=15),
+        sampler=optuna.samplers.TPESampler(n_startup_trials=15),
     )
+
+    prior_trials = len(study.trials)
+    print(f"\n{'='*70}")
+    print(f"OPTUNA {target.upper()} MODEL SEARCH: {num_trials} new trials (TPE + pruning)")
+    print(f"Optimizing: {target} class accuracy")
+    print(f"Resuming from {prior_trials} prior trials in {db_path}")
+    print(f"{'='*70}\n")
+
+    # Seed best_state_holder from study's historical best (score only — no weights)
+    if prior_trials > 0:
+        for t in study.trials:
+            if t.state == optuna.trial.TrialState.COMPLETE and t.user_attrs.get('val_acc', 0) > 0.34:
+                if (t.value or 0) > best_state_holder['score']:
+                    best_state_holder['score'] = t.value
+                    best_state_holder['cfg'] = t.user_attrs.get('cfg', {})
+                    best_state_holder['val_acc'] = t.user_attrs.get('val_acc', 0)
+                    best_state_holder['per_class'] = t.user_attrs.get('per_class', {})
+        if best_state_holder['score'] > 0:
+            print(f"Prior best {target}={best_state_holder['score']:.3f} — new trials must beat this")
 
     objective_fn = create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim)
     study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback])
 
     # --- RESULTS ---
     total_time = time.time() - t0
+    total_trials = len(study.trials)
     print(f"\n{'='*70}")
-    print(f"DONE: {num_trials} {target} trials in {total_time/60:.1f}min")
+    print(f"DONE: {num_trials} new {target} trials in {total_time/60:.1f}min ({total_trials} total in study)")
     print(f"{'='*70}")
 
-    # Find best completed trial
-    best_trial = None
-    for t in study.trials:
-        if t.state != optuna.trial.TrialState.COMPLETE:
-            continue
-        if t.user_attrs.get('val_acc', 0) <= 0.34:
-            continue
-        if best_trial is None or (t.value or 0) > (best_trial.value or 0):
-            best_trial = t
+    # Save model if we found a new best in THIS run (we have weights in memory)
+    if best_state_holder['state'] is not None:
+        best_cfg = best_state_holder['cfg']
+        best_state = best_state_holder['state']
+        pc = best_state_holder['per_class']
 
-    if best_trial is not None:
-        best_cfg = best_trial.user_attrs['cfg']
-        best_state = best_trial.user_attrs['best_state']
-        pc = best_trial.user_attrs['per_class']
-
-        print(f"\nBest {target} model ({target}={best_trial.value:.3f}, acc={best_trial.user_attrs['val_acc']:.3f}):")
+        print(f"\nBest {target} model ({target}={best_state_holder['score']:.3f}, "
+              f"acc={best_state_holder['val_acc']:.3f}):")
         for k, v in best_cfg.items():
             print(f"  {k}: {v}")
         print(f"  {pc}")
@@ -384,26 +427,27 @@ def main():
         joblib.dump(feature_cols, 'feature_cols.pkl')
         joblib.dump(None, 'scaler_y.pkl')
         print(f"\n{target.capitalize()} model saved to {target}_model.pth / {target}_config.pkl")
-
-        # Param importance
-        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-        if len(completed) >= 10:
-            try:
-                importance = optuna.importance.get_param_importances(study)
-                print("\nParameter importance:")
-                for param, imp in importance.items():
-                    print(f"  {param}: {imp:.3f}")
-            except Exception:
-                pass
     else:
-        print(f"\nNo valid {target} model found!")
+        print(f"\nNo new best found in this run (prior best {target}={best_state_holder['score']:.3f})")
+        print(f"Existing {target}_model.pth (if any) unchanged.")
+
+    # Param importance (across ALL trials in study)
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if len(completed) >= 10:
+        try:
+            importance = optuna.importance.get_param_importances(study)
+            print("\nParameter importance:")
+            for param, imp in importance.items():
+                print(f"  {param}: {imp:.3f}")
+        except Exception:
+            pass
 
     # Save full log
     with open(f'hypersearch_{target}_log.json', 'w') as f:
         json.dump(results_log, f, indent=2, default=str)
 
     pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
-    print(f"\nTrials: {len(study.trials)} total, {pruned} pruned")
+    print(f"\nTrials: {total_trials} total (study), {pruned} pruned")
     print(f"Log: hypersearch_{target}_log.json")
 
 

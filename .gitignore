@@ -9,3 +9,4 @@ hypersearch_log.json
 hypersearch_bear_log.json
 hypersearch_bull_log.json
 models/
+*_study.db
