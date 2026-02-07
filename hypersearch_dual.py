@@ -119,7 +119,7 @@ def get_indices_and_classes(all_returns, tickers, ticker_boundaries, bull_thresh
     return valid_indices, classes
 
 
-def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim):
+def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache):
     # target class index: bear=0, bull=2
     target_class = 0 if target == 'bear' else 2
 
@@ -262,9 +262,9 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         trial.set_user_attr('val_acc', best_val_acc)
         trial.set_user_attr('cfg', cfg)
 
-        # Store model weights in memory (not in SQLite — too large)
-        # The callback will pick this up
-        trial._best_state_cache = best_state
+        # Store model weights in shared dict (not in SQLite — too large)
+        # The callback receives a FrozenTrial copy, so we use trial.number as key
+        _state_cache[trial.number] = best_state
 
         del model, train_ds, val_ds, train_loader, val_loader, weights_t
         gc.collect()
@@ -295,11 +295,8 @@ def main():
     # Track best model weights in memory (can't store in SQLite efficiently)
     best_state_holder = {'state': None, 'score': 0.0, 'cfg': None, 'val_acc': 0.0, 'per_class': {}}
 
-    # Load existing best from disk if resuming
-    existing_model = f'{target}_model.pth'
-    if os.path.exists(existing_model) and not args.fresh:
-        # We have a previous best on disk — score will be compared against
-        pass
+    # Shared cache: trial.number -> model state_dict (objective writes, callback reads)
+    _state_cache = {}
 
     # Callback state
     results_log = []
@@ -321,8 +318,8 @@ def main():
         if trial.state == optuna.trial.TrialState.PRUNED:
             tag = " [PRUNED]"
         elif score > best_state_holder['score'] and val_acc > 0.34:
-            # Grab model weights from the trial's in-memory cache
-            state = getattr(trial, '_best_state_cache', None)
+            # Grab model weights from shared cache (keyed by trial number)
+            state = _state_cache.get(trial.number)
             if state is not None:
                 best_state_holder['state'] = state
                 best_state_holder['score'] = score
@@ -332,11 +329,14 @@ def main():
                 trials_since_improvement = 0
                 tag = " ** BEST **"
 
+        d = cfg.get('dropout', '')
+        lr = cfg.get('learning_rate', '')
+        th = cfg.get('bull_threshold', '')
         print(f"[{n:3d}] acc={val_acc:.3f} {target}={score:.3f} "
               f"B:{pc.get('bear',0):.0%} N:{pc.get('neutral',0):.0%} U:{pc.get('bull',0):.0%} "
               f"| s={cfg.get('seq_len','')} h={cfg.get('hidden_dim','')} "
-              f"l={cfg.get('num_layers','')} d={cfg.get('dropout',''):.2f} "
-              f"lr={cfg.get('learning_rate',''):.4f} th={cfg.get('bull_threshold',''):.2f}"
+              f"l={cfg.get('num_layers','')} d={d if d == '' else f'{d:.2f}'} "
+              f"lr={lr if lr == '' else f'{lr:.4f}'} th={th if th == '' else f'{th:.2f}'}"
               f"{tag}")
 
         results_log.append({
@@ -383,7 +383,7 @@ def main():
         if best_state_holder['score'] > 0:
             print(f"Prior best {target}={best_state_holder['score']:.3f} — new trials must beat this")
 
-    objective_fn = create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim)
+    objective_fn = create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache)
     study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback])
 
     # --- RESULTS ---
