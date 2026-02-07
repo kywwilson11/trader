@@ -74,7 +74,7 @@ def get_live_prediction(symbol, model, scaler_X, scaler_y, input_dim):
 
     if df.empty:
         print("Error: No data found for symbol.")
-        return
+        return None
 
     # Flatten multi-level columns from yfinance
     if isinstance(df.columns, pd.MultiIndex):
@@ -95,7 +95,7 @@ def get_live_prediction(symbol, model, scaler_X, scaler_y, input_dim):
 
     if current_features.shape[1] != input_dim:
         print(f"Shape Mismatch! Model expects {input_dim} features, but we found {current_features.shape[1]}.")
-        return
+        return None
 
     # 4. Scale and Predict
     current_features_scaled = scaler_X.transform(current_features)
@@ -119,6 +119,8 @@ def get_live_prediction(symbol, model, scaler_X, scaler_y, input_dim):
         print("Recommendation:  [SELL/AVOID]")
     else:
         print("Recommendation:  [HOLD/WEAK]")
+
+    return result
 
 if __name__ == "__main__":
     print(f"Using device: {device}")
