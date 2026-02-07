@@ -62,12 +62,16 @@ def parse_args():
                         help=f'Number of trials (default: {NUM_TRIALS})')
     parser.add_argument('--fresh', action='store_true',
                         help='Delete existing study DB and start fresh')
+    parser.add_argument('--data', type=str, default='training_data.csv',
+                        help='Path to training CSV (default: training_data.csv)')
+    parser.add_argument('--prefix', type=str, default='',
+                        help='Prefix for output files (e.g. "stock" -> stock_bear_model.pth)')
     return parser.parse_args()
 
 
-def load_data():
+def load_data(data_path='training_data.csv'):
     print("Loading data...")
-    df = pd.read_csv('training_data.csv', index_col=0, parse_dates=True)
+    df = pd.read_csv(data_path, index_col=0, parse_dates=True)
     print(f"Dataset: {len(df)} rows")
 
     exclude_cols = ['Target_Return', 'Ticker', 'Date', 'Datetime', 'NextClose']
@@ -287,10 +291,11 @@ def main():
     args = parse_args()
     target = args.target
     num_trials = args.trials
+    prefix = f'{args.prefix}_' if args.prefix else ''
 
     # Persistent SQLite storage — Bayesian memory survives across invocations
-    db_path = f'{target}_study.db'
-    study_name = f'{target}_search'
+    db_path = f'{prefix}{target}_study.db'
+    study_name = f'{prefix}{target}_search'
 
     if args.fresh and os.path.exists(db_path):
         os.remove(db_path)
@@ -298,7 +303,7 @@ def main():
 
     storage = f'sqlite:///{db_path}'
 
-    all_scaled, all_returns, tickers, ticker_boundaries, scaler_X, feature_cols, input_dim = load_data()
+    all_scaled, all_returns, tickers, ticker_boundaries, scaler_X, feature_cols, input_dim = load_data(args.data)
 
     # Track best model weights in memory (can't store in SQLite efficiently)
     best_state_holder = {'state': None, 'score': 0.0, 'cfg': None, 'val_acc': 0.0, 'per_class': {}}
@@ -355,7 +360,7 @@ def main():
         })
 
         if n % 10 == 0:
-            with open(f'hypersearch_{target}_log.json', 'w') as f:
+            with open(f'hypersearch_{prefix}{target}_log.json', 'w') as f:
                 json.dump(results_log, f, indent=2, default=str)
             print(f"  --- {elapsed/60:.1f}min elapsed, best {target}={best_state_holder['score']:.3f}, "
                   f"total trials in study={len(study.trials)}, "
@@ -416,7 +421,7 @@ def main():
         mdl = CryptoLSTM(input_dim, best_cfg['hidden_dim'],
                           best_cfg['num_layers'], best_cfg['dropout'], NUM_CLASSES)
         mdl.load_state_dict(best_state)
-        torch.save(mdl.state_dict(), f'{target}_model.pth')
+        torch.save(mdl.state_dict(), f'{prefix}{target}_model.pth')
 
         config = {
             'input_dim': input_dim,
@@ -429,15 +434,16 @@ def main():
             'bull_threshold': best_cfg['bull_threshold'],
             'bear_threshold': -best_cfg['bull_threshold'],
             'target': target,
+            'prefix': args.prefix,
         }
-        joblib.dump(config, f'{target}_config.pkl')
-        joblib.dump(scaler_X, 'scaler_X.pkl')
-        joblib.dump(feature_cols, 'feature_cols.pkl')
-        joblib.dump(None, 'scaler_y.pkl')
-        print(f"\n{target.capitalize()} model saved to {target}_model.pth / {target}_config.pkl")
+        joblib.dump(config, f'{prefix}{target}_config.pkl')
+        joblib.dump(scaler_X, f'{prefix}scaler_X.pkl')
+        joblib.dump(feature_cols, f'{prefix}feature_cols.pkl')
+        joblib.dump(None, f'{prefix}scaler_y.pkl')
+        print(f"\n{target.capitalize()} model saved to {prefix}{target}_model.pth / {prefix}{target}_config.pkl")
     else:
         print(f"\nNo new best found in this run (prior best {target}={best_state_holder['score']:.3f})")
-        print(f"Existing {target}_model.pth (if any) unchanged.")
+        print(f"Existing {prefix}{target}_model.pth (if any) unchanged.")
 
     # Param importance (across ALL trials in study)
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
@@ -451,12 +457,12 @@ def main():
             pass
 
     # Save full log
-    with open(f'hypersearch_{target}_log.json', 'w') as f:
+    with open(f'hypersearch_{prefix}{target}_log.json', 'w') as f:
         json.dump(results_log, f, indent=2, default=str)
 
     pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
     print(f"\nTrials: {total_trials} total (study), {pruned} pruned")
-    print(f"Log: hypersearch_{target}_log.json")
+    print(f"Log: hypersearch_{prefix}{target}_log.json")
 
 
 if __name__ == '__main__':

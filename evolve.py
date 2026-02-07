@@ -40,7 +40,7 @@ MODELS_DIR = 'models'
 SCORES_FILE = os.path.join(MODELS_DIR, 'scores.json')
 MAX_VERSIONS = 5
 CYCLE_INTERVAL_HOURS = 72  # 3 days between evolution cycles
-TRIALS_PER_MODEL = 150     # trials per model per cycle
+TRIALS_PER_MODEL = 100     # trials per model per cycle (4 models x 100 = 400 total)
 BATCH_SIZE_TRIALS = 50     # alternate bear/bull in batches of this size
 
 # Paths for active models (crypto_loop.py reads these)
@@ -50,6 +50,12 @@ ACTIVE_BULL = 'bull_model.pth'
 ACTIVE_BULL_CFG = 'bull_config.pkl'
 SCALER_PATH = 'scaler_X.pkl'
 FEATURE_COLS_PATH = 'feature_cols.pkl'
+
+# Model groups: (prefix, data_csv, harvest_script)
+MODEL_GROUPS = [
+    ('', 'training_data.csv', 'harvest_crypto_data.py'),
+    ('stock', 'stock_training_data.csv', 'harvest_stock_data.py'),
+]
 
 
 def parse_args():
@@ -89,43 +95,47 @@ def get_next_version(scores, target):
     return max(int(v) for v in versions.keys()) + 1
 
 
-def harvest_data():
-    """Run harvest_data.py to get fresh training data."""
-    print("\n[EVOLVE] Harvesting fresh data...")
+def harvest_data(script='harvest_crypto_data.py'):
+    """Run a harvest script to get fresh training data."""
+    print(f"\n[EVOLVE] Harvesting fresh data ({script})...")
     result = subprocess.run(
-        [sys.executable, '-u', 'harvest_data.py'],
+        [sys.executable, '-u', script],
         capture_output=False,
     )
     if result.returncode != 0:
-        print(f"[EVOLVE] WARNING: harvest_data.py exited with code {result.returncode}")
+        print(f"[EVOLVE] WARNING: {script} exited with code {result.returncode}")
         return False
     return True
 
 
-def run_hypersearch(target, trials):
-    """Run hypersearch_dual.py for a target (bear/bull)."""
-    print(f"\n[EVOLVE] Running {target} hypersearch ({trials} trials)...")
-    result = subprocess.run(
-        [sys.executable, '-u', 'hypersearch_dual.py', '--target', target, '--trials', str(trials)],
-        capture_output=False,
-    )
+def run_hypersearch(target, trials, prefix='', data_csv='training_data.csv'):
+    """Run hypersearch_dual.py for a target (bear/bull) with optional prefix."""
+    label = f"{prefix + ' ' if prefix else ''}{target}"
+    print(f"\n[EVOLVE] Running {label} hypersearch ({trials} trials)...")
+    cmd = [sys.executable, '-u', 'hypersearch_dual.py',
+           '--target', target, '--trials', str(trials),
+           '--data', data_csv]
+    if prefix:
+        cmd.extend(['--prefix', prefix])
+    result = subprocess.run(cmd, capture_output=False)
     if result.returncode != 0:
-        print(f"[EVOLVE] WARNING: {target} hypersearch exited with code {result.returncode}")
+        print(f"[EVOLVE] WARNING: {label} hypersearch exited with code {result.returncode}")
         return False
     return True
 
 
-def evaluate_model(model_path, config_path, target):
+def evaluate_model(model_path, config_path, target, prefix='', data_csv='training_data.csv'):
     """Evaluate a model on the validation set. Returns target class accuracy.
     target: 'bear' (class 0) or 'bull' (class 2)
     """
     if not os.path.exists(model_path) or not os.path.exists(config_path):
         return 0.0
 
+    p = f'{prefix}_' if prefix else ''
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     config = joblib.load(config_path)
-    scaler_X = joblib.load(SCALER_PATH)
-    feature_cols = joblib.load(FEATURE_COLS_PATH)
+    scaler_X = joblib.load(f'{p}scaler_X.pkl' if os.path.exists(f'{p}scaler_X.pkl') else SCALER_PATH)
+    feature_cols = joblib.load(f'{p}feature_cols.pkl' if os.path.exists(f'{p}feature_cols.pkl') else FEATURE_COLS_PATH)
 
     model = CryptoLSTM(
         input_dim=config['input_dim'],
@@ -138,7 +148,7 @@ def evaluate_model(model_path, config_path, target):
     model.eval()
 
     # Load data for validation
-    df = pd.read_csv('training_data.csv', index_col=0, parse_dates=True)
+    df = pd.read_csv(data_csv, index_col=0, parse_dates=True)
     exclude_cols = ['Target_Return', 'Ticker', 'Date', 'Datetime', 'NextClose']
     feat_cols = [c for c in df.columns if c not in exclude_cols]
     feat_cols = [c for c in feat_cols if df[c].dtype in ['float64', 'float32', 'int64', 'int32']]
@@ -255,10 +265,11 @@ def cleanup_old_versions(scores, target):
 
 
 def run_cycle(trials_per_model, batch_size, dry_run=False):
-    """Run one full evolution cycle with alternating bear/bull batches."""
+    """Run one full evolution cycle with alternating bear/bull batches for all model groups."""
     print(f"\n{'='*70}")
     print(f"[EVOLVE] CYCLE START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[EVOLVE] {trials_per_model} trials/model, alternating in batches of {batch_size}")
+    print(f"[EVOLVE] {trials_per_model} trials/model, {len(MODEL_GROUPS)} groups, "
+          f"alternating in batches of {batch_size}")
     print(f"{'='*70}")
 
     ensure_models_dir()
@@ -275,74 +286,111 @@ def run_cycle(trials_per_model, batch_size, dry_run=False):
 
     if dry_run:
         print("[EVOLVE] DRY RUN — skipping data harvest and training")
-        for target in ['bear', 'bull']:
-            model_path = f'{target}_model.pth'
-            config_path = f'{target}_config.pkl'
-            if os.path.exists(model_path):
-                score = evaluate_model(model_path, config_path, target)
-                print(f"[EVOLVE] Current {target} model score: {score:.4f}")
-            else:
-                print(f"[EVOLVE] No {target} model found")
+        for prefix, data_csv, _ in MODEL_GROUPS:
+            p = f'{prefix}_' if prefix else ''
+            label = prefix or 'crypto'
+            for target in ['bear', 'bull']:
+                model_path = f'{p}{target}_model.pth'
+                config_path = f'{p}{target}_config.pkl'
+                if os.path.exists(model_path):
+                    score = evaluate_model(model_path, config_path, target, prefix, data_csv)
+                    print(f"[EVOLVE] Current {label} {target} model score: {score:.4f}")
+                else:
+                    print(f"[EVOLVE] No {label} {target} model found")
         return
 
-    # 2. Harvest fresh data
-    harvest_data()
+    # Process each model group
+    for prefix, data_csv, harvest_script in MODEL_GROUPS:
+        p = f'{prefix}_' if prefix else ''
+        label = prefix or 'crypto'
+        print(f"\n{'='*50}")
+        print(f"[EVOLVE] GROUP: {label.upper()} (data={data_csv})")
+        print(f"{'='*50}")
 
-    # 3. Snapshot current scores for promotion comparison
-    current_scores = {}
-    for target in ['bear', 'bull']:
-        model_path = f'{target}_model.pth'
-        config_path = f'{target}_config.pkl'
-        if os.path.exists(model_path) and os.path.exists(config_path):
-            current_scores[target] = evaluate_model(model_path, config_path, target)
-            print(f"[EVOLVE] Current {target} score: {current_scores[target]:.4f}")
-        else:
-            current_scores[target] = 0.0
-            print(f"[EVOLVE] No current {target} model")
+        # 2. Harvest fresh data
+        harvest_data(harvest_script)
 
-    # 4. Alternating bear/bull hypersearch
-    num_rounds = (trials_per_model + batch_size - 1) // batch_size  # ceil division
-    for round_num in range(1, num_rounds + 1):
-        remaining = trials_per_model - (round_num - 1) * batch_size
-        this_batch = min(batch_size, remaining)
+        # 3. Snapshot current scores for promotion comparison
+        current_scores = {}
+        scores_key_bear = f'{p}bear' if prefix else 'bear'
+        scores_key_bull = f'{p}bull' if prefix else 'bull'
 
         for target in ['bear', 'bull']:
-            print(f"\n[EVOLVE] Round {round_num}/{num_rounds}: {target} ({this_batch} trials)")
-            wait_for_cool_gpu(70)
-            gc.collect()
-            torch.cuda.empty_cache()
-            run_hypersearch(target, this_batch)
+            scores_key = f'{p}{target}' if prefix else target
+            model_path = f'{p}{target}_model.pth'
+            config_path = f'{p}{target}_config.pkl'
+            if os.path.exists(model_path) and os.path.exists(config_path):
+                current_scores[target] = evaluate_model(model_path, config_path, target, prefix, data_csv)
+                print(f"[EVOLVE] Current {label} {target} score: {current_scores[target]:.4f}")
+            else:
+                current_scores[target] = 0.0
+                print(f"[EVOLVE] No current {label} {target} model")
 
-    # 5. Evaluate and promote
-    for target in ['bear', 'bull']:
-        model_path = f'{target}_model.pth'
-        config_path = f'{target}_config.pkl'
-        if not os.path.exists(model_path):
-            print(f"[EVOLVE] No {target} model produced")
-            continue
+        # 4. Alternating bear/bull hypersearch
+        num_rounds = (trials_per_model + batch_size - 1) // batch_size
+        for round_num in range(1, num_rounds + 1):
+            remaining = trials_per_model - (round_num - 1) * batch_size
+            this_batch = min(batch_size, remaining)
 
-        new_score = evaluate_model(model_path, config_path, target)
-        old_score = current_scores[target]
-        print(f"[EVOLVE] {target}: {old_score:.4f} -> {new_score:.4f}")
+            for target in ['bear', 'bull']:
+                print(f"\n[EVOLVE] {label} Round {round_num}/{num_rounds}: {target} ({this_batch} trials)")
+                wait_for_cool_gpu(70)
+                gc.collect()
+                torch.cuda.empty_cache()
+                run_hypersearch(target, this_batch, prefix, data_csv)
 
-        version = get_next_version(scores, target)
-        if new_score > old_score:
-            promote_model(target, version, new_score, scores)
-        else:
-            print(f"[EVOLVE] {target} not improved, archiving as v{version}")
-            dst = os.path.join(MODELS_DIR, f'{target}_v{version}.pth')
-            shutil.copy2(model_path, dst)
-            scores[target][str(version)] = {
-                'score': new_score,
-                'timestamp': datetime.now().isoformat(),
-                'promoted': False,
-            }
-            save_scores(scores)
+        # 5. Evaluate and promote
+        for target in ['bear', 'bull']:
+            scores_key = f'{p}{target}' if prefix else target
+            model_path = f'{p}{target}_model.pth'
+            config_path = f'{p}{target}_config.pkl'
+            if not os.path.exists(model_path):
+                print(f"[EVOLVE] No {label} {target} model produced")
+                continue
 
-        cleanup_old_versions(scores, target)
+            new_score = evaluate_model(model_path, config_path, target, prefix, data_csv)
+            old_score = current_scores[target]
+            print(f"[EVOLVE] {label} {target}: {old_score:.4f} -> {new_score:.4f}")
+
+            # Ensure scores dict has keys for this group
+            if scores_key not in scores:
+                scores[scores_key] = {}
+
+            version = get_next_version(scores, scores_key)
+            if new_score > old_score:
+                # Promote — copy to versioned path
+                dst_model = os.path.join(MODELS_DIR, f'{scores_key}_v{version}.pth')
+                dst_config = os.path.join(MODELS_DIR, f'{scores_key}_v{version}_config.pkl')
+                shutil.copy2(model_path, dst_model)
+                shutil.copy2(config_path, dst_config)
+                scores[scores_key][str(version)] = {
+                    'score': new_score,
+                    'timestamp': datetime.now().isoformat(),
+                }
+                scores[f'current_{scores_key}'] = version
+                save_scores(scores)
+                print(f"[EVOLVE] Promoted {label} {target}_v{version} (score={new_score:.4f})")
+            else:
+                print(f"[EVOLVE] {label} {target} not improved, archiving as v{version}")
+                dst = os.path.join(MODELS_DIR, f'{scores_key}_v{version}.pth')
+                shutil.copy2(model_path, dst)
+                scores[scores_key][str(version)] = {
+                    'score': new_score,
+                    'timestamp': datetime.now().isoformat(),
+                    'promoted': False,
+                }
+                save_scores(scores)
+
+            cleanup_old_versions(scores, scores_key)
 
     print(f"\n[EVOLVE] CYCLE COMPLETE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[EVOLVE] Bear: v{scores.get('current_bear', '?')} | Bull: v{scores.get('current_bull', '?')}")
+    for prefix, _, _ in MODEL_GROUPS:
+        p = f'{prefix}_' if prefix else ''
+        label = prefix or 'crypto'
+        bear_key = f'{p}bear' if prefix else 'bear'
+        bull_key = f'{p}bull' if prefix else 'bull'
+        print(f"[EVOLVE] {label}: bear=v{scores.get(f'current_{bear_key}', '?')} "
+              f"bull=v{scores.get(f'current_{bull_key}', '?')}")
 
 
 def main():

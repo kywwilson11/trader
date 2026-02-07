@@ -60,7 +60,7 @@ def compute_roc(close, length=12):
 
 
 def compute_features(df):
-    """Compute all features matching harvest_data.py exactly."""
+    """Compute all features matching harvest_crypto_data.py exactly."""
     df['RSI'] = compute_rsi(df['Close'], length=14)
 
     macd_line, macd_hist, macd_signal = compute_macd(df['Close'])
@@ -101,5 +101,83 @@ def compute_features(df):
     df['Hour_cos'] = np.cos(2 * np.pi * hour / 24)
     df['Day_sin'] = np.sin(2 * np.pi * day / 7)
     df['Day_cos'] = np.cos(2 * np.pi * day / 7)
+
+    return df
+
+
+# --- STOCK-SPECIFIC INDICATORS ---
+
+def compute_vwap(high, low, close, volume):
+    """Session VWAP — resets each trading day.
+    Returns a Series with intraday VWAP values.
+    """
+    typical_price = (high + low + close) / 3.0
+    tp_vol = typical_price * volume
+
+    # Group by date for daily reset
+    dates = close.index.date
+    cum_tp_vol = tp_vol.groupby(dates).cumsum()
+    cum_vol = volume.groupby(dates).cumsum()
+    vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
+    return vwap
+
+
+def compute_gap(open_price, close):
+    """Overnight gap: (today's open - yesterday's close) / yesterday's close * 100.
+    Returns a Series with gap % for each bar (only meaningful on first bar of day).
+    """
+    prev_close = close.shift(1)
+    gap = (open_price - prev_close) / prev_close * 100
+    return gap
+
+
+def compute_relative_strength(close, benchmark_close):
+    """Relative strength vs benchmark (e.g. SPY).
+    RS = stock ROC / benchmark ROC over a rolling window.
+    Returns ratio > 1 means outperforming, < 1 means underperforming.
+    """
+    stock_roc = close.pct_change(12)
+    bench_roc = benchmark_close.pct_change(12)
+    # Avoid division by zero
+    rs = stock_roc / bench_roc.replace(0, np.nan)
+    return rs
+
+
+def compute_normalized_atr(high, low, close, length=14):
+    """ATR normalized by price: ATR / close * 100.
+    Gives volatility as a percentage, comparable across different price levels.
+    """
+    atr = compute_atr(high, low, close, length)
+    return atr / close * 100
+
+
+def compute_stock_features(df, spy_close=None):
+    """Compute all features for stocks. Includes base crypto features + stock-specific ones.
+
+    Args:
+        df: DataFrame with OHLCV columns (DatetimeIndex)
+        spy_close: Optional Series of SPY close prices aligned to df's index
+                   for relative strength calculation
+    """
+    # Base features (same as crypto)
+    df = compute_features(df)
+
+    # VWAP
+    df['VWAP'] = compute_vwap(df['High'], df['Low'], df['Close'], df['Volume'])
+    df['Price_VWAP_Ratio'] = df['Close'] / df['VWAP']
+
+    # Overnight gap
+    df['Gap_Pct'] = compute_gap(df['Open'], df['Close'])
+
+    # Normalized ATR (volatility as % of price)
+    df['ATR_Pct'] = compute_normalized_atr(df['High'], df['Low'], df['Close'])
+
+    # Relative strength vs SPY
+    if spy_close is not None:
+        # Align SPY close to df's index
+        spy_aligned = spy_close.reindex(df.index, method='ffill')
+        df['RS_vs_SPY'] = compute_relative_strength(df['Close'], spy_aligned)
+    else:
+        df['RS_vs_SPY'] = 1.0  # neutral if no benchmark
 
     return df
