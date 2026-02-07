@@ -123,7 +123,10 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
     # target class index: bear=0, bull=2
     target_class = 0 if target == 'bear' else 2
 
+    MAX_TRIAL_SECONDS = 300  # kill any trial running longer than 5 min
+
     def objective(trial):
+        trial_start = time.time()
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -224,6 +227,11 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
                 gc.collect()
                 torch.cuda.empty_cache()
                 raise optuna.TrialPruned()
+
+            # Hard time limit per trial
+            if time.time() - trial_start > MAX_TRIAL_SECONDS:
+                print(f"  [TIMEOUT] Trial {trial.number} exceeded {MAX_TRIAL_SECONDS}s at epoch {epoch}, stopping")
+                break
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
