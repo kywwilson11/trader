@@ -1,30 +1,22 @@
 #!/bin/bash
-# Watchdog: monitor hypersearch, then launch predict + crypto_loop
+# Watchdog: launch evolve.py (continuous improvement) alongside crypto_loop.py
 set -e
 
 source activate jetson
 export LD_LIBRARY_PATH="/home/kyle/miniforge3/lib/python3.12/site-packages/nvidia/cusparselt/lib:$LD_LIBRARY_PATH"
 
-HSEARCH_PID=$1
 LOG="/home/kyle/trader/pipeline_output.log"
+EVOLVE_LOG="/home/kyle/trader/evolve_output.log"
 
-echo "[watchdog] Monitoring hypersearch PID $HSEARCH_PID"
+echo "[watchdog] Starting continuous improvement pipeline"
+echo "[watchdog] $(date)" >> "$LOG"
 
-# Wait for hypersearch to finish
-while kill -0 "$HSEARCH_PID" 2>/dev/null; do
-    sleep 30
-done
+# Launch evolve.py in background (daily retrain + promotion)
+echo "[watchdog] Starting evolve.py..." >> "$LOG"
+nohup python -u /home/kyle/trader/evolve.py >> "$EVOLVE_LOG" 2>&1 &
+EVOLVE_PID=$!
+echo "[watchdog] evolve.py PID: $EVOLVE_PID" >> "$LOG"
 
-echo "" >> "$LOG"
-echo "=== HYPERSEARCH COMPLETE ===" >> "$LOG"
-echo "" >> "$LOG"
-
-# Phase 2: test predictions
-echo "=== PHASE 2: Test Predictions ===" >> "$LOG"
-python -u /home/kyle/trader/predict_now.py >> "$LOG" 2>&1
-
-echo "" >> "$LOG"
-
-# Phase 3: launch live trading
-echo "=== PHASE 3: Launch Live Trading ===" >> "$LOG"
+# Launch crypto_loop.py (live trading with hot-reload)
+echo "[watchdog] Starting crypto_loop.py..." >> "$LOG"
 python -u /home/kyle/trader/crypto_loop.py >> "$LOG" 2>&1

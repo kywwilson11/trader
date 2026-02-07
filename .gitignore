@@ -6,3 +6,6 @@ training_data.csv
 *.swp
 *.log
 hypersearch_log.json
+hypersearch_bear_log.json
+hypersearch_bull_log.json
+models/

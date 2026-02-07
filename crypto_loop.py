@@ -1,11 +1,8 @@
-# NOTE: yfinance must be imported BEFORE torch to avoid CUDA's bundled
-# SQLite library overriding the system one (breaks yfinance's cache).
-import yfinance as yf
-
 import alpaca_trade_api as tradeapi
 import time
 import datetime
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 from order_utils import (
@@ -13,7 +10,8 @@ from order_utils import (
     verify_position, get_all_positions, should_trade,
     cancel_all_open_orders,
 )
-from predict_now import load_model, get_live_prediction
+from predict_now import load_dual_models, get_live_prediction
+from hw_monitor import get_gpu_temp, is_gpu_available
 
 load_dotenv()
 
@@ -36,16 +34,32 @@ CRYPTO_SYMBOLS = [
     'BCH/USD',
 ]
 
-# yfinance uses '-' not '/'
-YFINANCE_MAP = {sym: sym.replace('/', '-') for sym in CRYPTO_SYMBOLS}
-
 NOTIONAL_PER_SYMBOL = 25  # $25 per symbol per cycle
 ORDER_TIMEOUT = 30  # seconds to wait for limit fill
-LOOP_INTERVAL = 90  # seconds between checks
+LOOP_INTERVAL = 30  # seconds between checks
 COOLDOWN_MINUTES = 30  # min time between trades on same symbol
+MAX_PREDICTION_WORKERS = 5
+TEMP_LOG_EVERY_N_CYCLES = 10
+THERMAL_THROTTLE_TEMP = 75  # increase sleep if GPU above this
+
 
 def get_api():
     return tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version='v2')
+
+
+def _get_model_mtime(path):
+    """Get modification time of a model file, or 0 if it doesn't exist."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def _choose_inference_device():
+    """Choose inference device: CPU if GPU is busy/unavailable, else default."""
+    if not is_gpu_available():
+        return 'cpu'
+    return None  # None = use default device
 
 
 def place_smart_order(api, symbol, side, notional):
@@ -85,19 +99,47 @@ def cooldown_ok(last_trade_time, symbol):
     return elapsed >= COOLDOWN_MINUTES * 60
 
 
+def _predict_symbol(api, symbol, bear_model, bear_config, bull_model, bull_config,
+                    scaler_X, feature_cols, inference_device):
+    """Run both bear and bull predictions for a single symbol.
+    Returns (symbol, bear_pred, bull_pred).
+    """
+    bear_pred = get_live_prediction(
+        symbol, bear_model, scaler_X, bear_config, feature_cols,
+        api=api, inference_device=inference_device,
+    )
+    bull_pred = get_live_prediction(
+        symbol, bull_model, scaler_X, bull_config, feature_cols,
+        api=api, inference_device=inference_device,
+    )
+    return symbol, bear_pred, bull_pred
+
+
 def run_crypto_bot():
     api = get_api()
 
-    # Load prediction model
-    print("Loading prediction model...")
+    # Load prediction models (dual bear/bull with fallback to default)
+    print("Loading prediction models...")
     try:
-        model, scaler_X, config, seq_len, feature_cols = load_model()
-        bull_threshold = config.get('bull_threshold', 0.15)
-        print(f"Model loaded successfully (bull_threshold={bull_threshold:.2f}).")
+        inference_device = _choose_inference_device()
+        bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
+            load_dual_models(inference_device)
+        bear_threshold = bear_config.get('bull_threshold', 0.15)
+        bull_threshold = bull_config.get('bull_threshold', 0.15)
+        is_dual = bear_model is not bull_model
+        print(f"Models loaded (dual={is_dual}, bear_th={bear_threshold:.2f}, bull_th={bull_threshold:.2f})")
     except FileNotFoundError:
         print("WARNING: Model files not found. Running without prediction gating.")
-        model = None
-        bull_threshold = 0.15
+        bear_model = bull_model = None
+        bear_config = bull_config = {}
+        bear_threshold = bull_threshold = 0.15
+        scaler_X = feature_cols = None
+        is_dual = False
+
+    # Track model file mtimes for hot-reload
+    bear_mtime = _get_model_mtime('bear_model.pth')
+    bull_mtime = _get_model_mtime('bull_model.pth')
+    default_mtime = _get_model_mtime('stock_predictor.pth')
 
     # Cancel any stale orders from previous runs
     cancel_all_open_orders(api)
@@ -118,23 +160,72 @@ def run_crypto_bot():
     print(f"Symbols: {', '.join(CRYPTO_SYMBOLS)}")
     print(f"Notional: ${NOTIONAL_PER_SYMBOL} per symbol per trade")
     print(f"Loop interval: {LOOP_INTERVAL}s | Cooldown: {COOLDOWN_MINUTES} min")
+    print(f"Parallel workers: {MAX_PREDICTION_WORKERS}")
 
     cycle = 0
     while True:
         cycle += 1
         print(f"\n--- CYCLE {cycle}: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
-        # 1. Get predictions for all symbols
-        predictions = {}
-        if model is not None:
-            for symbol in CRYPTO_SYMBOLS:
-                yf_sym = YFINANCE_MAP[symbol]
-                pred = get_live_prediction(yf_sym, model, scaler_X, config, seq_len, feature_cols)
-                if pred is not None:
-                    predictions[symbol] = pred
-                time.sleep(0.5)
+        # --- Hot-reload check ---
+        new_bear_mt = _get_model_mtime('bear_model.pth')
+        new_bull_mt = _get_model_mtime('bull_model.pth')
+        new_default_mt = _get_model_mtime('stock_predictor.pth')
+
+        if (new_bear_mt != bear_mtime or new_bull_mt != bull_mtime
+                or new_default_mt != default_mtime):
+            print("[HOT-RELOAD] Model files changed, reloading...")
+            try:
+                inference_device = _choose_inference_device()
+                bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
+                    load_dual_models(inference_device)
+                bear_threshold = bear_config.get('bull_threshold', 0.15)
+                bull_threshold = bull_config.get('bull_threshold', 0.15)
+                is_dual = bear_model is not bull_model
+                bear_mtime = new_bear_mt
+                bull_mtime = new_bull_mt
+                default_mtime = new_default_mt
+                print(f"[HOT-RELOAD] Success (dual={is_dual}, bear_th={bear_threshold:.2f}, bull_th={bull_threshold:.2f})")
+            except Exception as e:
+                print(f"[HOT-RELOAD] Failed: {e}, keeping current models")
+
+        # --- Log GPU temp periodically ---
+        if cycle % TEMP_LOG_EVERY_N_CYCLES == 0:
+            temp = get_gpu_temp()
+            if temp is not None:
+                print(f"[HW] GPU temp: {temp:.0f}C")
+
+        # 1. Get predictions for all symbols in parallel
+        bear_preds = {}
+        bull_preds = {}
+        if bear_model is not None:
+            inference_device = _choose_inference_device()
+            if inference_device == 'cpu':
+                print("[HW] GPU unavailable, using CPU for inference")
+
+            with ThreadPoolExecutor(max_workers=MAX_PREDICTION_WORKERS) as executor:
+                futures = {}
+                for symbol in CRYPTO_SYMBOLS:
+                    f = executor.submit(
+                        _predict_symbol, api, symbol,
+                        bear_model, bear_config, bull_model, bull_config,
+                        scaler_X, feature_cols, inference_device,
+                    )
+                    futures[f] = symbol
+
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        sym, bear_pred, bull_pred = future.result()
+                        if bear_pred is not None:
+                            bear_preds[sym] = bear_pred
+                        if bull_pred is not None:
+                            bull_preds[sym] = bull_pred
+                    except Exception as e:
+                        print(f"  {symbol}: Prediction error: {e}")
 
         # 2. SELL: bearish positions with cooldown expired
+        #    Use bear model's prediction against bear threshold
         for symbol in list(positions):
             pos = verify_position(api, symbol)
             if pos is None:
@@ -142,9 +233,9 @@ def run_crypto_bot():
                 positions.discard(symbol)
                 continue
 
-            pred = predictions.get(symbol)
-            if pred is not None and pred > -bull_threshold:
-                print(f"  {symbol}: Prediction {pred:+.4f}%, HOLDING")
+            bear_pred = bear_preds.get(symbol)
+            if bear_pred is not None and bear_pred > -bear_threshold:
+                print(f"  {symbol}: Bear pred {bear_pred:+.4f}% > -{bear_threshold:.2f}, HOLDING")
                 continue
 
             # Bearish — check cooldown
@@ -153,7 +244,7 @@ def run_crypto_bot():
                 print(f"  {symbol}: Bearish but in cooldown ({remaining/60:.1f} min left), skipping sell")
                 continue
 
-            reason = f"pred={pred:+.4f}%" if pred is not None else "no prediction"
+            reason = f"bear_pred={bear_pred:+.4f}%" if bear_pred is not None else "no prediction"
             print(f"  {symbol}: SELLING ({reason})")
 
             quote = get_crypto_quote(api, symbol)
@@ -186,6 +277,7 @@ def run_crypto_bot():
             time.sleep(1)
 
         # 3. BUY: bullish symbols we don't hold, with cooldown expired
+        #    Use bull model's prediction against bull threshold
         for symbol in CRYPTO_SYMBOLS:
             if symbol in positions:
                 continue
@@ -195,16 +287,16 @@ def run_crypto_bot():
                 print(f"  {symbol}: In cooldown ({remaining/60:.1f} min left), skipping buy")
                 continue
 
-            pred = predictions.get(symbol)
+            bull_pred = bull_preds.get(symbol)
             quote = get_crypto_quote(api, symbol)
 
-            if pred is not None and quote is not None:
-                if not should_trade(pred, quote['spread_pct']):
-                    print(f"  {symbol}: Prediction {pred:+.4f}% too weak vs spread "
+            if bull_pred is not None and quote is not None:
+                if not should_trade(bull_pred, quote['spread_pct']):
+                    print(f"  {symbol}: Bull pred {bull_pred:+.4f}% too weak vs spread "
                           f"{quote['spread_pct']:.3f}%, skipping")
                     continue
-                if pred < bull_threshold:
-                    print(f"  {symbol}: Prediction {pred:+.4f}% not bullish enough, skipping")
+                if bull_pred < bull_threshold:
+                    print(f"  {symbol}: Bull pred {bull_pred:+.4f}% < {bull_threshold:.2f}, skipping")
                     continue
 
             if place_smart_order(api, symbol, 'buy', NOTIONAL_PER_SYMBOL):
@@ -212,8 +304,15 @@ def run_crypto_bot():
                 last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(1)
 
-        print(f"[SLEEP] Next check in {LOOP_INTERVAL}s...")
-        time.sleep(LOOP_INTERVAL)
+        # Thermal throttling
+        sleep_interval = LOOP_INTERVAL
+        temp = get_gpu_temp()
+        if temp is not None and temp > THERMAL_THROTTLE_TEMP:
+            sleep_interval = LOOP_INTERVAL * 2
+            print(f"[HW] GPU temp {temp:.0f}C > {THERMAL_THROTTLE_TEMP}C, throttling to {sleep_interval}s")
+
+        print(f"[SLEEP] Next check in {sleep_interval}s...")
+        time.sleep(sleep_interval)
 
 if __name__ == "__main__":
     run_crypto_bot()
