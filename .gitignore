@@ -3,3 +3,6 @@ __pycache__/
 training_data.csv
 *.pth
 *.pkl
+*.swp
+*.log
+hypersearch_log.json
