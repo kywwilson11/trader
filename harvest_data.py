@@ -10,7 +10,11 @@ def prepare_data(ticker):
     
     # 1. Download hourly data (last 730 days is max for hourly usually, but we'll do 60 days for speed)
     df = yf.download(ticker, period="1y", interval="1h", progress=False)
-    
+
+    # Flatten multi-level columns from yfinance
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
     if df.empty:
         return None
 
