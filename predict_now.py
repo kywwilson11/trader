@@ -128,5 +128,10 @@ if __name__ == "__main__":
         print("Error: Model or Scaler files not found. Did you run train_model.py?")
         exit(1)
 
-    get_live_prediction('ETH-USD', model, scaler_X, scaler_y, input_dim)
-    get_live_prediction('NVDA', model, scaler_X, scaler_y, input_dim)
+    # Top 10 cryptos (yfinance uses '-' instead of '/')
+    symbols = [
+        'BTC-USD', 'ETH-USD', 'XRP-USD', 'SOL-USD', 'DOGE-USD',
+        'LINK-USD', 'AVAX-USD', 'DOT-USD', 'LTC-USD', 'UNI-USD',
+    ]
+    for sym in symbols:
+        get_live_prediction(sym, model, scaler_X, scaler_y, input_dim)

@@ -2,8 +2,16 @@ import yfinance as yf
 import pandas as pd
 import pandas_ta as ta # You must install this: pip install pandas_ta
 
-# Stocks that fit your "High Beta" profile
-TICKERS = ['NVDA', 'TSLA', 'AMD', 'META', 'AMZN', 'QQQ']
+# Stocks (High Beta)
+STOCK_TICKERS = ['NVDA', 'TSLA', 'AMD', 'META', 'AMZN', 'QQQ']
+
+# Top 10 cryptos (yfinance format)
+CRYPTO_TICKERS = [
+    'BTC-USD', 'ETH-USD', 'XRP-USD', 'SOL-USD', 'DOGE-USD',
+    'LINK-USD', 'AVAX-USD', 'DOT-USD', 'LTC-USD', 'UNI-USD',
+]
+
+TICKERS = STOCK_TICKERS + CRYPTO_TICKERS
 
 def prepare_data(ticker):
     print(f"Processing {ticker}...")

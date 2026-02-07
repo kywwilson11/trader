@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:forums.developer.nvidia.com)",
+      "WebFetch(domain:pypi.jetson-ai-lab.io)",
+      "WebSearch",
+      "WebFetch(domain:ninjalabo.ai)",
+      "WebFetch(domain:docs.nvidia.com)",
+      "WebFetch(domain:developer.nvidia.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(dpkg:*)",
+      "Bash(python3:*)",
+      "Bash(/home/kyle/miniforge3/bin/python:*)",
+      "Bash(conda:*)",
+      "Bash(/home/kyle/miniforge3/bin/conda:*)",
+      "Bash(/home/kyle/miniforge3/bin/conda env:*)"
+    ]
+  }
+}
