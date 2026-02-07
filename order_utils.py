@@ -188,16 +188,22 @@ def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2, fallback_
 # --- POSITION VERIFICATION ---
 
 def verify_position(api, symbol):
-    """Check actual position via API. Returns position object or None if no position."""
-    try:
-        pos = api.get_position(symbol)
-        qty = float(pos.qty)
-        if qty > 0:
-            return pos
-        return None
-    except Exception:
-        # 404 = no position
-        return None
+    """Check actual position via API. Returns position object or None if no position.
+    Handles Alpaca's crypto symbol format (BTC/USD -> BTCUSD).
+    """
+    # Try the symbol as-is first, then without the slash
+    candidates = [symbol]
+    if '/' in symbol:
+        candidates.append(symbol.replace('/', ''))
+    for sym in candidates:
+        try:
+            pos = api.get_position(sym)
+            qty = float(pos.qty)
+            if qty > 0:
+                return pos
+        except Exception:
+            continue
+    return None
 
 
 def get_all_positions(api):
