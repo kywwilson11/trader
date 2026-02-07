@@ -91,7 +91,7 @@ def run_crypto_bot():
     # Load prediction model
     print("Loading prediction model...")
     try:
-        model, scaler_X, scaler_y, input_dim = load_model()
+        model, scaler_X, config, seq_len, feature_cols = load_model()
         print("Model loaded successfully.")
     except FileNotFoundError:
         print("WARNING: Model files not found. Running without prediction gating.")
@@ -127,7 +127,7 @@ def run_crypto_bot():
         if model is not None:
             for symbol in CRYPTO_SYMBOLS:
                 yf_sym = YFINANCE_MAP[symbol]
-                pred = get_live_prediction(yf_sym, model, scaler_X, scaler_y, input_dim)
+                pred = get_live_prediction(yf_sym, model, scaler_X, config, seq_len, feature_cols)
                 if pred is not None:
                     predictions[symbol] = pred
                 time.sleep(0.5)
