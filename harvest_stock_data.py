@@ -10,7 +10,7 @@ from indicators import (
 
 # ~30 high-beta, liquid stocks (no penny stocks)
 STOCK_TICKERS = [
-    'AMD', 'PLTR', 'SNAP', 'ROKU', 'SQ', 'HOOD', 'SHOP', 'NET', 'CRWD', 'COIN',
+    'AMD', 'PLTR', 'SNAP', 'ROKU', 'AFRM', 'HOOD', 'SHOP', 'NET', 'CRWD', 'COIN',
     'MARA', 'MSTR', 'UBER', 'SOFI', 'ABNB', 'DASH', 'RBLX', 'SMCI', 'MRVL', 'ARM',
     'FSLR', 'ENPH', 'OXY', 'MRNA', 'CRSP', 'ARKK', 'TQQQ', 'SOXL', 'TSLA', 'NVDA',
     'META',

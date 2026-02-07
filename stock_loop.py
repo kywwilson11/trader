@@ -32,7 +32,7 @@ BASE_URL = os.getenv('ALPACA_BASE_URL')
 
 # ~30 high-beta, liquid stocks
 STOCK_UNIVERSE = [
-    'AMD', 'PLTR', 'SNAP', 'ROKU', 'SQ', 'HOOD', 'SHOP', 'NET', 'CRWD', 'COIN',
+    'AMD', 'PLTR', 'SNAP', 'ROKU', 'AFRM', 'HOOD', 'SHOP', 'NET', 'CRWD', 'COIN',
     'MARA', 'MSTR', 'UBER', 'SOFI', 'ABNB', 'DASH', 'RBLX', 'SMCI', 'MRVL', 'ARM',
     'FSLR', 'ENPH', 'OXY', 'MRNA', 'CRSP', 'ARKK', 'TQQQ', 'SOXL', 'TSLA', 'NVDA',
     'META',
