@@ -92,10 +92,12 @@ def run_crypto_bot():
     print("Loading prediction model...")
     try:
         model, scaler_X, config, seq_len, feature_cols = load_model()
-        print("Model loaded successfully.")
+        bull_threshold = config.get('bull_threshold', 0.15)
+        print(f"Model loaded successfully (bull_threshold={bull_threshold:.2f}).")
     except FileNotFoundError:
         print("WARNING: Model files not found. Running without prediction gating.")
         model = None
+        bull_threshold = 0.15
 
     # Cancel any stale orders from previous runs
     cancel_all_open_orders(api)
@@ -141,7 +143,7 @@ def run_crypto_bot():
                 continue
 
             pred = predictions.get(symbol)
-            if pred is not None and pred > -0.1:
+            if pred is not None and pred > -bull_threshold:
                 print(f"  {symbol}: Prediction {pred:+.4f}%, HOLDING")
                 continue
 
@@ -201,7 +203,7 @@ def run_crypto_bot():
                     print(f"  {symbol}: Prediction {pred:+.4f}% too weak vs spread "
                           f"{quote['spread_pct']:.3f}%, skipping")
                     continue
-                if pred < 0.1:
+                if pred < bull_threshold:
                     print(f"  {symbol}: Prediction {pred:+.4f}% not bullish enough, skipping")
                     continue
 

@@ -1,5 +1,5 @@
 """
-Optuna-powered hyperparameter search — 100 trials with Bayesian optimization.
+Optuna-powered hyperparameter search — 500 trials with Bayesian optimization.
 Memory-optimized for Jetson Orin Nano 8GB with on-the-fly sequence generation.
 """
 import pandas as pd
@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from model import CryptoLSTM
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 import joblib
@@ -16,7 +17,7 @@ import time
 import optuna
 from optuna.pruners import MedianPruner
 
-NUM_TRIALS = 100
+NUM_TRIALS = 500
 MAX_EPOCHS = 80
 EARLY_STOP_PATIENCE = 15
 TRAIN_RATIO = 0.8
@@ -26,24 +27,6 @@ PRUNE_WARMUP_EPOCHS = 8
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
-
-
-class CryptoLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, num_layers=2, dropout=0.3, num_classes=3):
-        super(CryptoLSTM, self).__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_dim, hidden_size=hidden_dim,
-            num_layers=num_layers, batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, 64), nn.ReLU(),
-            nn.Dropout(dropout), nn.Linear(64, num_classes),
-        )
-
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        return self.fc(lstm_out[:, -1, :])
 
 
 class SequenceDataset(Dataset):
@@ -267,10 +250,11 @@ def objective(trial):
 results_log = []
 t0 = time.time()
 best_score_so_far = 0.0
+trials_since_improvement = 0
 
 
 def trial_callback(study, trial):
-    global best_score_so_far
+    global best_score_so_far, trials_since_improvement
 
     elapsed = time.time() - t0
     n = trial.number + 1
@@ -280,10 +264,12 @@ def trial_callback(study, trial):
     val_acc = trial.user_attrs.get('val_acc', 0.0)
 
     tag = ""
+    trials_since_improvement += 1
     if trial.state == optuna.trial.TrialState.PRUNED:
         tag = " [PRUNED]"
     elif score > best_score_so_far and val_acc > 0.34:
         best_score_so_far = score
+        trials_since_improvement = 0
         tag = " ** BEST **"
 
     print(f"[{n:3d}] acc={val_acc:.3f} ts={score:.3f} "
@@ -303,7 +289,8 @@ def trial_callback(study, trial):
     if n % 10 == 0:
         with open('hypersearch_log.json', 'w') as f:
             json.dump(results_log, f, indent=2, default=str)
-        print(f"  --- {elapsed/60:.1f}min elapsed, best={best_score_so_far:.3f} ---")
+        print(f"  --- {elapsed/60:.1f}min elapsed, best={best_score_so_far:.3f}, "
+              f"{trials_since_improvement} trials since last improvement ---")
 
 
 # --- MAIN SEARCH ---
