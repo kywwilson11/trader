@@ -24,7 +24,8 @@ import alpaca_trade_api as tradeapi
 from PySide6.QtCore import (
     Qt, QTimer, QThread, Signal, Slot, QObject,
 )
-from PySide6.QtGui import QColor, QPalette, QFont, QAction, QPainter, QPixmap
+from PySide6.QtGui import QColor, QPalette, QFont, QAction, QPainter, QPixmap, QDesktopServices
+from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget,
     QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
@@ -43,13 +44,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TZ_CENTRAL = ZoneInfo("America/Chicago")
 
 LOG_FILES = {
-    "Evolve": BASE_DIR / "evolve_full_run.log",
-    "Monitor": BASE_DIR / "monitor.log",
-    "Alternating Search": BASE_DIR / "alternating_search.log",
-    "Hypersearch": BASE_DIR / "hypersearch_output.log",
-    "Hypersearch Bear": BASE_DIR / "hypersearch_bear_full.log",
     "Pipeline": BASE_DIR / "pipeline_output.log",
-    "Watchdog": BASE_DIR / "watchdog.log",
 }
 
 CONFIG_FILES = {
@@ -1319,19 +1314,24 @@ class TradingDashboard(QMainWindow):
         self._news_articles = []
 
         # News table
-        self._news_table = QTableWidget(0, 4)
+        self._news_table = QTableWidget(0, 5)
         self._news_table.setHorizontalHeaderLabels(
-            ["Time", "Category", "Headline", "Sentiment"]
+            ["Time", "Source", "Category", "Headline", "Sentiment"]
         )
         header = self._news_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self._news_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._news_table.setAlternatingRowColors(True)
         self._news_table.setWordWrap(True)
         self._news_table.verticalHeader().setDefaultSectionSize(32)
+        self._news_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._news_table.setCursor(Qt.PointingHandCursor)
+        self._news_table.cellClicked.connect(self._on_news_row_clicked)
+        self._news_filtered = []  # track filtered articles for click lookup
         layout.addWidget(self._news_table)
 
         self.tabs.addTab(tab, "News")
@@ -1710,6 +1710,8 @@ class TradingDashboard(QMainWindow):
             articles = [a for a in articles if a.get('_category') == 'Market']
         # idx == 1 (All News) — no filtering
 
+        self._news_filtered = articles  # store for click lookup
+
         tbl = self._news_table
         tbl.setUpdatesEnabled(False)
         tbl.setRowCount(len(articles))
@@ -1720,8 +1722,10 @@ class TradingDashboard(QMainWindow):
             else:
                 time_str = "—"
 
+            source = a.get('source', '—')
             category = a.get('_category', '—')
             headline = a.get('headline', '—')
+            summary = a.get('summary', '')
             sentiment = a.get('_sentiment', 0.0)
 
             if sentiment > 0.1:
@@ -1734,16 +1738,29 @@ class TradingDashboard(QMainWindow):
                 sent_color = T.get('yellow', T['white'])
                 sent_text = f"{sentiment:.2f}"
 
-            items_data = [time_str, category, headline, sent_text]
+            # Tooltip: show summary on hover for every cell in the row
+            tooltip = summary if summary else ''
+
+            items_data = [time_str, source, category, headline, sent_text]
             for col, val in enumerate(items_data):
                 item = QTableWidgetItem(str(val))
-                if col == 3:
+                if col == 4:  # Sentiment
                     item.setForeground(sent_color)
                     item.setTextAlignment(Qt.AlignCenter)
-                elif col <= 1:
+                elif col <= 2:  # Time, Source, Category
                     item.setTextAlignment(Qt.AlignCenter)
+                if tooltip:
+                    item.setToolTip(tooltip)
                 tbl.setItem(row, col, item)
         tbl.setUpdatesEnabled(True)
+
+    def _on_news_row_clicked(self, row, _col):
+        """Open the article URL in the system browser."""
+        articles = getattr(self, '_news_filtered', [])
+        if 0 <= row < len(articles):
+            url = articles[row].get('url', '')
+            if url:
+                QDesktopServices.openUrl(QUrl(url))
 
     @Slot(str)
     def on_error(self, msg):

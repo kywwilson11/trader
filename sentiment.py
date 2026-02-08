@@ -241,9 +241,13 @@ def _score_text(text):
             # No negation applied — use base score
             raw_score += base
 
-    # Smooth with tanh: maps any raw sum to (-1, 1) with granular values
-    # Scale factor 0.4 means: 1 keyword ≈ ±0.38, 2 ≈ ±0.66, 3 ≈ ±0.83
-    return math.tanh(raw_score * 0.4)
+    # Smooth with tanh: maps any raw sum to (-1, 1).
+    # Scale by sqrt(word_count) so longer text doesn't saturate to ±1.0.
+    # Headlines (~10 words): scale ≈ 0.4 (unchanged behavior)
+    # Articles (~200 words): scale ≈ 0.09 (dampened, stays granular)
+    n_words = max(len(words), 1)
+    scale = 0.4 / math.sqrt(n_words / 10)
+    return math.tanh(raw_score * scale)
 
 
 _HTML_TAG = _re.compile(r'<[^>]+>')
@@ -251,6 +255,103 @@ _WHITESPACE_ONLY = _re.compile(r'^[\s\W]*$')
 
 
 _URL_PATTERN = _re.compile(r'^https?://')
+
+# --- Full article fetching ---
+_article_cache = {}  # url -> (timestamp, text or None)
+_ARTICLE_CACHE_TTL = 1800  # 30 min — articles don't change
+
+_USER_AGENT = (
+    'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
+)
+
+
+def _fetch_article_text(url, timeout=5):
+    """Fetch article URL and extract body text using BeautifulSoup.
+
+    Returns extracted text string, or None on failure.
+    Results are cached for 30 minutes.
+    """
+    if not url:
+        return None
+
+    now = time.time()
+    if url in _article_cache:
+        ts, text = _article_cache[url]
+        if now - ts < _ARTICLE_CACHE_TTL:
+            return text
+
+    try:
+        from bs4 import BeautifulSoup
+
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={'User-Agent': _USER_AGENT},
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            _article_cache[url] = (now, None)
+            return None
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        # Remove non-content elements
+        for tag in soup(['script', 'style', 'nav', 'header', 'footer',
+                         'aside', 'iframe', 'form', 'noscript']):
+            tag.decompose()
+
+        # Try common article body selectors
+        body = None
+        for selector in ['article', '[role="main"]', '.article-body',
+                         '.post-content', '.entry-content', '.story-body',
+                         '.article-content', 'main']:
+            body = soup.select_one(selector)
+            if body:
+                break
+
+        if body is None:
+            body = soup.body or soup
+
+        # Extract paragraph text, filtering junk
+        paragraphs = body.find_all('p')
+        clean_paragraphs = []
+        for p in paragraphs:
+            t = p.get_text(strip=True)
+            # Skip very short paragraphs (captions, links, CTAs)
+            if len(t) < 40:
+                continue
+            # Skip boilerplate patterns
+            t_lower = t.lower()
+            if any(junk in t_lower for junk in (
+                'never miss an important', 'find winning stocks',
+                'sign up for', 'subscribe to', 'newsletter',
+                'getty images', 'via getty', 'shutterstock',
+                'in your inbox', 'related stories',
+                'click here', 'read more:', 'read next',
+                'simply wall st', 'seeking alpha',
+                'download the app', 'join premium',
+                'trusted by over', 'million investors',
+            )):
+                continue
+            clean_paragraphs.append(t)
+        text = ' '.join(clean_paragraphs)
+
+        # Validate: need at least a sentence worth of content
+        if len(text) < 50:
+            _article_cache[url] = (now, None)
+            return None
+
+        # Cap at ~2000 chars to keep scoring fast
+        if len(text) > 2000:
+            text = text[:2000]
+
+        _article_cache[url] = (now, text)
+        return text
+
+    except Exception:
+        _article_cache[url] = (now, None)
+        return None
 
 
 def _validate_text(text):
@@ -304,7 +405,17 @@ def _score_articles(articles):
         # Score validated text (0.0 for missing components)
         h_score = _score_text(headline) if headline else 0.0
         s_score = _score_text(summary) if summary else 0.0
-        combined = h_score * 0.6 + s_score * 0.4
+
+        # Try to fetch and score full article text
+        full_text = _fetch_article_text(article.get('url', ''))
+        if full_text:
+            f_score = _score_text(full_text)
+            # Full article available: headline 25%, summary 25%, full text 50%
+            combined = h_score * 0.25 + s_score * 0.25 + f_score * 0.50
+        else:
+            # No full text: headline 60%, summary 40% (original weights)
+            combined = h_score * 0.6 + s_score * 0.4
+
         scores.append(combined)
 
     if not scores:

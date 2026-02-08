@@ -272,8 +272,9 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
                 if counter >= EARLY_STOP_PATIENCE:
                     break
 
-        # Per-class accuracy
+        # Per-class accuracy + confusion matrix analysis
         per_class = {}
+        composite_score = 0.0
         if best_state:
             model.load_state_dict(best_state)
             model.eval()
@@ -285,27 +286,50 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
                     ap.extend(p.cpu().numpy())
                     al.extend(y_vb.numpy())
             ap, al = np.array(ap), np.array(al)
+            n_samples = len(al)
             for c, n in [(0, 'bear'), (1, 'neutral'), (2, 'bull')]:
                 m = al == c
                 per_class[n] = float((ap[m] == c).mean()) if m.sum() > 0 else 0.0
 
-        # Reject degenerate models: any class at 100% while another is 0%
-        # means the model is just predicting one class for everything
+        # Reject non-discriminative models: every class must exceed a floor.
+        MIN_CLASS_ACC = 0.10
         pc_vals = list(per_class.values())
-        if pc_vals and (max(pc_vals) >= 0.99 and min(pc_vals) <= 0.01):
+        if pc_vals and min(pc_vals) < MIN_CLASS_ACC:
             del model, train_ds, val_ds, train_loader, val_loader, weights_t
             gc.collect()
             torch.cuda.empty_cache()
             return 0.0
 
-        # Score = target class accuracy
-        target_name = 'bear' if target_class == 0 else 'bull'
-        target_score = per_class.get(target_name, 0.0)
-        trading_score = (per_class.get('bear', 0) + per_class.get('bull', 0)) / 2
+        # --- Confusion-matrix scoring for real-world trading ---
+        # 1) Target class F1: balances precision (trust the signal) and recall (catch moves)
+        # 2) Balanced accuracy: overall 3-class discrimination
+        # 3) Catastrophic penalty: bear<->bull confusion rate (the expensive mistake)
+        if n_samples > 0:
+            # Target class precision, recall, F1
+            tp = int(((ap == target_class) & (al == target_class)).sum())
+            fp = int(((ap == target_class) & (al != target_class)).sum())
+            fn = int(((ap != target_class) & (al == target_class)).sum())
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            target_f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+            # Balanced accuracy (mean per-class recall)
+            balanced_acc = sum(pc_vals) / len(pc_vals) if pc_vals else 0.0
+
+            # Catastrophic confusion: bear predicted as bull + bull predicted as bear
+            # These are the mistakes that lose real money in trading
+            bear_as_bull = int(((al == 0) & (ap == 2)).sum())
+            bull_as_bear = int(((al == 2) & (ap == 0)).sum())
+            catastrophic_rate = (bear_as_bull + bull_as_bear) / n_samples
+
+            # Composite: F1 * 0.5 + balanced_acc * 0.2 - catastrophic * 0.3
+            composite_score = target_f1 * 0.5 + balanced_acc * 0.2 - catastrophic_rate * 0.3
+            composite_score = max(composite_score, 0.0)  # floor at 0
 
         trial.set_user_attr('per_class', per_class)
-        trial.set_user_attr('target_score', target_score)
-        trial.set_user_attr('trading_score', trading_score)
+        trial.set_user_attr('composite_score', composite_score)
+        trial.set_user_attr('target_f1', target_f1 if n_samples > 0 else 0.0)
+        trial.set_user_attr('catastrophic_rate', catastrophic_rate if n_samples > 0 else 1.0)
         trial.set_user_attr('val_acc', best_val_acc)
         trial.set_user_attr('cfg', cfg)
 
@@ -317,7 +341,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         gc.collect()
         torch.cuda.empty_cache()
 
-        return target_score
+        return composite_score
 
     return objective
 
@@ -380,7 +404,9 @@ def main():
         d = cfg.get('dropout', '')
         lr = cfg.get('learning_rate', '')
         th = cfg.get('bull_threshold', '')
-        print(f"[{n:3d}] acc={val_acc:.3f} {target}={score:.3f} "
+        f1 = trial.user_attrs.get('target_f1', 0.0)
+        cat = trial.user_attrs.get('catastrophic_rate', 0.0)
+        print(f"[{n:3d}] score={score:.3f} F1={f1:.2f} cat={cat:.2f} "
               f"B:{pc.get('bear',0):.0%} N:{pc.get('neutral',0):.0%} U:{pc.get('bull',0):.0%} "
               f"| s={cfg.get('seq_len','')} h={cfg.get('hidden_dim','')} "
               f"l={cfg.get('num_layers','')} d={d if d == '' else f'{d:.2f}'} "
@@ -389,7 +415,8 @@ def main():
 
         results_log.append({
             'i': n, 'cfg': cfg, 'val_acc': val_acc,
-            'target_score': score, 'per_class': pc,
+            'composite_score': score, 'target_f1': f1,
+            'catastrophic_rate': cat, 'per_class': pc,
             'state': str(trial.state),
             'time': elapsed,
         })
@@ -397,7 +424,7 @@ def main():
         if n % 10 == 0:
             with open(f'hypersearch_{prefix}{target}_log.json', 'w') as f:
                 json.dump(results_log, f, indent=2, default=str)
-            print(f"  --- {elapsed/60:.1f}min elapsed, best {target}={best_state_holder['score']:.3f}, "
+            print(f"  --- {elapsed/60:.1f}min elapsed, best score={best_state_holder['score']:.3f}, "
                   f"total trials in study={len(study.trials)}, "
                   f"{trials_since_improvement} since last improvement ---")
 
@@ -415,7 +442,7 @@ def main():
     prior_trials = len(study.trials)
     print(f"\n{'='*70}")
     print(f"OPTUNA {target.upper()} MODEL SEARCH: {num_trials} new trials (TPE + pruning)")
-    print(f"Optimizing: {target} class accuracy")
+    print(f"Optimizing: F1 * 0.5 + balanced_acc * 0.2 - catastrophic * 0.3 (target={target})")
     print(f"Resuming from {prior_trials} prior trials in {db_path}")
     print(f"{'='*70}\n")
 
@@ -426,18 +453,18 @@ def main():
                 continue
             if t.user_attrs.get('val_acc', 0) <= 0.34:
                 continue
-            # Skip degenerate trials (one class 100%, another 0%)
+            # Skip non-discriminative trials (any class below floor)
             pc = t.user_attrs.get('per_class', {})
             pc_vals = list(pc.values())
-            if pc_vals and (max(pc_vals) >= 0.99 and min(pc_vals) <= 0.01):
+            if pc_vals and min(pc_vals) < 0.10:
                 continue
             if (t.value or 0) > best_state_holder['score']:
-                    best_state_holder['score'] = t.value
-                    best_state_holder['cfg'] = t.user_attrs.get('cfg', {})
-                    best_state_holder['val_acc'] = t.user_attrs.get('val_acc', 0)
-                    best_state_holder['per_class'] = t.user_attrs.get('per_class', {})
+                best_state_holder['score'] = t.value
+                best_state_holder['cfg'] = t.user_attrs.get('cfg', {})
+                best_state_holder['val_acc'] = t.user_attrs.get('val_acc', 0)
+                best_state_holder['per_class'] = t.user_attrs.get('per_class', {})
         if best_state_holder['score'] > 0:
-            print(f"Prior best {target}={best_state_holder['score']:.3f} — new trials must beat this")
+            print(f"Prior best score={best_state_holder['score']:.3f} — new trials must beat this")
 
     objective_fn = create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache)
     study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback],
@@ -456,7 +483,7 @@ def main():
         best_state = best_state_holder['state']
         pc = best_state_holder['per_class']
 
-        print(f"\nBest {target} model ({target}={best_state_holder['score']:.3f}, "
+        print(f"\nBest {target} model (score={best_state_holder['score']:.3f}, "
               f"acc={best_state_holder['val_acc']:.3f}):")
         for k, v in best_cfg.items():
             print(f"  {k}: {v}")

@@ -121,9 +121,15 @@ def run_phase(phase, log_fh, status):
 
         # Parse best score on "** BEST **" lines
         if '** BEST **' in line:
-            m = re.search(r'(?:bear|bull)=(\d+\.\d+)', line)
+            m = re.search(r'score=(\d+\.\d+)', line)
             if m:
                 status['best_score'] = float(m.group(1))
+            m = re.search(r'F1=(\d+\.\d+)', line)
+            if m:
+                status['best_f1'] = float(m.group(1))
+            m = re.search(r'cat=(\d+\.\d+)', line)
+            if m:
+                status['best_catastrophic'] = float(m.group(1))
             m = re.search(r'B:(\d+)% N:(\d+)% U:(\d+)%', line)
             if m:
                 status['best_per_class'] = {
