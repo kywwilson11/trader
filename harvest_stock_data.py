@@ -10,22 +10,9 @@ import yfinance as yf
 import pandas as pd
 from indicators import compute_stock_features
 from market_data import flatten_yfinance_columns
+from stock_config import load_stock_universe
 
-# ~45 high-beta, liquid stocks (no penny stocks)
-STOCK_TICKERS = [
-    'AMD', 'PLTR', 'SNAP', 'ROKU', 'AFRM', 'HOOD', 'SHOP', 'NET', 'CRWD', 'COIN',
-    'MARA', 'MSTR', 'UBER', 'SOFI', 'ABNB', 'DASH', 'RBLX', 'SMCI', 'MRVL', 'ARM',
-    'FSLR', 'ENPH', 'OXY', 'MRNA', 'CRSP', 'ARKK', 'TQQQ', 'SOXL', 'TSLA', 'NVDA',
-    'META',
-    # Commodities / precious metals
-    'SLV', 'GLD', 'PALL', 'PPLT', 'COPX',
-    # Space / defense
-    'ASTS', 'RKLB', 'RDW',
-    # Quantum / tech
-    'QS', 'QBTS', 'IONQ', 'POET',
-    # Other
-    'SERV',
-]
+STOCK_TICKERS = load_stock_universe()
 
 BENCHMARK = 'SPY'
 

@@ -13,6 +13,8 @@ Uses ATR-adaptive stops with fixed-percentage fallbacks.
 import time
 import datetime
 import gc
+import json
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from order_utils import (
@@ -64,6 +66,36 @@ CRYPTO_TAKE_PROFIT_CEIL_PCT = 0.12  # max take-profit distance 12%
 CRYPTO_STOP_LOSS_PCT = 0.04        # 4% hard stop-loss from entry
 CRYPTO_TRAIL_PCT = 0.03            # 3% trailing stop from high water mark
 CIRCUIT_BREAKER_PCT = 0.05         # 5% daily equity drawdown triggers flatten
+
+_PRED_CACHE_FILE = Path(__file__).resolve().parent / "crypto_predictions.json"
+
+
+def _write_prediction_cache(bear_preds, bull_preds, bear_threshold, bull_threshold):
+    """Write prediction scores to JSON for GUI consumption."""
+    try:
+        data = {}
+        all_syms = set(bear_preds) | set(bull_preds)
+        for sym in sorted(all_syms):
+            bear = bear_preds.get(sym)
+            bull = bull_preds.get(sym)
+            score = (bull or 0) - abs(bear or 0)
+            if bull is not None and bull >= bull_threshold:
+                signal = "BULL"
+            elif bear is not None and bear < -bear_threshold:
+                signal = "BEAR"
+            else:
+                signal = "NEUTRAL"
+            data[sym] = {
+                "bear": round(bear, 6) if bear is not None else None,
+                "bull": round(bull, 6) if bull is not None else None,
+                "score": round(score, 6),
+                "signal": signal,
+                "updated": datetime.datetime.now().isoformat(),
+            }
+        with open(_PRED_CACHE_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"  [CACHE] Error writing crypto prediction cache: {e}")
 
 
 # --- ORDER HELPERS ---
@@ -288,6 +320,9 @@ def run_crypto_bot():
 
             # Free temporary tensors from prediction batch
             gc.collect()
+
+            # Write prediction cache for GUI
+            _write_prediction_cache(bear_preds, bull_preds, bear_threshold, bull_threshold)
 
         # ── SELL: bearish positions with cooldown expired ──
         for symbol in list(positions):

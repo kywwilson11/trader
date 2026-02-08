@@ -10,9 +10,11 @@ Trades only during regular market hours (9:30 AM - 4:00 PM ET):
 Uses stock-prefixed models (stock_bear_model.pth, stock_bull_model.pth).
 """
 
+import json
 import time
 import datetime
 import gc
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from order_utils import (
@@ -26,24 +28,13 @@ from market_data import fetch_spy_bars_alpaca, get_live_atr
 from trading_utils import get_api, get_model_mtime, choose_inference_device, cooldown_ok, predict_symbol
 from hw_monitor import get_gpu_temp
 from sentiment import sentiment_gate, get_market_sentiment
+from stock_config import load_stock_universe
 
 # --- CONFIGURATION ---
 
-# ~45 high-beta, liquid stocks + ETFs
-STOCK_UNIVERSE = [
-    'AMD', 'PLTR', 'SNAP', 'ROKU', 'AFRM', 'HOOD', 'SHOP', 'NET', 'CRWD', 'COIN',
-    'MARA', 'MSTR', 'UBER', 'SOFI', 'ABNB', 'DASH', 'RBLX', 'SMCI', 'MRVL', 'ARM',
-    'FSLR', 'ENPH', 'OXY', 'MRNA', 'CRSP', 'ARKK', 'TQQQ', 'SOXL', 'TSLA', 'NVDA',
-    'META',
-    # Commodities / precious metals
-    'SLV', 'GLD', 'PALL', 'PPLT', 'COPX',
-    # Space / defense
-    'ASTS', 'RKLB', 'RDW',
-    # Quantum / tech
-    'QS', 'QBTS', 'IONQ', 'POET',
-    # Other
-    'SERV',
-]
+STOCK_UNIVERSE = load_stock_universe()
+
+_PRED_CACHE_FILE = Path(__file__).resolve().parent / "stock_predictions.json"
 
 TOP_N = 10                   # Trade only top N stocks by bull signal
 NOTIONAL_PER_STOCK = 2500    # $2,500 per position
@@ -78,6 +69,29 @@ MARKET_CLOSE_HOUR = 16
 MARKET_CLOSE_MINUTE = 0
 FLATTEN_HOUR = 15
 FLATTEN_MINUTE = 50
+
+
+def _write_prediction_cache(bear_preds, bull_preds, top_symbols):
+    """Write prediction scores to JSON for GUI consumption (no torch needed)."""
+    try:
+        data = {}
+        all_syms = set(bear_preds) | set(bull_preds)
+        for sym in sorted(all_syms):
+            bear = bear_preds.get(sym)
+            bull = bull_preds.get(sym)
+            score = (bull or 0) - abs(bear or 0)
+            signal = "BULL" if sym in top_symbols else ("BEAR" if bear is not None and bear < 0 else "NEUTRAL")
+            data[sym] = {
+                "bear": round(bear, 6) if bear is not None else None,
+                "bull": round(bull, 6) if bull is not None else None,
+                "score": round(score, 6),
+                "signal": signal,
+                "updated": datetime.datetime.now().isoformat(),
+            }
+        with open(_PRED_CACHE_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"  [CACHE] Error writing prediction cache: {e}")
 
 
 # --- MARKET HOURS HELPERS ---
@@ -264,7 +278,7 @@ def run_stock_bot():
             time.sleep(3600)
             continue
 
-        # ── Hot-reload check ──
+        # ── Hot-reload check (models + universe) ──
         new_bear_mt = get_model_mtime(f'{MODEL_PREFIX}_bear_model.pth')
         new_bull_mt = get_model_mtime(f'{MODEL_PREFIX}_bull_model.pth')
         if new_bear_mt != bear_mtime or new_bull_mt != bull_mtime:
@@ -280,6 +294,9 @@ def run_stock_bot():
                 print(f"[HOT-RELOAD] Success (bear_th={bear_threshold:.2f}, bull_th={bull_threshold:.2f})")
             except Exception as e:
                 print(f"[HOT-RELOAD] Failed: {e}, keeping current models")
+
+        # Reload universe each cycle so GUI edits take effect
+        STOCK_UNIVERSE = load_stock_universe()
 
         # ── Log GPU temp periodically ──
         if cycle % TEMP_LOG_EVERY_N_CYCLES == 0:
@@ -384,6 +401,9 @@ def run_stock_bot():
         ranked = sorted(bull_preds.items(), key=lambda x: x[1], reverse=True)
         top_symbols = [sym for sym, _ in ranked[:TOP_N]]
         print(f"[RANK] Top {TOP_N}: {', '.join(f'{s}({bull_preds[s]:+.4f})' for s in top_symbols)}")
+
+        # Write prediction cache for GUI
+        _write_prediction_cache(bear_preds, bull_preds, top_symbols)
 
         # ── SELL: bearish positions ──
         for symbol in list(positions):

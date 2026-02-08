@@ -55,6 +55,7 @@ evolve.py                         3-day retraining orchestrator (alternative to 
 | Cooldown | 30 min per symbol |
 
 - Loads dual bear/bull models, runs parallel predictions via `ThreadPoolExecutor` (5 workers)
+- Writes `crypto_predictions.json` each cycle for GUI Markets tab (bear/bull/score/signal per symbol)
 - Sentiment multiplier (0.3x–1.3x) gates all trades based on Fear & Greed + symbol-specific news
 - Circuit breaker: 5% daily equity drawdown flattens all positions + 1-hour halt
 - Hot-reload: detects `.pth` file changes and reloads models without stopping
@@ -74,6 +75,8 @@ Market-hours stock trading loop with dynamic top-N selection.
 | Flatten time | 3:50 PM ET (avoid overnight gap risk) |
 
 - Scores all ~45 stocks with both models, trades only the top 10 by bull confidence
+- Writes `stock_predictions.json` each cycle for GUI Markets tab (bear/bull/score/signal per symbol)
+- Dynamic stock universe: reloads `stock_universe.json` each cycle so GUI edits take effect live
 - Bracket orders: buy with stop-loss + take-profit children
 - End-of-day: cancels all stop orders and market-sells all positions at 3:50 PM ET
 - SPY relative strength features for cross-market context
@@ -159,10 +162,9 @@ Downloads 1 year of hourly OHLCV bars for 10 cryptocurrencies via yfinance, comp
 
 #### `harvest_stock_data.py` — Stock Data Pipeline
 
-Downloads 1 year of hourly OHLCV bars for ~45 high-beta stocks via yfinance, computes stock-specific features, and saves to `stock_training_data.csv`.
+Downloads 1 year of hourly OHLCV bars for stocks via yfinance, computes stock-specific features, and saves to `stock_training_data.csv`.
 
-**Stock universe:** AMD, PLTR, SNAP, ROKU, AFRM, HOOD, SHOP, NET, CRWD, COIN, MARA, MSTR, UBER, SOFI, ABNB, DASH, RBLX, SMCI, MRVL, ARM, FSLR, ENPH, OXY, MRNA, CRSP, ARKK, TQQQ, SOXL, TSLA, NVDA, META, SLV, GLD, PALL, PPLT, COPX, ASTS, RKLB, RDW, QS, QBTS, IONQ, POET, SERV
-
+- Stock universe loaded dynamically from `stock_universe.json` (editable via GUI Markets tab)
 - SPY used as benchmark for relative strength features (ratio, correlation, RSI divergence)
 
 #### `evolve.py` — 3-Day Retraining Orchestrator (Alternative)
@@ -300,7 +302,7 @@ Desktop monitoring app with live updates (2-second polling of `pipeline_status.j
 - **Positions** — open positions, P&L, exposure, recent fills
 - **Performance** — equity curve, daily P&L, drawdown
 - **News** — Fear & Greed Index, Finnhub headlines (My Universe / All News / Global Macro filters)
-- **Markets** — combined stocks + crypto universe with heatmap, price chart (1Y/3M/1M/1W/1D zoom), metrics table with model predictions, add/remove symbols
+- **Markets** — combined stocks + crypto universe with heatmap, price chart (1Y/3M/1M/1W/1D zoom), metrics table with live model predictions (bear/bull/score/signal from both bots), add/remove symbols
 - **Models** — model scores (C-Bear, C-Bull, S-Bear, S-Bull), trial progress, pipeline phase, next retrain time
 - **Hardware** — GPU temp, RAM usage, CUDA status
 - **Logs** — tailing pipeline, crypto bot, and stock bot log files
@@ -411,6 +413,8 @@ python stock_loop.py
 | `*scaler_X.pkl` | hypersearch_dual.py | Feature scaler (MinMaxScaler) |
 | `*_study.db` | hypersearch_dual.py | Optuna SQLite study (Bayesian memory) |
 | `stock_universe.json` | stock_config.py / GUI | Market universe (stocks + crypto symbols) |
+| `stock_predictions.json` | stock_loop.py | Live stock model predictions for GUI |
+| `crypto_predictions.json` | crypto_loop.py | Live crypto model predictions for GUI |
 | `pipeline_status.json` | run_pipeline.py | Live pipeline state for GUI |
 | `pipeline_output.log` | run_pipeline.py | Pipeline log |
 | `crypto_bot_output.log` | run_pipeline.py | Crypto bot log |

@@ -1024,15 +1024,16 @@ class DataFetcher(QObject):
                 except Exception as e:
                     self.error_occurred.emit(f"Crypto snapshots: {e}")
 
-            # Read prediction cache (written by stock_loop.py in jetson env)
+            # Read prediction caches (written by stock_loop / crypto_loop in jetson env)
             predictions = {}
-            pred_file = BASE_DIR / "stock_predictions.json"
-            try:
-                if pred_file.exists():
-                    with open(pred_file) as f:
-                        predictions = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                pass
+            for pred_name in ("stock_predictions.json", "crypto_predictions.json"):
+                pred_file = BASE_DIR / pred_name
+                try:
+                    if pred_file.exists():
+                        with open(pred_file) as f:
+                            predictions.update(json.load(f))
+                except (OSError, json.JSONDecodeError):
+                    pass
 
             self.stocks_updated.emit({
                 'symbols': symbols,
