@@ -360,8 +360,8 @@ def main():
                         help='Day of week to retrain (0=Mon, 5=Sat, default: 5)')
     parser.add_argument('--retrain-hour', type=int, default=2,
                         help='Hour to start retrain (0-23, default: 2)')
-    parser.add_argument('--retrain-trials', type=int, default=50,
-                        help='Trials per model for weekly retrain (default: 50)')
+    parser.add_argument('--retrain-trials', type=int, default=100,
+                        help='Trials per model for weekly retrain (default: 100)')
     args = parser.parse_args()
 
     train_crypto = not args.stock_only
