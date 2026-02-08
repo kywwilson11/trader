@@ -2925,7 +2925,10 @@ def main():
     if app_icon.exists():
         app.setWindowIcon(QIcon(str(app_icon)))
 
-    set_theme("Bubblegum Goth")
+    saved_theme = _load_gui_settings().get('theme', 'Batman')
+    if saved_theme not in THEMES:
+        saved_theme = 'Batman'
+    set_theme(saved_theme)
     apply_theme(app)
 
     window = TradingDashboard(api, app)
