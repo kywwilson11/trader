@@ -208,6 +208,21 @@ THEMES = {
         "bg_log":    QColor(8, 6, 14),
     },
     # --- Other themes ---
+    "Black Metal": {
+        "green":     QColor(180, 180, 180),
+        "red":       QColor(180, 30, 30),
+        "yellow":    QColor(160, 160, 160),
+        "white":     QColor(190, 190, 190),
+        "muted":     QColor(90, 90, 90),
+        "bg_dark":   QColor(5, 5, 5),
+        "bg_card":   QColor(14, 14, 14),
+        "bg_table":  QColor(10, 10, 10),
+        "accent":    QColor(160, 160, 160),
+        "bg_header": QColor(18, 18, 18),
+        "bg_border": QColor(40, 40, 40),
+        "bg_hover":  QColor(24, 24, 24),
+        "bg_log":    QColor(2, 2, 2),
+    },
     "Bubblegum Goth": {
         "green":     QColor(0, 230, 118),
         "red":       QColor(255, 56, 96),
@@ -461,6 +476,7 @@ _THEME_IMAGES = {
     "Joker": BASE_DIR / "logos" / "joker.png",
     "Harley Quinn": BASE_DIR / "logos" / "harley.jpeg",
     "Two-Face": BASE_DIR / "logos" / "twoface.jpeg",
+    "Black Metal": BASE_DIR / "logos" / "blackmetal.jpg",
 }
 
 
