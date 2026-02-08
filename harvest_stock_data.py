@@ -8,6 +8,14 @@ STOCK_TICKERS = [
     'MARA', 'MSTR', 'UBER', 'SOFI', 'ABNB', 'DASH', 'RBLX', 'SMCI', 'MRVL', 'ARM',
     'FSLR', 'ENPH', 'OXY', 'MRNA', 'CRSP', 'ARKK', 'TQQQ', 'SOXL', 'TSLA', 'NVDA',
     'META',
+    # Commodities / precious metals
+    'SLV', 'GLD', 'PALL', 'PPLT', 'COPX',
+    # Space / defense
+    'ASTS', 'RKLB', 'RDW',
+    # Quantum / tech
+    'QS', 'QBTS', 'IONQ', 'POET',
+    # Other
+    'SERV',
 ]
 
 BENCHMARK = 'SPY'

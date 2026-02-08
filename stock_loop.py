@@ -39,6 +39,14 @@ STOCK_UNIVERSE = [
     'MARA', 'MSTR', 'UBER', 'SOFI', 'ABNB', 'DASH', 'RBLX', 'SMCI', 'MRVL', 'ARM',
     'FSLR', 'ENPH', 'OXY', 'MRNA', 'CRSP', 'ARKK', 'TQQQ', 'SOXL', 'TSLA', 'NVDA',
     'META',
+    # Commodities / precious metals
+    'SLV', 'GLD', 'PALL', 'PPLT', 'COPX',
+    # Space / defense
+    'ASTS', 'RKLB', 'RDW',
+    # Quantum / tech
+    'QS', 'QBTS', 'IONQ', 'POET',
+    # Other
+    'SERV',
 ]
 
 TOP_N = 10                   # Trade only top N stocks by bull signal
@@ -475,15 +483,25 @@ def run_stock_bot():
                       f"{quote['spread_pct']:.3f}%, skipping")
                 continue
 
-            # Sentiment gate: adjust position size or block trade
+            # Confidence-based sizing: scale notional by prediction strength
+            if bull_pred is not None and bull_threshold > 0:
+                confidence = min(2.0, max(0.5, bull_pred / bull_threshold))
+            else:
+                confidence = 1.0
+            sized_notional = int(NOTIONAL_PER_STOCK * confidence)
+
+            # Sentiment gate: further adjust position size or block trade
             gate, gate_reasons = sentiment_gate(symbol, 'stock')
             if gate <= 0:
                 print(f"  {symbol}: BLOCKED by sentiment ({', '.join(gate_reasons)})")
                 continue
-            effective_notional = int(NOTIONAL_PER_STOCK * gate)
+            effective_notional = int(sized_notional * gate)
+            sizing_info = f"conf={confidence:.2f}x"
             if gate != 1.0:
-                print(f"  {symbol}: Sentiment gate {gate:.2f}x -> ${effective_notional} "
-                      f"({', '.join(gate_reasons)})")
+                sizing_info += f", sent={gate:.2f}x"
+            if gate_reasons:
+                sizing_info += f" ({', '.join(gate_reasons)})"
+            print(f"  {symbol}: Sizing ${effective_notional} [{sizing_info}]")
 
             # Calculate qty (whole shares)
             price = quote['midpoint']

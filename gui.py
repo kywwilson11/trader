@@ -59,10 +59,10 @@ CONFIG_FILES = {
 }
 
 MODEL_FILES = {
-    "Crypto Bear": BASE_DIR / "bear_model.pt",
-    "Crypto Bull": BASE_DIR / "bull_model.pt",
-    "Stock Bear": BASE_DIR / "stock_bear_model.pt",
-    "Stock Bull": BASE_DIR / "stock_bull_model.pt",
+    "Crypto Bear": BASE_DIR / "bear_model.pth",
+    "Crypto Bull": BASE_DIR / "bull_model.pth",
+    "Stock Bear": BASE_DIR / "stock_bear_model.pth",
+    "Stock Bull": BASE_DIR / "stock_bull_model.pth",
 }
 
 # Tax rates
@@ -511,6 +511,7 @@ class DataFetcher(QObject):
     orders_updated = Signal(list)
     history_updated = Signal(dict)
     hw_updated = Signal(dict)
+    news_updated = Signal(dict)
     error_occurred = Signal(str)
 
     def __init__(self, api):
@@ -526,7 +527,7 @@ class DataFetcher(QObject):
 
         self._timer_positions = QTimer(self)
         self._timer_positions.timeout.connect(self.fetch_positions)
-        self._timer_positions.start(10_000)
+        self._timer_positions.start(5_000)
 
         self._timer_orders = QTimer(self)
         self._timer_orders.timeout.connect(self.fetch_orders)
@@ -540,18 +541,23 @@ class DataFetcher(QObject):
         self._timer_hw.timeout.connect(self.fetch_hw)
         self._timer_hw.start(5_000)
 
+        self._timer_news = QTimer(self)
+        self._timer_news.timeout.connect(self.fetch_news)
+        self._timer_news.start(300_000)  # 5 min
+
         # Immediate first fetch
         self.fetch_account()
         self.fetch_positions()
         self.fetch_orders()
         self.fetch_history()
         self.fetch_hw()
+        self.fetch_news()
 
     @Slot()
     def stop_timers(self):
         """Stop all timers (must be called from this object's thread)."""
         for attr in ("_timer_account", "_timer_positions", "_timer_orders",
-                      "_timer_history", "_timer_hw"):
+                      "_timer_history", "_timer_hw", "_timer_news"):
             timer = getattr(self, attr, None)
             if timer:
                 timer.stop()
@@ -639,6 +645,46 @@ class DataFetcher(QObject):
             })
         except Exception as e:
             self.error_occurred.emit(f"HW fetch: {e}")
+
+    @Slot()
+    def fetch_news(self):
+        """Fetch news headlines from Finnhub and Fear & Greed Index."""
+        try:
+            from sentiment import get_fear_greed, _get_finnhub, _score_articles
+            articles = []
+            fng = get_fear_greed()
+
+            client = _get_finnhub()
+            if client is not None:
+                try:
+                    crypto_news = client.general_news('crypto', min_id=0)
+                    for a in crypto_news[:15]:
+                        a['_category'] = 'Crypto'
+                    articles.extend(crypto_news[:15])
+                except Exception:
+                    pass
+                try:
+                    general_news = client.general_news('general', min_id=0)
+                    for a in general_news[:15]:
+                        a['_category'] = 'Market'
+                    articles.extend(general_news[:15])
+                except Exception:
+                    pass
+
+            # Score each article
+            for a in articles:
+                score_data = _score_articles([a])
+                a['_sentiment'] = score_data['sentiment_score']
+
+            # Sort by datetime descending
+            articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
+
+            self.news_updated.emit({
+                'articles': articles[:30],
+                'fng': fng,
+            })
+        except Exception as e:
+            self.error_occurred.emit(f"News fetch: {e}")
 
     @staticmethod
     def _read_gpu_temp():
@@ -794,6 +840,7 @@ def parse_evolve_status(log_path):
         "cycle_start": None, "current_group": None,
         "trial_current": 0, "trial_total": 0,
         "best_score": 0.0, "best_trial": 0, "status": "idle",
+        "round_info": None, "current_bear": None, "current_bull": None,
     }
     try:
         text = log_path.read_text(errors="replace")
@@ -805,6 +852,17 @@ def parse_evolve_status(log_path):
     for m in re.finditer(r"\[EVOLVE\] GROUP: (\w+)", text):
         info["current_group"] = m.group(1)
 
+    # Current round info (e.g. "crypto Round 1/2: bear (50 trials)")
+    rounds = re.findall(r"\[EVOLVE\] (\w+ Round \d+/\d+: \w+)", text)
+    if rounds:
+        info["round_info"] = rounds[-1]
+
+    # Current baseline scores
+    for m in re.finditer(r"\[EVOLVE\] Current \w+ bear score: ([\d.]+)", text):
+        info["current_bear"] = float(m.group(1))
+    for m in re.finditer(r"\[EVOLVE\] Current \w+ bull score: ([\d.]+)", text):
+        info["current_bull"] = float(m.group(1))
+
     trials = re.findall(r"\[\s*(\d+)\]", text)
     if trials:
         info["trial_current"] = int(trials[-1])
@@ -813,7 +871,7 @@ def parse_evolve_status(log_path):
     if m:
         info["trial_total"] = int(m.group(1))
 
-    bests = re.findall(r"Best is trial (\d+) with value: (\d+\.\d+)", text)
+    bests = re.findall(r"Best is trial (\d+) with value: ([\d.]+)", text)
     if bests:
         info["best_trial"] = int(bests[-1][0])
         info["best_score"] = float(bests[-1][1])
@@ -856,9 +914,10 @@ def apply_theme(app):
         QTabWidget::pane {{ border: 1px solid {t["bg_border"].name()}; }}
         QTabBar::tab {{
             background: {t["bg_header"].name()}; color: {t["muted"].name()};
-            padding: 8px 16px; border: 1px solid {t["bg_border"].name()};
-            border-bottom: none; border-top-left-radius: 4px;
-            border-top-right-radius: 4px; margin-right: 2px;
+            padding: 10px 20px; border: 1px solid {t["bg_border"].name()};
+            border-bottom: none; border-top-left-radius: 6px;
+            border-top-right-radius: 6px; margin-right: 2px;
+            font-size: 13px; font-weight: bold;
         }}
         QTabBar::tab:selected {{
             background: {t["bg_dark"].name()}; color: {t["accent"].name()};
@@ -934,6 +993,7 @@ class TradingDashboard(QMainWindow):
         self._build_dashboard_tab()
         self._build_trading_tab()
         self._build_performance_tab()
+        self._build_news_tab()
         self._build_models_tab()
         self._build_logs_tab()
 
@@ -966,6 +1026,7 @@ class TradingDashboard(QMainWindow):
         self._fetcher.orders_updated.connect(self.on_orders)
         self._fetcher.history_updated.connect(self.on_history)
         self._fetcher.hw_updated.connect(self.on_hw)
+        self._fetcher.news_updated.connect(self.on_news)
         self._fetcher.error_occurred.connect(self.on_error)
         self._fetcher_thread.started.connect(self._fetcher.start_timers)
         self._fetcher_thread.start()
@@ -1059,7 +1120,8 @@ class TradingDashboard(QMainWindow):
         )
         card_style = (
             f"QFrame {{ background-color: {t['bg_card'].name()};"
-            f" border-radius: 8px; padding: 12px; }}"
+            f" border-radius: 10px; padding: 14px;"
+            f" border: 1px solid {t['bg_border'].name()}; }}"
         )
 
         # Cards
@@ -1081,7 +1143,7 @@ class TradingDashboard(QMainWindow):
 
         # Tables
         for table in [self._positions_table, self._open_orders_table,
-                       self._fills_table, self._model_table]:
+                       self._fills_table, self._model_table, self._news_table]:
             table.setStyleSheet(table_style)
 
         # Group boxes
@@ -1127,9 +1189,10 @@ class TradingDashboard(QMainWindow):
         pos_label.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 8px;")
         layout.addWidget(pos_label)
 
-        self._positions_table = QTableWidget(0, 7)
+        self._positions_table = QTableWidget(0, 8)
         self._positions_table.setHorizontalHeaderLabels(
-            ["Symbol", "Qty", "Side", "Avg Entry", "Current Price", "Unrealized P&L", "P&L %"]
+            ["Symbol", "Qty", "Side", "Avg Entry", "Current Price",
+             "Mkt Value", "Unrealized P&L", "P&L %"]
         )
         self._positions_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._positions_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1230,6 +1293,41 @@ class TradingDashboard(QMainWindow):
         self.tabs.addTab(tab, "Performance")
 
     # ---- Tab 4: Models ---------------------------------------------------
+    # ---- Tab 4: News ----------------------------------------------------
+    def _build_news_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Fear & Greed header
+        fng_layout = QHBoxLayout()
+        self._news_fng_label = QLabel("Crypto Fear & Greed Index: —")
+        self._news_fng_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        fng_layout.addWidget(self._news_fng_label)
+        fng_layout.addStretch()
+        self._news_refresh_label = QLabel("")
+        self._news_refresh_label.setStyleSheet("font-size: 11px;")
+        fng_layout.addWidget(self._news_refresh_label)
+        layout.addLayout(fng_layout)
+
+        # News table
+        self._news_table = QTableWidget(0, 4)
+        self._news_table.setHorizontalHeaderLabels(
+            ["Time", "Category", "Headline", "Sentiment"]
+        )
+        header = self._news_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self._news_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._news_table.setAlternatingRowColors(True)
+        self._news_table.setWordWrap(True)
+        self._news_table.verticalHeader().setDefaultSectionSize(32)
+        layout.addWidget(self._news_table)
+
+        self.tabs.addTab(tab, "News")
+
+    # ---- Tab 5: Models ---------------------------------------------------
     def _build_models_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1396,10 +1494,15 @@ class TradingDashboard(QMainWindow):
             except (TypeError, ValueError):
                 unr = 0.0
             total_unr += unr
+            try:
+                mkt_val = float(p["qty"]) * float(p["current_price"])
+            except (TypeError, ValueError):
+                mkt_val = 0.0
             items = [
                 p["symbol"], p["qty"], p["side"],
                 fmt_money(p["avg_entry_price"]),
                 fmt_money(p["current_price"]),
+                fmt_money(mkt_val),
                 fmt_money(p["unrealized_pl"]),
                 fmt_pct(float(p["unrealized_plpc"]) * 100),
             ]
@@ -1407,7 +1510,7 @@ class TradingDashboard(QMainWindow):
             for col, val in enumerate(items):
                 item = QTableWidgetItem(str(val))
                 item.setTextAlignment(Qt.AlignCenter)
-                if col >= 5:
+                if col >= 6:
                     item.setForeground(color)
                 tbl.setItem(row, col, item)
         tbl.setUpdatesEnabled(True)
@@ -1536,6 +1639,68 @@ class TradingDashboard(QMainWindow):
                 self._gpu_avail_label.setText("Unavailable")
                 self._gpu_avail_label.setStyleSheet(
                     f"font-size: 28px; font-weight: bold; color: {T['red'].name()};")
+
+    @Slot(dict)
+    def on_news(self, data):
+        import datetime as _dt
+        articles = data.get('articles', [])
+        fng = data.get('fng')
+
+        # Update Fear & Greed
+        if fng is not None:
+            val = fng['value']
+            label = fng['label']
+            if val <= 25:
+                color = T['red'].name()
+            elif val >= 75:
+                color = T['green'].name()
+            else:
+                color = T.get('yellow', T['white']).name()
+            self._news_fng_label.setText(
+                f"Crypto Fear & Greed Index: "
+                f"<span style='color:{color}; font-size:20px;'>{val}</span> "
+                f"<span style='color:{color};'>({label})</span>")
+
+        now = _dt.datetime.now(TZ_CENTRAL).strftime("%I:%M %p")
+        self._news_refresh_label.setText(f"Updated {now}")
+
+        # Populate news table
+        tbl = self._news_table
+        tbl.setUpdatesEnabled(False)
+        tbl.setRowCount(len(articles))
+        for row, a in enumerate(articles):
+            # Time
+            ts = a.get('datetime', 0)
+            if ts:
+                time_str = _dt.datetime.fromtimestamp(ts, tz=TZ_CENTRAL).strftime("%m/%d %I:%M %p")
+            else:
+                time_str = "—"
+
+            category = a.get('_category', '—')
+            headline = a.get('headline', '—')
+            sentiment = a.get('_sentiment', 0.0)
+
+            # Sentiment color
+            if sentiment > 0.1:
+                sent_color = T['green']
+                sent_text = f"+{sentiment:.2f}"
+            elif sentiment < -0.1:
+                sent_color = T['red']
+                sent_text = f"{sentiment:.2f}"
+            else:
+                sent_color = T.get('yellow', T['white'])
+                sent_text = f"{sentiment:.2f}"
+
+            items_data = [time_str, category, headline, sent_text]
+            for col, val in enumerate(items_data):
+                item = QTableWidgetItem(str(val))
+                if col == 3:
+                    item.setForeground(sent_color)
+                    item.setTextAlignment(Qt.AlignCenter)
+                elif col <= 1:
+                    item.setTextAlignment(Qt.AlignCenter)
+                tbl.setItem(row, col, item)
+        tbl.setUpdatesEnabled(True)
 
     @Slot(str)
     def on_error(self, msg):
@@ -1704,9 +1869,18 @@ class TradingDashboard(QMainWindow):
         evolve_info = parse_evolve_status(
             LOG_FILES.get("Evolve", BASE_DIR / "evolve_full_run.log"))
         status_color = T["green"].name() if evolve_info["status"] == "running" else T["muted"].name()
+        status_text = evolve_info["status"].upper()
+        if evolve_info["round_info"]:
+            status_text += f" — {evolve_info['round_info']}"
         self._evolve_status.setText(
-            f"Status: <span style='color:{status_color}'>{evolve_info['status'].upper()}</span>")
-        self._evolve_group.setText(f"Group: {evolve_info['current_group'] or '\u2014'}")
+            f"Status: <span style='color:{status_color}'>{status_text}</span>")
+
+        group_text = f"Group: {evolve_info['current_group'] or '\u2014'}"
+        if evolve_info["current_bear"] is not None:
+            group_text += (f"  |  Baseline: bear={evolve_info['current_bear']:.4f}"
+                          f", bull={evolve_info['current_bull']:.4f}"
+                          if evolve_info['current_bull'] is not None else "")
+        self._evolve_group.setText(group_text)
 
         trial_cur = evolve_info["trial_current"]
         trial_tot = evolve_info["trial_total"] or 0

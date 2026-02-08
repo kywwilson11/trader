@@ -355,15 +355,27 @@ def run_crypto_bot():
                     print(f"  {symbol}: Bull pred {bull_pred:+.4f}% < {bull_threshold:.2f}, skipping")
                     continue
 
-            # Sentiment gate: adjust notional or block trade
+            # Confidence-based sizing: scale notional by prediction strength
+            # bull_pred / bull_threshold gives a ratio >= 1.0 (since we passed the threshold check)
+            # Clamp to [0.5, 2.0] range so we don't over/under-bet
+            if bull_pred is not None and bull_threshold > 0:
+                confidence = min(2.0, max(0.5, bull_pred / bull_threshold))
+            else:
+                confidence = 1.0
+            sized_notional = int(NOTIONAL_PER_SYMBOL * confidence)
+
+            # Sentiment gate: further adjust notional or block trade
             gate, gate_reasons = sentiment_gate(symbol, 'crypto')
             if gate <= 0:
                 print(f"  {symbol}: BLOCKED by sentiment ({', '.join(gate_reasons)})")
                 continue
-            adjusted_notional = int(NOTIONAL_PER_SYMBOL * gate)
+            adjusted_notional = int(sized_notional * gate)
+            sizing_info = f"conf={confidence:.2f}x"
             if gate != 1.0:
-                print(f"  {symbol}: Sentiment gate {gate:.2f}x -> ${adjusted_notional} "
-                      f"({', '.join(gate_reasons)})")
+                sizing_info += f", sent={gate:.2f}x"
+            if gate_reasons:
+                sizing_info += f" ({', '.join(gate_reasons)})"
+            print(f"  {symbol}: Sizing ${adjusted_notional} [{sizing_info}]")
 
             if place_smart_order(api, symbol, 'buy', adjusted_notional):
                 # Get fill info for position tracking
