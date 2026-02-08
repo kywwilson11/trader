@@ -320,9 +320,9 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None):
     d_start = datetime.date.fromisoformat(start_date)
     d_end = datetime.date.fromisoformat(end_date)
 
-    # Rate limiter: 55 calls/min (Finnhub limit is 60)
+    # Rate limiter: 25 calls/min (Finnhub free tier = 30/min, leave headroom)
     call_times = []
-    calls_per_min = 55
+    calls_per_min = 25
 
     total_articles = 0
     now_iso = datetime.datetime.now().isoformat()
@@ -352,8 +352,11 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None):
                     to=window_end.isoformat(),
                 )
             except Exception as e:
+                err_str = str(e)
                 print(f"[SENTIMENT_HIST] Finnhub error {ticker} "
                       f"{window_start}..{window_end}: {e}")
+                if '429' in err_str:
+                    time.sleep(62)  # Wait full minute on rate limit
                 window_start = window_end + datetime.timedelta(days=1)
                 continue
 

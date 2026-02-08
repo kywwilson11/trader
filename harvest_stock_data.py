@@ -12,7 +12,7 @@ from indicators import compute_stock_features
 from market_data import flatten_yfinance_columns
 from stock_config import load_stock_universe
 
-STOCK_TICKERS = load_stock_universe()
+STOCK_TICKERS = [t for t in load_stock_universe() if '/' not in t]
 
 BENCHMARK = 'SPY'
 
