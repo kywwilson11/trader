@@ -682,13 +682,13 @@ class DataFetcher(QObject):
             })
 
         # Immediate first fetch (news will merge with cache)
-        self.fetch_account()
-        self.fetch_positions()
-        self.fetch_orders()
-        self.fetch_history()
-        self.fetch_hw()
-        self.fetch_news()
-        self.fetch_stocks()
+        # Check interruption between calls so closeEvent can break the burst
+        for fn in (self.fetch_account, self.fetch_positions, self.fetch_orders,
+                   self.fetch_history, self.fetch_hw, self.fetch_news,
+                   self.fetch_stocks):
+            if QThread.currentThread().isInterruptionRequested():
+                return
+            fn()
 
     @Slot()
     def stop_timers(self):
@@ -1798,6 +1798,7 @@ class TradingDashboard(QMainWindow):
 
         # Initialize article cache
         self._news_articles = []
+        self._news_fng = None
 
         # News table
         self._news_table = QTableWidget(0, 5)
@@ -2845,6 +2846,7 @@ class TradingDashboard(QMainWindow):
 
         # Cache articles and apply current filter
         self._news_articles = articles
+        self._news_fng = fng
         self._apply_news_filter()
 
     def _apply_news_filter(self):
@@ -3219,16 +3221,44 @@ class TradingDashboard(QMainWindow):
         self._pipeline_retrain.setText(retrain_text)
 
     def closeEvent(self, event):
+        from PySide6.QtCore import QMetaObject
+
+        # 1. Stop main-thread timers immediately
         self._model_timer.stop()
         self._clock_timer.stop()
-        from PySide6.QtCore import QMetaObject
+
+        # 2. Ask worker threads to stop their timers (queued → runs before quit)
         QMetaObject.invokeMethod(self._fetcher, "stop_timers", Qt.QueuedConnection)
         QMetaObject.invokeMethod(self._tailer, "stop_timer", Qt.QueuedConnection)
+
+        # 3. Signal threads to stop, then ask event loops to exit
+        self._fetcher_thread.requestInterruption()
+        self._tailer_thread.requestInterruption()
         self._fetcher_thread.quit()
         self._tailer_thread.quit()
-        self._fetcher_thread.wait(3000)
-        self._tailer_thread.wait(3000)
+
+        # 4. Wait briefly for clean shutdown; os._exit fallback handles stragglers
+        threads_stuck = False
+        for name, thread in [("fetcher", self._fetcher_thread),
+                             ("tailer", self._tailer_thread)]:
+            if not thread.wait(2000):
+                print(f"WARNING: {name} thread did not stop in time")
+                threads_stuck = True
+
+        # 5. Flush news cache so recent articles persist
+        if self._news_articles:
+            try:
+                _save_news_cache(self._news_articles, self._news_fng)
+            except Exception:
+                pass
+
         super().closeEvent(event)
+
+        # 6. If threads are stuck in blocking network calls, force-exit to
+        #    avoid "QThread: Destroyed while thread is still running" crash
+        if threads_stuck:
+            import os
+            os._exit(0)
 
 
 # ---------------------------------------------------------------------------
