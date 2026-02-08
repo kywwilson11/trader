@@ -45,7 +45,8 @@ def fetch_bars_alpaca(api, symbol, limit=120):
         start = datetime.now(timezone.utc) - timedelta(days=6)
         bars = api.get_crypto_bars(symbol, '1Hour', start=start.isoformat(), limit=limit)
         rows = []
-        for bar in bars[symbol]:
+        timestamps = []
+        for bar in bars:
             rows.append({
                 'Open': float(bar.o),
                 'High': float(bar.h),
@@ -53,10 +54,10 @@ def fetch_bars_alpaca(api, symbol, limit=120):
                 'Close': float(bar.c),
                 'Volume': float(bar.v),
             })
+            timestamps.append(bar.t)
         if not rows:
             return None
         df = pd.DataFrame(rows)
-        timestamps = [bar.t for bar in bars[symbol]]
         df.index = pd.DatetimeIndex(timestamps)
         df.index.name = 'Datetime'
         return df
