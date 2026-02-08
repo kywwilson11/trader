@@ -45,6 +45,8 @@ TZ_CENTRAL = ZoneInfo("America/Chicago")
 
 LOG_FILES = {
     "Pipeline": BASE_DIR / "pipeline_output.log",
+    "Crypto Bot": BASE_DIR / "crypto_bot_output.log",
+    "Stock Bot": BASE_DIR / "stock_bot_output.log",
 }
 
 CONFIG_FILES = {
@@ -1375,8 +1377,10 @@ class TradingDashboard(QMainWindow):
         pipeline_layout.addWidget(self._pipeline_trial, 1, 0)
         pipeline_layout.addWidget(self._pipeline_best, 1, 1)
         pipeline_layout.addWidget(self._pipeline_progress, 2, 0, 1, 2)
+        self._pipeline_retrain = QLabel("")
         pipeline_layout.addWidget(self._pipeline_elapsed, 3, 0)
         pipeline_layout.addWidget(self._pipeline_scores, 3, 1)
+        pipeline_layout.addWidget(self._pipeline_retrain, 4, 0, 1, 2)
         layout.addWidget(pipeline_group)
 
         hw_group = QGroupBox("Hardware")
@@ -1942,6 +1946,8 @@ class TradingDashboard(QMainWindow):
         except OSError:
             pass
 
+        bots_running = pinfo.get("bots_running", False)
+
         if phase == "idle" or not is_running:
             status_color = T["muted"].name()
             status_text = "IDLE"
@@ -1951,12 +1957,17 @@ class TradingDashboard(QMainWindow):
         elif phase == "complete":
             status_color = T["green"].name()
             status_text = "COMPLETE"
+        elif phase == "trading":
+            status_color = T["green"].name()
+            status_text = "TRADING"
         else:
             status_color = T["green"].name()
-            status_text = "RUNNING"
+            status_text = "TRAINING" if bots_running else "RUNNING"
 
-        if total_phases > 0 and phase_idx >= 0:
+        if total_phases > 0 and phase_idx >= 0 and phase != "trading":
             status_text += f" ({phase_idx + 1}/{total_phases})"
+        if bots_running and phase != "trading":
+            status_text += " + BOTS"
 
         self._pipeline_status.setText(
             f"Status: <span style='color:{status_color}'>{status_text}</span>")
@@ -2013,12 +2024,32 @@ class TradingDashboard(QMainWindow):
         # Show final scores from completed phases
         bear_final = pinfo.get("bear_final_score")
         bull_final = pinfo.get("bull_final_score")
+        stock_bear_final = pinfo.get("stock_bear_final_score")
+        stock_bull_final = pinfo.get("stock_bull_final_score")
         scores_parts = []
         if bear_final is not None:
-            scores_parts.append(f"Bear: {bear_final:.4f}")
+            scores_parts.append(f"C-Bear: {bear_final:.4f}")
         if bull_final is not None:
-            scores_parts.append(f"Bull: {bull_final:.4f}")
+            scores_parts.append(f"C-Bull: {bull_final:.4f}")
+        if stock_bear_final is not None:
+            scores_parts.append(f"S-Bear: {stock_bear_final:.4f}")
+        if stock_bull_final is not None:
+            scores_parts.append(f"S-Bull: {stock_bull_final:.4f}")
         self._pipeline_scores.setText("  |  ".join(scores_parts) if scores_parts else "")
+
+        # Next retrain time
+        next_retrain = pinfo.get("next_retrain")
+        retrain_cycle = pinfo.get("retrain_cycle", 0)
+        retrain_text = ""
+        if next_retrain:
+            try:
+                rt = dt.datetime.fromisoformat(next_retrain)
+                retrain_text = f"Next retrain: {rt.strftime('%a %m/%d %I:%M %p')}"
+                if retrain_cycle:
+                    retrain_text += f"  (cycle {retrain_cycle})"
+            except (ValueError, TypeError):
+                pass
+        self._pipeline_retrain.setText(retrain_text)
 
     def closeEvent(self, event):
         self._model_timer.stop()
