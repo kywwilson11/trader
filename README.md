@@ -7,15 +7,21 @@ Runs on an NVIDIA Jetson Orin Nano. Trades via the [Alpaca](https://alpaca.marke
 ## Architecture
 
 ```
-watchdog.sh
-├── evolve.py          3-day retraining cycle (harvest → hypersearch → promote)
-├── stock_loop.py      Market-hours stock trading (top 10 of ~50 stocks)
-└── crypto_loop.py     24/7 crypto trading (10 symbols)
+watchdog.py
+├── crypto_loop.py     24/7 crypto trading (10 symbols)
+└── stock_loop.py      Market-hours stock trading (top 10 of ~45 stocks)
+
+evolve.py              3-day retraining cycle (harvest → hypersearch → promote)
 ```
 
-**Inference stack**: `predict_now.py` → `model.py` (CryptoLSTM) → `indicators.py` (Numba JIT)
-
-**Risk stack**: `order_utils.py` (order lifecycle) → `sentiment.py` (F&G + Finnhub gating)
+**Shared modules**:
+- `market_data.py` — bar fetching (Alpaca + yfinance), ATR computation
+- `trading_utils.py` — API client, model hot-reload, cooldown, prediction wrapper
+- `order_utils.py` — order lifecycle, quotes, position tracking, circuit breaker
+- `predict_now.py` — model loading, JIT tracing, live inference
+- `model.py` — CryptoLSTM architecture (LSTM → FC head, 3-class)
+- `indicators.py` — Numba JIT technical indicators (~1.8x speedup)
+- `sentiment.py` — Fear & Greed Index + Finnhub news sentiment gating
 
 ## Features
 
@@ -23,7 +29,7 @@ watchdog.sh
 - **ATR-based adaptive risk** — stop-loss, trailing stops, and take-profit scaled to current volatility
 - **Sentiment gating** — Fear & Greed Index + Finnhub news scores modulate position sizing (0x–1.5x)
 - **Confidence-based sizing** — trade notional scaled by prediction strength
-- **Numba JIT indicators** — RSI, MACD, ATR, Bollinger Bands, Stochastic, OBV (~1.8x speedup)
+- **Numba JIT indicators** — RSI, MACD, ATR, Bollinger Bands, Stochastic, OBV
 - **Cross-asset features** — BTC prices for crypto correlations, SPY for stock relative strength
 - **Circuit breaker** — auto-flattens all positions on 5% daily drawdown
 - **Persistent Optuna studies** — Bayesian hyperparameter search with SQLite memory across cycles
@@ -40,9 +46,61 @@ watchdog.sh
 
 ### Stocks (`stock_loop.py`)
 - **Schedule**: Market hours only (9:30 AM – 4:00 PM ET), auto-flatten at 3:50 PM
-- **Universe**: ~50 stocks (tech, commodities, space, quantum) → top 10 by bull signal
+- **Universe**: ~45 stocks (tech, commodities, space, quantum) → top 10 by bull signal
 - **Sizing**: $2,500/position, $25k max exposure, confidence-scaled
 - **Risk**: Bracket orders (stop + TP), trailing stop upgrade at 1.5% profit, sentiment gate
+
+## Quick Start
+
+### 1. Install
+```bash
+pip install alpaca-trade-api python-dotenv torch numpy pandas numba \
+    yfinance finnhub-python optuna joblib scikit-learn PySide6 pyqtgraph
+```
+
+### 2. Configure
+Create a `.env` file:
+```
+ALPACA_API_KEY=your_key
+ALPACA_API_SECRET=your_secret
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
+FINNHUB_API_KEY=your_finnhub_key
+```
+
+### 3. Verify connectivity
+```bash
+python connection_test.py
+```
+
+### 4. Harvest training data
+```bash
+python harvest_crypto_data.py    # → training_data.csv
+python harvest_stock_data.py     # → stock_training_data.csv
+```
+
+### 5. Train models
+```bash
+# Crypto models (bear + bull)
+python hypersearch_dual.py --target bear --data training_data.csv
+python hypersearch_dual.py --target bull --data training_data.csv
+
+# Stock models (bear + bull)
+python hypersearch_dual.py --target bear --data stock_training_data.csv --prefix stock
+python hypersearch_dual.py --target bull --data stock_training_data.csv --prefix stock
+```
+
+### 6. Run
+```bash
+# Full system (both loops + auto-restart)
+python watchdog.py
+
+# Individual loops
+python crypto_loop.py
+python stock_loop.py
+
+# GUI dashboard
+python gui.py
+```
 
 ## Model Training
 
@@ -68,51 +126,11 @@ PySide6 desktop app with tabs:
 
 Themes: Bubblegum Goth, Batman, Joker, Harley Quinn, Dark, Space, Money
 
-## Setup
-
-### Requirements
-- Python 3.10+
-- NVIDIA GPU (optional, falls back to CPU)
-- Alpaca paper trading account
-- Finnhub API key (optional, for news sentiment)
-
-### Install
-```bash
-pip install alpaca-trade-api python-dotenv torch numpy pandas numba \
-    yfinance finnhub-python optuna PySide6 pyqtgraph
-```
-
-### Configure
-Create a `.env` file:
-```
-ALPACA_API_KEY=your_key
-ALPACA_API_SECRET=your_secret
-ALPACA_BASE_URL=https://paper-api.alpaca.markets
-FINNHUB_API_KEY=your_finnhub_key
-```
-
-### Run
-```bash
-# Full system (trading + retraining)
-./watchdog.sh
-
-# GUI dashboard
-python gui.py
-
-# Individual loops
-python crypto_loop.py
-python stock_loop.py
-
-# One-off hypersearch
-python hypersearch_dual.py --target bull --trials 100
-```
-
 ## Monitoring
 
 - `watchdog.py` — process supervisor, restarts crashed loops, emergency flatten on repeated failures
 - `hw_monitor.py` — GPU temp, RAM, thermal throttling (pauses at 75°C)
 - `connection_test.py` — Alpaca connectivity and PDT status check
-- `monitor_search.sh` — hypersearch health (stall detection, trial progress)
 
 ## File Overview
 
@@ -120,11 +138,13 @@ python hypersearch_dual.py --target bull --trials 100
 |---|---|
 | `crypto_loop.py` | 24/7 crypto trading loop |
 | `stock_loop.py` | Market-hours stock trading loop |
-| `indicators.py` | Numba JIT technical indicators |
-| `predict_now.py` | Live inference with torch.jit.trace |
+| `market_data.py` | Bar fetching (Alpaca + yfinance) and ATR |
+| `trading_utils.py` | Shared API client, cooldown, prediction wrapper |
+| `order_utils.py` | Order placement, lifecycle, circuit breaker |
+| `predict_now.py` | Model loading, JIT tracing, live inference |
 | `model.py` | CryptoLSTM architecture |
-| `order_utils.py` | Order placement and lifecycle |
-| `sentiment.py` | Fear & Greed + Finnhub sentiment |
+| `indicators.py` | Numba JIT technical indicators |
+| `sentiment.py` | Fear & Greed + Finnhub sentiment gating |
 | `gui.py` | PySide6 dashboard |
 | `evolve.py` | 3-day retraining orchestrator |
 | `hypersearch_dual.py` | Optuna hyperparameter search |
@@ -133,3 +153,4 @@ python hypersearch_dual.py --target bull --trials 100
 | `watchdog.py` | Process supervisor |
 | `hw_monitor.py` | Hardware monitoring |
 | `connection_test.py` | API connectivity test |
+| `test_sentiment.py` | Sentiment scoring test suite (1035 cases) |
