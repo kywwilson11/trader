@@ -51,24 +51,29 @@ _POSITIVE = frozenset({
     'surge', 'surges', 'surging', 'rally', 'rallies', 'rallying',
     'gain', 'gains', 'soar', 'soars', 'soaring', 'jump', 'jumps',
     'climbing', 'climbs', 'rises', 'rising', 'rebound', 'rebounds',
-    'breakout', 'moon', 'mooning', 'skyrocket', 'spike', 'spikes',
+    'breakout', 'moon', 'mooning', 'skyrocket',
     # Fundamentals
     'bull', 'bullish', 'profit', 'profits', 'profitable', 'beat',
-    'beats', 'record', 'growth', 'boost', 'boosts', 'strong',
-    'strength', 'positive', 'optimistic', 'optimism', 'recovery',
-    'outperform', 'outperforms', 'upgrade', 'upgrades', 'upgraded',
+    'beats', 'record', 'growth', 'boost', 'boosts', 'boosting',
+    'strong', 'strength', 'positive', 'optimistic', 'optimism',
+    'recovery', 'recovering', 'outperform', 'outperforms',
+    'upgrade', 'upgrades', 'upgraded',
     'success', 'successful', 'milestone', 'exceeded', 'exceeds',
     'upbeat', 'robust', 'stellar', 'impressive', 'blowout',
+    'smashes', 'crushes', 'crush',
     # Business
     'innovation', 'partnership', 'deal', 'approval', 'approved',
     'launch', 'launches', 'expand', 'expansion', 'adoption',
-    'inflow', 'inflows', 'accumulation', 'institutional',
-    'buy', 'buying', 'accumulate', 'etf',
+    'inflow', 'inflows', 'accumulation', 'accumulates', 'accumulating',
+    'institutional', 'buy', 'buying', 'accumulate', 'etf',
     # Crypto-specific
     'halving', 'airdrop', 'staking', 'defi',
     # Modifiers
     'tailwind', 'tailwinds', 'upside', 'overweight',
     'sustainable', 'momentum',
+    # Analyst / employment
+    'raised', 'raises', 'hired', 'hiring',
+    'victory', 'wins',
 })
 
 _NEGATIVE = frozenset({
@@ -79,35 +84,52 @@ _NEGATIVE = frozenset({
     'slide', 'slides', 'sliding', 'slip', 'slips', 'slipping',
     'selloff', 'sell-off', 'dumping', 'dump', 'dumps', 'plummets',
     'nosedive', 'freefall', 'rout', 'bloodbath', 'carnage', 'tanking',
+    'wipes', 'wiped', 'erased', 'erases',
     # Fundamentals
     'bear', 'bearish', 'loss', 'losses', 'miss', 'misses', 'missed',
     'downgrade', 'downgrades', 'downgraded', 'weak', 'weakness',
     'negative', 'pessimistic', 'pessimism', 'ugly', 'terrible',
-    'worst', 'disappointing', 'disappointed', 'lackluster', 'dismal',
+    'worst', 'disappointing', 'disappointed', 'disappoints',
+    'lackluster', 'dismal',
     'underperform', 'underperforms', 'underweight',
+    'slashes', 'slashed', 'slash',
     # Business / macro
     'recession', 'bankruptcy', 'bankrupt', 'fraud', 'fraudulent',
     'hack', 'hacked', 'exploit', 'exploited', 'regulation',
     'ban', 'banned', 'warning', 'warns', 'warned', 'crisis',
-    'investigation', 'lawsuit', 'layoff', 'layoffs', 'cut', 'cuts',
+    'investigation', 'lawsuit', 'sues', 'sued', 'suing',
+    'layoff', 'layoffs', 'cut', 'cuts',
     'outflow', 'outflows', 'fine', 'fined', 'subpoena', 'default',
     'inflation', 'tariff', 'tariffs', 'war', 'sanctions', 'shutdown',
     'fear', 'fears', 'risk', 'risks', 'risky', 'concern', 'concerns',
     'uncertainty', 'volatile', 'volatility', 'contagion', 'bubble',
     'overvalued', 'sell', 'selling',
+    'bleed', 'bleeds', 'bleeding',
+    'freezes', 'freeze', 'frozen',
+    'zero', 'worthless',
+    'trap',
     # Modifiers
     'headwind', 'headwinds', 'downside', 'downbeat', 'grim',
     'dire', 'ominous', 'trouble', 'troubled', 'struggling',
+    'cautious', 'caution',
+    'slowing', 'slower', 'slowdown',
 })
 
 # Phrases scored as a unit (checked before single-word matching)
 _POSITIVE_PHRASES = [
-    ('all time high', 1.5), ('all-time high', 1.5), ('ath', 1.0),
+    ('all time high', 1.5), ('all-time high', 1.5),
     ('beat expectations', 1.5), ('beats expectations', 1.5),
     ('strong buy', 1.5), ('price target raised', 1.5),
+    ('raises price target', 1.5),
     ('short squeeze', 1.0), ('green light', 1.0),
     ('better than expected', 1.5), ('revenue beat', 1.5),
     ('earnings beat', 1.5), ('guidance raised', 1.5),
+    ('rate cut', 1.0), ('rate cuts', 1.0),
+    ('cuts interest rates', 1.5), ('cuts rates', 1.5),
+    ('cut interest rates', 1.5), ('cut rates', 1.5),
+    ('unemployment falls', 1.0), ('unemployment drops', 1.0),
+    ('blows past', 1.0), ('crush expectations', 1.5),
+    ('pile into', 1.0), ('piling into', 1.0),
 ]
 
 _NEGATIVE_PHRASES = [
@@ -115,12 +137,24 @@ _NEGATIVE_PHRASES = [
     ('death cross', -1.5), ('going down', -1.0), ('sell off', -1.0),
     ('missed expectations', -1.5), ('misses expectations', -1.5),
     ('price target cut', -1.5), ('price target lowered', -1.5),
+    ('price target slashed', -1.5),
     ('guidance lowered', -1.5), ('guidance cut', -1.5),
     ('revenue miss', -1.5), ('earnings miss', -1.5),
     ('worse than expected', -1.5), ('worst since', -1.5),
     ('bear market', -1.5), ('margin call', -1.5),
     ('not saying downside overdone', -1.0),
-    ('downside overdone', -0.5),  # without negation, slightly negative
+    ('downside overdone', -0.5),
+    ('bull trap', -1.5),
+    ('go to zero', -1.5), ('goes to zero', -1.5),
+    ('short interest', -1.0),
+    ('dries up', -1.0), ('dried up', -1.0),
+    ('freezes withdrawals', -1.5), ('frozen withdrawals', -1.5),
+    ('no longer', -0.5),
+    ('not happening', -1.0), ('not going well', -1.0),
+    ('not justified', -1.0),
+    ('slashes price target', -2.0), ('slashed price target', -2.0),
+    ('price target slashed', -2.0),
+    ('slowing momentum', -1.0), ('slowing growth', -1.0),
 ]
 
 # Negation words — flip sentiment of the next keyword within 3 words
@@ -133,6 +167,18 @@ _NEGATORS = frozenset({
 # Strip punctuation for clean word matching
 _PUNCT = _re.compile(r"[^\w\s'-]")
 
+# Pre-compiled negation prefix pattern (checks if a negator appears before a phrase)
+_NEG_PREFIX = _re.compile(
+    r'\b(?:' + '|'.join(_re.escape(n) for n in _NEGATORS) + r')\s+',
+    _re.IGNORECASE,
+)
+
+# Pre-compiled phrase patterns with word boundaries (avoids substring matches)
+_POS_PHRASE_RES = [(_re.compile(r'\b' + _re.escape(p) + r'\b', _re.IGNORECASE), w)
+                   for p, w in _POSITIVE_PHRASES]
+_NEG_PHRASE_RES = [(_re.compile(r'\b' + _re.escape(p) + r'\b', _re.IGNORECASE), w)
+                   for p, w in _NEGATIVE_PHRASES]
+
 
 def _score_text(text):
     """Score a single text string. Returns a float in roughly (-1, 1).
@@ -143,50 +189,57 @@ def _score_text(text):
 
     raw_score = 0.0
 
-    # Phase 1: Phrase matching (higher weight, checked first)
-    # Negation-aware: if a negator appears within 4 chars before the phrase, flip it
-    _neg_prefix = _re.compile(r'\b(?:' + '|'.join(_re.escape(n) for n in _NEGATORS) + r')\s+')
-    for phrase, weight in _POSITIVE_PHRASES:
-        idx = text_lower.find(phrase)
-        if idx >= 0:
-            prefix = text_lower[max(0, idx - 15):idx]
-            if _neg_prefix.search(prefix):
+    # Phase 1: Phrase matching (higher weight, word-boundary, negation-aware)
+    for pat, weight in _POS_PHRASE_RES:
+        m = pat.search(text_lower)
+        if m:
+            prefix = text_lower[max(0, m.start() - 15):m.start()]
+            if _NEG_PREFIX.search(prefix):
                 raw_score -= weight * 0.7  # negated positive → negative
             else:
                 raw_score += weight
-    for phrase, weight in _NEGATIVE_PHRASES:
-        if phrase in text_lower:
+    for pat, weight in _NEG_PHRASE_RES:
+        if pat.search(text_lower):
             raw_score += weight  # weight is already negative
 
-    # Phase 2: Negation-aware single-word matching
+    # Phase 2: Negation-aware single-word matching (bidirectional)
     clean = _PUNCT.sub(' ', text_lower)
     words = clean.split()
-    negation_window = 0  # countdown: how many words the negation applies to
 
-    for word in words:
-        # Check if this word is a negator
+    # Build per-word scores, then apply negation in both directions
+    word_scores = []  # (index, base_score)
+    negator_positions = []
+
+    for i, word in enumerate(words):
         if word in _NEGATORS or word.endswith("n't"):
-            negation_window = 3  # affects next 3 words
-            continue
+            negator_positions.append(i)
+        elif word in _POSITIVE:
+            word_scores.append((i, 1.0))
+        elif word in _NEGATIVE:
+            word_scores.append((i, -1.0))
 
-        is_pos = word in _POSITIVE
-        is_neg = word in _NEGATIVE
-
-        if is_pos or is_neg:
-            if negation_window > 0:
-                # Flip: positive becomes negative and vice versa (at 0.7x weight)
-                if is_pos:
-                    raw_score -= 0.7
-                else:
-                    raw_score += 0.7
-                negation_window = 0  # consumed by this keyword
-            else:
-                if is_pos:
-                    raw_score += 1.0
-                else:
-                    raw_score -= 1.0
-        elif negation_window > 0:
-            negation_window -= 1
+    # Apply negation: a negator flips the nearest sentiment word within 3 positions
+    used_negators = set()
+    for idx, base in word_scores:
+        for ni in negator_positions:
+            if ni in used_negators:
+                continue
+            dist = abs(idx - ni)
+            # Negator must be within 3 words and not on the same word
+            if 0 < dist <= 3:
+                # Count non-keyword words between negator and keyword
+                lo, hi = min(idx, ni), max(idx, ni)
+                filler = sum(1 for j in range(lo + 1, hi)
+                             if words[j] not in _POSITIVE and words[j] not in _NEGATIVE
+                             and words[j] not in _NEGATORS)
+                if filler <= 2:  # allow up to 2 filler words between
+                    raw_score -= base * 0.7  # flip: cancel original + add opposite
+                    raw_score -= base * 1.0   # (net: -1.7 * base direction)
+                    used_negators.add(ni)
+                    break
+        else:
+            # No negation applied — use base score
+            raw_score += base
 
     # Smooth with tanh: maps any raw sum to (-1, 1) with granular values
     # Scale factor 0.4 means: 1 keyword ≈ ±0.38, 2 ≈ ±0.66, 3 ≈ ±0.83
@@ -350,11 +403,15 @@ def sentiment_gate(symbol, asset_type='crypto'):
         0.0  = block trade entirely (extreme negative sentiment)
         0.5  = reduce position size (negative sentiment)
         1.0  = normal (neutral or no data)
-        1.25 = slightly increase position (positive sentiment)
-        1.5  = increase position (strong positive sentiment)
+        1.15 = slightly increase position (positive sentiment)
+        1.3  = max increase (strong positive, calm market)
 
     Uses Fear & Greed Index for crypto, Finnhub news for both.
     Gracefully returns 1.0 if no sentiment data is available.
+
+    F&G philosophy: this is a short-term momentum trader (30s cycles),
+    not a long-term value investor. Fear = active selling = reduce size.
+    Greed = momentum up = trade normally. Extremes = reduce (volatile).
     """
     multiplier = 1.0
     reasons = []
@@ -364,24 +421,29 @@ def sentiment_gate(symbol, asset_type='crypto'):
         fng = get_fear_greed()
         if fng is not None:
             val = fng['value']
-            if val <= 15:
-                # Extreme fear — contrarian buy signal (slightly bullish)
-                multiplier *= 1.15
-                reasons.append(f"FnG={val}(extreme_fear/contrarian)")
-            elif val <= 30:
-                # Fear — moderate caution
-                multiplier *= 0.85
-                reasons.append(f"FnG={val}(fear)")
-            elif val >= 85:
-                # Extreme greed — contrarian sell signal (reduce buys)
+            if val <= 10:
+                # Extreme fear — panic selling, spreads wide, don't catch knives
+                multiplier *= 0.3
+                reasons.append(f"FnG={val}(extreme_fear/block)")
+            elif val <= 25:
+                # Fear — active downturn, reduce exposure significantly
                 multiplier *= 0.5
+                reasons.append(f"FnG={val}(fear/reduce)")
+            elif val <= 40:
+                # Mild fear — cautious
+                multiplier *= 0.8
+                reasons.append(f"FnG={val}(cautious)")
+            elif val >= 90:
+                # Extreme greed — blow-off top risk, reduce
+                multiplier *= 0.6
                 reasons.append(f"FnG={val}(extreme_greed/reduce)")
-            elif val >= 70:
-                # Greed — slight caution
-                multiplier *= 0.9
-                reasons.append(f"FnG={val}(greed)")
+            elif val >= 75:
+                # High greed — late-cycle caution
+                multiplier *= 0.85
+                reasons.append(f"FnG={val}(greed/caution)")
             else:
-                reasons.append(f"FnG={val}(neutral)")
+                # 40-75: healthy range, trade normally
+                reasons.append(f"FnG={val}(normal)")
 
     # --- Finnhub news sentiment ---
     news = get_news_sentiment(symbol, asset_type)
