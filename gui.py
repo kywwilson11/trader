@@ -4,7 +4,7 @@
 Monitors positions, P&L, trade history, account balance, tax estimation,
 model status, pipeline progress, and hardware health — all in one window.
 
-Themes: Bubblegum Goth, Batman, Joker, Harley Quinn, Dark, Space, Money
+Themes: Batman, Joker, Harley Quinn, Two-Face, Bubblegum Goth, Dark, Space, Money
 All timestamps displayed in US/Central time.
 """
 
@@ -68,26 +68,85 @@ FED_SHORT_TERM = 0.37
 FED_LONG_TERM = 0.20
 STATE_RATE = 0.05
 
+# Persistence files
+NEWS_CACHE_FILE = BASE_DIR / "news_cache.json"
+NEWS_CACHE_MAX_AGE_DAYS = 7
+GUI_SETTINGS_FILE = BASE_DIR / "gui_settings.json"
+
+
+def _load_gui_settings():
+    """Load persisted GUI settings (theme, etc.)."""
+    try:
+        if GUI_SETTINGS_FILE.exists():
+            with open(GUI_SETTINGS_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_gui_settings(settings):
+    """Save GUI settings to disk."""
+    try:
+        with open(GUI_SETTINGS_FILE, 'w') as f:
+            json.dump(settings, f, indent=2)
+    except Exception:
+        pass
+
+
+def _load_news_cache():
+    """Load cached news articles (up to NEWS_CACHE_MAX_AGE_DAYS old)."""
+    try:
+        if NEWS_CACHE_FILE.exists():
+            with open(NEWS_CACHE_FILE) as f:
+                cache = json.load(f)
+            cutoff = dt.datetime.now().timestamp() - NEWS_CACHE_MAX_AGE_DAYS * 86400
+            articles = [a for a in cache.get('articles', [])
+                        if a.get('datetime', 0) > cutoff]
+            return {
+                'articles': articles,
+                'fng': cache.get('fng'),
+                'cached_at': cache.get('cached_at', 0),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _save_news_cache(articles, fng):
+    """Save news articles + sentiment to disk cache."""
+    try:
+        # Only keep articles from last 7 days
+        cutoff = dt.datetime.now().timestamp() - NEWS_CACHE_MAX_AGE_DAYS * 86400
+        recent = [a for a in articles if a.get('datetime', 0) > cutoff]
+        # Strip non-serializable fields, keep only what we need
+        clean = []
+        for a in recent:
+            clean.append({
+                'headline': a.get('headline', ''),
+                'summary': a.get('summary', ''),
+                'source': a.get('source', ''),
+                'url': a.get('url', ''),
+                'datetime': a.get('datetime', 0),
+                '_category': a.get('_category', ''),
+                '_symbol': a.get('_symbol', ''),
+                '_sentiment': a.get('_sentiment', 0.0),
+            })
+        with open(NEWS_CACHE_FILE, 'w') as f:
+            json.dump({
+                'articles': clean,
+                'fng': fng,
+                'cached_at': dt.datetime.now().timestamp(),
+            }, f)
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Theme System
 # ---------------------------------------------------------------------------
 THEMES = {
-    "Bubblegum Goth": {
-        "green":     QColor(0, 230, 118),
-        "red":       QColor(255, 56, 96),
-        "yellow":    QColor(255, 170, 230),
-        "white":     QColor(240, 210, 245),
-        "muted":     QColor(170, 130, 190),
-        "bg_dark":   QColor(18, 10, 26),
-        "bg_card":   QColor(35, 20, 50),
-        "bg_table":  QColor(28, 16, 40),
-        "accent":    QColor(255, 105, 180),
-        "bg_header": QColor(45, 25, 60),
-        "bg_border": QColor(80, 40, 100),
-        "bg_hover":  QColor(55, 30, 75),
-        "bg_log":    QColor(12, 6, 18),
-    },
+    # --- Batman characters ---
     "Batman": {
         "green":     QColor(76, 175, 80),
         "red":       QColor(244, 67, 54),
@@ -102,6 +161,67 @@ THEMES = {
         "bg_border": QColor(58, 58, 58),
         "bg_hover":  QColor(42, 42, 42),
         "bg_log":    QColor(5, 5, 5),
+    },
+    "Joker": {
+        "green":     QColor(0, 255, 102),
+        "red":       QColor(255, 34, 68),
+        "yellow":    QColor(170, 255, 170),
+        "white":     QColor(220, 210, 240),
+        "muted":     QColor(140, 120, 180),
+        "bg_dark":   QColor(13, 10, 24),
+        "bg_card":   QColor(31, 16, 53),
+        "bg_table":  QColor(22, 12, 38),
+        "accent":    QColor(0, 255, 102),
+        "bg_header": QColor(40, 20, 66),
+        "bg_border": QColor(70, 40, 110),
+        "bg_hover":  QColor(50, 28, 82),
+        "bg_log":    QColor(8, 5, 16),
+    },
+    "Harley Quinn": {
+        "green":     QColor(0, 200, 150),
+        "red":       QColor(255, 23, 68),
+        "yellow":    QColor(255, 224, 232),
+        "white":     QColor(240, 230, 235),
+        "muted":     QColor(160, 120, 140),
+        "bg_dark":   QColor(10, 10, 10),
+        "bg_card":   QColor(42, 16, 24),
+        "bg_table":  QColor(30, 12, 18),
+        "accent":    QColor(255, 23, 68),
+        "bg_header": QColor(50, 20, 30),
+        "bg_border": QColor(90, 40, 55),
+        "bg_hover":  QColor(65, 28, 40),
+        "bg_log":    QColor(5, 5, 5),
+    },
+    "Two-Face": {
+        "green":     QColor(100, 200, 120),
+        "red":       QColor(220, 50, 50),
+        "yellow":    QColor(200, 180, 255),
+        "white":     QColor(210, 210, 230),
+        "muted":     QColor(130, 120, 150),
+        "bg_dark":   QColor(12, 10, 20),
+        "bg_card":   QColor(28, 22, 45),
+        "bg_table":  QColor(20, 16, 35),
+        "accent":    QColor(120, 90, 200),
+        "bg_header": QColor(35, 28, 55),
+        "bg_border": QColor(65, 50, 100),
+        "bg_hover":  QColor(45, 35, 70),
+        "bg_log":    QColor(8, 6, 14),
+    },
+    # --- Other themes ---
+    "Bubblegum Goth": {
+        "green":     QColor(0, 230, 118),
+        "red":       QColor(255, 56, 96),
+        "yellow":    QColor(255, 170, 230),
+        "white":     QColor(240, 210, 245),
+        "muted":     QColor(170, 130, 190),
+        "bg_dark":   QColor(18, 10, 26),
+        "bg_card":   QColor(35, 20, 50),
+        "bg_table":  QColor(28, 16, 40),
+        "accent":    QColor(255, 105, 180),
+        "bg_header": QColor(45, 25, 60),
+        "bg_border": QColor(80, 40, 100),
+        "bg_hover":  QColor(55, 30, 75),
+        "bg_log":    QColor(12, 6, 18),
     },
     "Dark": {
         "green":     QColor(0, 200, 83),
@@ -148,40 +268,10 @@ THEMES = {
         "bg_hover":  QColor(34, 54, 34),
         "bg_log":    QColor(6, 12, 6),
     },
-    "Joker": {
-        "green":     QColor(0, 255, 102),
-        "red":       QColor(255, 34, 68),
-        "yellow":    QColor(170, 255, 170),
-        "white":     QColor(220, 210, 240),
-        "muted":     QColor(140, 120, 180),
-        "bg_dark":   QColor(13, 10, 24),
-        "bg_card":   QColor(31, 16, 53),
-        "bg_table":  QColor(22, 12, 38),
-        "accent":    QColor(0, 255, 102),
-        "bg_header": QColor(40, 20, 66),
-        "bg_border": QColor(70, 40, 110),
-        "bg_hover":  QColor(50, 28, 82),
-        "bg_log":    QColor(8, 5, 16),
-    },
-    "Harley Quinn": {
-        "green":     QColor(0, 200, 150),
-        "red":       QColor(255, 23, 68),
-        "yellow":    QColor(255, 224, 232),
-        "white":     QColor(240, 230, 235),
-        "muted":     QColor(160, 120, 140),
-        "bg_dark":   QColor(10, 10, 10),
-        "bg_card":   QColor(42, 16, 24),
-        "bg_table":  QColor(30, 12, 18),
-        "accent":    QColor(255, 23, 68),
-        "bg_header": QColor(50, 20, 30),
-        "bg_border": QColor(90, 40, 55),
-        "bg_hover":  QColor(65, 28, 40),
-        "bg_log":    QColor(5, 5, 5),
-    },
 }
 
 # Active theme — module-level so helpers can reference it
-T = THEMES["Bubblegum Goth"]
+T = THEMES["Batman"]
 
 
 def set_theme(name):
@@ -370,6 +460,7 @@ _THEME_IMAGES = {
     "Batman": BASE_DIR / "logos" / "batman.jpeg",
     "Joker": BASE_DIR / "logos" / "joker.png",
     "Harley Quinn": BASE_DIR / "logos" / "harley.jpeg",
+    "Two-Face": BASE_DIR / "logos" / "twoface.jpeg",
 }
 
 
@@ -552,7 +643,15 @@ class DataFetcher(QObject):
         self._timer_news.timeout.connect(self.fetch_news)
         self._timer_news.start(300_000)  # 5 min
 
-        # Immediate first fetch
+        # Load cached news immediately (instant startup)
+        cached = _load_news_cache()
+        if cached and cached.get('articles'):
+            self.news_updated.emit({
+                'articles': cached['articles'],
+                'fng': cached.get('fng'),
+            })
+
+        # Immediate first fetch (news will merge with cache)
         self.fetch_account()
         self.fetch_positions()
         self.fetch_orders()
@@ -720,6 +819,21 @@ class DataFetcher(QObject):
 
             # Sort by datetime descending
             articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
+
+            # Merge with cache: keep new articles + older cached ones not in this fetch
+            cache = _load_news_cache()
+            if cache and cache.get('articles'):
+                # Deduplicate by (headline, datetime) — new articles take priority
+                seen = {(a.get('headline', ''), a.get('datetime', 0)) for a in articles}
+                for cached_a in cache['articles']:
+                    key = (cached_a.get('headline', ''), cached_a.get('datetime', 0))
+                    if key not in seen:
+                        articles.append(cached_a)
+                        seen.add(key)
+                articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
+
+            # Save merged articles to cache
+            _save_news_cache(articles, fng)
 
             self.news_updated.emit({
                 'articles': articles,
@@ -969,7 +1083,12 @@ class TradingDashboard(QMainWindow):
 
         self._orders_cache = []
         self._hw_cache = {}
-        self._current_theme = "Bubblegum Goth"
+
+        # Restore last used theme
+        settings = _load_gui_settings()
+        saved_theme = settings.get('theme', 'Batman')
+        self._current_theme = saved_theme if saved_theme in THEMES else "Batman"
+        set_theme(self._current_theme)
 
         # Toolbar with theme selector and clock
         self._build_toolbar()
@@ -1088,6 +1207,10 @@ class TradingDashboard(QMainWindow):
             self._logo_label.setPixmap(generate_theme_logo(name))
             self.setWindowTitle(f"Trader Dashboard \u2014 {name}")
             self._restyle()
+            # Persist theme choice
+            settings = _load_gui_settings()
+            settings['theme'] = name
+            _save_gui_settings(settings)
 
     # ---- Restyle (called on theme change) --------------------------------
     def _restyle(self):
