@@ -246,6 +246,35 @@ def _score_text(text):
     return math.tanh(raw_score * 0.4)
 
 
+_HTML_TAG = _re.compile(r'<[^>]+>')
+_WHITESPACE_ONLY = _re.compile(r'^[\s\W]*$')
+
+
+_URL_PATTERN = _re.compile(r'^https?://')
+
+
+def _validate_text(text):
+    """Validate that text is scorable. Returns cleaned text or None if invalid."""
+    if not text or not isinstance(text, str):
+        return None
+    # Strip HTML tags (some Finnhub articles have HTML in summary)
+    text = _HTML_TAG.sub(' ', text).strip()
+    # Too short to be meaningful
+    if len(text) < 10:
+        return None
+    # Mostly non-word characters (URLs, garbage)
+    if _WHITESPACE_ONLY.match(text):
+        return None
+    # Raw URLs are not scorable text
+    if _URL_PATTERN.match(text):
+        return None
+    # Mostly non-ASCII (likely wrong encoding)
+    ascii_ratio = sum(1 for c in text if ord(c) < 128) / len(text)
+    if ascii_ratio < 0.5:
+        return None
+    return text
+
+
 def _score_articles(articles):
     """Score a list of Finnhub news articles.
 
@@ -265,13 +294,26 @@ def _score_articles(articles):
 
     scores = []
     for article in articles:
-        headline = article.get('headline', '')
-        summary = article.get('summary', '')
-        # Headline carries more weight than summary
-        h_score = _score_text(headline)
+        headline = _validate_text(article.get('headline', ''))
+        summary = _validate_text(article.get('summary', ''))
+
+        # Skip articles with no usable text
+        if headline is None and summary is None:
+            continue
+
+        # Score validated text (0.0 for missing components)
+        h_score = _score_text(headline) if headline else 0.0
         s_score = _score_text(summary) if summary else 0.0
         combined = h_score * 0.6 + s_score * 0.4
         scores.append(combined)
+
+    if not scores:
+        return {
+            'sentiment_score': 0.0,
+            'article_count': 0,
+            'positive_ratio': 0.5,
+            'negative_ratio': 0.5,
+        }
 
     avg = sum(scores) / len(scores)
     pos_count = sum(1 for s in scores if s > 0.05)
@@ -445,35 +487,47 @@ def sentiment_gate(symbol, asset_type='crypto'):
                 # 40-75: healthy range, trade normally
                 reasons.append(f"FnG={val}(normal)")
 
-    # --- Finnhub news sentiment ---
+    # --- Symbol-specific news sentiment (heavy weight) ---
+    # This is the most actionable signal: bad news about THIS symbol
+    # directly threatens THIS position. Weight it strongly.
     news = get_news_sentiment(symbol, asset_type)
     if news is not None and news['article_count'] > 0:
         score = news['sentiment_score']
-        if score <= -0.4:
-            multiplier *= 0.0  # Block trade
-            reasons.append(f"news={score:+.2f}(block)")
-        elif score <= -0.2:
-            multiplier *= 0.6
-            reasons.append(f"news={score:+.2f}(bearish)")
-        elif score >= 0.4:
-            multiplier *= 1.3
-            reasons.append(f"news={score:+.2f}(bullish)")
-        elif score >= 0.2:
+        if score <= -0.3:
+            multiplier *= 0.0  # Block — strong negative press on this symbol
+            reasons.append(f"sym_news={score:+.2f}(block)")
+        elif score <= -0.15:
+            multiplier *= 0.4  # Heavy reduce — this symbol is under pressure
+            reasons.append(f"sym_news={score:+.2f}(bearish)")
+        elif score <= -0.05:
+            multiplier *= 0.7  # Cautious — mild negative sentiment
+            reasons.append(f"sym_news={score:+.2f}(cautious)")
+        elif score >= 0.3:
+            multiplier *= 1.2  # Moderate boost — strong positive news
+            reasons.append(f"sym_news={score:+.2f}(bullish)")
+        elif score >= 0.15:
             multiplier *= 1.1
-            reasons.append(f"news={score:+.2f}(positive)")
+            reasons.append(f"sym_news={score:+.2f}(positive)")
         else:
-            reasons.append(f"news={score:+.2f}(neutral)")
+            reasons.append(f"sym_news={score:+.2f}(neutral)")
 
-    # --- Market-wide sentiment (light weight) ---
+    # --- Market-wide sentiment (lighter weight) ---
+    # General market mood affects everything but shouldn't override
+    # symbol-specific signals. Smaller multiplier range.
     market = get_market_sentiment()
     if market is not None and market['article_count'] > 0:
         mscore = market['sentiment_score']
         if mscore <= -0.3:
-            multiplier *= 0.8
+            multiplier *= 0.85
             reasons.append(f"market={mscore:+.2f}(bearish)")
+        elif mscore <= -0.15:
+            multiplier *= 0.9
+            reasons.append(f"market={mscore:+.2f}(cautious)")
         elif mscore >= 0.3:
             multiplier *= 1.1
             reasons.append(f"market={mscore:+.2f}(bullish)")
+        else:
+            reasons.append(f"market={mscore:+.2f}(neutral)")
 
     # Clamp to [0, 1.5]
     multiplier = max(0.0, min(1.5, multiplier))
