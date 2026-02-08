@@ -41,8 +41,13 @@ llm_config.json
 # Indicator preset config
 indicator_config.json
 
-# Sentiment cache
+# Sentiment cache (SQLite + WAL files)
 sentiment_cache.db
+sentiment_cache.db-shm
+sentiment_cache.db-wal
+
+# Sentiment fetch log (background process)
+sentiment_fetch.log
 
 # Trade journal logs
 journals/

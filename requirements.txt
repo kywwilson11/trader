@@ -1,0 +1,25 @@
+# Core dependencies (works on any Python 3.10+ system)
+# For Jetson Orin Nano GPU setup, see requirements-jetson.txt
+
+alpaca-trade-api>=3.0.0
+python-dotenv>=1.0.0
+numpy>=1.26,<2
+pandas>=2.0
+scikit-learn>=1.5
+joblib>=1.3
+optuna>=4.0
+yfinance>=1.0
+numba>=0.60
+finnhub-python>=2.4
+beautifulsoup4>=4.12
+requests>=2.31
+websockets>=12.0
+PyYAML>=6.0
+
+# GUI (optional — only needed for gui.py)
+PySide6>=6.6
+pyqtgraph>=0.13
+
+# PyTorch — install separately per platform:
+#   pip:    pip install torch torchvision
+#   Jetson: see requirements-jetson.txt
