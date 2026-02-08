@@ -1,8 +1,16 @@
-# Trader
+<p align="center">
+  <img src="logos/circuit_bull.png" alt="Trader" width="200">
+</p>
 
-Autonomous paper trading system for stocks and crypto, powered by dual bear/bull LSTM models with Numba-accelerated technical indicators and sentiment-gated risk management.
+<h1 align="center">Trader</h1>
 
-Runs on an NVIDIA Jetson Orin Nano. Trades via the [Alpaca](https://alpaca.markets/) paper trading API.
+<p align="center">
+  Autonomous paper trading system for stocks and crypto, powered by dual bear/bull LSTM models with Numba-accelerated technical indicators and sentiment-gated risk management.
+</p>
+
+<p align="center">
+  Runs on an NVIDIA Jetson Orin Nano. Trades via the <a href="https://alpaca.markets/">Alpaca</a> paper trading API.
+</p>
 
 ## Architecture
 

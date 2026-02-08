@@ -30,3 +30,10 @@ hypersearch_*_log.json
 .clean_slate
 errors.txt
 alpaca_emerg.txt
+gui_settings.json
+news_cache.json
+pipeline_status.json
+*_predictions.json
+
+# Old/backup logos
+logos/old/
