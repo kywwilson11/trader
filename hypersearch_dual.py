@@ -128,7 +128,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
     # target class index: bear=0, bull=2
     target_class = 0 if target == 'bear' else 2
 
-    MAX_TRIAL_SECONDS = 300  # kill any trial running longer than 5 min
+    MAX_TRIAL_SECONDS = 600  # kill any trial running longer than 10 min
 
     def objective(trial):
         trial_start = time.time()
