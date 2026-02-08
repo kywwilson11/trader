@@ -43,31 +43,161 @@ def _get_finnhub():
 
 # --- Keyword sentiment scoring ---
 
+import math
+import re as _re
+
 _POSITIVE = frozenset({
-    'surge', 'rally', 'bull', 'bullish', 'gain', 'profit', 'soar',
-    'breakout', 'upgrade', 'beat', 'record', 'high', 'growth', 'boost',
-    'strong', 'positive', 'optimistic', 'recovery', 'buy', 'up',
-    'outperform', 'innovation', 'partnership', 'deal', 'approval',
-    'launch', 'expand', 'success', 'milestone', 'adoption', 'etf',
-    'institutional', 'inflow', 'accumulation', 'halving', 'upgrade',
+    # Price action
+    'surge', 'surges', 'surging', 'rally', 'rallies', 'rallying',
+    'gain', 'gains', 'soar', 'soars', 'soaring', 'jump', 'jumps',
+    'climbing', 'climbs', 'rises', 'rising', 'rebound', 'rebounds',
+    'breakout', 'moon', 'mooning', 'skyrocket', 'spike', 'spikes',
+    # Fundamentals
+    'bull', 'bullish', 'profit', 'profits', 'profitable', 'beat',
+    'beats', 'record', 'growth', 'boost', 'boosts', 'strong',
+    'strength', 'positive', 'optimistic', 'optimism', 'recovery',
+    'outperform', 'outperforms', 'upgrade', 'upgrades', 'upgraded',
+    'success', 'successful', 'milestone', 'exceeded', 'exceeds',
+    'upbeat', 'robust', 'stellar', 'impressive', 'blowout',
+    # Business
+    'innovation', 'partnership', 'deal', 'approval', 'approved',
+    'launch', 'launches', 'expand', 'expansion', 'adoption',
+    'inflow', 'inflows', 'accumulation', 'institutional',
+    'buy', 'buying', 'accumulate', 'etf',
+    # Crypto-specific
+    'halving', 'airdrop', 'staking', 'defi',
+    # Modifiers
+    'tailwind', 'tailwinds', 'upside', 'overweight',
+    'sustainable', 'momentum',
 })
 
 _NEGATIVE = frozenset({
-    'crash', 'plunge', 'bear', 'bearish', 'loss', 'decline', 'drop',
-    'sell', 'selloff', 'downgrade', 'miss', 'low', 'risk', 'fear',
-    'negative', 'pessimistic', 'recession', 'bankruptcy', 'fraud',
-    'hack', 'exploit', 'regulation', 'ban', 'warning', 'crisis',
-    'investigation', 'lawsuit', 'layoff', 'cut', 'weak', 'dump',
-    'outflow', 'sec', 'fine', 'subpoena', 'default', 'inflation',
-    'tariff', 'war', 'sanctions', 'shutdown',
+    # Price action
+    'crash', 'crashes', 'crashing', 'plunge', 'plunges', 'plunging',
+    'drop', 'drops', 'dropping', 'decline', 'declines', 'declining',
+    'tumble', 'tumbles', 'tumbling', 'sink', 'sinks', 'sinking',
+    'slide', 'slides', 'sliding', 'slip', 'slips', 'slipping',
+    'selloff', 'sell-off', 'dumping', 'dump', 'dumps', 'plummets',
+    'nosedive', 'freefall', 'rout', 'bloodbath', 'carnage', 'tanking',
+    # Fundamentals
+    'bear', 'bearish', 'loss', 'losses', 'miss', 'misses', 'missed',
+    'downgrade', 'downgrades', 'downgraded', 'weak', 'weakness',
+    'negative', 'pessimistic', 'pessimism', 'ugly', 'terrible',
+    'worst', 'disappointing', 'disappointed', 'lackluster', 'dismal',
+    'underperform', 'underperforms', 'underweight',
+    # Business / macro
+    'recession', 'bankruptcy', 'bankrupt', 'fraud', 'fraudulent',
+    'hack', 'hacked', 'exploit', 'exploited', 'regulation',
+    'ban', 'banned', 'warning', 'warns', 'warned', 'crisis',
+    'investigation', 'lawsuit', 'layoff', 'layoffs', 'cut', 'cuts',
+    'outflow', 'outflows', 'fine', 'fined', 'subpoena', 'default',
+    'inflation', 'tariff', 'tariffs', 'war', 'sanctions', 'shutdown',
+    'fear', 'fears', 'risk', 'risks', 'risky', 'concern', 'concerns',
+    'uncertainty', 'volatile', 'volatility', 'contagion', 'bubble',
+    'overvalued', 'sell', 'selling',
+    # Modifiers
+    'headwind', 'headwinds', 'downside', 'downbeat', 'grim',
+    'dire', 'ominous', 'trouble', 'troubled', 'struggling',
 })
+
+# Phrases scored as a unit (checked before single-word matching)
+_POSITIVE_PHRASES = [
+    ('all time high', 1.5), ('all-time high', 1.5), ('ath', 1.0),
+    ('beat expectations', 1.5), ('beats expectations', 1.5),
+    ('strong buy', 1.5), ('price target raised', 1.5),
+    ('short squeeze', 1.0), ('green light', 1.0),
+    ('better than expected', 1.5), ('revenue beat', 1.5),
+    ('earnings beat', 1.5), ('guidance raised', 1.5),
+]
+
+_NEGATIVE_PHRASES = [
+    ('pretty ugly', -1.5), ('not good', -1.0), ('not great', -1.0),
+    ('death cross', -1.5), ('going down', -1.0), ('sell off', -1.0),
+    ('missed expectations', -1.5), ('misses expectations', -1.5),
+    ('price target cut', -1.5), ('price target lowered', -1.5),
+    ('guidance lowered', -1.5), ('guidance cut', -1.5),
+    ('revenue miss', -1.5), ('earnings miss', -1.5),
+    ('worse than expected', -1.5), ('worst since', -1.5),
+    ('bear market', -1.5), ('margin call', -1.5),
+    ('not saying downside overdone', -1.0),
+    ('downside overdone', -0.5),  # without negation, slightly negative
+]
+
+# Negation words — flip sentiment of the next keyword within 3 words
+_NEGATORS = frozenset({
+    'not', "n't", 'no', 'never', 'neither', 'nor', 'hardly', 'barely',
+    "don't", "doesn't", "didn't", "won't", "can't", "couldn't",
+    "shouldn't", "wouldn't", "isn't", "aren't", "wasn't", "weren't",
+})
+
+# Strip punctuation for clean word matching
+_PUNCT = _re.compile(r"[^\w\s'-]")
+
+
+def _score_text(text):
+    """Score a single text string. Returns a float in roughly (-1, 1).
+
+    Uses phrase matching, negation-aware keyword scoring, and tanh smoothing.
+    """
+    text_lower = text.lower()
+
+    raw_score = 0.0
+
+    # Phase 1: Phrase matching (higher weight, checked first)
+    # Negation-aware: if a negator appears within 4 chars before the phrase, flip it
+    _neg_prefix = _re.compile(r'\b(?:' + '|'.join(_re.escape(n) for n in _NEGATORS) + r')\s+')
+    for phrase, weight in _POSITIVE_PHRASES:
+        idx = text_lower.find(phrase)
+        if idx >= 0:
+            prefix = text_lower[max(0, idx - 15):idx]
+            if _neg_prefix.search(prefix):
+                raw_score -= weight * 0.7  # negated positive → negative
+            else:
+                raw_score += weight
+    for phrase, weight in _NEGATIVE_PHRASES:
+        if phrase in text_lower:
+            raw_score += weight  # weight is already negative
+
+    # Phase 2: Negation-aware single-word matching
+    clean = _PUNCT.sub(' ', text_lower)
+    words = clean.split()
+    negation_window = 0  # countdown: how many words the negation applies to
+
+    for word in words:
+        # Check if this word is a negator
+        if word in _NEGATORS or word.endswith("n't"):
+            negation_window = 3  # affects next 3 words
+            continue
+
+        is_pos = word in _POSITIVE
+        is_neg = word in _NEGATIVE
+
+        if is_pos or is_neg:
+            if negation_window > 0:
+                # Flip: positive becomes negative and vice versa (at 0.7x weight)
+                if is_pos:
+                    raw_score -= 0.7
+                else:
+                    raw_score += 0.7
+                negation_window = 0  # consumed by this keyword
+            else:
+                if is_pos:
+                    raw_score += 1.0
+                else:
+                    raw_score -= 1.0
+        elif negation_window > 0:
+            negation_window -= 1
+
+    # Smooth with tanh: maps any raw sum to (-1, 1) with granular values
+    # Scale factor 0.4 means: 1 keyword ≈ ±0.38, 2 ≈ ±0.66, 3 ≈ ±0.83
+    return math.tanh(raw_score * 0.4)
 
 
 def _score_articles(articles):
-    """Score a list of Finnhub news articles via keyword matching.
+    """Score a list of Finnhub news articles.
 
     Returns dict:
-        sentiment_score: float in [-1, 1], average across articles
+        sentiment_score: float in (-1, 1), average across articles
         article_count: int
         positive_ratio: float in [0, 1]
         negative_ratio: float in [0, 1]
@@ -82,16 +212,17 @@ def _score_articles(articles):
 
     scores = []
     for article in articles:
-        text = f"{article.get('headline', '')} {article.get('summary', '')}".lower()
-        words = set(text.split())
-        pos = len(words & _POSITIVE)
-        neg = len(words & _NEGATIVE)
-        total = pos + neg
-        scores.append((pos - neg) / total if total > 0 else 0.0)
+        headline = article.get('headline', '')
+        summary = article.get('summary', '')
+        # Headline carries more weight than summary
+        h_score = _score_text(headline)
+        s_score = _score_text(summary) if summary else 0.0
+        combined = h_score * 0.6 + s_score * 0.4
+        scores.append(combined)
 
     avg = sum(scores) / len(scores)
-    pos_count = sum(1 for s in scores if s > 0)
-    neg_count = sum(1 for s in scores if s < 0)
+    pos_count = sum(1 for s in scores if s > 0.05)
+    neg_count = sum(1 for s in scores if s < -0.05)
     n = len(scores)
 
     return {
