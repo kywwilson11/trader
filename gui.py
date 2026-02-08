@@ -1990,12 +1990,14 @@ class TradingDashboard(QMainWindow):
             else:
                 bar_color = T["green"].name()
             self._pipeline_progress.setStyleSheet(
+                f"QProgressBar {{ color: #111111; }}"
                 f"QProgressBar::chunk {{ background-color: {bar_color}; }}")
         elif cycle > 0:
             self._pipeline_trial.setText(f"Bot Cycle: {cycle}")
             self._pipeline_progress.setRange(0, 1)
             self._pipeline_progress.setValue(1)
             self._pipeline_progress.setStyleSheet(
+                f"QProgressBar {{ color: #111111; }}"
                 f"QProgressBar::chunk {{ background-color: {T['green'].name()}; }}")
         else:
             self._pipeline_trial.setText("Trial: \u2014")

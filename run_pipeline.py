@@ -344,8 +344,8 @@ def _run_training(phases, log_fh, status, is_retrain):
 
 def main():
     parser = argparse.ArgumentParser(description='Trading pipeline orchestrator')
-    parser.add_argument('--trials', type=int, default=250,
-                        help='Trials per model on first run (default: 250)')
+    parser.add_argument('--trials', type=int, default=500,
+                        help='Trials per model on first run (default: 500)')
     parser.add_argument('--bot-only', action='store_true',
                         help='Skip training, start bots immediately')
     parser.add_argument('--skip-harvest', action='store_true',

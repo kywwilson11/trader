@@ -24,11 +24,11 @@ import time
 import optuna
 from optuna.pruners import MedianPruner
 
-NUM_TRIALS = 250
+NUM_TRIALS = 500
 MAX_EPOCHS = 80
 EARLY_STOP_PATIENCE = 15
 PRUNE_WARMUP_EPOCHS = 20       # don't prune until model has had time to learn
-PRUNE_STARTUP_TRIALS = 15      # match TPE's random exploration phase
+PRUNE_STARTUP_TRIALS = 50      # match TPE's random exploration phase
 TRAIN_RATIO = 0.8
 NUM_CLASSES = 3
 
@@ -152,6 +152,9 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
             'bull_threshold': bull_threshold, 'weight_decay': weight_decay,
             'scheduler': scheduler,
         }
+
+        # Store config early so callback can log params even on rejected/failed trials
+        trial.set_user_attr('cfg', cfg)
 
         try:
             return _train_and_evaluate(
