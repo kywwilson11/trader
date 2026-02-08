@@ -25,3 +25,8 @@ models/
 
 # Hypersearch JSON logs
 hypersearch_*_log.json
+
+# Runtime state
+.clean_slate
+errors.txt
+alpaca_emerg.txt

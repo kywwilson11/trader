@@ -599,7 +599,12 @@ class DataFetcher(QObject):
     @Slot()
     def fetch_orders(self):
         try:
-            orders = self.api.list_orders(status="all", limit=100)
+            # Only show orders after clean-slate cutoff (if set)
+            after = None
+            slate = BASE_DIR / ".clean_slate"
+            if slate.exists():
+                after = slate.read_text().strip()
+            orders = self.api.list_orders(status="all", limit=100, after=after)
             data = []
             for o in orders:
                 data.append({
