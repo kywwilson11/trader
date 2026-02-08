@@ -8,7 +8,7 @@ import os
 import torch
 import torch.nn as nn
 from model import CryptoLSTM
-from indicators import compute_features, compute_stock_features
+from indicators import compute_features, compute_stock_features, compute_atr
 
 # --- CONFIGURATION ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -199,10 +199,39 @@ def _fetch_spy_bars_alpaca(api, limit=120):
     return _fetch_stock_bars_alpaca(api, 'SPY', limit)
 
 
+def get_live_atr(api, symbol, asset_type='crypto', length=14):
+    """Fetch recent bars and compute the latest ATR value.
+
+    Args:
+        api: Alpaca API object
+        symbol: Alpaca format symbol (e.g. 'BTC/USD' or 'TSLA')
+        asset_type: 'crypto' or 'stock'
+        length: ATR period (default 14)
+
+    Returns:
+        float ATR value, or None on error
+    """
+    try:
+        if asset_type == 'crypto':
+            df = _fetch_bars_alpaca(api, symbol, limit=max(60, length * 3))
+        else:
+            df = _fetch_stock_bars_alpaca(api, symbol, limit=max(60, length * 3))
+
+        if df is None or len(df) < length + 1:
+            return None
+
+        atr_series = compute_atr(df['High'], df['Low'], df['Close'], length)
+        atr_val = atr_series.dropna().iloc[-1]
+        return float(atr_val)
+    except Exception as e:
+        print(f"  [ATR] Error computing ATR for {symbol}: {e}")
+        return None
+
+
 def get_live_prediction(symbol, model, scaler_X, config_or_seq,
                         seq_len_or_feature_cols=None, feature_cols=None,
                         api=None, inference_device=None,
-                        asset_type='crypto', spy_close=None):
+                        asset_type='crypto', spy_close=None, btc_close=None):
     """Get prediction for a symbol. Returns a score:
     - Positive = bullish (higher = more confident)
     - Negative = bearish (lower = more confident)
@@ -219,6 +248,7 @@ def get_live_prediction(symbol, model, scaler_X, config_or_seq,
         inference_device: Override device for inference (e.g. 'cpu')
         asset_type: 'crypto' or 'stock' — determines feature computation and data source
         spy_close: SPY close Series for stock relative strength (optional)
+        btc_close: BTC/USD close Series for crypto cross-asset features (optional)
     """
     dev = torch.device(inference_device) if inference_device else device
 
@@ -263,7 +293,7 @@ def get_live_prediction(symbol, model, scaler_X, config_or_seq,
     if asset_type == 'stock':
         df = compute_stock_features(df, spy_close=spy_close)
     else:
-        df = compute_features(df)
+        df = compute_features(df, btc_close=btc_close)
     df = df.dropna()
 
     if len(df) < seq_len:

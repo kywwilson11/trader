@@ -51,14 +51,21 @@ if _HAS_NUMBA:
     def _rolling_mean(arr, window):
         n = len(arr)
         out = np.empty(n)
-        out[:window - 1] = np.nan
+        out[:] = np.nan
+        # Track consecutive valid count to know when we have a full window
         s = 0.0
-        for i in range(window):
+        valid_run = 0
+        for i in range(n):
+            if np.isnan(arr[i]):
+                s = 0.0
+                valid_run = 0
+                continue
             s += arr[i]
-        out[window - 1] = s / window
-        for i in range(window, n):
-            s += arr[i] - arr[i - window]
-            out[i] = s / window
+            valid_run += 1
+            if valid_run > window:
+                s -= arr[i - window]
+            if valid_run >= window:
+                out[i] = s / window
         return out
 
     @njit(cache=True)
@@ -211,6 +218,49 @@ if _HAS_NUMBA:
                 out[i] = out[i - 1]
         return out
 
+    @njit(cache=True)
+    def _rolling_percentile(arr, window):
+        """Rolling percentile rank of the last value within its window (0-1)."""
+        n = len(arr)
+        out = np.empty(n)
+        out[:window - 1] = np.nan
+        for i in range(window - 1, n):
+            val = arr[i]
+            count_below = 0
+            valid = 0
+            for j in range(i - window + 1, i + 1):
+                if not np.isnan(arr[j]):
+                    valid += 1
+                    if arr[j] < val:
+                        count_below += 1
+            if valid > 0:
+                out[i] = count_below / valid
+            else:
+                out[i] = np.nan
+        return out
+
+    @njit(cache=True)
+    def _linear_slope(arr, window):
+        """Rolling linear regression slope over window (simple least-squares)."""
+        n = len(arr)
+        out = np.empty(n)
+        out[:window - 1] = np.nan
+        # Precompute x values: 0, 1, ..., window-1
+        x_mean = (window - 1.0) / 2.0
+        ss_x = 0.0
+        for k in range(window):
+            ss_x += (k - x_mean) * (k - x_mean)
+        for i in range(window - 1, n):
+            y_mean = 0.0
+            for j in range(window):
+                y_mean += arr[i - window + 1 + j]
+            y_mean /= window
+            ss_xy = 0.0
+            for j in range(window):
+                ss_xy += (j - x_mean) * (arr[i - window + 1 + j] - y_mean)
+            out[i] = ss_xy / ss_x if ss_x != 0 else 0.0
+        return out
+
 
 # ── Public API (unchanged signatures) ────────────────────────────────────────
 
@@ -295,12 +345,41 @@ def compute_obv(close, volume):
     return (sign * volume).cumsum()
 
 
+def compute_rolling_percentile(series, window=100):
+    if _HAS_NUMBA:
+        result = _rolling_percentile(series.values.astype(np.float64), window)
+        return pd.Series(result, index=series.index)
+    # Pure-pandas fallback
+    return series.rolling(window).apply(
+        lambda x: (x < x.iloc[-1]).sum() / len(x), raw=False
+    )
+
+
+def compute_linear_slope(series, window=5):
+    if _HAS_NUMBA:
+        result = _linear_slope(series.values.astype(np.float64), window)
+        return pd.Series(result, index=series.index)
+    # Pure-pandas fallback
+    x = np.arange(window, dtype=np.float64)
+    x_mean = x.mean()
+    ss_x = ((x - x_mean) ** 2).sum()
+    def _slope(arr):
+        y_mean = arr.mean()
+        return ((x - x_mean) * (arr - y_mean)).sum() / ss_x
+    return series.rolling(window).apply(_slope, raw=True)
+
+
 def compute_roc(close, length=12):
     return ((close - close.shift(length)) / close.shift(length)) * 100
 
 
-def compute_features(df):
-    """Compute all features matching harvest_crypto_data.py exactly."""
+def compute_features(df, btc_close=None):
+    """Compute all features for crypto (and base features for stocks).
+
+    Args:
+        df: DataFrame with OHLCV columns (DatetimeIndex)
+        btc_close: Optional Series of BTC/USD close prices for cross-asset features
+    """
     df['RSI'] = compute_rsi(df['Close'], length=14)
 
     macd_line, macd_hist, macd_signal = compute_macd(df['Close'])
@@ -341,6 +420,35 @@ def compute_features(df):
     df['Hour_cos'] = np.cos(2 * np.pi * hour / 24)
     df['Day_sin'] = np.sin(2 * np.pi * day / 7)
     df['Day_cos'] = np.cos(2 * np.pi * day / 7)
+
+    # --- New indicators (Phase C) ---
+
+    # SMA_100 + ratio (longer-term trend)
+    df['SMA_100'] = df['Close'].rolling(window=100).mean()
+    df['Price_SMA100_Ratio'] = df['Close'] / df['SMA_100']
+
+    # ATR Percentile: rolling 100-period rank of ATR (volatility regime)
+    df['ATR_Percentile'] = compute_rolling_percentile(df['ATR'], window=100)
+
+    # RSI Divergence: RSI slope minus price slope (5-period)
+    rsi_slope = compute_linear_slope(df['RSI'], window=5)
+    price_slope = compute_linear_slope(df['Close'], window=5)
+    # Normalize price slope by price level so it's comparable to RSI slope
+    df['RSI_Divergence'] = rsi_slope - (price_slope / df['Close'] * 100)
+
+    # Volume-Price Confirmation: sign agreement between OBV slope and price slope
+    obv_slope = compute_linear_slope(df['OBV'], window=5)
+    obv_sign = np.sign(obv_slope)
+    price_sign = np.sign(price_slope)
+    df['Vol_Price_Confirm'] = obv_sign * price_sign  # +1=confirm, -1=diverge
+
+    # BTC cross-asset features (crypto only)
+    if btc_close is not None:
+        btc_aligned = btc_close.reindex(df.index, method='ffill')
+        df['BTC_Return_1h'] = btc_aligned.pct_change(1)
+        btc_sma20 = btc_aligned.rolling(window=20).mean()
+        df['BTC_SMA_Ratio'] = btc_aligned / btc_sma20
+        df['BTC_RSI'] = compute_rsi(btc_aligned, length=14)
 
     return df
 

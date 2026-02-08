@@ -11,7 +11,7 @@ from order_utils import (
     cancel_all_open_orders, reconstruct_positions,
     check_circuit_breaker, emergency_flatten,
 )
-from predict_now import load_dual_models, get_live_prediction
+from predict_now import load_dual_models, get_live_prediction, get_live_atr, _fetch_bars_alpaca
 from hw_monitor import get_gpu_temp, is_gpu_available
 from sentiment import sentiment_gate, get_fear_greed
 
@@ -44,11 +44,19 @@ MAX_PREDICTION_WORKERS = 5
 TEMP_LOG_EVERY_N_CYCLES = 10
 THERMAL_THROTTLE_TEMP = 75  # increase sleep if GPU above this
 
-# Stop-loss / trailing stop settings
-CRYPTO_STOP_LOSS_PCT = 0.04       # 4% hard stop-loss from entry
-CRYPTO_TRAIL_ACTIVATE_PCT = 0.01  # Activate trailing after 1% profit
-CRYPTO_TRAIL_PCT = 0.03           # 3% trailing stop from high water mark
-CIRCUIT_BREAKER_PCT = 0.05        # 5% daily equity drawdown triggers flatten
+# ATR-based stop-loss / trailing stop / take-profit settings
+ATR_STOP_MULTIPLIER = 2.0          # stop = entry - (ATR * 2.0)
+ATR_TRAIL_MULTIPLIER = 1.5         # trail = hwm - (ATR * 1.5)
+ATR_TRAIL_ACTIVATE_PCT = 0.01      # activate trailing at 1% profit
+ATR_STOP_FLOOR_PCT = 0.015         # min stop distance 1.5%
+ATR_STOP_CEIL_PCT = 0.08           # max stop distance 8%
+CRYPTO_TAKE_PROFIT_RR = 2.0        # 2:1 risk-reward take-profit
+CRYPTO_TAKE_PROFIT_CEIL_PCT = 0.12  # max take-profit distance 12%
+
+# Fallback fixed percentages (used when ATR unavailable)
+CRYPTO_STOP_LOSS_PCT = 0.04        # 4% hard stop-loss from entry
+CRYPTO_TRAIL_PCT = 0.03            # 3% trailing stop from high water mark
+CIRCUIT_BREAKER_PCT = 0.05         # 5% daily equity drawdown triggers flatten
 
 
 def get_api():
@@ -108,17 +116,19 @@ def cooldown_ok(last_trade_time, symbol):
 
 
 def _predict_symbol(api, symbol, bear_model, bear_config, bull_model, bull_config,
-                    scaler_X, feature_cols, inference_device):
+                    scaler_X, feature_cols, inference_device, btc_close=None):
     """Run both bear and bull predictions for a single symbol.
     Returns (symbol, bear_pred, bull_pred).
     """
     bear_pred = get_live_prediction(
         symbol, bear_model, scaler_X, bear_config, feature_cols,
         api=api, inference_device=inference_device,
+        btc_close=btc_close,
     )
     bull_pred = get_live_prediction(
         symbol, bull_model, scaler_X, bull_config, feature_cols,
         api=api, inference_device=inference_device,
+        btc_close=btc_close,
     )
     return symbol, bear_pred, bull_pred
 
@@ -157,7 +167,19 @@ def run_crypto_bot():
     if positions:
         print(f"Existing positions found: {', '.join(positions)}")
         for sym, info in positions.items():
-            print(f"  {sym}: qty={info['qty']}, entry=${info['entry_price']:.4f}, hwm=${info['high_water_mark']:.4f}")
+            # Backfill ATR for reconstructed positions
+            entry_atr = get_live_atr(api, sym, asset_type='crypto')
+            info['entry_atr'] = entry_atr
+            tp_price = None
+            if entry_atr is not None and info['entry_price'] > 0:
+                raw_stop_dist = (entry_atr * ATR_STOP_MULTIPLIER) / info['entry_price']
+                stop_dist = max(ATR_STOP_FLOOR_PCT, min(ATR_STOP_CEIL_PCT, raw_stop_dist))
+                tp_dist = min(CRYPTO_TAKE_PROFIT_CEIL_PCT, stop_dist * CRYPTO_TAKE_PROFIT_RR)
+                tp_price = info['entry_price'] * (1 + tp_dist)
+            info['take_profit_price'] = tp_price
+            atr_str = f"ATR=${entry_atr:.4f}" if entry_atr else "ATR=N/A"
+            tp_str = f"tp=${tp_price:.4f}" if tp_price else "tp=N/A"
+            print(f"  {sym}: qty={info['qty']}, entry=${info['entry_price']:.4f}, hwm=${info['high_water_mark']:.4f}, {atr_str}, {tp_str}")
 
     # Per-symbol cooldown tracking: symbol -> datetime of last trade
     last_trade_time = {}
@@ -217,7 +239,7 @@ def run_crypto_bot():
             if temp is not None:
                 print(f"[HW] GPU temp: {temp:.0f}C")
 
-        # --- Software stop-loss / trailing stop checks ---
+        # --- Software stop-loss / trailing stop / take-profit checks ---
         for symbol in list(positions):
             quote = get_crypto_quote(api, symbol)
             if quote is None:
@@ -228,18 +250,33 @@ def run_crypto_bot():
             info['high_water_mark'] = max(info['high_water_mark'], current_price)
             hwm = info['high_water_mark']
 
+            # Determine stop distances based on ATR or fallback
+            entry_atr = info.get('entry_atr')
+            if entry_atr is not None and entry_price > 0:
+                raw_stop_dist = (entry_atr * ATR_STOP_MULTIPLIER) / entry_price
+                stop_dist = max(ATR_STOP_FLOOR_PCT, min(ATR_STOP_CEIL_PCT, raw_stop_dist))
+                raw_trail_dist = (entry_atr * ATR_TRAIL_MULTIPLIER) / hwm if hwm > 0 else stop_dist
+                trail_dist = max(ATR_STOP_FLOOR_PCT, min(ATR_STOP_CEIL_PCT, raw_trail_dist))
+            else:
+                stop_dist = CRYPTO_STOP_LOSS_PCT
+                trail_dist = CRYPTO_TRAIL_PCT
+
             stop_reason = None
             # Hard stop-loss
-            if current_price <= entry_price * (1 - CRYPTO_STOP_LOSS_PCT):
+            if current_price <= entry_price * (1 - stop_dist):
                 stop_reason = 'hard_stop'
+            # Take-profit
+            elif info.get('take_profit_price') and current_price >= info['take_profit_price']:
+                stop_reason = 'take_profit'
             # Trailing stop (only if profit target reached)
-            elif (hwm >= entry_price * (1 + CRYPTO_TRAIL_ACTIVATE_PCT)
-                  and current_price <= hwm * (1 - CRYPTO_TRAIL_PCT)):
+            elif (hwm >= entry_price * (1 + ATR_TRAIL_ACTIVATE_PCT)
+                  and current_price <= hwm * (1 - trail_dist)):
                 stop_reason = 'trailing'
 
             if stop_reason:
+                tp_str = f", tp=${info.get('take_profit_price', 0):.4f}" if info.get('take_profit_price') else ""
                 print(f"  [STOP] {symbol}: STOPPED OUT at ${current_price:.4f} "
-                      f"(entry=${entry_price:.4f}, hwm=${hwm:.4f}, reason={stop_reason})")
+                      f"(entry=${entry_price:.4f}, hwm=${hwm:.4f}, stop_d={stop_dist:.1%}, trail_d={trail_dist:.1%}{tp_str}, reason={stop_reason})")
                 try:
                     api.submit_order(
                         symbol=symbol, qty=info['qty'],
@@ -249,6 +286,15 @@ def run_crypto_bot():
                     last_trade_time[symbol] = datetime.datetime.now()
                 except Exception as e:
                     print(f"  [STOP] {symbol}: Sell error: {e}")
+
+        # --- Fetch BTC bars once per cycle for cross-asset features ---
+        btc_close = None
+        try:
+            btc_df = _fetch_bars_alpaca(api, 'BTC/USD')
+            if btc_df is not None:
+                btc_close = btc_df['Close']
+        except Exception as e:
+            print(f"  [BTC] Error fetching benchmark: {e}")
 
         # 1. Get predictions for all symbols in parallel
         bear_preds = {}
@@ -264,7 +310,7 @@ def run_crypto_bot():
                     f = executor.submit(
                         _predict_symbol, api, symbol,
                         bear_model, bear_config, bull_model, bull_config,
-                        scaler_X, feature_cols, inference_device,
+                        scaler_X, feature_cols, inference_device, btc_close,
                     )
                     futures[f] = symbol
 
@@ -386,12 +432,31 @@ def run_crypto_bot():
                 pos = verify_position(api, symbol)
                 if pos:
                     fill_price = float(pos.avg_entry_price)
+
+                    # Fetch ATR for adaptive stops and take-profit
+                    entry_atr = get_live_atr(api, symbol, asset_type='crypto')
+                    tp_price = None
+                    if entry_atr is not None and fill_price > 0:
+                        raw_stop_dist = (entry_atr * ATR_STOP_MULTIPLIER) / fill_price
+                        stop_dist = max(ATR_STOP_FLOOR_PCT, min(ATR_STOP_CEIL_PCT, raw_stop_dist))
+                        raw_tp_dist = stop_dist * CRYPTO_TAKE_PROFIT_RR
+                        tp_dist = min(CRYPTO_TAKE_PROFIT_CEIL_PCT, raw_tp_dist)
+                        tp_price = fill_price * (1 + tp_dist)
+                        raw_trail_dist = (entry_atr * ATR_TRAIL_MULTIPLIER) / fill_price
+                        trail_dist = max(ATR_STOP_FLOOR_PCT, min(ATR_STOP_CEIL_PCT, raw_trail_dist))
+                        print(f"  [ATR-STOP] {symbol}: ATR=${entry_atr:.4f}, "
+                              f"stop={stop_dist:.1%}, trail={trail_dist:.1%}, tp={tp_dist:.1%}")
+                    else:
+                        print(f"  [ATR-STOP] {symbol}: ATR unavailable, using fixed stops")
+
                     positions[symbol] = {
                         'qty': float(pos.qty),
                         'entry_price': fill_price,
                         'high_water_mark': fill_price,
                         'stop_order_id': None,
                         'trailing_activated': False,
+                        'entry_atr': entry_atr,
+                        'take_profit_price': tp_price,
                     }
                 last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(1)

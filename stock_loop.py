@@ -22,7 +22,7 @@ from order_utils import (
     reconstruct_positions, check_circuit_breaker, emergency_flatten,
     compute_limit_price,
 )
-from predict_now import load_dual_models, get_live_prediction, _fetch_spy_bars_alpaca
+from predict_now import load_dual_models, get_live_prediction, _fetch_spy_bars_alpaca, get_live_atr
 from hw_monitor import get_gpu_temp, is_gpu_available
 from sentiment import sentiment_gate, get_market_sentiment
 
@@ -60,10 +60,19 @@ TEMP_LOG_EVERY_N_CYCLES = 10
 THERMAL_THROTTLE_TEMP = 75
 MODEL_PREFIX = 'stock'       # stock_bear_model.pth, stock_bull_model.pth
 
-# Stop-loss / trailing stop settings
+# ATR-based stop-loss / trailing stop / take-profit settings
+ATR_STOP_MULTIPLIER = 2.0          # stop = entry - (ATR * 2.0)
+ATR_TRAIL_MULTIPLIER = 1.5         # trail = hwm - (ATR * 1.5)
+ATR_TRAIL_ACTIVATE_PCT = 0.015     # activate trailing at 1.5% profit
+ATR_STOP_FLOOR_PCT = 0.015         # min stop distance 1.5%
+ATR_STOP_CEIL_PCT = 0.08           # max stop distance 8%
+STOCK_TAKE_PROFIT_RR = 2.0         # 2:1 risk-reward take-profit
+STOCK_TAKE_PROFIT_CEIL_PCT = 0.15  # max take-profit distance 15%
+
+# Fallback fixed percentages (used when ATR unavailable)
 STOCK_STOP_LOSS_PCT = 0.03        # 3% hard stop-loss
-STOCK_TRAIL_ACTIVATE_PCT = 0.015  # Activate trailing after 1.5% profit
 STOCK_TRAIL_PCT = 0.02            # 2% trailing stop
+STOCK_TP_PCT = 0.10               # 10% take-profit cap
 CIRCUIT_BREAKER_PCT = 0.05        # 5% daily equity drawdown triggers flatten
 
 # Market hours (Eastern Time)
@@ -226,7 +235,11 @@ def run_stock_bot():
     if positions:
         print(f"Existing stock positions: {', '.join(positions)}")
         for sym, info in positions.items():
-            print(f"  {sym}: qty={info['qty']}, entry=${info['entry_price']:.2f}, hwm=${info['high_water_mark']:.2f}")
+            # Backfill ATR for reconstructed positions
+            entry_atr = get_live_atr(api, sym, asset_type='stock')
+            info['entry_atr'] = entry_atr
+            atr_str = f"ATR=${entry_atr:.2f}" if entry_atr else "ATR=N/A"
+            print(f"  {sym}: qty={info['qty']}, entry=${info['entry_price']:.2f}, hwm=${info['high_water_mark']:.2f}, {atr_str}")
 
     last_trade_time = {}
 
@@ -339,8 +352,16 @@ def run_stock_bot():
             entry_price = info['entry_price']
             info['high_water_mark'] = max(info['high_water_mark'], current_price)
 
+            # Determine ATR-based or fallback trail width
+            entry_atr = info.get('entry_atr')
+            if entry_atr is not None and entry_price > 0:
+                raw_trail_dist = (entry_atr * ATR_TRAIL_MULTIPLIER) / entry_price
+                trail_pct = max(ATR_STOP_FLOOR_PCT, min(ATR_STOP_CEIL_PCT, raw_trail_dist))
+            else:
+                trail_pct = STOCK_TRAIL_PCT
+
             if (not info.get('trailing_activated')
-                    and current_price >= entry_price * (1 + STOCK_TRAIL_ACTIVATE_PCT)
+                    and current_price >= entry_price * (1 + ATR_TRAIL_ACTIVATE_PCT)
                     and info.get('stop_order_id')):
                 # Cancel the fixed stop and replace with trailing stop
                 try:
@@ -351,12 +372,12 @@ def run_stock_bot():
                         qty=int(info['qty']),
                         side='sell',
                         type='trailing_stop',
-                        trail_percent=round(STOCK_TRAIL_PCT * 100, 1),
+                        trail_percent=round(trail_pct * 100, 1),
                         time_in_force='day',
                     )
                     info['stop_order_id'] = trail_order.id
                     info['trailing_activated'] = True
-                    print(f"  [TRAIL] {symbol}: Upgraded to trailing stop ({STOCK_TRAIL_PCT:.0%}) "
+                    print(f"  [TRAIL] {symbol}: Upgraded to trailing stop ({trail_pct:.1%}) "
                           f"at ${current_price:.2f} (entry=${entry_price:.2f})")
                 except Exception as e:
                     print(f"  [TRAIL] {symbol}: Upgrade error: {e}")
@@ -515,8 +536,22 @@ def run_stock_bot():
             print(f"  {symbol}: BUYING {qty} shares @ ~${price:.2f} (bull={bull_pred:+.4f}%)")
             limit_price = compute_limit_price('buy', quote, offset_bps=5)
             limit_price = round(limit_price, 2)
-            stop_price = round(limit_price * (1 - STOCK_STOP_LOSS_PCT), 2)
-            tp_price = round(limit_price * 1.10, 2)  # 10% take-profit safety cap
+
+            # Compute ATR-based stop and take-profit, with fallback
+            entry_atr = get_live_atr(api, symbol, asset_type='stock')
+            if entry_atr is not None and limit_price > 0:
+                raw_stop_dist = (entry_atr * ATR_STOP_MULTIPLIER) / limit_price
+                stop_dist = max(ATR_STOP_FLOOR_PCT, min(ATR_STOP_CEIL_PCT, raw_stop_dist))
+                raw_tp_dist = stop_dist * STOCK_TAKE_PROFIT_RR
+                tp_dist = min(STOCK_TAKE_PROFIT_CEIL_PCT, raw_tp_dist)
+                print(f"  [ATR-STOP] {symbol}: ATR=${entry_atr:.2f}, stop={stop_dist:.1%}, tp={tp_dist:.1%}")
+            else:
+                stop_dist = STOCK_STOP_LOSS_PCT
+                tp_dist = STOCK_TP_PCT
+                print(f"  [ATR-STOP] {symbol}: ATR unavailable, using fixed stops")
+
+            stop_price = round(limit_price * (1 - stop_dist), 2)
+            tp_price = round(limit_price * (1 + tp_dist), 2)
             try:
                 order = api.submit_order(
                     symbol=symbol,
@@ -557,6 +592,7 @@ def run_stock_bot():
                         'high_water_mark': fill_price,
                         'stop_order_id': child_stop_id,
                         'trailing_activated': False,
+                        'entry_atr': entry_atr,
                     }
                     last_trade_time[symbol] = datetime.datetime.now()
                     current_exposure += qty * fill_price
