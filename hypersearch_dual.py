@@ -140,7 +140,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         dropout = trial.suggest_float('dropout', 0.05, 0.45, step=0.05)
         learning_rate = trial.suggest_float('learning_rate', 1e-4, 3e-3, log=True)
         batch_size = trial.suggest_categorical('batch_size', [128, 256])
-        bull_threshold = trial.suggest_float('bull_threshold', 0.05, 0.35, step=0.01)
+        bull_threshold = trial.suggest_float('bull_threshold', 0.10, 0.35, step=0.01)
         weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
         scheduler = trial.suggest_categorical('scheduler', ['cosine', 'plateau', 'none'])
 
@@ -289,6 +289,15 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
                 m = al == c
                 per_class[n] = float((ap[m] == c).mean()) if m.sum() > 0 else 0.0
 
+        # Reject degenerate models: any class at 100% while another is 0%
+        # means the model is just predicting one class for everything
+        pc_vals = list(per_class.values())
+        if pc_vals and (max(pc_vals) >= 0.99 and min(pc_vals) <= 0.01):
+            del model, train_ds, val_ds, train_loader, val_loader, weights_t
+            gc.collect()
+            torch.cuda.empty_cache()
+            return 0.0
+
         # Score = target class accuracy
         target_name = 'bear' if target_class == 0 else 'bull'
         target_score = per_class.get(target_name, 0.0)
@@ -413,8 +422,16 @@ def main():
     # Seed best_state_holder from study's historical best (score only — no weights)
     if prior_trials > 0:
         for t in study.trials:
-            if t.state == optuna.trial.TrialState.COMPLETE and t.user_attrs.get('val_acc', 0) > 0.34:
-                if (t.value or 0) > best_state_holder['score']:
+            if t.state != optuna.trial.TrialState.COMPLETE:
+                continue
+            if t.user_attrs.get('val_acc', 0) <= 0.34:
+                continue
+            # Skip degenerate trials (one class 100%, another 0%)
+            pc = t.user_attrs.get('per_class', {})
+            pc_vals = list(pc.values())
+            if pc_vals and (max(pc_vals) >= 0.99 and min(pc_vals) <= 0.01):
+                continue
+            if (t.value or 0) > best_state_holder['score']:
                     best_state_holder['score'] = t.value
                     best_state_holder['cfg'] = t.user_attrs.get('cfg', {})
                     best_state_holder['val_acc'] = t.user_attrs.get('val_acc', 0)

@@ -2,7 +2,7 @@
 """PySide6 Trading Dashboard for Alpaca paper trading system.
 
 Monitors positions, P&L, trade history, account balance, tax estimation,
-model status, evolve.py progress, and hardware health — all in one window.
+model status, pipeline progress, and hardware health — all in one window.
 
 Themes: Bubblegum Goth, Batman, Joker, Harley Quinn, Dark, Space, Money
 All timestamps displayed in US/Central time.
@@ -11,6 +11,7 @@ All timestamps displayed in US/Central time.
 import os
 import sys
 import re
+import json
 import pickle
 import datetime as dt
 from pathlib import Path
@@ -500,6 +501,15 @@ def read_config(path):
         return None
 
 
+def _read_pipeline_status():
+    """Read pipeline_status.json, returning empty dict on failure."""
+    try:
+        with open(BASE_DIR / "pipeline_status.json") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Data Fetcher Thread
 # ---------------------------------------------------------------------------
@@ -866,59 +876,6 @@ def estimate_taxes(orders):
     }
 
 
-# ---------------------------------------------------------------------------
-# Parse evolve log for status
-# ---------------------------------------------------------------------------
-def parse_evolve_status(log_path):
-    """Parse evolve_full_run.log for current status info."""
-    info = {
-        "cycle_start": None, "current_group": None,
-        "trial_current": 0, "trial_total": 0,
-        "best_score": 0.0, "best_trial": 0, "status": "idle",
-        "round_info": None, "current_bear": None, "current_bull": None,
-    }
-    try:
-        text = log_path.read_text(errors="replace")
-    except OSError:
-        return info
-
-    for m in re.finditer(r"\[EVOLVE\] CYCLE START: (.+)", text):
-        info["cycle_start"] = m.group(1).strip()
-    for m in re.finditer(r"\[EVOLVE\] GROUP: (\w+)", text):
-        info["current_group"] = m.group(1)
-
-    # Current round info (e.g. "crypto Round 1/2: bear (50 trials)")
-    rounds = re.findall(r"\[EVOLVE\] (\w+ Round \d+/\d+: \w+)", text)
-    if rounds:
-        info["round_info"] = rounds[-1]
-
-    # Current baseline scores
-    for m in re.finditer(r"\[EVOLVE\] Current \w+ bear score: (\d+\.?\d*)", text):
-        info["current_bear"] = float(m.group(1))
-    for m in re.finditer(r"\[EVOLVE\] Current \w+ bull score: (\d+\.?\d*)", text):
-        info["current_bull"] = float(m.group(1))
-
-    trials = re.findall(r"\[\s*(\d+)\]", text)
-    if trials:
-        info["trial_current"] = int(trials[-1])
-
-    m = re.search(r"(\d+) trials/model", text)
-    if m:
-        info["trial_total"] = int(m.group(1))
-
-    bests = re.findall(r"Best is trial (\d+) with value: (\d+\.?\d*)", text)
-    if bests:
-        info["best_trial"] = int(bests[-1][0])
-        info["best_score"] = float(bests[-1][1])
-
-    try:
-        mtime = log_path.stat().st_mtime
-        age = dt.datetime.now().timestamp() - mtime
-        info["status"] = "running" if age < 600 else "idle"
-    except OSError:
-        pass
-
-    return info
 
 
 # ---------------------------------------------------------------------------
@@ -1398,27 +1355,29 @@ class TradingDashboard(QMainWindow):
         self._model_table.setAlternatingRowColors(True)
         layout.addWidget(self._model_table)
 
-        evolve_group = QGroupBox("Evolve.py Status")
-        evolve_layout = QGridLayout(evolve_group)
-        self._evolve_status = QLabel("Status: \u2014")
-        self._evolve_group = QLabel("Group: \u2014")
-        self._evolve_trial = QLabel("Trial: \u2014")
-        self._evolve_best = QLabel("Best Score: \u2014")
-        self._evolve_cycle = QLabel("Cycle Start: \u2014")
+        pipeline_group = QGroupBox("Pipeline Status")
+        pipeline_layout = QGridLayout(pipeline_group)
+        self._pipeline_status = QLabel("Status: \u2014")
+        self._pipeline_phase = QLabel("Phase: \u2014")
+        self._pipeline_trial = QLabel("Trial: \u2014")
+        self._pipeline_best = QLabel("Best Score: \u2014")
+        self._pipeline_elapsed = QLabel("Elapsed: \u2014")
+        self._pipeline_scores = QLabel("")
 
-        self._evolve_progress = QProgressBar()
-        self._evolve_progress.setRange(0, 100)
-        self._evolve_progress.setFixedHeight(16)
-        self._evolve_progress.setTextVisible(True)
-        self._evolve_progress.setFormat("%v / %m trials")
+        self._pipeline_progress = QProgressBar()
+        self._pipeline_progress.setRange(0, 100)
+        self._pipeline_progress.setFixedHeight(16)
+        self._pipeline_progress.setTextVisible(True)
+        self._pipeline_progress.setFormat("%v / %m trials")
 
-        evolve_layout.addWidget(self._evolve_status, 0, 0)
-        evolve_layout.addWidget(self._evolve_group, 0, 1)
-        evolve_layout.addWidget(self._evolve_trial, 1, 0)
-        evolve_layout.addWidget(self._evolve_best, 1, 1)
-        evolve_layout.addWidget(self._evolve_progress, 2, 0, 1, 2)
-        evolve_layout.addWidget(self._evolve_cycle, 3, 0, 1, 2)
-        layout.addWidget(evolve_group)
+        pipeline_layout.addWidget(self._pipeline_status, 0, 0)
+        pipeline_layout.addWidget(self._pipeline_phase, 0, 1)
+        pipeline_layout.addWidget(self._pipeline_trial, 1, 0)
+        pipeline_layout.addWidget(self._pipeline_best, 1, 1)
+        pipeline_layout.addWidget(self._pipeline_progress, 2, 0, 1, 2)
+        pipeline_layout.addWidget(self._pipeline_elapsed, 3, 0)
+        pipeline_layout.addWidget(self._pipeline_scores, 3, 1)
+        layout.addWidget(pipeline_group)
 
         hw_group = QGroupBox("Hardware")
         hw_layout = QHBoxLayout(hw_group)
@@ -1950,48 +1909,99 @@ class TradingDashboard(QMainWindow):
                 self._model_table.setItem(row, col, item)
         self._model_table.setUpdatesEnabled(True)
 
-        evolve_info = parse_evolve_status(
-            LOG_FILES.get("Evolve", BASE_DIR / "evolve_full_run.log"))
-        status_color = T["green"].name() if evolve_info["status"] == "running" else T["muted"].name()
-        status_text = evolve_info["status"].upper()
-        if evolve_info["round_info"]:
-            status_text += f" — {evolve_info['round_info']}"
-        self._evolve_status.setText(
+        # --- Pipeline Status (from pipeline_status.json) ---
+        pinfo = _read_pipeline_status()
+        phase = pinfo.get("phase", "idle")
+        phase_label = pinfo.get("phase_label", "Idle")
+        phase_idx = pinfo.get("phase_idx", -1)
+        total_phases = pinfo.get("total_phases", 0)
+
+        # Determine if pipeline is actively running (status file updated < 60s ago)
+        is_running = False
+        status_path = BASE_DIR / "pipeline_status.json"
+        try:
+            age = now_ts - status_path.stat().st_mtime
+            is_running = age < 60
+        except OSError:
+            pass
+
+        if phase == "idle" or not is_running:
+            status_color = T["muted"].name()
+            status_text = "IDLE"
+        elif phase == "failed":
+            status_color = T["red"].name()
+            status_text = "FAILED"
+        elif phase == "complete":
+            status_color = T["green"].name()
+            status_text = "COMPLETE"
+        else:
+            status_color = T["green"].name()
+            status_text = "RUNNING"
+
+        if total_phases > 0 and phase_idx >= 0:
+            status_text += f" ({phase_idx + 1}/{total_phases})"
+
+        self._pipeline_status.setText(
             f"Status: <span style='color:{status_color}'>{status_text}</span>")
 
-        group_text = f"Group: {evolve_info['current_group'] or '\u2014'}"
-        if evolve_info["current_bear"] is not None:
-            group_text += (f"  |  Baseline: bear={evolve_info['current_bear']:.4f}"
-                          f", bull={evolve_info['current_bull']:.4f}"
-                          if evolve_info['current_bull'] is not None else "")
-        self._evolve_group.setText(group_text)
+        self._pipeline_phase.setText(f"Phase: {phase_label}")
 
-        trial_cur = evolve_info["trial_current"]
-        trial_tot = evolve_info["trial_total"] or 0
-        trial_text = f"Trial: {trial_cur}"
-        if trial_tot:
-            trial_text += f" / {trial_tot}"
-        self._evolve_trial.setText(trial_text)
+        trial_cur = pinfo.get("trial_current", 0)
+        trial_tot = pinfo.get("trial_total", 0)
+        cycle = pinfo.get("cycle", 0)
 
         if trial_tot > 0:
-            self._evolve_progress.setRange(0, trial_tot)
-            self._evolve_progress.setValue(min(trial_cur, trial_tot))
-            pct = trial_cur / trial_tot
+            self._pipeline_trial.setText(f"Trial: {trial_cur} / {trial_tot}")
+            self._pipeline_progress.setRange(0, trial_tot)
+            self._pipeline_progress.setValue(min(trial_cur, trial_tot))
+            pct = trial_cur / trial_tot if trial_tot else 0
             if pct < 0.5:
                 bar_color = T["accent"].name()
             elif pct < 0.9:
                 bar_color = T["yellow"].name()
             else:
                 bar_color = T["green"].name()
-            self._evolve_progress.setStyleSheet(
+            self._pipeline_progress.setStyleSheet(
                 f"QProgressBar::chunk {{ background-color: {bar_color}; }}")
+        elif cycle > 0:
+            self._pipeline_trial.setText(f"Bot Cycle: {cycle}")
+            self._pipeline_progress.setRange(0, 1)
+            self._pipeline_progress.setValue(1)
+            self._pipeline_progress.setStyleSheet(
+                f"QProgressBar::chunk {{ background-color: {T['green'].name()}; }}")
         else:
-            self._evolve_progress.setRange(0, 1)
-            self._evolve_progress.setValue(0)
+            self._pipeline_trial.setText("Trial: \u2014")
+            self._pipeline_progress.setRange(0, 1)
+            self._pipeline_progress.setValue(0)
 
-        self._evolve_best.setText(
-            f"Best Score: {evolve_info['best_score']:.4f} (trial {evolve_info['best_trial']})")
-        self._evolve_cycle.setText(f"Cycle Start: {evolve_info['cycle_start'] or '\u2014'}")
+        best_score = pinfo.get("best_score", 0)
+        per_class = pinfo.get("best_per_class", {})
+        if best_score > 0:
+            pc_str = ""
+            if per_class:
+                pc_str = (f"  (B:{per_class.get('bear', 0):.0%}"
+                          f" N:{per_class.get('neutral', 0):.0%}"
+                          f" U:{per_class.get('bull', 0):.0%})")
+            self._pipeline_best.setText(f"Best Score: {best_score:.4f}{pc_str}")
+        else:
+            self._pipeline_best.setText("Best Score: \u2014")
+
+        elapsed = pinfo.get("elapsed_sec", 0)
+        if elapsed > 0:
+            h, m = divmod(elapsed // 60, 60)
+            self._pipeline_elapsed.setText(f"Elapsed: {h:.0f}h {m:.0f}m")
+        else:
+            self._pipeline_elapsed.setText("Elapsed: \u2014")
+
+        # Show final scores from completed phases
+        bear_final = pinfo.get("bear_final_score")
+        bull_final = pinfo.get("bull_final_score")
+        scores_parts = []
+        if bear_final is not None:
+            scores_parts.append(f"Bear: {bear_final:.4f}")
+        if bull_final is not None:
+            scores_parts.append(f"Bull: {bull_final:.4f}")
+        self._pipeline_scores.setText("  |  ".join(scores_parts) if scores_parts else "")
 
     def closeEvent(self, event):
         self._model_timer.stop()
