@@ -393,8 +393,9 @@ def _deduplicate_articles(articles):
 def _llm_score_batch(articles):
     """Batch-score articles via the configured LLM. Returns list[float] or None.
 
-    Sends all headlines + truncated summaries in one prompt, asks for a JSON
-    array of sentiment scores. One API call per batch = cost-efficient.
+    For each article, uses the richest content available:
+      full article text > summary > headline (always included).
+    Article bodies are fetched in parallel with short timeouts.
     Falls back to None on any failure (caller should use keyword scoring).
     """
     try:
@@ -405,25 +406,50 @@ def _llm_score_batch(articles):
     if not articles:
         return None
 
+    # Fetch full article text in parallel (cached, 5s timeout each)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    urls = [a.get('url', '') for a in articles]
+    full_texts = [None] * len(articles)
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_fetch_article_text, u): i
+                   for i, u in enumerate(urls) if u}
+        for fut in as_completed(futures, timeout=15):
+            try:
+                full_texts[futures[fut]] = fut.result()
+            except Exception:
+                pass
+
+    n = len(articles)
+    fetched = sum(1 for t in full_texts if t)
+    print(f"[SENTIMENT] Fetched {fetched}/{n} article bodies for LLM")
+
     lines = []
-    for i, a in enumerate(articles, 1):
-        h = a.get('headline', '').strip()
-        s = a.get('summary', '').strip()
-        if s and len(s) > 150:
-            s = s[:147] + '...'
-        lines.append(f"{i}. {h}" + (f" — {s}" if s else ""))
+    for i, a in enumerate(articles):
+        h = ' '.join(a.get('headline', '').split())
+        s = ' '.join(a.get('summary', '').split())
+        body = full_texts[i]
+
+        # Build best-available content: headline is always first
+        parts = [f"{i + 1}. {h}"]
+        if body:
+            # Full text already has summary content; cap at 500 chars
+            parts.append(body[:500])
+        elif s:
+            parts.append(s)
+        lines.append(" — ".join(parts))
 
     prompt = (
-        "Score each headline's financial sentiment from -1.0 (very bearish) "
-        "to 1.0 (very bullish). 0.0 = neutral.\n"
-        "Return ONLY a JSON array of numbers, one per headline.\n\n"
+        f"Score each article's financial sentiment from -1.0 (very bearish) "
+        f"to 1.0 (very bullish). 0.0 = neutral.\n"
+        f'Return ONLY a JSON object mapping article number to score, '
+        f'e.g. {{"1": 0.3, "2": -0.5, "3": 0.0}}\n\n'
         + "\n".join(lines)
     )
 
     result = call_llm(
         prompt,
-        system="Financial sentiment scorer. Return only a JSON array of floats. No explanation.",
-        max_tokens=max(128, len(articles) * 8),
+        system="Financial sentiment scorer. Return only a JSON object mapping article number strings to float scores. No explanation.",
+        max_tokens=max(256, n * 12),
     )
     if not result:
         return None
@@ -436,15 +462,25 @@ def _llm_score_batch(articles):
                 stripped = part.strip()
                 if stripped.startswith('json'):
                     stripped = stripped[4:].strip()
-                if stripped.startswith('['):
+                if stripped.startswith('{'):
                     text = stripped
                     break
 
-        scores = json.loads(text)
-        if isinstance(scores, list) and len(scores) == len(articles):
-            return [max(-1.0, min(1.0, float(s))) for s in scores]
-        print(f"[SENTIMENT] LLM returned {len(scores) if isinstance(scores, list) else type(scores).__name__} items, "
-              f"expected {len(articles)}")
+        data = json.loads(text)
+        if isinstance(data, dict):
+            # Look up each article by its 1-based number; default 0.0 if missing
+            scores = []
+            for i in range(1, n + 1):
+                raw = data.get(str(i), data.get(i, 0.0))
+                scores.append(max(-1.0, min(1.0, float(raw))))
+            matched = sum(1 for i in range(1, n + 1) if str(i) in data or i in data)
+            if matched < n * 0.5:
+                print(f"[SENTIMENT] LLM only scored {matched}/{n} articles, falling back")
+                return None
+            if matched < n:
+                print(f"[SENTIMENT] LLM scored {matched}/{n} articles (missing default to 0.0)")
+            return scores
+        print(f"[SENTIMENT] LLM returned {type(data).__name__}, expected dict")
     except (ValueError, TypeError, json.JSONDecodeError) as e:
         print(f"[SENTIMENT] LLM score parse failed: {e}")
 
@@ -455,7 +491,7 @@ def score_article_batch(articles):
     """Score articles for display. Returns list of per-article float scores.
 
     Uses LLM batch scoring when available (one API call for all articles).
-    Falls back to keyword scoring (headline + summary only, no full-text fetch).
+    Falls back to keyword scoring with full-text fetch for accuracy.
     """
     if not articles:
         return []
@@ -465,7 +501,7 @@ def score_article_batch(articles):
         print(f"[SENTIMENT] LLM scored {len(articles)} articles")
         return llm_scores
 
-    # Fallback: keyword scoring (headline + summary only)
+    # Fallback: keyword scoring with full-text fetch
     print(f"[SENTIMENT] Keyword scoring {len(articles)} articles (LLM unavailable)")
     scores = []
     for a in articles:
@@ -476,7 +512,12 @@ def score_article_batch(articles):
             continue
         h = _score_text(headline) if headline else 0.0
         s = _score_text(summary) if summary else 0.0
-        scores.append(h * 0.6 + s * 0.4)
+        full_text = _fetch_article_text(a.get('url', ''))
+        if full_text:
+            f = _score_text(full_text)
+            scores.append(h * 0.25 + s * 0.25 + f * 0.50)
+        else:
+            scores.append(h * 0.6 + s * 0.4)
     return scores
 
 

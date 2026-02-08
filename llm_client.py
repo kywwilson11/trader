@@ -5,7 +5,7 @@ Never blocks trades: all errors result in None return.
 
 Fallback chain:
   1. Try the configured provider/model
-  2. On billing/rate-limit/auth errors (HTTP 429, 402, 403), fall back to
+  2. On transient/billing/rate-limit/auth errors, fall back to
      Gemini free tier (gemini-2.5-flash-lite) using the stored Gemini API key
   3. If Gemini also fails or no key exists, return None (keyword fallback)
 """
@@ -20,14 +20,21 @@ from llm_config import load_llm_config
 # Best free-tier model: 15 RPM, 1000 RPD, no billing required
 _GEMINI_FREE_MODEL = "gemini-2.5-flash-lite"
 
-# HTTP status codes that indicate billing/auth/rate issues (worth retrying on free tier)
-_FALLBACK_CODES = {429, 402, 403}
+# HTTP codes worth retrying on free tier:
+#   402 = billing/payment required
+#   403 = forbidden / auth error
+#   429 = rate limited
+#   500 = internal server error
+#   502 = bad gateway
+#   503 = service unavailable
+#   504 = gateway timeout
+_FALLBACK_CODES = {402, 403, 429, 500, 502, 503, 504}
 
 
 def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | None:
     """Send prompt to the configured LLM provider. Returns text or None.
 
-    On billing/rate-limit errors, automatically falls back to Gemini free tier.
+    On transient/billing/rate-limit errors, automatically falls back to Gemini free tier.
     """
     config = load_llm_config()
 
