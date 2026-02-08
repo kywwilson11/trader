@@ -49,6 +49,8 @@ def parse_args():
                         help='Path to training CSV (default: training_data.csv)')
     parser.add_argument('--prefix', type=str, default='',
                         help='Prefix for output files (e.g. "stock" -> stock_bear_model.pth)')
+    parser.add_argument('--fixed-threshold', type=float, default=None,
+                        help='Use a fixed bull_threshold instead of searching (for shared threshold between bear/bull)')
     return parser.parse_args()
 
 
@@ -106,7 +108,7 @@ def get_indices_and_classes(all_returns, tickers, ticker_boundaries, bull_thresh
     return valid_indices, classes
 
 
-def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache):
+def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache, fixed_threshold=None):
     # target class index: bear=0, bull=2
     target_class = 0 if target == 'bear' else 2
 
@@ -123,7 +125,10 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         dropout = trial.suggest_float('dropout', 0.05, 0.45, step=0.05)
         learning_rate = trial.suggest_float('learning_rate', 1e-4, 3e-3, log=True)
         batch_size = trial.suggest_categorical('batch_size', [128, 256])
-        bull_threshold = trial.suggest_float('bull_threshold', 0.10, 0.35, step=0.01)
+        if fixed_threshold is not None:
+            bull_threshold = fixed_threshold
+        else:
+            bull_threshold = trial.suggest_float('bull_threshold', 0.10, 0.35, step=0.01)
         weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
         scheduler = trial.suggest_categorical('scheduler', ['cosine', 'plateau', 'none'])
 
@@ -437,6 +442,8 @@ def main():
     print(f"OPTUNA {target.upper()} MODEL SEARCH: {num_trials} new trials (TPE + pruning)")
     print(f"Optimizing: F1 * 0.5 + balanced_acc * 0.2 - catastrophic * 0.3 (target={target})")
     print(f"Resuming from {prior_trials} prior trials in {db_path}")
+    if args.fixed_threshold is not None:
+        print(f"Using FIXED threshold: {args.fixed_threshold:.2f} (shared from bear model)")
     print(f"{'='*70}\n")
 
     # Seed best_state_holder from study's historical best (score only — no weights)
@@ -459,7 +466,7 @@ def main():
         if best_state_holder['score'] > 0:
             print(f"Prior best score={best_state_holder['score']:.3f} — new trials must beat this")
 
-    objective_fn = create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache)
+    objective_fn = create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache, fixed_threshold=args.fixed_threshold)
     study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback],
                    catch=(Exception,))
 
@@ -499,6 +506,7 @@ def main():
             'bear_threshold': -best_cfg['bull_threshold'],
             'target': target,
             'prefix': args.prefix,
+            'shared_threshold': args.fixed_threshold is not None,
         }
         joblib.dump(config, f'{prefix}{target}_config.pkl')
         joblib.dump(scaler_X, f'{prefix}scaler_X.pkl')

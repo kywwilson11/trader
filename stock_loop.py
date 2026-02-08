@@ -80,7 +80,15 @@ def _write_prediction_cache(bear_preds, bull_preds, top_symbols):
             bear = bear_preds.get(sym)
             bull = bull_preds.get(sym)
             score = (bull or 0) - abs(bear or 0)
-            signal = "BULL" if sym in top_symbols else ("BEAR" if bear is not None and bear < 0 else "NEUTRAL")
+            if sym in top_symbols:
+                signal = "BULL"
+            elif bear is not None and bear < 0:
+                if bull is not None and bull > 0:
+                    signal = "DISAGREE"
+                else:
+                    signal = "BEAR"
+            else:
+                signal = "NEUTRAL"
             data[sym] = {
                 "bear": round(bear, 6) if bear is not None else None,
                 "bull": round(bull, 6) if bull is not None else None,
@@ -397,8 +405,13 @@ def run_stock_bot():
         # Free temporary tensors from prediction batch
         gc.collect()
 
-        # ── Dynamic top N selection by bull signal strength ──
-        ranked = sorted(bull_preds.items(), key=lambda x: x[1], reverse=True)
+        # ── Dynamic top N selection by bull signal strength (bear agreement filter) ──
+        agree_candidates = {sym: pred for sym, pred in bull_preds.items()
+                            if bear_preds.get(sym) is None or bear_preds[sym] >= -bear_threshold}
+        n_filtered = len(bull_preds) - len(agree_candidates)
+        if n_filtered:
+            print(f"[RANK] {n_filtered} symbol(s) excluded by bear disagreement")
+        ranked = sorted(agree_candidates.items(), key=lambda x: x[1], reverse=True)
         top_symbols = [sym for sym, _ in ranked[:TOP_N]]
         print(f"[RANK] Top {TOP_N}: {', '.join(f'{s}({bull_preds[s]:+.4f})' for s in top_symbols)}")
 
@@ -472,6 +485,12 @@ def run_stock_bot():
             if bull_pred is None or bull_pred < bull_threshold:
                 if bull_pred is not None:
                     print(f"  {symbol}: Bull pred {bull_pred:+.4f}% < {bull_threshold:.2f}, skipping")
+                continue
+
+            # Bear agreement check — skip if bear model disagrees
+            bear_pred = bear_preds.get(symbol)
+            if bear_pred is not None and bear_pred < -bear_threshold:
+                print(f"  {symbol}: Bull {bull_pred:+.4f}% but bear {bear_pred:+.4f}% disagrees, skipping")
                 continue
 
             quote = get_stock_quote(api, symbol)

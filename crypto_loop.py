@@ -80,7 +80,10 @@ def _write_prediction_cache(bear_preds, bull_preds, bear_threshold, bull_thresho
             bull = bull_preds.get(sym)
             score = (bull or 0) - abs(bear or 0)
             if bull is not None and bull >= bull_threshold:
-                signal = "BULL"
+                if bear is not None and bear < -bear_threshold:
+                    signal = "DISAGREE"
+                else:
+                    signal = "BULL"
             elif bear is not None and bear < -bear_threshold:
                 signal = "BEAR"
             else:
@@ -395,6 +398,12 @@ def run_crypto_bot():
                     continue
                 if bull_pred < bull_threshold:
                     print(f"  {symbol}: Bull pred {bull_pred:+.4f}% < {bull_threshold:.2f}, skipping")
+                    continue
+
+                # Bear agreement check — skip if bear model disagrees
+                bear_pred = bear_preds.get(symbol)
+                if bear_pred is not None and bear_pred < -bear_threshold:
+                    print(f"  {symbol}: Bull {bull_pred:+.4f}% but bear {bear_pred:+.4f}% disagrees, skipping")
                     continue
 
             # Confidence-based sizing

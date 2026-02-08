@@ -31,6 +31,8 @@ import subprocess
 import sys
 import time
 
+import joblib
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATUS_FILE = os.path.join(BASE_DIR, 'pipeline_status.json')
 LOG_FILE = os.path.join(BASE_DIR, 'pipeline_output.log')
@@ -262,6 +264,21 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
     return phases
 
 
+def _read_bear_threshold(prefix=''):
+    """Read the best threshold from a completed bear model config."""
+    p = f'{prefix}_' if prefix else ''
+    path = os.path.join(BASE_DIR, f'{p}bear_config.pkl')
+    try:
+        config = joblib.load(path)
+        th = config.get('bull_threshold')
+        if th is not None:
+            print(f"  Bear threshold extracted: {th:.2f} (will share with bull search)")
+        return th
+    except Exception as e:
+        print(f"  WARNING: Could not read bear config ({e}), bull will search independently")
+        return None
+
+
 def _build_training_phases(trials, train_crypto, train_stock):
     """Build model training phases."""
     phases = []
@@ -307,6 +324,17 @@ def _run_training(phases, log_fh, status, is_retrain):
     """Run all training phases. Returns True if all succeeded."""
     for phase in phases:
         rc = run_phase(phase, log_fh, status)
+
+        # After bear search succeeds, inject --fixed-threshold into the bull phase
+        if rc == 0 and phase['id'] in ('bear_search', 'stock_bear_search'):
+            prefix = '' if phase['id'] == 'bear_search' else 'stock'
+            th = _read_bear_threshold(prefix)
+            if th is not None:
+                bull_id = 'bull_search' if phase['id'] == 'bear_search' else 'stock_bull_search'
+                for p in phases:
+                    if p['id'] == bull_id and '--fixed-threshold' not in p['cmd']:
+                        p['cmd'].extend(['--fixed-threshold', str(th)])
+                        break
 
         # Save final scores
         if phase['id'] == 'bear_search':

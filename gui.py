@@ -24,7 +24,7 @@ import alpaca_trade_api as tradeapi
 from PySide6.QtCore import (
     Qt, QTimer, QThread, Signal, Slot, QObject,
 )
-from PySide6.QtGui import QColor, QPalette, QFont, QAction, QPainter, QPixmap, QDesktopServices
+from PySide6.QtGui import QColor, QPalette, QFont, QAction, QPainter, QPixmap, QDesktopServices, QIcon
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget,
@@ -472,11 +472,15 @@ _THEME_SVGS = {
 
 
 _THEME_IMAGES = {
-    "Batman": BASE_DIR / "logos" / "batman.jpeg",
+    "Batman": BASE_DIR / "logos" / "batman.png",
     "Joker": BASE_DIR / "logos" / "joker.png",
-    "Harley Quinn": BASE_DIR / "logos" / "harley.jpeg",
-    "Two-Face": BASE_DIR / "logos" / "twoface.jpeg",
-    "Black Metal": BASE_DIR / "logos" / "blackmetal.jpg",
+    "Harley Quinn": BASE_DIR / "logos" / "harley_quinn.png",
+    "Two-Face": BASE_DIR / "logos" / "two_face.png",
+    "Black Metal": BASE_DIR / "logos" / "black_metal.png",
+    "Bubblegum Goth": BASE_DIR / "logos" / "bubblegum_goth.png",
+    "Dark": BASE_DIR / "logos" / "night.png",
+    "Space": BASE_DIR / "logos" / "space.png",
+    "Money": BASE_DIR / "logos" / "money.png",
 }
 
 
@@ -2130,7 +2134,8 @@ class TradingDashboard(QMainWindow):
                  T['green'] if score is not None and score > 0 else
                  (T['red'] if score is not None and score < 0 else T['muted'])),
                 (signal, T['green'] if signal == 'BULL' else
-                 (T['red'] if signal == 'BEAR' else T['muted'])),
+                 (T['red'] if signal == 'BEAR' else
+                  (T['yellow'] if signal == 'DISAGREE' else T['muted']))),
             ]
 
             for col, (val, color) in enumerate(items_data):
@@ -2915,6 +2920,10 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("Trader Dashboard")
+    app.setDesktopFileName("trader-dashboard")
+    app_icon = BASE_DIR / "logos" / "circuit_bull.png"
+    if app_icon.exists():
+        app.setWindowIcon(QIcon(str(app_icon)))
 
     set_theme("Bubblegum Goth")
     apply_theme(app)
