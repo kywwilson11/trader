@@ -449,6 +449,25 @@ def main():
             log_fh.flush()
             print(banner, end='')
 
+            # Start background sentiment fetch (runs during training)
+            sentiment_proc = None
+            try:
+                sentiment_proc = subprocess.Popen(
+                    [PYTHON, '-u', 'sentiment_history.py', '--fetch-stocks'],
+                    stdout=open(os.path.join(BASE_DIR, 'sentiment_fetch.log'), 'a'),
+                    stderr=subprocess.STDOUT,
+                    env=ENV, cwd=BASE_DIR,
+                )
+                msg = f"Background sentiment fetch started (PID {sentiment_proc.pid})\n"
+                log_fh.write(msg)
+                log_fh.flush()
+                print(msg, end='')
+            except Exception as e:
+                msg = f"Sentiment fetch failed to start: {e}\n"
+                log_fh.write(msg)
+                log_fh.flush()
+                print(msg, end='')
+
             _run_training(phases, log_fh, status, is_retrain=False)
 
         # =============================================================

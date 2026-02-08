@@ -61,13 +61,14 @@ def main():
     final_df = pd.concat(all_data)
     final_df = final_df.sort_index()
 
-    # Add historical sentiment (Finnhub company news for stocks)
+    # Add historical sentiment — use cached data if available, else 0.0
+    # (run_pipeline.py fetches fresh sentiment in background during training)
     try:
         from sentiment_history import fetch_stock_sentiment_history
-        stock_tickers = [t for t in STOCK_TICKERS if '/' not in t and '-USD' not in t]
         start_date = str(final_df.index.min().date())
         end_date = str(final_df.index.max().date())
-        sentiment = fetch_stock_sentiment_history(stock_tickers, start_date, end_date)
+        sentiment = fetch_stock_sentiment_history(
+            STOCK_TICKERS, start_date, end_date, cached_only=True)
         final_df['Daily_Sentiment'] = [
             sentiment.get((ticker, str(date)), 0.0)
             for ticker, date in zip(final_df['Ticker'], final_df.index.date)
@@ -75,7 +76,7 @@ def main():
         filled = sum(1 for v in final_df['Daily_Sentiment'] if v != 0.0)
         print(f"Daily_Sentiment: {filled}/{len(final_df)} bars have sentiment")
     except Exception as e:
-        print(f"WARNING: Could not fetch stock sentiment history: {e}")
+        print(f"WARNING: Could not load stock sentiment history: {e}")
         final_df['Daily_Sentiment'] = 0.0
 
     final_df.to_csv('stock_training_data.csv')

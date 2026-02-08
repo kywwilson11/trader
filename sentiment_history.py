@@ -259,20 +259,34 @@ def _get_finnhub():
         return None
 
 
-def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None):
+def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
+                                   cached_only=False):
     """Fetch historical news for stock tickers via Finnhub and keyword-score.
 
-    Fetches in 7-day windows, rate-limited at 55 calls/min. Caches all articles
+    Fetches in 7-day windows, rate-limited at 25 calls/min. Caches all articles
     in SQLite — subsequent runs only fetch new/uncached date ranges.
 
     Args:
         tickers: List of stock ticker symbols (crypto symbols with '/' are skipped)
         start_date: str 'YYYY-MM-DD' or None (defaults to 365 days ago)
         end_date: str 'YYYY-MM-DD' or None (defaults to today)
+        cached_only: If True, only return already-cached data (no network calls)
 
     Returns:
         dict[(ticker, date_str), float_score]
     """
+    if cached_only:
+        db = _get_db()
+        if start_date is None:
+            start_date = (datetime.date.today() - datetime.timedelta(days=365)).isoformat()
+        if end_date is None:
+            end_date = datetime.date.today().isoformat()
+        rows = db.execute(
+            "SELECT symbol, date, score FROM daily_sentiment WHERE date >= ? AND date <= ?",
+            (start_date, end_date),
+        ).fetchall()
+        return {(sym, dt): score for sym, dt, score in rows}
+
     client = _get_finnhub()
     if client is None:
         print("[SENTIMENT_HIST] No Finnhub API key — stock sentiment will be 0.0")
@@ -328,13 +342,14 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None):
     now_iso = datetime.datetime.now().isoformat()
 
     for ti, ticker in enumerate(tickers_to_fetch):
+      try:
         ticker_articles = 0
         ticker_scores = []
 
-        # Fetch in 7-day windows
+        # Fetch in 30-day windows (reduces API calls ~4x vs 7-day)
         window_start = d_start
         while window_start <= d_end:
-            window_end = min(window_start + datetime.timedelta(days=6), d_end)
+            window_end = min(window_start + datetime.timedelta(days=29), d_end)
 
             # Rate limit
             now = time.time()
@@ -345,18 +360,27 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None):
                     time.sleep(sleep_time)
             call_times.append(time.time())
 
-            try:
-                articles = client.company_news(
-                    ticker,
-                    _from=window_start.isoformat(),
-                    to=window_end.isoformat(),
-                )
-            except Exception as e:
-                err_str = str(e)
-                print(f"[SENTIMENT_HIST] Finnhub error {ticker} "
-                      f"{window_start}..{window_end}: {e}")
-                if '429' in err_str:
-                    time.sleep(62)  # Wait full minute on rate limit
+            # Retry with exponential backoff on rate limits
+            articles = None
+            for attempt in range(3):
+                try:
+                    articles = client.company_news(
+                        ticker,
+                        _from=window_start.isoformat(),
+                        to=window_end.isoformat(),
+                    )
+                    break
+                except Exception as e:
+                    if '429' in str(e):
+                        wait = 62 * (2 ** attempt)  # 62s, 124s, 248s
+                        print(f"[SENTIMENT_HIST] Rate limited, waiting {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        print(f"[SENTIMENT_HIST] Finnhub error {ticker} "
+                              f"{window_start}..{window_end}: {e}")
+                        break
+
+            if articles is None:
                 window_start = window_end + datetime.timedelta(days=1)
                 continue
 
@@ -413,9 +437,11 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None):
 
         avg_score = sum(ticker_scores) / len(ticker_scores) if ticker_scores else 0.0
         total_articles += ticker_articles
-        weeks = max(1, (d_end - d_start).days // 7)
-        print(f"[SENTIMENT_HIST] {ticker}: {weeks} weeks, {ticker_articles} articles, "
+        print(f"[SENTIMENT_HIST] {ticker}: {ticker_articles} articles, "
               f"avg {avg_score:+.2f}  [{ti + 1}/{len(tickers_to_fetch)}]")
+      except Exception as e:
+        print(f"[SENTIMENT_HIST] Skipping {ticker}: {e}")
+        continue
 
     print(f"[SENTIMENT_HIST] Done: {total_articles} total articles, "
           f"{len(result)} daily scores")
@@ -602,6 +628,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Sentiment history tools')
     parser.add_argument('--backfill', action='store_true',
                         help='Run LLM backfill worker')
+    parser.add_argument('--fetch-stocks', action='store_true',
+                        help='Fetch stock sentiment history (Finnhub)')
     parser.add_argument('--stats', action='store_true',
                         help='Show backfill statistics')
     parser.add_argument('--rpm', type=int, default=8,
@@ -614,6 +642,10 @@ if __name__ == '__main__':
         print(f"LLM scored:      {stats['llm_scored']}")
         print(f"Remaining:       {stats['remaining']}")
         print(f"Progress:        {stats['pct_complete']:.1f}%")
+    elif args.fetch_stocks:
+        from stock_config import load_stock_universe
+        tickers = [t for t in load_stock_universe() if '/' not in t]
+        fetch_stock_sentiment_history(tickers)
     elif args.backfill:
         run_backfill_worker(max_rpm=args.rpm)
     else:

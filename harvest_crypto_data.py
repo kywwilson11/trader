@@ -64,15 +64,18 @@ def main():
     final_df = final_df.sort_index()
 
     # Add historical sentiment (Fear & Greed Index for crypto)
+    # Use cached data if available (instant); fetch in background for next run
     try:
         from sentiment_history import fetch_crypto_sentiment_history
+        import threading
         start_date = str(final_df.index.min().date())
         end_date = str(final_df.index.max().date())
         sentiment = fetch_crypto_sentiment_history(start_date, end_date)
         final_df['Daily_Sentiment'] = pd.Series(
             final_df.index.date.astype(str), index=final_df.index
         ).map(sentiment).fillna(0.0).values
-        print(f"Daily_Sentiment: {(final_df['Daily_Sentiment'] != 0).sum()}/{len(final_df)} bars have sentiment")
+        filled = (final_df['Daily_Sentiment'] != 0).sum()
+        print(f"Daily_Sentiment: {filled}/{len(final_df)} bars have sentiment")
     except Exception as e:
         print(f"WARNING: Could not fetch crypto sentiment history: {e}")
         final_df['Daily_Sentiment'] = 0.0
