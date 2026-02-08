@@ -27,9 +27,10 @@ from optuna.pruners import MedianPruner
 NUM_TRIALS = 250
 MAX_EPOCHS = 80
 EARLY_STOP_PATIENCE = 15
+PRUNE_WARMUP_EPOCHS = 20       # don't prune until model has had time to learn
+PRUNE_STARTUP_TRIALS = 15      # match TPE's random exploration phase
 TRAIN_RATIO = 0.8
 NUM_CLASSES = 3
-PRUNE_WARMUP_EPOCHS = 8
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -236,6 +237,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
 
             model.eval()
             vc, vt, vl = 0, 0, 0.0
+            all_preds, all_labels = [], []
             with torch.inference_mode():
                 for X_vb, y_vb in val_loader:
                     X_vb, y_vb = X_vb.to(device), y_vb.to(device)
@@ -244,6 +246,8 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
                     _, p = torch.max(vo, 1)
                     vc += (p == y_vb).sum().item()
                     vt += y_vb.size(0)
+                    all_preds.extend(p.cpu().numpy())
+                    all_labels.extend(y_vb.cpu().numpy())
 
             val_acc = vc / vt
             val_loss = vl / vt
@@ -251,7 +255,22 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
             if scheduler == 'plateau' and sched:
                 sched.step(val_loss)
 
-            trial.report(val_acc, epoch)
+            # Compute epoch composite_score for pruner (same metric as final objective)
+            ep_preds = np.array(all_preds)
+            ep_labels = np.array(all_labels)
+            ep_tp = int(((ep_preds == target_class) & (ep_labels == target_class)).sum())
+            ep_fp = int(((ep_preds == target_class) & (ep_labels != target_class)).sum())
+            ep_fn = int(((ep_preds != target_class) & (ep_labels == target_class)).sum())
+            ep_prec = ep_tp / (ep_tp + ep_fp) if (ep_tp + ep_fp) > 0 else 0.0
+            ep_rec = ep_tp / (ep_tp + ep_fn) if (ep_tp + ep_fn) > 0 else 0.0
+            ep_f1 = 2 * ep_prec * ep_rec / (ep_prec + ep_rec) if (ep_prec + ep_rec) > 0 else 0.0
+            ep_bal = sum((ep_preds[ep_labels == c] == c).mean() if (ep_labels == c).sum() > 0 else 0.0
+                         for c in range(NUM_CLASSES)) / NUM_CLASSES
+            ep_cat = (int(((ep_labels == 0) & (ep_preds == 2)).sum()) +
+                      int(((ep_labels == 2) & (ep_preds == 0)).sum())) / vt
+            epoch_score = max(ep_f1 * 0.5 + ep_bal * 0.2 - ep_cat * 0.3, 0.0)
+
+            trial.report(epoch_score, epoch)
             if epoch >= PRUNE_WARMUP_EPOCHS and trial.should_prune():
                 del model, train_ds, val_ds, train_loader, val_loader, weights_t
                 gc.collect()
@@ -435,8 +454,9 @@ def main():
         storage=storage,
         load_if_exists=True,
         direction='maximize',
-        pruner=MedianPruner(n_startup_trials=10, n_warmup_steps=PRUNE_WARMUP_EPOCHS),
-        sampler=optuna.samplers.TPESampler(n_startup_trials=15),
+        pruner=MedianPruner(n_startup_trials=PRUNE_STARTUP_TRIALS,
+                            n_warmup_steps=PRUNE_WARMUP_EPOCHS),
+        sampler=optuna.samplers.TPESampler(n_startup_trials=PRUNE_STARTUP_TRIALS),
     )
 
     prior_trials = len(study.trials)
