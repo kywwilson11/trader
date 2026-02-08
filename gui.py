@@ -651,18 +651,33 @@ class DataFetcher(QObject):
         """Fetch news headlines from Finnhub and Fear & Greed Index."""
         try:
             from sentiment import get_fear_greed, _get_finnhub, _score_articles
+            from crypto_loop import CRYPTO_SYMBOLS
+            import datetime as _dt
+
+            # Build base-symbol set for crypto headline matching
+            crypto_bases = {s.split('/')[0] for s in CRYPTO_SYMBOLS}
+
             articles = []
             fng = get_fear_greed()
 
             client = _get_finnhub()
             if client is not None:
+                # Crypto general news
                 try:
                     crypto_news = client.general_news('crypto', min_id=0)
                     for a in crypto_news[:15]:
                         a['_category'] = 'Crypto'
+                        # Tag _symbol by scanning headline for known crypto bases
+                        headline_upper = (a.get('headline', '') + ' ' + a.get('summary', '')).upper()
+                        for sym in crypto_bases:
+                            if sym in headline_upper:
+                                a['_symbol'] = sym
+                                break
                     articles.extend(crypto_news[:15])
                 except Exception:
                     pass
+
+                # General / market news
                 try:
                     general_news = client.general_news('general', min_id=0)
                     for a in general_news[:15]:
@@ -670,6 +685,21 @@ class DataFetcher(QObject):
                     articles.extend(general_news[:15])
                 except Exception:
                     pass
+
+                # Company news for high-activity stocks
+                _today = _dt.date.today()
+                _from = (_today - _dt.timedelta(days=2)).isoformat()
+                _to = _today.isoformat()
+                for stock in ['TSLA', 'NVDA', 'META', 'AMD', 'PLTR',
+                              'COIN', 'MARA', 'MSTR', 'SOFI', 'HOOD']:
+                    try:
+                        co_news = client.company_news(stock, _from=_from, to=_to)
+                        for a in co_news[:5]:
+                            a['_category'] = 'Stock'
+                            a['_symbol'] = stock
+                        articles.extend(co_news[:5])
+                    except Exception:
+                        pass
 
             # Score each article
             for a in articles:
@@ -680,7 +710,7 @@ class DataFetcher(QObject):
             articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
 
             self.news_updated.emit({
-                'articles': articles[:30],
+                'articles': articles,
                 'fng': fng,
             })
         except Exception as e:
@@ -858,9 +888,9 @@ def parse_evolve_status(log_path):
         info["round_info"] = rounds[-1]
 
     # Current baseline scores
-    for m in re.finditer(r"\[EVOLVE\] Current \w+ bear score: ([\d.]+)", text):
+    for m in re.finditer(r"\[EVOLVE\] Current \w+ bear score: (\d+\.?\d*)", text):
         info["current_bear"] = float(m.group(1))
-    for m in re.finditer(r"\[EVOLVE\] Current \w+ bull score: ([\d.]+)", text):
+    for m in re.finditer(r"\[EVOLVE\] Current \w+ bull score: (\d+\.?\d*)", text):
         info["current_bull"] = float(m.group(1))
 
     trials = re.findall(r"\[\s*(\d+)\]", text)
@@ -871,7 +901,7 @@ def parse_evolve_status(log_path):
     if m:
         info["trial_total"] = int(m.group(1))
 
-    bests = re.findall(r"Best is trial (\d+) with value: ([\d.]+)", text)
+    bests = re.findall(r"Best is trial (\d+) with value: (\d+\.?\d*)", text)
     if bests:
         info["best_trial"] = int(bests[-1][0])
         info["best_score"] = float(bests[-1][1])
@@ -1309,6 +1339,23 @@ class TradingDashboard(QMainWindow):
         fng_layout.addWidget(self._news_refresh_label)
         layout.addLayout(fng_layout)
 
+        # Filter combo
+        filter_layout = QHBoxLayout()
+        filter_label = QLabel("Filter:")
+        filter_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        filter_layout.addWidget(filter_label)
+        self._news_filter_combo = QComboBox()
+        self._news_filter_combo.addItems(["My Universe", "All News", "Global / Macro"])
+        self._news_filter_combo.setCurrentIndex(0)
+        self._news_filter_combo.currentIndexChanged.connect(self._apply_news_filter)
+        self._news_filter_combo.setFixedWidth(180)
+        filter_layout.addWidget(self._news_filter_combo)
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
+
+        # Initialize article cache
+        self._news_articles = []
+
         # News table
         self._news_table = QTableWidget(0, 4)
         self._news_table.setHorizontalHeaderLabels(
@@ -1664,12 +1711,45 @@ class TradingDashboard(QMainWindow):
         now = _dt.datetime.now(TZ_CENTRAL).strftime("%I:%M %p")
         self._news_refresh_label.setText(f"Updated {now}")
 
-        # Populate news table
+        # Cache articles and apply current filter
+        self._news_articles = articles
+        self._apply_news_filter()
+
+    def _apply_news_filter(self):
+        """Filter cached news articles based on combo selection."""
+        import datetime as _dt
+        from crypto_loop import CRYPTO_SYMBOLS
+        from stock_loop import STOCK_UNIVERSE
+
+        idx = self._news_filter_combo.currentIndex()
+        articles = getattr(self, '_news_articles', [])
+
+        if idx == 0:  # My Universe
+            crypto_bases = {s.split('/')[0] for s in CRYPTO_SYMBOLS}
+            stock_set = set(STOCK_UNIVERSE)
+            universe = crypto_bases | stock_set
+            filtered = []
+            for a in articles:
+                sym = a.get('_symbol', '')
+                if sym and sym in universe:
+                    filtered.append(a)
+                    continue
+                # Scan headline for any universe symbol (word boundary)
+                headline = a.get('headline', '') + ' ' + a.get('summary', '')
+                headline_upper = headline.upper()
+                for s in universe:
+                    if re.search(r'\b' + re.escape(s) + r'\b', headline_upper):
+                        filtered.append(a)
+                        break
+            articles = filtered
+        elif idx == 2:  # Global / Macro
+            articles = [a for a in articles if a.get('_category') == 'Market']
+        # idx == 1 (All News) — no filtering
+
         tbl = self._news_table
         tbl.setUpdatesEnabled(False)
         tbl.setRowCount(len(articles))
         for row, a in enumerate(articles):
-            # Time
             ts = a.get('datetime', 0)
             if ts:
                 time_str = _dt.datetime.fromtimestamp(ts, tz=TZ_CENTRAL).strftime("%m/%d %I:%M %p")
@@ -1680,7 +1760,6 @@ class TradingDashboard(QMainWindow):
             headline = a.get('headline', '—')
             sentiment = a.get('_sentiment', 0.0)
 
-            # Sentiment color
             if sentiment > 0.1:
                 sent_color = T['green']
                 sent_text = f"+{sentiment:.2f}"
