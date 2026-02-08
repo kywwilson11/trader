@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QPlainTextEdit, QComboBox, QCheckBox, QFrame,
     QSplitter, QGroupBox, QProgressBar, QToolBar,
-    QSizePolicy, QLineEdit, QPushButton,
+    QSizePolicy, QLineEdit, QPushButton, QSpinBox,
 )
 import pyqtgraph as pg
 import numpy as np
@@ -1408,6 +1408,7 @@ class TradingDashboard(QMainWindow):
         self._build_stocks_tab()
         self._build_models_tab()
         self._build_logs_tab()
+        self._build_settings_tab()
 
         # Status bar
         self._status_conn = QLabel("API: \u2014")
@@ -1594,6 +1595,29 @@ class TradingDashboard(QMainWindow):
             f" color: {t['white'].name()};"
             f" border: 1px solid {t['bg_border'].name()}; }}"
         )
+
+        # Settings tab inputs
+        input_style = (
+            f"QLineEdit, QSpinBox, QComboBox {{ background-color: {t['bg_table'].name()};"
+            f" color: {t['white'].name()}; border: 1px solid {t['bg_border'].name()};"
+            f" border-radius: 4px; padding: 4px; }}"
+        )
+        btn_style = (
+            f"QPushButton {{ background-color: {t['bg_header'].name()}; color: {t['white'].name()};"
+            f" border: 1px solid {t['bg_border'].name()}; border-radius: 4px; padding: 4px 8px; }}"
+            f" QPushButton:hover {{ background-color: {t['accent'].name()}; color: {t['bg_dark'].name()}; }}"
+        )
+        if hasattr(self, '_settings_test_btn'):
+            self._settings_test_btn.setStyleSheet(btn_style)
+            for key_edit in self._settings_api_keys.values():
+                key_edit.setStyleSheet(input_style)
+            self._settings_fmp_key.setStyleSheet(input_style)
+            for combo in self._settings_models.values():
+                combo.setStyleSheet(input_style)
+            self._settings_latency.setStyleSheet(input_style)
+            self._settings_provider.setStyleSheet(input_style)
+            for toggle in self._settings_key_toggles.values():
+                toggle.setStyleSheet(btn_style)
 
         # Clock
         self._clock_label_right.setStyleSheet(
@@ -2255,6 +2279,202 @@ class TradingDashboard(QMainWindow):
         self._on_log_selected(self._log_selector.currentText())
 
         self.tabs.addTab(tab, "Logs")
+
+    def _build_settings_tab(self):
+        from llm_config import load_llm_config, save_llm_config
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        config = load_llm_config()
+
+        # --- LLM Configuration group ---
+        llm_group = QGroupBox("LLM Configuration")
+        llm_layout = QGridLayout(llm_group)
+        row = 0
+
+        # Enable/disable
+        self._settings_llm_enabled = QCheckBox("LLM Analysis Enabled")
+        self._settings_llm_enabled.setChecked(config.get("enabled", True))
+        self._settings_llm_enabled.toggled.connect(self._on_settings_changed)
+        llm_layout.addWidget(self._settings_llm_enabled, row, 0, 1, 2)
+        row += 1
+
+        # Provider selector
+        llm_layout.addWidget(QLabel("Provider:"), row, 0)
+        self._settings_provider = QComboBox()
+        self._settings_provider.addItems(["gemini", "claude", "openai"])
+        self._settings_provider.setCurrentText(config.get("provider", "gemini"))
+        self._settings_provider.currentTextChanged.connect(self._on_settings_changed)
+        llm_layout.addWidget(self._settings_provider, row, 1)
+        row += 1
+
+        # --- API Keys group ---
+        keys_group = QGroupBox("API Keys")
+        keys_layout = QGridLayout(keys_group)
+
+        self._settings_api_keys = {}
+        self._settings_key_toggles = {}
+        for i, (provider, label) in enumerate([
+            ("gemini", "Gemini"),
+            ("claude", "Claude"),
+            ("openai", "OpenAI"),
+        ]):
+            keys_layout.addWidget(QLabel(f"{label}:"), i, 0)
+            key_edit = QLineEdit()
+            key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+            key_edit.setPlaceholderText(f"Enter {label} API key")
+            key_val = config.get("models", {}).get(provider, {}).get("api_key", "")
+            key_edit.setText(key_val)
+            key_edit.editingFinished.connect(self._on_settings_changed)
+            keys_layout.addWidget(key_edit, i, 1)
+            self._settings_api_keys[provider] = key_edit
+
+            toggle_btn = QPushButton("Show")
+            toggle_btn.setFixedWidth(50)
+            toggle_btn.setCheckable(True)
+            toggle_btn.toggled.connect(lambda checked, le=key_edit, btn=toggle_btn: (
+                le.setEchoMode(QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password),
+                btn.setText("Hide" if checked else "Show"),
+            ))
+            keys_layout.addWidget(toggle_btn, i, 2)
+            self._settings_key_toggles[provider] = toggle_btn
+
+        # FMP key
+        keys_layout.addWidget(QLabel("FMP:"), 3, 0)
+        self._settings_fmp_key = QLineEdit()
+        self._settings_fmp_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._settings_fmp_key.setPlaceholderText("Financial Modeling Prep API key")
+        self._settings_fmp_key.setText(config.get("fmp_api_key", ""))
+        self._settings_fmp_key.editingFinished.connect(self._on_settings_changed)
+        keys_layout.addWidget(self._settings_fmp_key, 3, 1)
+
+        fmp_toggle = QPushButton("Show")
+        fmp_toggle.setFixedWidth(50)
+        fmp_toggle.setCheckable(True)
+        fmp_toggle.toggled.connect(lambda checked, le=self._settings_fmp_key, btn=fmp_toggle: (
+            le.setEchoMode(QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password),
+            btn.setText("Hide" if checked else "Show"),
+        ))
+        keys_layout.addWidget(fmp_toggle, 3, 2)
+
+        llm_layout.addWidget(keys_group, row, 0, 1, 2)
+        row += 1
+
+        # --- Model Selection group ---
+        model_group = QGroupBox("Model Selection")
+        model_layout = QGridLayout(model_group)
+
+        self._settings_models = {}
+        model_options = {
+            "gemini": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite",
+                        "gemini-3-flash-preview", "gemini-3-pro-preview"],
+            "claude": ["claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001", "claude-opus-4-6"],
+            "openai": ["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini"],
+        }
+        for i, (provider, label) in enumerate([
+            ("gemini", "Gemini Model"),
+            ("claude", "Claude Model"),
+            ("openai", "OpenAI Model"),
+        ]):
+            model_layout.addWidget(QLabel(f"{label}:"), i, 0)
+            combo = QComboBox()
+            combo.setEditable(True)
+            combo.addItems(model_options[provider])
+            current_model = config.get("models", {}).get(provider, {}).get("model", "")
+            if current_model:
+                idx = combo.findText(current_model)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                else:
+                    combo.setCurrentText(current_model)
+            combo.currentTextChanged.connect(self._on_settings_changed)
+            model_layout.addWidget(combo, i, 1)
+            self._settings_models[provider] = combo
+
+        llm_layout.addWidget(model_group, row, 0, 1, 2)
+        row += 1
+
+        # Journal enabled
+        self._settings_journal = QCheckBox("Trade Journal Enabled")
+        self._settings_journal.setChecked(config.get("journal_enabled", True))
+        self._settings_journal.toggled.connect(self._on_settings_changed)
+        llm_layout.addWidget(self._settings_journal, row, 0, 1, 2)
+        row += 1
+
+        # Max latency
+        latency_layout = QHBoxLayout()
+        latency_layout.addWidget(QLabel("Max LLM Latency:"))
+        self._settings_latency = QSpinBox()
+        self._settings_latency.setRange(5, 60)
+        self._settings_latency.setValue(config.get("max_llm_latency_sec", 15))
+        self._settings_latency.setSuffix(" seconds")
+        self._settings_latency.valueChanged.connect(self._on_settings_changed)
+        latency_layout.addWidget(self._settings_latency)
+        latency_layout.addStretch()
+        llm_layout.addLayout(latency_layout, row, 0, 1, 2)
+        row += 1
+
+        # Test connection button + status
+        test_layout = QHBoxLayout()
+        self._settings_test_btn = QPushButton("Test Connection")
+        self._settings_test_btn.clicked.connect(self._on_test_llm)
+        test_layout.addWidget(self._settings_test_btn)
+        self._settings_test_status = QLabel("")
+        test_layout.addWidget(self._settings_test_status)
+        test_layout.addStretch()
+        llm_layout.addLayout(test_layout, row, 0, 1, 2)
+
+        layout.addWidget(llm_group)
+        layout.addStretch()
+
+        self.tabs.addTab(tab, "Settings")
+
+    def _on_settings_changed(self, *_args):
+        """Auto-save settings when any field changes."""
+        from llm_config import load_llm_config, save_llm_config
+
+        config = load_llm_config()
+        config["enabled"] = self._settings_llm_enabled.isChecked()
+        config["provider"] = self._settings_provider.currentText()
+        config["journal_enabled"] = self._settings_journal.isChecked()
+        config["max_llm_latency_sec"] = self._settings_latency.value()
+        config["fmp_api_key"] = self._settings_fmp_key.text().strip()
+
+        for provider, key_edit in self._settings_api_keys.items():
+            config.setdefault("models", {}).setdefault(provider, {})["api_key"] = key_edit.text().strip()
+        for provider, combo in self._settings_models.items():
+            config.setdefault("models", {}).setdefault(provider, {})["model"] = combo.currentText().strip()
+
+        save_llm_config(config)
+
+    def _on_test_llm(self):
+        """Test LLM connection with a trivial prompt."""
+        self._settings_test_status.setText("Testing...")
+        self._settings_test_status.setStyleSheet("")
+        QApplication.processEvents()
+
+        # Force-save first so the client reads current keys
+        self._on_settings_changed()
+
+        import time
+        start = time.time()
+        try:
+            from llm_client import call_llm
+            result = call_llm("Respond with just the word OK.", max_tokens=16)
+            elapsed = (time.time() - start) * 1000
+
+            if result:
+                provider = self._settings_provider.currentText()
+                self._settings_test_status.setText(
+                    f"Connected to {provider} ({elapsed:.0f}ms)")
+                self._settings_test_status.setStyleSheet(f"color: {T['green'].name()};")
+            else:
+                self._settings_test_status.setText("No response — check API key")
+                self._settings_test_status.setStyleSheet(f"color: {T['red'].name()};")
+        except Exception as e:
+            self._settings_test_status.setText(f"Error: {e}")
+            self._settings_test_status.setStyleSheet(f"color: {T['red'].name()};")
 
     # ---- Signal Handlers -------------------------------------------------
     @Slot(dict)

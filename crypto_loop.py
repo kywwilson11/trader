@@ -28,6 +28,10 @@ from market_data import fetch_bars_alpaca, get_live_atr
 from trading_utils import get_api, get_model_mtime, choose_inference_device, cooldown_ok, predict_symbol
 from hw_monitor import get_gpu_temp
 from sentiment import sentiment_gate, get_fear_greed
+from llm_config import load_llm_config
+from llm_analyst import analyze_trades
+from fundamentals import get_fundamentals, format_fundamentals_for_llm
+from trade_journal import log_decision
 
 # --- CONFIGURATION ---
 
@@ -327,6 +331,43 @@ def run_crypto_bot():
             # Write prediction cache for GUI
             _write_prediction_cache(bear_preds, bull_preds, bear_threshold, bull_threshold)
 
+        # ── LLM pre-trade analysis ──
+        llm_scores = {}
+        llm_cfg = load_llm_config()
+        if llm_cfg.get("enabled"):
+            candidates = []
+            for symbol in CRYPTO_SYMBOLS:
+                if symbol in positions:
+                    continue
+                bp = bull_preds.get(symbol, 0)
+                if bp < bull_threshold:
+                    continue
+                # Bear agreement pre-filter
+                bear_p = bear_preds.get(symbol)
+                if bear_p is not None and bear_p < -bear_threshold:
+                    continue
+                fund = get_fundamentals(symbol, 'crypto')
+                fund_text = format_fundamentals_for_llm(symbol, fund)
+                candidates.append({
+                    'symbol': symbol,
+                    'bull_pred': bp,
+                    'bear_pred': bear_p,
+                    'fundamentals_text': fund_text,
+                })
+            if candidates:
+                fng_val = fng['value'] if fng else None
+                try:
+                    acct = api.get_account()
+                    equity = float(acct.equity)
+                except Exception:
+                    equity = 0
+                llm_scores = analyze_trades(
+                    candidates, 'crypto', equity=equity,
+                    positions=list(positions.keys()), fng_value=fng_val,
+                )
+                if llm_scores:
+                    print("[LLM] Scores: " + ", ".join(f"{s}={v.get('m', 1.0):.1f}x" for s, v in llm_scores.items()))
+
         # ── SELL: bearish positions with cooldown expired ──
         for symbol in list(positions):
             pos = verify_position(api, symbol)
@@ -417,11 +458,31 @@ def run_crypto_bot():
             gate, gate_reasons = sentiment_gate(symbol, 'crypto')
             if gate <= 0:
                 print(f"  {symbol}: BLOCKED by sentiment ({', '.join(gate_reasons)})")
+                log_decision({"symbol": symbol, "action": "skip", "skip_reason": "sentiment_block",
+                              "bull_pred": bull_pred, "bear_pred": bear_preds.get(symbol),
+                              "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
+                              "llm_multiplier": None, "llm_reasoning": None})
                 continue
             adjusted_notional = int(sized_notional * gate)
+
+            # LLM multiplier
+            llm_info = llm_scores.get(symbol, {})
+            llm_mult = llm_info.get('m', 1.0)
+            llm_reason = llm_info.get('r', '')
+            if llm_mult <= 0:
+                print(f"  {symbol}: BLOCKED by LLM ({llm_reason})")
+                log_decision({"symbol": symbol, "action": "skip", "skip_reason": "llm_block",
+                              "bull_pred": bull_pred, "bear_pred": bear_preds.get(symbol),
+                              "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
+                              "llm_multiplier": llm_mult, "llm_reasoning": llm_reason})
+                continue
+            adjusted_notional = int(adjusted_notional * llm_mult)
+
             sizing_info = f"conf={confidence:.2f}x"
             if gate != 1.0:
                 sizing_info += f", sent={gate:.2f}x"
+            if llm_mult != 1.0:
+                sizing_info += f", llm={llm_mult:.1f}x"
             if gate_reasons:
                 sizing_info += f" ({', '.join(gate_reasons)})"
             print(f"  {symbol}: Sizing ${adjusted_notional} [{sizing_info}]")
@@ -459,6 +520,12 @@ def run_crypto_bot():
                         'entry_atr': entry_atr,
                         'take_profit_price': tp_price,
                     }
+                log_decision({"symbol": symbol, "action": "buy",
+                              "bull_pred": bull_pred, "bear_pred": bear_preds.get(symbol),
+                              "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
+                              "llm_multiplier": llm_mult, "llm_reasoning": llm_reason,
+                              "final_notional": adjusted_notional, "confidence": confidence,
+                              "skip_reason": None})
                 last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(1)
 

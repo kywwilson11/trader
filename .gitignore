@@ -35,5 +35,11 @@ news_cache.json
 pipeline_status.json
 *_predictions.json
 
+# LLM config (contains API keys)
+llm_config.json
+
+# Trade journal logs
+journals/
+
 # Old/backup logos
 logos/old/
