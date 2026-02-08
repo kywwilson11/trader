@@ -382,7 +382,7 @@ def _deduplicate_articles(articles):
     seen = set()
     unique = []
     for a in articles:
-        key = a.get('headline', '').strip().lower()
+        key = (a.get('headline') or '').strip().lower()
         if not key or key in seen:
             continue
         seen.add(key)
