@@ -6,6 +6,7 @@ Data sources:
 
 Provides sentiment scoring and trade gating for crypto_loop.py and stock_loop.py.
 """
+import json
 import os
 import time
 import datetime
@@ -376,8 +377,115 @@ def _validate_text(text):
     return text
 
 
+def _deduplicate_articles(articles):
+    """Remove duplicate articles by normalized headline. First occurrence wins."""
+    seen = set()
+    unique = []
+    for a in articles:
+        key = a.get('headline', '').strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(a)
+    return unique
+
+
+def _llm_score_batch(articles):
+    """Batch-score articles via the configured LLM. Returns list[float] or None.
+
+    Sends all headlines + truncated summaries in one prompt, asks for a JSON
+    array of sentiment scores. One API call per batch = cost-efficient.
+    Falls back to None on any failure (caller should use keyword scoring).
+    """
+    try:
+        from llm_client import call_llm
+    except ImportError:
+        return None
+
+    if not articles:
+        return None
+
+    lines = []
+    for i, a in enumerate(articles, 1):
+        h = a.get('headline', '').strip()
+        s = a.get('summary', '').strip()
+        if s and len(s) > 150:
+            s = s[:147] + '...'
+        lines.append(f"{i}. {h}" + (f" — {s}" if s else ""))
+
+    prompt = (
+        "Score each headline's financial sentiment from -1.0 (very bearish) "
+        "to 1.0 (very bullish). 0.0 = neutral.\n"
+        "Return ONLY a JSON array of numbers, one per headline.\n\n"
+        + "\n".join(lines)
+    )
+
+    result = call_llm(
+        prompt,
+        system="Financial sentiment scorer. Return only a JSON array of floats. No explanation.",
+        max_tokens=max(128, len(articles) * 8),
+    )
+    if not result:
+        return None
+
+    try:
+        text = result.strip()
+        # Strip markdown code fences if present
+        if '```' in text:
+            for part in text.split('```')[1:]:
+                stripped = part.strip()
+                if stripped.startswith('json'):
+                    stripped = stripped[4:].strip()
+                if stripped.startswith('['):
+                    text = stripped
+                    break
+
+        scores = json.loads(text)
+        if isinstance(scores, list) and len(scores) == len(articles):
+            return [max(-1.0, min(1.0, float(s))) for s in scores]
+        print(f"[SENTIMENT] LLM returned {len(scores) if isinstance(scores, list) else type(scores).__name__} items, "
+              f"expected {len(articles)}")
+    except (ValueError, TypeError, json.JSONDecodeError) as e:
+        print(f"[SENTIMENT] LLM score parse failed: {e}")
+
+    return None
+
+
+def score_article_batch(articles):
+    """Score articles for display. Returns list of per-article float scores.
+
+    Uses LLM batch scoring when available (one API call for all articles).
+    Falls back to keyword scoring (headline + summary only, no full-text fetch).
+    """
+    if not articles:
+        return []
+
+    llm_scores = _llm_score_batch(articles)
+    if llm_scores is not None:
+        print(f"[SENTIMENT] LLM scored {len(articles)} articles")
+        return llm_scores
+
+    # Fallback: keyword scoring (headline + summary only)
+    print(f"[SENTIMENT] Keyword scoring {len(articles)} articles (LLM unavailable)")
+    scores = []
+    for a in articles:
+        headline = _validate_text(a.get('headline', ''))
+        summary = _validate_text(a.get('summary', ''))
+        if headline is None and summary is None:
+            scores.append(0.0)
+            continue
+        h = _score_text(headline) if headline else 0.0
+        s = _score_text(summary) if summary else 0.0
+        scores.append(h * 0.6 + s * 0.4)
+    return scores
+
+
 def _score_articles(articles):
-    """Score a list of Finnhub news articles.
+    """Score a list of Finnhub news articles. Deduplicates and aggregates.
+
+    Used by trading loops (get_news_sentiment, get_market_sentiment).
+    Tries LLM batch scoring first. Falls back to keyword scoring with
+    full-text article fetch for higher accuracy.
 
     Returns dict:
         sentiment_score: float in (-1, 1), average across articles
@@ -385,6 +493,8 @@ def _score_articles(articles):
         positive_ratio: float in [0, 1]
         negative_ratio: float in [0, 1]
     """
+    articles = _deduplicate_articles(articles)
+
     if not articles:
         return {
             'sentiment_score': 0.0,
@@ -393,30 +503,30 @@ def _score_articles(articles):
             'negative_ratio': 0.5,
         }
 
-    scores = []
-    for article in articles:
-        headline = _validate_text(article.get('headline', ''))
-        summary = _validate_text(article.get('summary', ''))
+    # Try LLM batch scoring first (one API call, cost-efficient)
+    scores = _llm_score_batch(articles)
 
-        # Skip articles with no usable text
-        if headline is None and summary is None:
-            continue
+    if scores is None:
+        # Fallback: keyword scoring with full-text fetch for accuracy
+        scores = []
+        for article in articles:
+            headline = _validate_text(article.get('headline', ''))
+            summary = _validate_text(article.get('summary', ''))
 
-        # Score validated text (0.0 for missing components)
-        h_score = _score_text(headline) if headline else 0.0
-        s_score = _score_text(summary) if summary else 0.0
+            if headline is None and summary is None:
+                continue
 
-        # Try to fetch and score full article text
-        full_text = _fetch_article_text(article.get('url', ''))
-        if full_text:
-            f_score = _score_text(full_text)
-            # Full article available: headline 25%, summary 25%, full text 50%
-            combined = h_score * 0.25 + s_score * 0.25 + f_score * 0.50
-        else:
-            # No full text: headline 60%, summary 40% (original weights)
-            combined = h_score * 0.6 + s_score * 0.4
+            h_score = _score_text(headline) if headline else 0.0
+            s_score = _score_text(summary) if summary else 0.0
 
-        scores.append(combined)
+            full_text = _fetch_article_text(article.get('url', ''))
+            if full_text:
+                f_score = _score_text(full_text)
+                combined = h_score * 0.25 + s_score * 0.25 + f_score * 0.50
+            else:
+                combined = h_score * 0.6 + s_score * 0.4
+
+            scores.append(combined)
 
     if not scores:
         return {
@@ -552,95 +662,88 @@ def get_market_sentiment():
 def sentiment_gate(symbol, asset_type='crypto'):
     """Compute a trade multiplier based on sentiment.
 
-    Returns a float:
-        0.0  = block trade entirely (extreme negative sentiment)
+    Returns tuple: (multiplier: float, reasons: list[str])
+        0.15 = severe reduce (catastrophic news, e.g. hack/fraud)
         0.5  = reduce position size (negative sentiment)
         1.0  = normal (neutral or no data)
-        1.15 = slightly increase position (positive sentiment)
-        1.3  = max increase (strong positive, calm market)
+        1.2  = increase position (positive sentiment)
+        1.5  = max increase (strong positive + calm market)
 
-    Uses Fear & Greed Index for crypto, Finnhub news for both.
-    Gracefully returns 1.0 if no sentiment data is available.
-
-    F&G philosophy: this is a short-term momentum trader (30s cycles),
-    not a long-term value investor. Fear = active selling = reduce size.
-    Greed = momentum up = trade normally. Extremes = reduce (volatile).
+    Design philosophy for profit optimization:
+    - The ML models are the primary signal (technical, leading indicator).
+      Sentiment is a position-sizing modifier, NOT a trade blocker.
+    - Never fully block (min 0.15x): the ML model may be catching a
+      bounce/reversal that news hasn't priced in yet.
+    - Reward positive confirmation aggressively: when technicals AND news
+      agree bullish, size up — momentum compounds.
+    - Wide neutral zone: most news is noise. Only act on strong signals.
+    - FnG is a real liquidity/spread signal — keep it multiplicative.
+    - Symbol news is most actionable — strong weight.
+    - Market news is diffuse — very light touch, wide neutral zone.
     """
     multiplier = 1.0
     reasons = []
 
-    # --- Crypto: Fear & Greed Index ---
+    # --- Crypto: Fear & Greed Index (liquidity/spread proxy) ---
     if asset_type == 'crypto':
         fng = get_fear_greed()
         if fng is not None:
             val = fng['value']
             if val <= 10:
-                # Extreme fear — panic selling, spreads wide, don't catch knives
-                multiplier *= 0.3
-                reasons.append(f"FnG={val}(extreme_fear/block)")
+                multiplier *= 0.35
+                reasons.append(f"FnG={val}(extreme_fear)")
             elif val <= 25:
-                # Fear — active downturn, reduce exposure significantly
-                multiplier *= 0.5
-                reasons.append(f"FnG={val}(fear/reduce)")
+                multiplier *= 0.55
+                reasons.append(f"FnG={val}(fear)")
             elif val <= 40:
-                # Mild fear — cautious
                 multiplier *= 0.8
                 reasons.append(f"FnG={val}(cautious)")
             elif val >= 90:
-                # Extreme greed — blow-off top risk, reduce
-                multiplier *= 0.6
-                reasons.append(f"FnG={val}(extreme_greed/reduce)")
+                multiplier *= 0.7
+                reasons.append(f"FnG={val}(extreme_greed)")
             elif val >= 75:
-                # High greed — late-cycle caution
-                multiplier *= 0.85
-                reasons.append(f"FnG={val}(greed/caution)")
+                multiplier *= 0.9
+                reasons.append(f"FnG={val}(greed)")
             else:
-                # 40-75: healthy range, trade normally
                 reasons.append(f"FnG={val}(normal)")
 
-    # --- Symbol-specific news sentiment (heavy weight) ---
-    # This is the most actionable signal: bad news about THIS symbol
-    # directly threatens THIS position. Weight it strongly.
+    # --- Symbol-specific news sentiment (strongest signal) ---
     news = get_news_sentiment(symbol, asset_type)
     if news is not None and news['article_count'] > 0:
         score = news['sentiment_score']
-        if score <= -0.3:
-            multiplier *= 0.0  # Block — strong negative press on this symbol
-            reasons.append(f"sym_news={score:+.2f}(block)")
-        elif score <= -0.15:
-            multiplier *= 0.4  # Heavy reduce — this symbol is under pressure
+        if score <= -0.5:
+            multiplier *= 0.15  # Catastrophic (hack, fraud, bankruptcy)
+            reasons.append(f"sym_news={score:+.2f}(catastrophic)")
+        elif score <= -0.3:
+            multiplier *= 0.35  # Heavy negative
             reasons.append(f"sym_news={score:+.2f}(bearish)")
-        elif score <= -0.05:
-            multiplier *= 0.7  # Cautious — mild negative sentiment
+        elif score <= -0.1:
+            multiplier *= 0.7   # Mildly negative
             reasons.append(f"sym_news={score:+.2f}(cautious)")
-        elif score >= 0.3:
-            multiplier *= 1.2  # Moderate boost — strong positive news
+        elif score >= 0.4:
+            multiplier *= 1.35  # Strong positive — conviction boost
+            reasons.append(f"sym_news={score:+.2f}(strong_bull)")
+        elif score >= 0.2:
+            multiplier *= 1.2   # Positive confirmation
             reasons.append(f"sym_news={score:+.2f}(bullish)")
-        elif score >= 0.15:
-            multiplier *= 1.1
-            reasons.append(f"sym_news={score:+.2f}(positive)")
         else:
+            # -0.1 to 0.2: wide neutral zone — most news is noise
             reasons.append(f"sym_news={score:+.2f}(neutral)")
 
-    # --- Market-wide sentiment (lighter weight) ---
-    # General market mood affects everything but shouldn't override
-    # symbol-specific signals. Smaller multiplier range.
+    # --- Market-wide sentiment (very light touch) ---
     market = get_market_sentiment()
     if market is not None and market['article_count'] > 0:
         mscore = market['sentiment_score']
-        if mscore <= -0.3:
+        if mscore <= -0.4:
             multiplier *= 0.85
             reasons.append(f"market={mscore:+.2f}(bearish)")
-        elif mscore <= -0.15:
-            multiplier *= 0.9
-            reasons.append(f"market={mscore:+.2f}(cautious)")
-        elif mscore >= 0.3:
+        elif mscore >= 0.4:
             multiplier *= 1.1
             reasons.append(f"market={mscore:+.2f}(bullish)")
         else:
             reasons.append(f"market={mscore:+.2f}(neutral)")
 
-    # Clamp to [0, 1.5]
-    multiplier = max(0.0, min(1.5, multiplier))
+    # Clamp: never fully block (ML signal always gets a chance), cap upside
+    multiplier = max(0.15, min(1.5, multiplier))
 
     return multiplier, reasons

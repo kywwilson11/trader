@@ -51,10 +51,12 @@ def parse_args():
                         help='Prefix for output files (e.g. "stock" -> stock_bear_model.pth)')
     parser.add_argument('--fixed-threshold', type=float, default=None,
                         help='Use a fixed bull_threshold instead of searching (for shared threshold between bear/bull)')
+    parser.add_argument('--preset', type=str, default=None,
+                        help='Indicator preset: minimal, standard, full')
     return parser.parse_args()
 
 
-def load_data(data_path='training_data.csv'):
+def load_data(data_path='training_data.csv', preset_override=None):
     print("Loading data...")
     df = pd.read_csv(data_path, index_col=0, parse_dates=True)
     print(f"Dataset: {len(df)} rows")
@@ -62,7 +64,14 @@ def load_data(data_path='training_data.csv'):
     exclude_cols = ['Target_Return', 'Ticker', 'Date', 'Datetime', 'NextClose']
     feature_cols = [c for c in df.columns if c not in exclude_cols]
     feature_cols = [c for c in feature_cols if df[c].dtype in ['float64', 'float32', 'int64', 'int32']]
-    print(f"Features: {len(feature_cols)}")
+
+    # Filter features by preset
+    from indicator_config import load_indicator_config, get_preset_features
+    preset_name = preset_override or load_indicator_config()["preset"]
+    preset_features = get_preset_features(preset_name)
+    if preset_features is not None:
+        feature_cols = [c for c in feature_cols if c in preset_features]
+    print(f"Preset: {preset_name} ({len(feature_cols)} features)")
 
     scaler_X = MinMaxScaler()
     scaler_X.fit(df[feature_cols].values)
@@ -90,7 +99,7 @@ def load_data(data_path='training_data.csv'):
     print(f"Contiguous arrays: {all_scaled.shape}, {all_scaled.nbytes / 1e6:.1f} MB")
     input_dim = all_scaled.shape[1]
 
-    return all_scaled, all_returns, tickers, ticker_boundaries, scaler_X, feature_cols, input_dim
+    return all_scaled, all_returns, tickers, ticker_boundaries, scaler_X, feature_cols, input_dim, preset_name
 
 
 def get_indices_and_classes(all_returns, tickers, ticker_boundaries, bull_thresh, seq_len):
@@ -359,7 +368,7 @@ def main():
 
     storage = f'sqlite:///{db_path}'
 
-    all_scaled, all_returns, tickers, ticker_boundaries, scaler_X, feature_cols, input_dim = load_data(args.data)
+    all_scaled, all_returns, tickers, ticker_boundaries, scaler_X, feature_cols, input_dim, preset_name = load_data(args.data, preset_override=args.preset)
 
     # Track best model weights in memory (can't store in SQLite efficiently)
     best_state_holder = {'state': None, 'score': 0.0, 'cfg': None, 'val_acc': 0.0, 'per_class': {}}
@@ -507,6 +516,7 @@ def main():
             'target': target,
             'prefix': args.prefix,
             'shared_threshold': args.fixed_threshold is not None,
+            'indicator_preset': preset_name,
         }
         joblib.dump(config, f'{prefix}{target}_config.pkl')
         joblib.dump(scaler_X, f'{prefix}scaler_X.pkl')

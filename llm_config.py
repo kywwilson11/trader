@@ -12,7 +12,7 @@ _DEFAULTS = {
     "provider": "gemini",
     "enabled": True,
     "models": {
-        "gemini": {"api_key": "", "model": "gemini-2.5-flash"},
+        "gemini": {"api_key": "", "model": "gemini-2.5-flash-lite"},
         "claude": {"api_key": "", "model": "claude-sonnet-4-5-20250929"},
         "openai": {"api_key": "", "model": "gpt-4.1"},
     },

@@ -281,6 +281,8 @@ def _read_bear_threshold(prefix=''):
 
 def _build_training_phases(trials, train_crypto, train_stock):
     """Build model training phases."""
+    from indicator_config import get_preset_name
+    preset = get_preset_name()
     phases = []
 
     if train_crypto:
@@ -288,14 +290,16 @@ def _build_training_phases(trials, train_crypto, train_stock):
             'id': 'bear_search',
             'label': 'Training Crypto Bear Model',
             'cmd': [PYTHON, '-u', 'hypersearch_dual.py',
-                    '--target', 'bear', '--trials', str(trials)],
+                    '--target', 'bear', '--trials', str(trials),
+                    '--preset', preset],
             'trials': trials,
         })
         phases.append({
             'id': 'bull_search',
             'label': 'Training Crypto Bull Model',
             'cmd': [PYTHON, '-u', 'hypersearch_dual.py',
-                    '--target', 'bull', '--trials', str(trials)],
+                    '--target', 'bull', '--trials', str(trials),
+                    '--preset', preset],
             'trials': trials,
         })
 
@@ -305,7 +309,8 @@ def _build_training_phases(trials, train_crypto, train_stock):
             'label': 'Training Stock Bear Model',
             'cmd': [PYTHON, '-u', 'hypersearch_dual.py',
                     '--target', 'bear', '--trials', str(trials),
-                    '--data', 'stock_training_data.csv', '--prefix', 'stock'],
+                    '--data', 'stock_training_data.csv', '--prefix', 'stock',
+                    '--preset', preset],
             'trials': trials,
         })
         phases.append({
@@ -313,7 +318,8 @@ def _build_training_phases(trials, train_crypto, train_stock):
             'label': 'Training Stock Bull Model',
             'cmd': [PYTHON, '-u', 'hypersearch_dual.py',
                     '--target', 'bull', '--trials', str(trials),
-                    '--data', 'stock_training_data.csv', '--prefix', 'stock'],
+                    '--data', 'stock_training_data.csv', '--prefix', 'stock',
+                    '--preset', preset],
             'trials': trials,
         })
 

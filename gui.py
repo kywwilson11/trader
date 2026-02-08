@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QComboBox, QCheckBox, QFrame,
     QSplitter, QGroupBox, QProgressBar, QToolBar,
     QSizePolicy, QLineEdit, QPushButton, QSpinBox,
+    QScrollArea,
 )
 import pyqtgraph as pg
 import numpy as np
@@ -803,7 +804,7 @@ class DataFetcher(QObject):
     def fetch_news(self):
         """Fetch news headlines from Finnhub and Fear & Greed Index."""
         try:
-            from sentiment import get_fear_greed, _get_finnhub, _score_articles
+            from sentiment import get_fear_greed, _get_finnhub, score_article_batch
             from crypto_loop import CRYPTO_SYMBOLS
             import datetime as _dt
 
@@ -854,10 +855,20 @@ class DataFetcher(QObject):
                     except Exception:
                         pass
 
-            # Score each article
+            # Deduplicate by headline before scoring
+            seen_headlines = set()
+            unique = []
             for a in articles:
-                score_data = _score_articles([a])
-                a['_sentiment'] = score_data['sentiment_score']
+                h = a.get('headline', '').strip().lower()
+                if h and h not in seen_headlines:
+                    seen_headlines.add(h)
+                    unique.append(a)
+            articles = unique
+
+            # Batch score all articles (LLM when available, keyword fallback)
+            scores = score_article_batch(articles)
+            for a, score in zip(articles, scores):
+                a['_sentiment'] = score
 
             # Sort by datetime descending
             articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
@@ -865,11 +876,11 @@ class DataFetcher(QObject):
             # Merge with cache: keep new articles + older cached ones not in this fetch
             cache = _load_news_cache()
             if cache and cache.get('articles'):
-                # Deduplicate by (headline, datetime) — new articles take priority
-                seen = {(a.get('headline', ''), a.get('datetime', 0)) for a in articles}
+                # Deduplicate by normalized headline — new articles take priority
+                seen = {a.get('headline', '').strip().lower() for a in articles}
                 for cached_a in cache['articles']:
-                    key = (cached_a.get('headline', ''), cached_a.get('datetime', 0))
-                    if key not in seen:
+                    key = cached_a.get('headline', '').strip().lower()
+                    if key and key not in seen:
                         articles.append(cached_a)
                         seen.add(key)
                 articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
@@ -1618,6 +1629,13 @@ class TradingDashboard(QMainWindow):
             self._settings_provider.setStyleSheet(input_style)
             for toggle in self._settings_key_toggles.values():
                 toggle.setStyleSheet(btn_style)
+        if hasattr(self, '_settings_indicator_preset'):
+            self._settings_indicator_preset.setStyleSheet(input_style)
+            self._indicator_feature_list.setStyleSheet(
+                f"QPlainTextEdit {{ background-color: {t['bg_table'].name()};"
+                f" color: {t['white'].name()}; border: 1px solid {t['bg_border'].name()};"
+                f" border-radius: 4px; padding: 4px; }}"
+            )
 
         # Clock
         self._clock_label_right.setStyleSheet(
@@ -2185,10 +2203,10 @@ class TradingDashboard(QMainWindow):
         model_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         layout.addWidget(model_label)
 
-        self._model_table = QTableWidget(0, 8)
+        self._model_table = QTableWidget(0, 9)
         self._model_table.setHorizontalHeaderLabels(
             ["Model", "Status", "Last Trained", "Age",
-             "Hidden Dim", "Layers", "Seq Len", "Threshold"]
+             "Hidden Dim", "Layers", "Seq Len", "Threshold", "Preset"]
         )
         self._model_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._model_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -2284,150 +2302,216 @@ class TradingDashboard(QMainWindow):
         from llm_config import load_llm_config, save_llm_config
 
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Scroll area so the page resizes cleanly
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll_widget = QWidget()
+        layout = QVBoxLayout(scroll_widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
         config = load_llm_config()
 
         # --- LLM Configuration group ---
         llm_group = QGroupBox("LLM Configuration")
-        llm_layout = QGridLayout(llm_group)
-        row = 0
+        llm_layout = QVBoxLayout(llm_group)
+        llm_layout.setSpacing(6)
 
-        # Enable/disable
-        self._settings_llm_enabled = QCheckBox("LLM Analysis Enabled")
+        # Enable + Provider row
+        top_row = QHBoxLayout()
+        self._settings_llm_enabled = QCheckBox("LLM Enabled")
         self._settings_llm_enabled.setChecked(config.get("enabled", True))
         self._settings_llm_enabled.toggled.connect(self._on_settings_changed)
-        llm_layout.addWidget(self._settings_llm_enabled, row, 0, 1, 2)
-        row += 1
-
-        # Provider selector
-        llm_layout.addWidget(QLabel("Provider:"), row, 0)
+        top_row.addWidget(self._settings_llm_enabled)
+        top_row.addSpacing(16)
+        top_row.addWidget(QLabel("Provider:"))
         self._settings_provider = QComboBox()
         self._settings_provider.addItems(["gemini", "claude", "openai"])
         self._settings_provider.setCurrentText(config.get("provider", "gemini"))
+        self._settings_provider.setMaximumWidth(120)
         self._settings_provider.currentTextChanged.connect(self._on_settings_changed)
-        llm_layout.addWidget(self._settings_provider, row, 1)
-        row += 1
+        top_row.addWidget(self._settings_provider)
+        top_row.addStretch()
+        self._settings_journal = QCheckBox("Trade Journal")
+        self._settings_journal.setChecked(config.get("journal_enabled", True))
+        self._settings_journal.toggled.connect(self._on_settings_changed)
+        top_row.addWidget(self._settings_journal)
+        llm_layout.addLayout(top_row)
 
-        # --- API Keys group ---
+        # API Keys — compact grid with constrained widths
         keys_group = QGroupBox("API Keys")
         keys_layout = QGridLayout(keys_group)
+        keys_layout.setColumnStretch(1, 1)
+        keys_layout.setColumnMinimumWidth(0, 55)
 
         self._settings_api_keys = {}
         self._settings_key_toggles = {}
         for i, (provider, label) in enumerate([
-            ("gemini", "Gemini"),
-            ("claude", "Claude"),
-            ("openai", "OpenAI"),
+            ("gemini", "Gemini"), ("claude", "Claude"),
+            ("openai", "OpenAI"), ("fmp", "FMP"),
         ]):
             keys_layout.addWidget(QLabel(f"{label}:"), i, 0)
             key_edit = QLineEdit()
             key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-            key_edit.setPlaceholderText(f"Enter {label} API key")
-            key_val = config.get("models", {}).get(provider, {}).get("api_key", "")
-            key_edit.setText(key_val)
+            key_edit.setMaximumWidth(320)
+            if provider == "fmp":
+                key_edit.setPlaceholderText("Financial Modeling Prep key")
+                key_edit.setText(config.get("fmp_api_key", ""))
+            else:
+                key_edit.setPlaceholderText(f"{label} API key")
+                key_edit.setText(config.get("models", {}).get(provider, {}).get("api_key", ""))
             key_edit.editingFinished.connect(self._on_settings_changed)
             keys_layout.addWidget(key_edit, i, 1)
-            self._settings_api_keys[provider] = key_edit
 
             toggle_btn = QPushButton("Show")
-            toggle_btn.setFixedWidth(50)
+            toggle_btn.setFixedWidth(54)
             toggle_btn.setCheckable(True)
             toggle_btn.toggled.connect(lambda checked, le=key_edit, btn=toggle_btn: (
                 le.setEchoMode(QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password),
                 btn.setText("Hide" if checked else "Show"),
             ))
             keys_layout.addWidget(toggle_btn, i, 2)
-            self._settings_key_toggles[provider] = toggle_btn
 
-        # FMP key
-        keys_layout.addWidget(QLabel("FMP:"), 3, 0)
-        self._settings_fmp_key = QLineEdit()
-        self._settings_fmp_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._settings_fmp_key.setPlaceholderText("Financial Modeling Prep API key")
-        self._settings_fmp_key.setText(config.get("fmp_api_key", ""))
-        self._settings_fmp_key.editingFinished.connect(self._on_settings_changed)
-        keys_layout.addWidget(self._settings_fmp_key, 3, 1)
+            if provider == "fmp":
+                self._settings_fmp_key = key_edit
+            else:
+                self._settings_api_keys[provider] = key_edit
+                self._settings_key_toggles[provider] = toggle_btn
 
-        fmp_toggle = QPushButton("Show")
-        fmp_toggle.setFixedWidth(50)
-        fmp_toggle.setCheckable(True)
-        fmp_toggle.toggled.connect(lambda checked, le=self._settings_fmp_key, btn=fmp_toggle: (
-            le.setEchoMode(QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password),
-            btn.setText("Hide" if checked else "Show"),
-        ))
-        keys_layout.addWidget(fmp_toggle, 3, 2)
+        llm_layout.addWidget(keys_group)
 
-        llm_layout.addWidget(keys_group, row, 0, 1, 2)
-        row += 1
-
-        # --- Model Selection group ---
+        # Model Selection — non-editable dropdowns
         model_group = QGroupBox("Model Selection")
         model_layout = QGridLayout(model_group)
+        model_layout.setColumnStretch(1, 1)
+        model_layout.setColumnMinimumWidth(0, 55)
 
         self._settings_models = {}
         model_options = {
-            "gemini": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite",
-                        "gemini-3-flash-preview", "gemini-3-pro-preview"],
-            "claude": ["claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001", "claude-opus-4-6"],
-            "openai": ["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini"],
+            "gemini": [
+                ("gemini-2.5-flash-lite", "Flash Lite (free, fastest)"),
+                ("gemini-2.5-flash", "Flash (free, balanced)"),
+                ("gemini-2.5-pro", "Pro (free, smartest, low RPM)"),
+            ],
+            "claude": [
+                ("claude-haiku-4-5-20251001", "Haiku 4.5 (cheapest)"),
+                ("claude-sonnet-4-5-20250929", "Sonnet 4.5"),
+                ("claude-opus-4-6", "Opus 4.6 (most capable)"),
+            ],
+            "openai": [
+                ("gpt-4.1-nano", "GPT-4.1 Nano (cheapest)"),
+                ("gpt-4.1-mini", "GPT-4.1 Mini"),
+                ("gpt-4.1", "GPT-4.1"),
+                ("o4-mini", "o4-mini (reasoning)"),
+            ],
         }
         for i, (provider, label) in enumerate([
-            ("gemini", "Gemini Model"),
-            ("claude", "Claude Model"),
-            ("openai", "OpenAI Model"),
+            ("gemini", "Gemini"), ("claude", "Claude"), ("openai", "OpenAI"),
         ]):
             model_layout.addWidget(QLabel(f"{label}:"), i, 0)
             combo = QComboBox()
-            combo.setEditable(True)
-            combo.addItems(model_options[provider])
+            combo.setMaximumWidth(320)
+            for model_id, display_name in model_options[provider]:
+                combo.addItem(display_name, model_id)
+            # Set current selection from config
             current_model = config.get("models", {}).get(provider, {}).get("model", "")
             if current_model:
-                idx = combo.findText(current_model)
+                idx = combo.findData(current_model)
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
-                else:
-                    combo.setCurrentText(current_model)
-            combo.currentTextChanged.connect(self._on_settings_changed)
+            combo.currentIndexChanged.connect(self._on_settings_changed)
             model_layout.addWidget(combo, i, 1)
             self._settings_models[provider] = combo
 
-        llm_layout.addWidget(model_group, row, 0, 1, 2)
-        row += 1
+        llm_layout.addWidget(model_group)
 
-        # Journal enabled
-        self._settings_journal = QCheckBox("Trade Journal Enabled")
-        self._settings_journal.setChecked(config.get("journal_enabled", True))
-        self._settings_journal.toggled.connect(self._on_settings_changed)
-        llm_layout.addWidget(self._settings_journal, row, 0, 1, 2)
-        row += 1
-
-        # Max latency
-        latency_layout = QHBoxLayout()
-        latency_layout.addWidget(QLabel("Max LLM Latency:"))
+        # Latency + Test row
+        bottom_row = QHBoxLayout()
+        bottom_row.addWidget(QLabel("Max Latency:"))
         self._settings_latency = QSpinBox()
         self._settings_latency.setRange(5, 60)
         self._settings_latency.setValue(config.get("max_llm_latency_sec", 15))
-        self._settings_latency.setSuffix(" seconds")
+        self._settings_latency.setSuffix("s")
+        self._settings_latency.setMaximumWidth(70)
         self._settings_latency.valueChanged.connect(self._on_settings_changed)
-        latency_layout.addWidget(self._settings_latency)
-        latency_layout.addStretch()
-        llm_layout.addLayout(latency_layout, row, 0, 1, 2)
-        row += 1
-
-        # Test connection button + status
-        test_layout = QHBoxLayout()
+        bottom_row.addWidget(self._settings_latency)
+        bottom_row.addSpacing(12)
         self._settings_test_btn = QPushButton("Test Connection")
         self._settings_test_btn.clicked.connect(self._on_test_llm)
-        test_layout.addWidget(self._settings_test_btn)
+        bottom_row.addWidget(self._settings_test_btn)
         self._settings_test_status = QLabel("")
-        test_layout.addWidget(self._settings_test_status)
-        test_layout.addStretch()
-        llm_layout.addLayout(test_layout, row, 0, 1, 2)
+        bottom_row.addWidget(self._settings_test_status)
+        bottom_row.addStretch()
+        llm_layout.addLayout(bottom_row)
 
         layout.addWidget(llm_group)
+
+        # --- Indicator Presets group ---
+        from indicator_config import load_indicator_config, save_indicator_config, get_all_preset_info, PRESETS, CRYPTO_ONLY_COLS, STOCK_ONLY_COLS
+
+        ind_group = QGroupBox("Indicator Presets")
+        ind_layout = QVBoxLayout(ind_group)
+        ind_layout.setSpacing(4)
+
+        preset_info = get_all_preset_info()
+        ind_config = load_indicator_config()
+        current_preset = ind_config.get("preset", "standard")
+
+        # Preset selector row
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Preset:"))
+        self._settings_indicator_preset = QComboBox()
+        self._settings_indicator_preset.setMaximumWidth(280)
+        preset_labels = {
+            "minimal": f"Minimal (~{preset_info['minimal']['count']} features)",
+            "standard": f"Standard (~{preset_info['standard']['count']} features)",
+            "full": "Full (all features)",
+        }
+        for name in ["minimal", "standard", "full"]:
+            self._settings_indicator_preset.addItem(preset_labels[name], name)
+        idx = self._settings_indicator_preset.findData(current_preset)
+        if idx >= 0:
+            self._settings_indicator_preset.setCurrentIndex(idx)
+        preset_row.addWidget(self._settings_indicator_preset)
+        preset_row.addStretch()
+        ind_layout.addLayout(preset_row)
+
+        # Description
+        self._indicator_desc_label = QLabel()
+        self._indicator_desc_label.setWordWrap(True)
+        self._indicator_desc_label.setStyleSheet("font-size: 11px;")
+        ind_layout.addWidget(self._indicator_desc_label)
+
+        # Feature list (compact)
+        self._indicator_feature_list = QPlainTextEdit()
+        self._indicator_feature_list.setReadOnly(True)
+        self._indicator_feature_list.setMaximumHeight(72)
+        self._indicator_feature_list.setFont(QFont("monospace", 8))
+        ind_layout.addWidget(self._indicator_feature_list)
+
+        # Cross-asset + warning on one line
+        self._indicator_cross_note = QLabel()
+        self._indicator_cross_note.setStyleSheet("color: gray; font-size: 10px;")
+        self._indicator_cross_note.setWordWrap(True)
+        ind_layout.addWidget(self._indicator_cross_note)
+
+        warn_label = QLabel("Changing presets requires model retraining.")
+        warn_label.setStyleSheet("color: orange; font-weight: bold; font-size: 10px;")
+        ind_layout.addWidget(warn_label)
+
+        self._update_indicator_feature_display()
+        self._settings_indicator_preset.currentIndexChanged.connect(
+            self._on_indicator_preset_changed)
+
+        layout.addWidget(ind_group)
         layout.addStretch()
 
+        scroll.setWidget(scroll_widget)
+        tab_layout.addWidget(scroll)
         self.tabs.addTab(tab, "Settings")
 
     def _on_settings_changed(self, *_args):
@@ -2444,7 +2528,9 @@ class TradingDashboard(QMainWindow):
         for provider, key_edit in self._settings_api_keys.items():
             config.setdefault("models", {}).setdefault(provider, {})["api_key"] = key_edit.text().strip()
         for provider, combo in self._settings_models.items():
-            config.setdefault("models", {}).setdefault(provider, {})["model"] = combo.currentText().strip()
+            model_id = combo.currentData()
+            if model_id:
+                config.setdefault("models", {}).setdefault(provider, {})["model"] = model_id
 
         save_llm_config(config)
 
@@ -2475,6 +2561,35 @@ class TradingDashboard(QMainWindow):
         except Exception as e:
             self._settings_test_status.setText(f"Error: {e}")
             self._settings_test_status.setStyleSheet(f"color: {T['red'].name()};")
+
+    def _on_indicator_preset_changed(self, _index):
+        """Save new preset and update feature display."""
+        from indicator_config import load_indicator_config, save_indicator_config
+        preset_name = self._settings_indicator_preset.currentData()
+        config = load_indicator_config()
+        config["preset"] = preset_name
+        save_indicator_config(config)
+        self._update_indicator_feature_display()
+
+    def _update_indicator_feature_display(self):
+        """Update description, feature list, and cross-asset note for selected preset."""
+        from indicator_config import get_all_preset_info, CRYPTO_ONLY_COLS, STOCK_ONLY_COLS
+        preset_name = self._settings_indicator_preset.currentData()
+        info = get_all_preset_info()
+        p = info.get(preset_name, info["standard"])
+
+        self._indicator_desc_label.setText(p["description"])
+
+        if p["features"] is not None:
+            self._indicator_feature_list.setPlainText(
+                ", ".join(p["features"]))
+        else:
+            self._indicator_feature_list.setPlainText(
+                "All available columns (varies by training data)")
+
+        crypto_note = "+ Crypto adds: " + ", ".join(CRYPTO_ONLY_COLS)
+        stock_note = "+ Stocks add: " + ", ".join(STOCK_ONLY_COLS)
+        self._indicator_cross_note.setText(f"{crypto_note}\n{stock_note}")
 
     # ---- Signal Handlers -------------------------------------------------
     @Slot(dict)
@@ -2967,10 +3082,11 @@ class TradingDashboard(QMainWindow):
                         str(cfg.get("hidden_dim", "?")),
                         str(cfg.get("num_layers", "?")),
                         str(cfg.get("seq_len", "?")),
-                        str(cfg.get("bull_threshold", "?"))]
+                        str(cfg.get("bull_threshold", "?")),
+                        str(cfg.get("indicator_preset", "N/A"))]
             else:
                 vals = [name, status, "Not found", age_str,
-                        "\u2014", "\u2014", "\u2014", "\u2014"]
+                        "\u2014", "\u2014", "\u2014", "\u2014", "\u2014"]
             for col, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setTextAlignment(Qt.AlignCenter)

@@ -38,6 +38,9 @@ pipeline_status.json
 # LLM config (contains API keys)
 llm_config.json
 
+# Indicator preset config
+indicator_config.json
+
 # Trade journal logs
 journals/
 
