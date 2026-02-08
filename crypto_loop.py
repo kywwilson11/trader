@@ -1,9 +1,19 @@
-import alpaca_trade_api as tradeapi
+"""24/7 crypto trading loop — 10 symbols, dual bear/bull models, sentiment-gated.
+
+Runs continuously (crypto markets never close):
+  1. Fetch predictions for all symbols in parallel (ThreadPoolExecutor)
+  2. Check stop-loss / trailing stop / take-profit on open positions
+  3. Sell positions where the bear model signals weakness
+  4. Buy symbols where the bull model signals strength (sentiment-gated)
+  5. Sleep and repeat
+
+Uses ATR-adaptive stops with fixed-percentage fallbacks.
+"""
+
 import time
 import datetime
-import os
+import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
 
 from order_utils import (
     get_crypto_quote, place_limit_order, manage_order_lifecycle,
@@ -11,16 +21,13 @@ from order_utils import (
     cancel_all_open_orders, reconstruct_positions,
     check_circuit_breaker, emergency_flatten,
 )
-from predict_now import load_dual_models, get_live_prediction, get_live_atr, _fetch_bars_alpaca
-from hw_monitor import get_gpu_temp, is_gpu_available
+from predict_now import load_dual_models, get_live_prediction
+from market_data import fetch_bars_alpaca, get_live_atr
+from trading_utils import get_api, get_model_mtime, choose_inference_device, cooldown_ok, predict_symbol
+from hw_monitor import get_gpu_temp
 from sentiment import sentiment_gate, get_fear_greed
 
-load_dotenv()
-
 # --- CONFIGURATION ---
-API_KEY = os.getenv('ALPACA_API_KEY')
-SECRET_KEY = os.getenv('ALPACA_API_SECRET')
-BASE_URL = os.getenv('ALPACA_BASE_URL')
 
 # Top 10 cryptos by market cap (USD pairs on Alpaca)
 CRYPTO_SYMBOLS = [
@@ -59,24 +66,7 @@ CRYPTO_TRAIL_PCT = 0.03            # 3% trailing stop from high water mark
 CIRCUIT_BREAKER_PCT = 0.05         # 5% daily equity drawdown triggers flatten
 
 
-def get_api():
-    return tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version='v2')
-
-
-def _get_model_mtime(path):
-    """Get modification time of a model file, or 0 if it doesn't exist."""
-    try:
-        return os.path.getmtime(path)
-    except OSError:
-        return 0
-
-
-def _choose_inference_device():
-    """Choose inference device: CPU if GPU is busy/unavailable, else default."""
-    if not is_gpu_available():
-        return 'cpu'
-    return None  # None = use default device
-
+# --- ORDER HELPERS ---
 
 def place_smart_order(api, symbol, side, notional):
     """Place a limit order with lifecycle management and market fallback."""
@@ -96,7 +86,6 @@ def place_smart_order(api, symbol, side, notional):
 
     # Market fallback may have been submitted — check if it's a new order
     if result and result.id != order.id:
-        # Wait briefly for market order to fill
         time.sleep(2)
         try:
             final = api.get_order(result.id)
@@ -107,39 +96,15 @@ def place_smart_order(api, symbol, side, notional):
     return False
 
 
-def cooldown_ok(last_trade_time, symbol):
-    """Return True if the symbol is not in cooldown."""
-    if symbol not in last_trade_time:
-        return True
-    elapsed = (datetime.datetime.now() - last_trade_time[symbol]).total_seconds()
-    return elapsed >= COOLDOWN_MINUTES * 60
-
-
-def _predict_symbol(api, symbol, bear_model, bear_config, bull_model, bull_config,
-                    scaler_X, feature_cols, inference_device, btc_close=None):
-    """Run both bear and bull predictions for a single symbol.
-    Returns (symbol, bear_pred, bull_pred).
-    """
-    bear_pred = get_live_prediction(
-        symbol, bear_model, scaler_X, bear_config, feature_cols,
-        api=api, inference_device=inference_device,
-        btc_close=btc_close,
-    )
-    bull_pred = get_live_prediction(
-        symbol, bull_model, scaler_X, bull_config, feature_cols,
-        api=api, inference_device=inference_device,
-        btc_close=btc_close,
-    )
-    return symbol, bear_pred, bull_pred
-
+# --- MAIN LOOP ---
 
 def run_crypto_bot():
     api = get_api()
 
-    # Load prediction models (dual bear/bull with fallback to default)
+    # ── Load prediction models ──
     print("Loading prediction models...")
     try:
-        inference_device = _choose_inference_device()
+        inference_device = choose_inference_device()
         bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
             load_dual_models(inference_device)
         bear_threshold = bear_config.get('bull_threshold', 0.15)
@@ -155,19 +120,18 @@ def run_crypto_bot():
         is_dual = False
 
     # Track model file mtimes for hot-reload
-    bear_mtime = _get_model_mtime('bear_model.pth')
-    bull_mtime = _get_model_mtime('bull_model.pth')
-    default_mtime = _get_model_mtime('stock_predictor.pth')
+    bear_mtime = get_model_mtime('bear_model.pth')
+    bull_mtime = get_model_mtime('bull_model.pth')
+    default_mtime = get_model_mtime('stock_predictor.pth')
 
-    # Cancel any stale orders from previous runs
+    # ── Cancel stale orders from previous runs ──
     cancel_all_open_orders(api)
 
-    # Reconstruct positions from API (survive restarts)
+    # ── Reconstruct positions from API (survive restarts) ──
     positions = reconstruct_positions(api, CRYPTO_SYMBOLS, asset_type='crypto')
     if positions:
         print(f"Existing positions found: {', '.join(positions)}")
         for sym, info in positions.items():
-            # Backfill ATR for reconstructed positions
             entry_atr = get_live_atr(api, sym, asset_type='crypto')
             info['entry_atr'] = entry_atr
             tp_price = None
@@ -181,7 +145,6 @@ def run_crypto_bot():
             tp_str = f"tp=${tp_price:.4f}" if tp_price else "tp=N/A"
             print(f"  {sym}: qty={info['qty']}, entry=${info['entry_price']:.4f}, hwm=${info['high_water_mark']:.4f}, {atr_str}, {tp_str}")
 
-    # Per-symbol cooldown tracking: symbol -> datetime of last trade
     last_trade_time = {}
 
     print("\n--- JETSON CRYPTO BOT STARTED (CONTINUOUS MODE) ---")
@@ -196,21 +159,21 @@ def run_crypto_bot():
         cycle += 1
         print(f"\n--- CYCLE {cycle}: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
-        # --- Sentiment check (once per cycle, cached 5 min) ---
+        # ── Sentiment check (once per cycle, cached 5 min) ──
         fng = get_fear_greed()
         if fng is not None and cycle % TEMP_LOG_EVERY_N_CYCLES == 1:
             print(f"[SENTIMENT] Fear & Greed: {fng['value']} ({fng['label']})")
 
-        # --- Hot-reload check ---
-        new_bear_mt = _get_model_mtime('bear_model.pth')
-        new_bull_mt = _get_model_mtime('bull_model.pth')
-        new_default_mt = _get_model_mtime('stock_predictor.pth')
+        # ── Hot-reload check ──
+        new_bear_mt = get_model_mtime('bear_model.pth')
+        new_bull_mt = get_model_mtime('bull_model.pth')
+        new_default_mt = get_model_mtime('stock_predictor.pth')
 
         if (new_bear_mt != bear_mtime or new_bull_mt != bull_mtime
                 or new_default_mt != default_mtime):
             print("[HOT-RELOAD] Model files changed, reloading...")
             try:
-                inference_device = _choose_inference_device()
+                inference_device = choose_inference_device()
                 bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
                     load_dual_models(inference_device)
                 bear_threshold = bear_config.get('bull_threshold', 0.15)
@@ -223,7 +186,7 @@ def run_crypto_bot():
             except Exception as e:
                 print(f"[HOT-RELOAD] Failed: {e}, keeping current models")
 
-        # --- Circuit breaker check ---
+        # ── Circuit breaker check ──
         tripped, dd = check_circuit_breaker(api, max_drawdown_pct=CIRCUIT_BREAKER_PCT)
         if tripped:
             print(f"[CIRCUIT BREAKER] Daily drawdown {dd:.1%} >= {CIRCUIT_BREAKER_PCT:.0%}, flattening all positions!")
@@ -233,13 +196,13 @@ def run_crypto_bot():
             time.sleep(3600)
             continue
 
-        # --- Log GPU temp periodically ---
+        # ── Log GPU temp periodically ──
         if cycle % TEMP_LOG_EVERY_N_CYCLES == 0:
             temp = get_gpu_temp()
             if temp is not None:
                 print(f"[HW] GPU temp: {temp:.0f}C")
 
-        # --- Software stop-loss / trailing stop / take-profit checks ---
+        # ── Software stop-loss / trailing stop / take-profit checks ──
         for symbol in list(positions):
             quote = get_crypto_quote(api, symbol)
             if quote is None:
@@ -262,13 +225,10 @@ def run_crypto_bot():
                 trail_dist = CRYPTO_TRAIL_PCT
 
             stop_reason = None
-            # Hard stop-loss
             if current_price <= entry_price * (1 - stop_dist):
                 stop_reason = 'hard_stop'
-            # Take-profit
             elif info.get('take_profit_price') and current_price >= info['take_profit_price']:
                 stop_reason = 'take_profit'
-            # Trailing stop (only if profit target reached)
             elif (hwm >= entry_price * (1 + ATR_TRAIL_ACTIVATE_PCT)
                   and current_price <= hwm * (1 - trail_dist)):
                 stop_reason = 'trailing'
@@ -287,20 +247,20 @@ def run_crypto_bot():
                 except Exception as e:
                     print(f"  [STOP] {symbol}: Sell error: {e}")
 
-        # --- Fetch BTC bars once per cycle for cross-asset features ---
+        # ── Fetch BTC bars once per cycle for cross-asset features ──
         btc_close = None
         try:
-            btc_df = _fetch_bars_alpaca(api, 'BTC/USD')
+            btc_df = fetch_bars_alpaca(api, 'BTC/USD')
             if btc_df is not None:
                 btc_close = btc_df['Close']
         except Exception as e:
             print(f"  [BTC] Error fetching benchmark: {e}")
 
-        # 1. Get predictions for all symbols in parallel
+        # ── Get predictions for all symbols in parallel ──
         bear_preds = {}
         bull_preds = {}
         if bear_model is not None:
-            inference_device = _choose_inference_device()
+            inference_device = choose_inference_device()
             if inference_device == 'cpu':
                 print("[HW] GPU unavailable, using CPU for inference")
 
@@ -308,9 +268,10 @@ def run_crypto_bot():
                 futures = {}
                 for symbol in CRYPTO_SYMBOLS:
                     f = executor.submit(
-                        _predict_symbol, api, symbol,
+                        predict_symbol, api, symbol,
                         bear_model, bear_config, bull_model, bull_config,
-                        scaler_X, feature_cols, inference_device, btc_close,
+                        scaler_X, feature_cols, inference_device,
+                        asset_type='crypto', benchmark_close=btc_close,
                     )
                     futures[f] = symbol
 
@@ -325,8 +286,10 @@ def run_crypto_bot():
                     except Exception as e:
                         print(f"  {symbol}: Prediction error: {e}")
 
-        # 2. SELL: bearish positions with cooldown expired
-        #    Use bear model's prediction against bear threshold
+            # Free temporary tensors from prediction batch
+            gc.collect()
+
+        # ── SELL: bearish positions with cooldown expired ──
         for symbol in list(positions):
             pos = verify_position(api, symbol)
             if pos is None:
@@ -339,8 +302,7 @@ def run_crypto_bot():
                 print(f"  {symbol}: Bear pred {bear_pred:+.4f}% > -{bear_threshold:.2f}, HOLDING")
                 continue
 
-            # Bearish — check cooldown
-            if not cooldown_ok(last_trade_time, symbol):
+            if not cooldown_ok(last_trade_time, symbol, COOLDOWN_MINUTES):
                 remaining = COOLDOWN_MINUTES * 60 - (datetime.datetime.now() - last_trade_time[symbol]).total_seconds()
                 print(f"  {symbol}: Bearish but in cooldown ({remaining/60:.1f} min left), skipping sell")
                 continue
@@ -378,13 +340,12 @@ def run_crypto_bot():
                     print(f"  {symbol}: Market sell error: {e}")
             time.sleep(1)
 
-        # 3. BUY: bullish symbols we don't hold, with cooldown expired
-        #    Use bull model's prediction against bull threshold
+        # ── BUY: bullish symbols we don't hold, with cooldown expired ──
         for symbol in CRYPTO_SYMBOLS:
             if symbol in positions:
                 continue
 
-            if not cooldown_ok(last_trade_time, symbol):
+            if not cooldown_ok(last_trade_time, symbol, COOLDOWN_MINUTES):
                 remaining = COOLDOWN_MINUTES * 60 - (datetime.datetime.now() - last_trade_time[symbol]).total_seconds()
                 print(f"  {symbol}: In cooldown ({remaining/60:.1f} min left), skipping buy")
                 continue
@@ -401,16 +362,14 @@ def run_crypto_bot():
                     print(f"  {symbol}: Bull pred {bull_pred:+.4f}% < {bull_threshold:.2f}, skipping")
                     continue
 
-            # Confidence-based sizing: scale notional by prediction strength
-            # bull_pred / bull_threshold gives a ratio >= 1.0 (since we passed the threshold check)
-            # Clamp to [0.5, 2.0] range so we don't over/under-bet
+            # Confidence-based sizing
             if bull_pred is not None and bull_threshold > 0:
                 confidence = min(2.0, max(0.5, bull_pred / bull_threshold))
             else:
                 confidence = 1.0
             sized_notional = int(NOTIONAL_PER_SYMBOL * confidence)
 
-            # Sentiment gate: further adjust notional or block trade
+            # Sentiment gate
             gate, gate_reasons = sentiment_gate(symbol, 'crypto')
             if gate <= 0:
                 print(f"  {symbol}: BLOCKED by sentiment ({', '.join(gate_reasons)})")
@@ -424,7 +383,6 @@ def run_crypto_bot():
             print(f"  {symbol}: Sizing ${adjusted_notional} [{sizing_info}]")
 
             if place_smart_order(api, symbol, 'buy', adjusted_notional):
-                # Get fill info for position tracking
                 fill_price = None
                 quote = get_crypto_quote(api, symbol)
                 if quote:
@@ -433,7 +391,6 @@ def run_crypto_bot():
                 if pos:
                     fill_price = float(pos.avg_entry_price)
 
-                    # Fetch ATR for adaptive stops and take-profit
                     entry_atr = get_live_atr(api, symbol, asset_type='crypto')
                     tp_price = None
                     if entry_atr is not None and fill_price > 0:
@@ -461,7 +418,7 @@ def run_crypto_bot():
                 last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(1)
 
-        # Thermal throttling
+        # ── Thermal throttling ──
         sleep_interval = LOOP_INTERVAL
         temp = get_gpu_temp()
         if temp is not None and temp > THERMAL_THROTTLE_TEMP:

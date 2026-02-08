@@ -1,4 +1,9 @@
-"""Shared order utilities for limit orders, lifecycle management, and position verification."""
+"""Shared order utilities for limit orders, lifecycle management, and position verification.
+
+Covers the full order lifecycle: quote fetching, limit/market order placement,
+fill polling with timeout + market fallback, position verification, circuit
+breaker, and emergency flatten.
+"""
 
 import time
 import math
@@ -7,13 +12,24 @@ import datetime
 
 # --- SPREAD / QUOTE HELPERS ---
 
-def get_crypto_quote(api, symbol):
-    """Get real-time bid/ask for a crypto symbol via Alpaca.
-    Returns dict with bid, ask, spread, midpoint, spread_pct or None on error.
+def get_quote(api, symbol, asset_type='crypto'):
+    """Get real-time bid/ask quote for any asset via Alpaca.
+
+    Args:
+        api: Alpaca REST API object
+        symbol: Alpaca symbol (e.g. 'BTC/USD' for crypto, 'TSLA' for stock)
+        asset_type: 'crypto' or 'stock' — determines which Alpaca endpoint to call
+
+    Returns:
+        dict with bid, ask, spread, midpoint, spread_pct — or None on error.
     """
     try:
-        quotes = api.get_latest_crypto_quotes([symbol])
-        q = quotes[symbol]
+        if asset_type == 'crypto':
+            quotes = api.get_latest_crypto_quotes([symbol])
+            q = quotes[symbol]
+        else:
+            q = api.get_latest_quote(symbol)
+
         bid = float(q.bp)
         ask = float(q.ap)
         spread = ask - bid
@@ -29,29 +45,16 @@ def get_crypto_quote(api, symbol):
     except Exception as e:
         print(f"  [QUOTE] Error fetching quote for {symbol}: {e}")
         return None
+
+
+def get_crypto_quote(api, symbol):
+    """Get real-time bid/ask for a crypto symbol. Wrapper around get_quote()."""
+    return get_quote(api, symbol, asset_type='crypto')
 
 
 def get_stock_quote(api, symbol):
-    """Get real-time bid/ask for a stock symbol via Alpaca.
-    Returns dict with bid, ask, spread, midpoint, spread_pct or None on error.
-    """
-    try:
-        q = api.get_latest_quote(symbol)
-        bid = float(q.bp)
-        ask = float(q.ap)
-        spread = ask - bid
-        midpoint = (bid + ask) / 2.0
-        spread_pct = (spread / midpoint) * 100.0 if midpoint > 0 else 0.0
-        return {
-            'bid': bid,
-            'ask': ask,
-            'spread': spread,
-            'midpoint': midpoint,
-            'spread_pct': spread_pct,
-        }
-    except Exception as e:
-        print(f"  [QUOTE] Error fetching quote for {symbol}: {e}")
-        return None
+    """Get real-time bid/ask for a stock symbol. Wrapper around get_quote()."""
+    return get_quote(api, symbol, asset_type='stock')
 
 
 def compute_limit_price(side, quote_info, offset_bps=5):

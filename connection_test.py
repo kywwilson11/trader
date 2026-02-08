@@ -1,5 +1,12 @@
+"""Alpaca API connection test — verifies credentials and reports account status.
+
+Run standalone to check:
+  - API key / secret are valid
+  - Account equity and PDT status
+  - Whether the account is in unlimited (>$25k) or conservative mode
+"""
+
 import alpaca_trade_api as tradeapi
-import time
 import os
 from dotenv import load_dotenv
 

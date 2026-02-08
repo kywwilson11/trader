@@ -1,20 +1,28 @@
+"""ML prediction engine — model loading, dual bear/bull inference, live predictions.
+
+Loads CryptoLSTM models (bear + bull) from disk, optionally JIT-traces them
+for faster inference, and provides get_live_prediction() which fetches recent
+bars, computes features, and returns a predicted-return score.
+
+Bar-fetching and ATR logic live in market_data.py.
+"""
+
 # NOTE: yfinance must be imported BEFORE torch to avoid CUDA's bundled
 # SQLite library overriding the system one (breaks yfinance's cache).
-import yfinance as yf
-import pandas as pd
 import joblib
-import numpy as np
 import os
 import torch
-import torch.nn as nn
 from model import CryptoLSTM
-from indicators import compute_features, compute_stock_features, compute_atr
+from indicators import compute_features, compute_stock_features
+from market_data import (
+    fetch_bars_alpaca, fetch_bars_yfinance,
+    fetch_stock_bars_alpaca,
+)
 
 # --- CONFIGURATION ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 MODEL_PATH = 'stock_predictor.pth'
 SCALER_X_PATH = 'scaler_X.pkl'
-SCALER_Y_PATH = 'scaler_y.pkl'
 FEATURE_COLS_PATH = 'feature_cols.pkl'
 MODEL_CONFIG_PATH = 'model_config.pkl'
 
@@ -26,7 +34,7 @@ BULL_CONFIG_PATH = 'bull_config.pkl'
 
 
 def _prefixed_paths(prefix):
-    """Return (bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols) paths for a prefix."""
+    """Return dict of file paths for a given model prefix (e.g. 'stock')."""
     p = f'{prefix}_' if prefix else ''
     return {
         'bear_model': f'{p}bear_model.pth',
@@ -40,7 +48,8 @@ def _prefixed_paths(prefix):
     }
 
 
-# --- LOAD MODEL AND SCALERS ONCE ---
+# --- MODEL LOADING ---
+
 def load_model(model_type='default', inference_device=None, prefix=''):
     """Load a model by type: 'default', 'bear', or 'bull'.
 
@@ -91,7 +100,7 @@ def load_model(model_type='default', inference_device=None, prefix=''):
 
 
 def load_dual_models(inference_device=None, prefix=''):
-    """Load both bear and bull models. Falls back to default model for both if dual models don't exist.
+    """Load both bear and bull models. Falls back to default model if dual models don't exist.
 
     Args:
         inference_device: Override device for inference
@@ -120,176 +129,57 @@ def load_dual_models(inference_device=None, prefix=''):
     return bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols
 
 
-def _fetch_bars_alpaca(api, symbol, limit=120):
-    """Fetch hourly bars from Alpaca's crypto data API.
-    symbol: Alpaca format e.g. 'BTC/USD'
-    Returns a DataFrame with OHLCV columns or None.
-    """
-    from datetime import datetime, timedelta, timezone
-    try:
-        start = datetime.now(timezone.utc) - timedelta(days=6)
-        bars = api.get_crypto_bars(symbol, '1Hour', start=start.isoformat(), limit=limit)
-        rows = []
-        for bar in bars[symbol]:
-            rows.append({
-                'Open': float(bar.o),
-                'High': float(bar.h),
-                'Low': float(bar.l),
-                'Close': float(bar.c),
-                'Volume': float(bar.v),
-            })
-        if not rows:
-            return None
-        df = pd.DataFrame(rows)
-        # Create a datetime index from bar timestamps
-        timestamps = [bar.t for bar in bars[symbol]]
-        df.index = pd.DatetimeIndex(timestamps)
-        df.index.name = 'Datetime'
-        return df
-    except Exception as e:
-        print(f"  [ALPACA BARS] Error fetching {symbol}: {e}")
-        return None
+# --- LIVE PREDICTION ---
 
-
-def _fetch_bars_yfinance(symbol):
-    """Fetch hourly bars from yfinance (standalone/fallback).
-    symbol: yfinance format e.g. 'BTC-USD'
-    """
-    df = yf.download(symbol, period="5d", interval="1h", progress=False)
-    if df.empty:
-        return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
-
-
-def _fetch_stock_bars_alpaca(api, symbol, limit=120):
-    """Fetch hourly bars from Alpaca's stock data API.
-    symbol: stock symbol e.g. 'TSLA'
-    Returns a DataFrame with OHLCV columns or None.
-    """
-    from datetime import datetime, timedelta, timezone
-    try:
-        start = datetime.now(timezone.utc) - timedelta(days=6)
-        bars = api.get_bars(symbol, '1Hour', start=start.isoformat(), limit=limit)
-        rows = []
-        timestamps = []
-        for bar in bars:
-            rows.append({
-                'Open': float(bar.o),
-                'High': float(bar.h),
-                'Low': float(bar.l),
-                'Close': float(bar.c),
-                'Volume': float(bar.v),
-            })
-            timestamps.append(bar.t)
-        if not rows:
-            return None
-        df = pd.DataFrame(rows)
-        df.index = pd.DatetimeIndex(timestamps)
-        df.index.name = 'Datetime'
-        return df
-    except Exception as e:
-        print(f"  [ALPACA BARS] Error fetching {symbol}: {e}")
-        return None
-
-
-def _fetch_spy_bars_alpaca(api, limit=120):
-    """Fetch SPY hourly bars for relative strength calculation."""
-    return _fetch_stock_bars_alpaca(api, 'SPY', limit)
-
-
-def get_live_atr(api, symbol, asset_type='crypto', length=14):
-    """Fetch recent bars and compute the latest ATR value.
-
-    Args:
-        api: Alpaca API object
-        symbol: Alpaca format symbol (e.g. 'BTC/USD' or 'TSLA')
-        asset_type: 'crypto' or 'stock'
-        length: ATR period (default 14)
-
-    Returns:
-        float ATR value, or None on error
-    """
-    try:
-        if asset_type == 'crypto':
-            df = _fetch_bars_alpaca(api, symbol, limit=max(60, length * 3))
-        else:
-            df = _fetch_stock_bars_alpaca(api, symbol, limit=max(60, length * 3))
-
-        if df is None or len(df) < length + 1:
-            return None
-
-        atr_series = compute_atr(df['High'], df['Low'], df['Close'], length)
-        atr_val = atr_series.dropna().iloc[-1]
-        return float(atr_val)
-    except Exception as e:
-        print(f"  [ATR] Error computing ATR for {symbol}: {e}")
-        return None
-
-
-def get_live_prediction(symbol, model, scaler_X, config_or_seq,
-                        seq_len_or_feature_cols=None, feature_cols=None,
+def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
                         api=None, inference_device=None,
                         asset_type='crypto', spy_close=None, btc_close=None):
-    """Get prediction for a symbol. Returns a score:
-    - Positive = bullish (higher = more confident)
-    - Negative = bearish (lower = more confident)
-    - Near zero = neutral
+    """Get prediction for a symbol. Returns a predicted-return score.
+
+    Score interpretation:
+        Positive = bullish (higher = more confident)
+        Negative = bearish (lower = more confident)
+        Near zero = neutral
 
     Args:
         symbol: Ticker symbol (Alpaca format 'BTC/USD' if api provided, else yfinance 'BTC-USD')
-        model: CryptoLSTM model
+        model: CryptoLSTM model (or JIT-traced variant)
         scaler_X: Feature scaler
-        config_or_seq: Config dict (new style) or legacy arg
-        seq_len_or_feature_cols: feature_cols when config_or_seq is dict
-        feature_cols: Explicit feature_cols override
+        config: Model config dict (must contain 'seq_len', 'bull_threshold')
+        feature_cols: List of feature column names
         api: Alpaca API object — if provided, uses Alpaca bars instead of yfinance
         inference_device: Override device for inference (e.g. 'cpu')
         asset_type: 'crypto' or 'stock' — determines feature computation and data source
         spy_close: SPY close Series for stock relative strength (optional)
         btc_close: BTC/USD close Series for crypto cross-asset features (optional)
+
+    Returns:
+        float predicted_return, or None on error
     """
     dev = torch.device(inference_device) if inference_device else device
-
-    # Handle different calling conventions
-    if isinstance(config_or_seq, dict):
-        config = config_or_seq
-        seq_len = config['seq_len']
-        if feature_cols is None:
-            feature_cols = seq_len_or_feature_cols
-    else:
-        try:
-            feature_cols_loaded = joblib.load(FEATURE_COLS_PATH)
-            config = joblib.load(MODEL_CONFIG_PATH)
-            seq_len = config['seq_len']
-            if feature_cols is None:
-                feature_cols = feature_cols_loaded
-        except FileNotFoundError:
-            print(f"  {symbol}: Cannot load config for prediction")
-            return None
+    seq_len = config['seq_len']
 
     print(f"\n--- ANALYZING {symbol} ---")
 
-    # Fetch data: different sources for stock vs crypto
+    # --- Fetch bars ---
     if asset_type == 'stock':
         if api is not None:
-            df = _fetch_stock_bars_alpaca(api, symbol)
+            df = fetch_stock_bars_alpaca(api, symbol)
         else:
-            df = _fetch_bars_yfinance(symbol)
+            df = fetch_bars_yfinance(symbol)
     else:
         if api is not None:
             alpaca_sym = symbol.replace('-', '/') if '-' in symbol else symbol
-            df = _fetch_bars_alpaca(api, alpaca_sym)
+            df = fetch_bars_alpaca(api, alpaca_sym)
         else:
             yf_sym = symbol.replace('/', '-') if '/' in symbol else symbol
-            df = _fetch_bars_yfinance(yf_sym)
+            df = fetch_bars_yfinance(yf_sym)
 
     if df is None or df.empty:
         print("Error: No data found for symbol.")
         return None
 
-    # Use stock features or crypto features
+    # --- Compute technical features ---
     if asset_type == 'stock':
         df = compute_stock_features(df, spy_close=spy_close)
     else:
@@ -306,13 +196,13 @@ def get_live_prediction(symbol, model, scaler_X, config_or_seq,
         print(f"  Feature mismatch: {e}")
         return None
 
+    # --- Scale and build input tensor ---
     current_features_scaled = scaler_X.transform(current_features)
-
     sequence = current_features_scaled[-seq_len:]
     sequence = sequence.reshape(1, seq_len, -1)
-
     tensor_input = torch.tensor(sequence, dtype=torch.float32).to(dev)
 
+    # --- Run inference ---
     with torch.inference_mode():
         logits = model(tensor_input)
         probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
@@ -320,12 +210,11 @@ def get_live_prediction(symbol, model, scaler_X, config_or_seq,
     # probs: [bearish, neutral, bullish]
     bear_prob, neut_prob, bull_prob = probs
 
-    # Convert to a score: bull_prob - bear_prob
-    # Range: [-1, +1], positive = bullish, negative = bearish
+    # Score = bull_prob - bear_prob, range [-1, +1]
     score = bull_prob - bear_prob
 
-    # Scale score by the model's trained bull_threshold so predicted_return
-    # is proportional to the magnitude the model was trained to detect
+    # Scale by model's trained threshold so predicted_return is proportional
+    # to the magnitude the model was trained to detect
     bull_threshold = config.get('bull_threshold', 0.15)
     predicted_return = score * bull_threshold
 

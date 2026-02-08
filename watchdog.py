@@ -9,12 +9,8 @@ import os
 import datetime
 from collections import deque
 
-from dotenv import load_dotenv
-import alpaca_trade_api as tradeapi
-
 from order_utils import emergency_flatten
-
-load_dotenv()
+from trading_utils import get_api
 
 # --- CONFIGURATION ---
 PROCESSES = {
@@ -31,15 +27,6 @@ PROCESSES = {
 MAX_RESTARTS = 3           # Max restarts within the window before liquidating
 RESTART_WINDOW = 3600      # 1 hour window for counting restarts
 HEALTH_CHECK_INTERVAL = 30 # Check every 30s
-
-
-def get_api():
-    return tradeapi.REST(
-        os.getenv('ALPACA_API_KEY'),
-        os.getenv('ALPACA_API_SECRET'),
-        os.getenv('ALPACA_BASE_URL'),
-        api_version='v2',
-    )
 
 
 def start_process(name, config):

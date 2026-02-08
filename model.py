@@ -1,3 +1,13 @@
+"""CryptoLSTM model — LSTM-based classifier for market regime prediction.
+
+Architecture: stacked LSTM -> final hidden state -> FC head (hidden -> 64 -> num_classes).
+Three output classes: bearish / neutral / bullish, used by the trading loops to decide
+buy/sell signals via softmax probabilities.
+
+Designed for small sequence lengths (12-48 bars) of technical indicator features.
+Supports JIT tracing for ~30% faster inference on the Jetson.
+"""
+
 import torch.nn as nn
 
 

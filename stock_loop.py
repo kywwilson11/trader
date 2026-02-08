@@ -1,20 +1,19 @@
-"""
-Stock trading loop — market-hours aware, dual bear/bull models, dynamic top 10 selection.
+"""Stock trading loop — market-hours aware, dual bear/bull models, dynamic top 10 selection.
 
-- Trades only during regular market hours (9:30 AM - 4:00 PM ET)
-- Scores all 30 stocks with bull model, trades only top 10 by signal strength
-- Flattens all stock positions at 3:50 PM ET to avoid overnight gap risk
-- $500 notional per position, max $5k total exposure
-- Uses stock-prefixed models (stock_bear_model.pth, stock_bull_model.pth)
-- Parallel predictions via ThreadPoolExecutor
-- Hot-reload when model files change
+Trades only during regular market hours (9:30 AM - 4:00 PM ET):
+  1. Score all stocks with both models, trade only top N by bull signal strength
+  2. Check stop-loss / trailing stop upgrades on open positions
+  3. Sell positions where the bear model signals weakness or they drop from top N
+  4. Buy top-N bullish stocks (sentiment-gated, confidence-sized)
+  5. Flatten all stock positions at 3:50 PM ET to avoid overnight gap risk
+
+Uses stock-prefixed models (stock_bear_model.pth, stock_bull_model.pth).
 """
-import alpaca_trade_api as tradeapi
+
 import time
 import datetime
-import os
+import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
 
 from order_utils import (
     get_stock_quote, place_stock_limit_order, manage_order_lifecycle,
@@ -22,18 +21,15 @@ from order_utils import (
     reconstruct_positions, check_circuit_breaker, emergency_flatten,
     compute_limit_price,
 )
-from predict_now import load_dual_models, get_live_prediction, _fetch_spy_bars_alpaca, get_live_atr
-from hw_monitor import get_gpu_temp, is_gpu_available
+from predict_now import load_dual_models, get_live_prediction
+from market_data import fetch_spy_bars_alpaca, get_live_atr
+from trading_utils import get_api, get_model_mtime, choose_inference_device, cooldown_ok, predict_symbol
+from hw_monitor import get_gpu_temp
 from sentiment import sentiment_gate, get_market_sentiment
 
-load_dotenv()
-
 # --- CONFIGURATION ---
-API_KEY = os.getenv('ALPACA_API_KEY')
-SECRET_KEY = os.getenv('ALPACA_API_SECRET')
-BASE_URL = os.getenv('ALPACA_BASE_URL')
 
-# ~30 high-beta, liquid stocks
+# ~45 high-beta, liquid stocks + ETFs
 STOCK_UNIVERSE = [
     'AMD', 'PLTR', 'SNAP', 'ROKU', 'AFRM', 'HOOD', 'SHOP', 'NET', 'CRWD', 'COIN',
     'MARA', 'MSTR', 'UBER', 'SOFI', 'ABNB', 'DASH', 'RBLX', 'SMCI', 'MRVL', 'ARM',
@@ -84,9 +80,7 @@ FLATTEN_HOUR = 15
 FLATTEN_MINUTE = 50
 
 
-def get_api():
-    return tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version='v2')
-
+# --- MARKET HOURS HELPERS ---
 
 def _get_eastern_now():
     """Get current time in US/Eastern."""
@@ -97,8 +91,7 @@ def _get_eastern_now():
 def _is_market_hours():
     """Check if current time is within regular market hours."""
     now = _get_eastern_now()
-    # Weekday check (0=Monday, 6=Sunday)
-    if now.weekday() >= 5:
+    if now.weekday() >= 5:  # 0=Mon, 6=Sun
         return False
     market_open = now.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0)
     market_close = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0)
@@ -113,48 +106,22 @@ def _is_flatten_time():
     return flatten_time <= now < market_close
 
 
-def _get_model_mtime(path):
-    try:
-        return os.path.getmtime(path)
-    except OSError:
-        return 0
-
-
-def _choose_inference_device():
-    if not is_gpu_available():
-        return 'cpu'
-    return None
-
+# --- EXPOSURE TRACKING ---
 
 def _get_current_exposure(api):
     """Calculate total stock exposure from current positions."""
     positions = get_all_positions(api)
     total = 0.0
     for sym, pos in positions.items():
-        # Only count stock positions (not crypto)
         if '/' not in sym and 'USD' not in sym:
             total += abs(float(pos.market_value))
     return total
 
 
-def _predict_symbol(api, symbol, bear_model, bear_config, bull_model, bull_config,
-                    scaler_X, feature_cols, inference_device, spy_close=None):
-    """Run both bear and bull predictions for a single stock symbol."""
-    bear_pred = get_live_prediction(
-        symbol, bear_model, scaler_X, bear_config, feature_cols,
-        api=api, inference_device=inference_device,
-        asset_type='stock', spy_close=spy_close,
-    )
-    bull_pred = get_live_prediction(
-        symbol, bull_model, scaler_X, bull_config, feature_cols,
-        api=api, inference_device=inference_device,
-        asset_type='stock', spy_close=spy_close,
-    )
-    return symbol, bear_pred, bull_pred
-
+# --- END-OF-DAY FLATTEN ---
 
 def flatten_all_stocks(api, positions):
-    """Sell all stock positions for end-of-day flatten. Cancel any outstanding stop orders."""
+    """Sell all stock positions for end-of-day flatten."""
     print("\n[FLATTEN] Selling all stock positions before market close...")
 
     # Cancel all outstanding stop orders first
@@ -164,7 +131,7 @@ def flatten_all_stocks(api, positions):
                 api.cancel_order(info['stop_order_id'])
                 print(f"  [FLATTEN] {symbol}: Canceled stop order {info['stop_order_id']}")
             except Exception:
-                pass  # Order may already be filled/canceled
+                pass
 
     for symbol in list(positions):
         try:
@@ -185,7 +152,6 @@ def flatten_all_stocks(api, positions):
                         del positions[symbol]
                         print(f"  [FLATTEN] {symbol}: Sold {qty} shares")
             else:
-                # No quote — market sell
                 api.submit_order(symbol=symbol, qty=qty, side='sell',
                                 type='market', time_in_force='day')
                 del positions[symbol]
@@ -198,20 +164,15 @@ def flatten_all_stocks(api, positions):
     return positions
 
 
-def cooldown_ok(last_trade_time, symbol):
-    if symbol not in last_trade_time:
-        return True
-    elapsed = (datetime.datetime.now() - last_trade_time[symbol]).total_seconds()
-    return elapsed >= COOLDOWN_MINUTES * 60
-
+# --- MAIN LOOP ---
 
 def run_stock_bot():
     api = get_api()
 
-    # Load stock-specific dual models
+    # ── Load stock-specific dual models ──
     print("Loading stock prediction models...")
     try:
-        inference_device = _choose_inference_device()
+        inference_device = choose_inference_device()
         bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
             load_dual_models(inference_device, prefix=MODEL_PREFIX)
         bear_threshold = bear_config.get('bull_threshold', 0.15)
@@ -224,18 +185,17 @@ def run_stock_bot():
         return
 
     # Track model mtimes for hot-reload
-    bear_mtime = _get_model_mtime(f'{MODEL_PREFIX}_bear_model.pth')
-    bull_mtime = _get_model_mtime(f'{MODEL_PREFIX}_bull_model.pth')
+    bear_mtime = get_model_mtime(f'{MODEL_PREFIX}_bear_model.pth')
+    bull_mtime = get_model_mtime(f'{MODEL_PREFIX}_bull_model.pth')
 
-    # Cancel stale orders
+    # ── Cancel stale orders ──
     cancel_all_open_orders(api)
 
-    # Reconstruct stock positions from API
+    # ── Reconstruct stock positions from API ──
     positions = reconstruct_positions(api, STOCK_UNIVERSE, asset_type='stock')
     if positions:
         print(f"Existing stock positions: {', '.join(positions)}")
         for sym, info in positions.items():
-            # Backfill ATR for reconstructed positions
             entry_atr = get_live_atr(api, sym, asset_type='stock')
             info['entry_atr'] = entry_atr
             atr_str = f"ATR=${entry_atr:.2f}" if entry_atr else "ATR=N/A"
@@ -264,7 +224,7 @@ def run_stock_bot():
             flattened_today = False
             last_date = eastern_now.date()
 
-        # Check market hours
+        # ── Wait for market open ──
         if not _is_market_hours():
             if cycle == 1 or cycle % 20 == 0:
                 print(f"\n[WAIT] {eastern_now.strftime('%Y-%m-%d %H:%M ET')} — Market closed. "
@@ -274,7 +234,7 @@ def run_stock_bot():
 
         print(f"\n--- CYCLE {cycle}: {eastern_now.strftime('%Y-%m-%d %H:%M:%S ET')} ---")
 
-        # --- Market sentiment check (logged periodically) ---
+        # ── Market sentiment check (logged periodically) ──
         if cycle % TEMP_LOG_EVERY_N_CYCLES == 1:
             mkt = get_market_sentiment()
             if mkt is not None:
@@ -282,7 +242,7 @@ def run_stock_bot():
                       f"articles={mkt['article_count']}, "
                       f"pos={mkt['positive_ratio']:.0%}/neg={mkt['negative_ratio']:.0%}")
 
-        # --- Flatten check ---
+        # ── Flatten check ──
         if _is_flatten_time() and not flattened_today:
             positions = flatten_all_stocks(api, positions)
             flattened_today = True
@@ -294,7 +254,7 @@ def run_stock_bot():
             time.sleep(LOOP_INTERVAL)
             continue
 
-        # --- Circuit breaker check ---
+        # ── Circuit breaker check ──
         tripped, dd = check_circuit_breaker(api, max_drawdown_pct=CIRCUIT_BREAKER_PCT)
         if tripped:
             print(f"[CIRCUIT BREAKER] Daily drawdown {dd:.1%} >= {CIRCUIT_BREAKER_PCT:.0%}, flattening all positions!")
@@ -304,13 +264,13 @@ def run_stock_bot():
             time.sleep(3600)
             continue
 
-        # --- Hot-reload check ---
-        new_bear_mt = _get_model_mtime(f'{MODEL_PREFIX}_bear_model.pth')
-        new_bull_mt = _get_model_mtime(f'{MODEL_PREFIX}_bull_model.pth')
+        # ── Hot-reload check ──
+        new_bear_mt = get_model_mtime(f'{MODEL_PREFIX}_bear_model.pth')
+        new_bull_mt = get_model_mtime(f'{MODEL_PREFIX}_bull_model.pth')
         if new_bear_mt != bear_mtime or new_bull_mt != bull_mtime:
             print("[HOT-RELOAD] Stock model files changed, reloading...")
             try:
-                inference_device = _choose_inference_device()
+                inference_device = choose_inference_device()
                 bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
                     load_dual_models(inference_device, prefix=MODEL_PREFIX)
                 bear_threshold = bear_config.get('bull_threshold', 0.15)
@@ -321,16 +281,15 @@ def run_stock_bot():
             except Exception as e:
                 print(f"[HOT-RELOAD] Failed: {e}, keeping current models")
 
-        # --- Log GPU temp periodically ---
+        # ── Log GPU temp periodically ──
         if cycle % TEMP_LOG_EVERY_N_CYCLES == 0:
             temp = get_gpu_temp()
             if temp is not None:
                 print(f"[HW] GPU temp: {temp:.0f}C")
 
-        # --- Stop fill detection + trailing stop upgrade ---
+        # ── Stop fill detection + trailing stop upgrade ──
         for symbol in list(positions):
             info = positions[symbol]
-            # Check if stop order has filled
             if info.get('stop_order_id'):
                 try:
                     stop_order = api.get_order(info['stop_order_id'])
@@ -344,7 +303,6 @@ def run_stock_bot():
                 except Exception:
                     info['stop_order_id'] = None
 
-            # Check for trailing stop upgrade
             quote = get_stock_quote(api, symbol)
             if quote is None:
                 continue
@@ -363,7 +321,6 @@ def run_stock_bot():
             if (not info.get('trailing_activated')
                     and current_price >= entry_price * (1 + ATR_TRAIL_ACTIVATE_PCT)
                     and info.get('stop_order_id')):
-                # Cancel the fixed stop and replace with trailing stop
                 try:
                     api.cancel_order(info['stop_order_id'])
                     time.sleep(0.5)
@@ -382,19 +339,19 @@ def run_stock_bot():
                 except Exception as e:
                     print(f"  [TRAIL] {symbol}: Upgrade error: {e}")
 
-        # --- Fetch SPY bars for relative strength ---
+        # ── Fetch SPY bars for relative strength ──
         spy_close = None
         try:
-            spy_df = _fetch_spy_bars_alpaca(api)
+            spy_df = fetch_spy_bars_alpaca(api)
             if spy_df is not None:
                 spy_close = spy_df['Close']
         except Exception as e:
             print(f"  [SPY] Error fetching benchmark: {e}")
 
-        # --- Get predictions for ALL stocks in parallel ---
+        # ── Get predictions for ALL stocks in parallel ──
         bear_preds = {}
         bull_preds = {}
-        inference_device = _choose_inference_device()
+        inference_device = choose_inference_device()
         if inference_device == 'cpu':
             print("[HW] GPU unavailable, using CPU for inference")
 
@@ -402,9 +359,10 @@ def run_stock_bot():
             futures = {}
             for symbol in STOCK_UNIVERSE:
                 f = executor.submit(
-                    _predict_symbol, api, symbol,
+                    predict_symbol, api, symbol,
                     bear_model, bear_config, bull_model, bull_config,
-                    scaler_X, feature_cols, inference_device, spy_close,
+                    scaler_X, feature_cols, inference_device,
+                    asset_type='stock', benchmark_close=spy_close,
                 )
                 futures[f] = symbol
 
@@ -419,12 +377,15 @@ def run_stock_bot():
                 except Exception as e:
                     print(f"  {symbol}: Prediction error: {e}")
 
-        # --- Dynamic top N selection by bull signal strength ---
+        # Free temporary tensors from prediction batch
+        gc.collect()
+
+        # ── Dynamic top N selection by bull signal strength ──
         ranked = sorted(bull_preds.items(), key=lambda x: x[1], reverse=True)
         top_symbols = [sym for sym, _ in ranked[:TOP_N]]
         print(f"[RANK] Top {TOP_N}: {', '.join(f'{s}({bull_preds[s]:+.4f})' for s in top_symbols)}")
 
-        # --- SELL: bearish positions ---
+        # ── SELL: bearish positions ──
         for symbol in list(positions):
             try:
                 pos = api.get_position(symbol)
@@ -433,7 +394,6 @@ def run_stock_bot():
                 continue
 
             bear_pred = bear_preds.get(symbol)
-            # Sell if: bear signal is strong, OR symbol dropped out of top N
             sell_reason = None
             if bear_pred is not None and bear_pred < -bear_threshold:
                 sell_reason = f"bear_pred={bear_pred:+.4f}%"
@@ -443,7 +403,7 @@ def run_stock_bot():
             if sell_reason is None:
                 continue
 
-            if not cooldown_ok(last_trade_time, symbol):
+            if not cooldown_ok(last_trade_time, symbol, COOLDOWN_MINUTES):
                 remaining = COOLDOWN_MINUTES * 60 - (datetime.datetime.now() - last_trade_time[symbol]).total_seconds()
                 print(f"  {symbol}: Sell signal but in cooldown ({remaining/60:.1f} min left)")
                 continue
@@ -454,7 +414,6 @@ def run_stock_bot():
                 del positions[symbol]
                 continue
 
-            # Cancel any outstanding stop order before selling
             info = positions[symbol]
             if info.get('stop_order_id'):
                 try:
@@ -474,7 +433,7 @@ def run_stock_bot():
                         last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(0.5)
 
-        # --- BUY: top N bullish stocks we don't hold ---
+        # ── BUY: top N bullish stocks we don't hold ──
         current_exposure = _get_current_exposure(api)
         for symbol in top_symbols:
             if symbol in positions:
@@ -484,7 +443,7 @@ def run_stock_bot():
                 print(f"  Max exposure ${MAX_EXPOSURE} reached, no more buys")
                 break
 
-            if not cooldown_ok(last_trade_time, symbol):
+            if not cooldown_ok(last_trade_time, symbol, COOLDOWN_MINUTES):
                 remaining = COOLDOWN_MINUTES * 60 - (datetime.datetime.now() - last_trade_time[symbol]).total_seconds()
                 print(f"  {symbol}: In cooldown ({remaining/60:.1f} min left)")
                 continue
@@ -504,14 +463,14 @@ def run_stock_bot():
                       f"{quote['spread_pct']:.3f}%, skipping")
                 continue
 
-            # Confidence-based sizing: scale notional by prediction strength
+            # Confidence-based sizing
             if bull_pred is not None and bull_threshold > 0:
                 confidence = min(2.0, max(0.5, bull_pred / bull_threshold))
             else:
                 confidence = 1.0
             sized_notional = int(NOTIONAL_PER_STOCK * confidence)
 
-            # Sentiment gate: further adjust position size or block trade
+            # Sentiment gate
             gate, gate_reasons = sentiment_gate(symbol, 'stock')
             if gate <= 0:
                 print(f"  {symbol}: BLOCKED by sentiment ({', '.join(gate_reasons)})")
@@ -537,7 +496,7 @@ def run_stock_bot():
             limit_price = compute_limit_price('buy', quote, offset_bps=5)
             limit_price = round(limit_price, 2)
 
-            # Compute ATR-based stop and take-profit, with fallback
+            # Compute ATR-based stop and take-profit
             entry_atr = get_live_atr(api, symbol, asset_type='stock')
             if entry_atr is not None and limit_price > 0:
                 raw_stop_dist = (entry_atr * ATR_STOP_MULTIPLIER) / limit_price
@@ -574,7 +533,6 @@ def run_stock_bot():
                 result = manage_order_lifecycle(api, order.id, timeout=ORDER_TIMEOUT,
                                                fallback_to_market=False)
                 if result and result.status == 'filled':
-                    # Find the child stop-loss order ID
                     child_stop_id = None
                     try:
                         legs = api.list_orders(status='open', symbols=[symbol])
@@ -598,7 +556,7 @@ def run_stock_bot():
                     current_exposure += qty * fill_price
             time.sleep(0.5)
 
-        # Thermal throttling
+        # ── Thermal throttling ──
         sleep_interval = LOOP_INTERVAL
         temp = get_gpu_temp()
         if temp is not None and temp > THERMAL_THROTTLE_TEMP:
