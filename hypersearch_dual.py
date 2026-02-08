@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from model import CryptoLSTM
-from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 import joblib
 import gc
@@ -33,26 +32,9 @@ TRAIN_RATIO = 0.8
 NUM_CLASSES = 3
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+torch.backends.cudnn.benchmark = True
 print(f"Using device: {device}")
 
-
-class SequenceDataset(Dataset):
-    """On-the-fly sequence generator — no pre-allocation of massive arrays."""
-    def __init__(self, indices, all_scaled, all_classes, seq_len):
-        self.indices = indices
-        self.all_scaled = all_scaled
-        self.all_classes = all_classes
-        self.seq_len = seq_len
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, idx):
-        end = self.indices[idx]
-        start = end - self.seq_len
-        x = torch.from_numpy(self.all_scaled[start:end])
-        y = self.all_classes[end]
-        return x, y
 
 
 def parse_args():
@@ -199,13 +181,13 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         weights = total / (3.0 * counts)
         weights_t = torch.tensor(weights, dtype=torch.float32).to(device)
 
-        train_ds = SequenceDataset(train_idx, all_scaled, classes, seq_len)
-        val_ds = SequenceDataset(val_idx, all_scaled, classes, seq_len)
-
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  num_workers=0, pin_memory=False)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                                num_workers=0, pin_memory=False)
+        # Pre-allocate full sequence tensors on GPU (avoids per-batch numpy→torch→GPU)
+        X_train = torch.stack([torch.from_numpy(all_scaled[i - seq_len:i]) for i in train_idx]).to(device)
+        y_train = torch.tensor(classes[train_idx], dtype=torch.long, device=device)
+        X_val = torch.stack([torch.from_numpy(all_scaled[i - seq_len:i]) for i in val_idx]).to(device)
+        y_val = torch.tensor(classes[val_idx], dtype=torch.long, device=device)
+        n_train = X_train.size(0)
+        n_val = X_val.size(0)
 
         model = CryptoLSTM(input_dim, hidden_dim, num_layers,
                             dropout, NUM_CLASSES).to(device)
@@ -222,15 +204,18 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
 
         best_val_acc = 0.0
         best_state = None
+        best_preds = None
+        best_labels = None
         counter = 0
 
         for epoch in range(MAX_EPOCHS):
             model.train()
-            for X_b, y_b in train_loader:
-                X_b, y_b = X_b.to(device), y_b.to(device)
-                out = model(X_b)
-                loss = criterion(out, y_b)
-                optimizer.zero_grad()
+            perm = torch.randperm(n_train, device=device)
+            for i in range(0, n_train, batch_size):
+                idx = perm[i:i + batch_size]
+                out = model(X_train[idx])
+                loss = criterion(out, y_train[idx])
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -239,28 +224,27 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
                 sched.step()
 
             model.eval()
-            vc, vt, vl = 0, 0, 0.0
-            all_preds, all_labels = [], []
             with torch.inference_mode():
-                for X_vb, y_vb in val_loader:
-                    X_vb, y_vb = X_vb.to(device), y_vb.to(device)
+                # Single forward pass over entire val set (batched to avoid OOM on large sets)
+                all_preds_list = []
+                val_loss_sum = 0.0
+                for i in range(0, n_val, batch_size):
+                    X_vb = X_val[i:i + batch_size]
+                    y_vb = y_val[i:i + batch_size]
                     vo = model(X_vb)
-                    vl += criterion(vo, y_vb).item() * X_vb.size(0)
-                    _, p = torch.max(vo, 1)
-                    vc += (p == y_vb).sum().item()
-                    vt += y_vb.size(0)
-                    all_preds.extend(p.cpu().numpy())
-                    all_labels.extend(y_vb.cpu().numpy())
+                    val_loss_sum += criterion(vo, y_vb).item() * X_vb.size(0)
+                    all_preds_list.append(vo.argmax(1))
+                ep_preds_t = torch.cat(all_preds_list)
 
-            val_acc = vc / vt
-            val_loss = vl / vt
+            val_acc = (ep_preds_t == y_val).float().mean().item()
+            val_loss = val_loss_sum / n_val
 
             if scheduler == 'plateau' and sched:
                 sched.step(val_loss)
 
             # Compute epoch composite_score for pruner (same metric as final objective)
-            ep_preds = np.array(all_preds)
-            ep_labels = np.array(all_labels)
+            ep_preds = ep_preds_t.cpu().numpy()
+            ep_labels = y_val.cpu().numpy()
             ep_tp = int(((ep_preds == target_class) & (ep_labels == target_class)).sum())
             ep_fp = int(((ep_preds == target_class) & (ep_labels != target_class)).sum())
             ep_fn = int(((ep_preds != target_class) & (ep_labels == target_class)).sum())
@@ -270,12 +254,12 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
             ep_bal = sum((ep_preds[ep_labels == c] == c).mean() if (ep_labels == c).sum() > 0 else 0.0
                          for c in range(NUM_CLASSES)) / NUM_CLASSES
             ep_cat = (int(((ep_labels == 0) & (ep_preds == 2)).sum()) +
-                      int(((ep_labels == 2) & (ep_preds == 0)).sum())) / vt
+                      int(((ep_labels == 2) & (ep_preds == 0)).sum())) / n_val
             epoch_score = max(ep_f1 * 0.5 + ep_bal * 0.2 - ep_cat * 0.3, 0.0)
 
             trial.report(epoch_score, epoch)
             if epoch >= PRUNE_WARMUP_EPOCHS and trial.should_prune():
-                del model, train_ds, val_ds, train_loader, val_loader, weights_t
+                del model, X_train, y_train, X_val, y_val, weights_t
                 gc.collect()
                 torch.cuda.empty_cache()
                 raise optuna.TrialPruned()
@@ -288,26 +272,22 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_preds = ep_preds
+                best_labels = ep_labels
                 counter = 0
             else:
                 counter += 1
                 if counter >= EARLY_STOP_PATIENCE:
                     break
 
-        # Per-class accuracy + confusion matrix analysis
+        # Per-class accuracy + confusion matrix analysis (using saved preds — no re-inference)
         per_class = {}
         composite_score = 0.0
-        if best_state:
-            model.load_state_dict(best_state)
-            model.eval()
-            ap, al = [], []
-            with torch.inference_mode():
-                for X_vb, y_vb in val_loader:
-                    X_vb = X_vb.to(device)
-                    _, p = torch.max(model(X_vb), 1)
-                    ap.extend(p.cpu().numpy())
-                    al.extend(y_vb.numpy())
-            ap, al = np.array(ap), np.array(al)
+        n_samples = 0
+        target_f1 = 0.0
+        catastrophic_rate = 1.0
+        if best_preds is not None:
+            ap, al = best_preds, best_labels
             n_samples = len(al)
             for c, n in [(0, 'bear'), (1, 'neutral'), (2, 'bull')]:
                 m = al == c
@@ -317,17 +297,13 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         MIN_CLASS_ACC = 0.10
         pc_vals = list(per_class.values())
         if pc_vals and min(pc_vals) < MIN_CLASS_ACC:
-            del model, train_ds, val_ds, train_loader, val_loader, weights_t
+            del model, X_train, y_train, X_val, y_val, weights_t
             gc.collect()
             torch.cuda.empty_cache()
             return 0.0
 
         # --- Confusion-matrix scoring for real-world trading ---
-        # 1) Target class F1: balances precision (trust the signal) and recall (catch moves)
-        # 2) Balanced accuracy: overall 3-class discrimination
-        # 3) Catastrophic penalty: bear<->bull confusion rate (the expensive mistake)
         if n_samples > 0:
-            # Target class precision, recall, F1
             tp = int(((ap == target_class) & (al == target_class)).sum())
             fp = int(((ap == target_class) & (al != target_class)).sum())
             fn = int(((ap != target_class) & (al == target_class)).sum())
@@ -335,31 +311,25 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
             target_f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
-            # Balanced accuracy (mean per-class recall)
             balanced_acc = sum(pc_vals) / len(pc_vals) if pc_vals else 0.0
 
-            # Catastrophic confusion: bear predicted as bull + bull predicted as bear
-            # These are the mistakes that lose real money in trading
             bear_as_bull = int(((al == 0) & (ap == 2)).sum())
             bull_as_bear = int(((al == 2) & (ap == 0)).sum())
             catastrophic_rate = (bear_as_bull + bull_as_bear) / n_samples
 
-            # Composite: F1 * 0.5 + balanced_acc * 0.2 - catastrophic * 0.3
             composite_score = target_f1 * 0.5 + balanced_acc * 0.2 - catastrophic_rate * 0.3
-            composite_score = max(composite_score, 0.0)  # floor at 0
+            composite_score = max(composite_score, 0.0)
 
         trial.set_user_attr('per_class', per_class)
         trial.set_user_attr('composite_score', composite_score)
-        trial.set_user_attr('target_f1', target_f1 if n_samples > 0 else 0.0)
-        trial.set_user_attr('catastrophic_rate', catastrophic_rate if n_samples > 0 else 1.0)
+        trial.set_user_attr('target_f1', target_f1)
+        trial.set_user_attr('catastrophic_rate', catastrophic_rate)
         trial.set_user_attr('val_acc', best_val_acc)
         trial.set_user_attr('cfg', cfg)
 
-        # Store model weights in shared dict (not in SQLite — too large)
-        # The callback receives a FrozenTrial copy, so we use trial.number as key
         _state_cache[trial.number] = best_state
 
-        del model, train_ds, val_ds, train_loader, val_loader, weights_t
+        del model, X_train, y_train, X_val, y_val, weights_t
         gc.collect()
         torch.cuda.empty_cache()
 

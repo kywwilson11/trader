@@ -14,7 +14,8 @@ run_pipeline.py                   Orchestrator (train → trade → weekly retra
 ├── crypto_loop.py                24/7 crypto trading (10 symbols)
 └── stock_loop.py                 Market-hours stock trading (top 10 of ~45)
 
-gui.py                            PySide6 dashboard (positions, P&L, news, models, logs)
+gui.py                            PySide6 dashboard (positions, P&L, news, markets, models, logs)
+stock_config.py                   Market universe config (stocks + crypto → stock_universe.json)
 watchdog.py                       Standalone process supervisor (alternative to pipeline)
 evolve.py                         3-day retraining orchestrator (alternative to pipeline)
 ```
@@ -31,7 +32,7 @@ evolve.py                         3-day retraining orchestrator (alternative to 
 - **Persistent Optuna studies** — Bayesian hyperparameter search with SQLite memory across cycles
 - **Weekly auto-retrain** — Saturday 2 AM: harvest fresh data, retrain models, bots hot-reload improvements
 - **Position reconstruction** — survives crashes by syncing state from Alpaca API on restart
-- **PySide6 dashboard** — live positions, P&L, orders, news (filterable), model status, hardware gauges, 7 themes
+- **PySide6 dashboard** — live positions, P&L, orders, news (filterable), markets (stocks + crypto heatmap/chart), model status, hardware gauges, 7 themes
 
 ---
 
@@ -130,10 +131,16 @@ Optuna TPE sampler with MedianPruner for efficient bear/bull model optimization.
 - **Balanced accuracy**: mean per-class recall across bear/neutral/bull
 - **Catastrophic rate**: bear↔bull confusion (the expensive mistakes in trading)
 
+**Performance optimizations:**
+- Pre-allocates full sequence tensors on GPU — eliminates per-batch CPU→GPU transfers
+- `cudnn.benchmark = True` — cuDNN auto-tunes LSTM kernels for fixed input shapes
+- Saves best-epoch predictions to skip redundant final validation pass
+- `optimizer.zero_grad(set_to_none=True)` — deallocates gradients instead of zeroing
+
 **Safety mechanisms:**
 - MedianPruner reports `composite_score` each epoch (same metric as final objective), 20-epoch warmup, 15-trial startup matching TPE
 - Early stopping with patience=15 epochs
-- Hard timeout of 300 seconds per trial
+- Hard timeout of 600 seconds per trial
 - Rejects degenerate models: any class accuracy below 10% returns score 0
 - Persistent SQLite storage: studies survive restarts, Bayesian memory accumulates
 
@@ -293,11 +300,12 @@ Desktop monitoring app with live updates (2-second polling of `pipeline_status.j
 - **Positions** — open positions, P&L, exposure, recent fills
 - **Performance** — equity curve, daily P&L, drawdown
 - **News** — Fear & Greed Index, Finnhub headlines (My Universe / All News / Global Macro filters)
+- **Markets** — combined stocks + crypto universe with heatmap, price chart (1Y/3M/1M/1W/1D zoom), metrics table with model predictions, add/remove symbols
 - **Models** — model scores (C-Bear, C-Bull, S-Bear, S-Bull), trial progress, pipeline phase, next retrain time
 - **Hardware** — GPU temp, RAM usage, CUDA status
 - **Logs** — tailing pipeline, crypto bot, and stock bot log files
 
-**Themes:** Bubblegum Goth, Batman, Joker, Harley Quinn, Dark, Space, Money
+**Themes:** Bubblegum Goth, Batman, Joker, Harley Quinn, Dark, Space, Money, Two-Face, Black Metal
 
 #### `watchdog.py` — Process Supervisor (Alternative)
 
@@ -402,6 +410,7 @@ python stock_loop.py
 | `*_config.pkl` | hypersearch_dual.py | Model hyperparameters |
 | `*scaler_X.pkl` | hypersearch_dual.py | Feature scaler (MinMaxScaler) |
 | `*_study.db` | hypersearch_dual.py | Optuna SQLite study (Bayesian memory) |
+| `stock_universe.json` | stock_config.py / GUI | Market universe (stocks + crypto symbols) |
 | `pipeline_status.json` | run_pipeline.py | Live pipeline state for GUI |
 | `pipeline_output.log` | run_pipeline.py | Pipeline log |
 | `crypto_bot_output.log` | run_pipeline.py | Crypto bot log |

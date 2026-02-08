@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QPlainTextEdit, QComboBox, QCheckBox, QFrame,
     QSplitter, QGroupBox, QProgressBar, QToolBar,
-    QSizePolicy,
+    QSizePolicy, QLineEdit, QPushButton,
 )
 import pyqtgraph as pg
 import numpy as np
@@ -626,11 +626,16 @@ class DataFetcher(QObject):
     history_updated = Signal(dict)
     hw_updated = Signal(dict)
     news_updated = Signal(dict)
+    stocks_updated = Signal(dict)
+    chart_updated = Signal(dict)
     error_occurred = Signal(str)
 
     def __init__(self, api):
         super().__init__()
         self.api = api
+        # sym -> {'daily': {closes,timestamps,cached_at}, 'hourly': ..., '15min': ...}
+        self._chart_cache = {}
+        self._chart_cache_ttl = 300  # 5 min before re-fetching same resolution
 
     @Slot()
     def start_timers(self):
@@ -659,6 +664,10 @@ class DataFetcher(QObject):
         self._timer_news.timeout.connect(self.fetch_news)
         self._timer_news.start(300_000)  # 5 min
 
+        self._timer_stocks = QTimer(self)
+        self._timer_stocks.timeout.connect(self.fetch_stocks)
+        self._timer_stocks.start(30_000)  # 30s
+
         # Load cached news immediately (instant startup)
         cached = _load_news_cache()
         if cached and cached.get('articles'):
@@ -674,12 +683,14 @@ class DataFetcher(QObject):
         self.fetch_history()
         self.fetch_hw()
         self.fetch_news()
+        self.fetch_stocks()
 
     @Slot()
     def stop_timers(self):
         """Stop all timers (must be called from this object's thread)."""
         for attr in ("_timer_account", "_timer_positions", "_timer_orders",
-                      "_timer_history", "_timer_hw", "_timer_news"):
+                      "_timer_history", "_timer_hw", "_timer_news",
+                      "_timer_stocks"):
             timer = getattr(self, attr, None)
             if timer:
                 timer.stop()
@@ -857,6 +868,179 @@ class DataFetcher(QObject):
             })
         except Exception as e:
             self.error_occurred.emit(f"News fetch: {e}")
+
+    @Slot(str, str)
+    def fetch_chart(self, symbol, resolution):
+        """Fetch bars for a symbol at a given resolution (background thread).
+
+        resolution: 'daily' | 'hourly' | '15min' | '5min'
+        Uses get_crypto_bars() for crypto symbols (containing '/').
+        Caches per (symbol, resolution) so zoom switches within the same
+        resolution are instant.
+        """
+        try:
+            import datetime as _dt
+
+            now_ts = _dt.datetime.now().timestamp()
+
+            # Check cache
+            sym_cache = self._chart_cache.get(symbol, {})
+            cached = sym_cache.get(resolution)
+            if cached and (now_ts - cached['cached_at']) < self._chart_cache_ttl:
+                self.chart_updated.emit({
+                    'symbol': symbol, 'resolution': resolution,
+                    'closes': cached['closes'],
+                    'timestamps': cached['timestamps'],
+                })
+                return
+
+            # Resolution → API params
+            res_config = {
+                'daily':  ('1Day',  365, 365),
+                'hourly': ('1Hour',  10, 168),   # 7 days of hourly = ~168 bars
+                '15min':  ('15Min',   2, 104),   # 2 days of 15-min = ~104 bars
+            }
+            tf, lookback_days, limit = res_config.get(resolution, ('1Day', 365, 365))
+
+            start = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=lookback_days)
+            if '/' in symbol:
+                bars = self.api.get_crypto_bars(
+                    symbol, tf, start=start.isoformat(), limit=limit,
+                )
+            else:
+                bars = self.api.get_bars(
+                    symbol, tf, start=start.isoformat(), limit=limit,
+                )
+
+            closes = []
+            timestamps = []
+            for b in bars:
+                closes.append(float(b.c))
+                try:
+                    t = b.t
+                    if hasattr(t, 'timestamp'):
+                        timestamps.append(t.timestamp())
+                    else:
+                        ts_parsed = _dt.datetime.fromisoformat(
+                            str(t).replace('Z', '+00:00'))
+                        timestamps.append(ts_parsed.timestamp())
+                except Exception:
+                    timestamps.append(start.timestamp() + len(timestamps) * 3600)
+
+            # Store in nested cache: sym -> {resolution -> data}
+            if symbol not in self._chart_cache:
+                # Evict oldest symbol if cache is full (max 6 symbols)
+                if len(self._chart_cache) >= 6:
+                    oldest_sym = min(
+                        self._chart_cache,
+                        key=lambda s: max(
+                            (v.get('cached_at', 0)
+                             for v in self._chart_cache[s].values()), default=0))
+                    del self._chart_cache[oldest_sym]
+                self._chart_cache[symbol] = {}
+
+            self._chart_cache[symbol][resolution] = {
+                'closes': closes, 'timestamps': timestamps,
+                'cached_at': now_ts,
+            }
+
+            self.chart_updated.emit({
+                'symbol': symbol, 'resolution': resolution,
+                'closes': closes, 'timestamps': timestamps,
+            })
+        except Exception as e:
+            self.chart_updated.emit({
+                'symbol': symbol, 'resolution': resolution,
+                'closes': [], 'timestamps': [], 'error': str(e),
+            })
+
+    @Slot()
+    def fetch_stocks(self):
+        """Fetch stock + crypto snapshots + prediction cache for Markets tab."""
+        try:
+            from stock_config import load_stock_universe
+            symbols = load_stock_universe()
+            if not symbols:
+                return
+
+            stock_syms = [s for s in symbols if '/' not in s]
+            crypto_syms = [s for s in symbols if '/' in s]
+
+            # Batch snapshot from Alpaca
+            snapshots = {}
+            if stock_syms:
+                try:
+                    snaps = self.api.get_snapshots(stock_syms)
+                    for sym, snap in snaps.items():
+                        try:
+                            latest = snap.latest_trade
+                            price = float(latest.p) if latest else 0
+                            bar = snap.daily_bar
+                            prev_close = float(snap.prev_daily_bar.c) if snap.prev_daily_bar else price
+                            day_open = float(bar.o) if bar else price
+                            day_high = float(bar.h) if bar else price
+                            day_low = float(bar.l) if bar else price
+                            volume = int(bar.v) if bar else 0
+                            change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
+                            snapshots[sym] = {
+                                'price': price,
+                                'prev_close': prev_close,
+                                'open': day_open,
+                                'high': day_high,
+                                'low': day_low,
+                                'volume': volume,
+                                'change_pct': change_pct,
+                            }
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.error_occurred.emit(f"Stock snapshots: {e}")
+
+            if crypto_syms:
+                try:
+                    csnaps = self.api.get_crypto_snapshots(crypto_syms)
+                    for sym, snap in csnaps.items():
+                        try:
+                            bar = snap.daily_bar
+                            prev_bar = snap.prev_daily_bar
+                            price = float(bar.c) if bar else 0
+                            prev_close = float(prev_bar.c) if prev_bar else price
+                            day_open = float(bar.o) if bar else price
+                            day_high = float(bar.h) if bar else price
+                            day_low = float(bar.l) if bar else price
+                            volume = int(bar.v) if bar else 0
+                            change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
+                            snapshots[sym] = {
+                                'price': price,
+                                'prev_close': prev_close,
+                                'open': day_open,
+                                'high': day_high,
+                                'low': day_low,
+                                'volume': volume,
+                                'change_pct': change_pct,
+                            }
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.error_occurred.emit(f"Crypto snapshots: {e}")
+
+            # Read prediction cache (written by stock_loop.py in jetson env)
+            predictions = {}
+            pred_file = BASE_DIR / "stock_predictions.json"
+            try:
+                if pred_file.exists():
+                    with open(pred_file) as f:
+                        predictions = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            self.stocks_updated.emit({
+                'symbols': symbols,
+                'snapshots': snapshots,
+                'predictions': predictions,
+            })
+        except Exception as e:
+            self.error_occurred.emit(f"Stocks fetch: {e}")
 
     @staticmethod
     def _read_gpu_temp():
@@ -1118,6 +1302,7 @@ class TradingDashboard(QMainWindow):
         self._build_trading_tab()
         self._build_performance_tab()
         self._build_news_tab()
+        self._build_stocks_tab()
         self._build_models_tab()
         self._build_logs_tab()
 
@@ -1151,6 +1336,8 @@ class TradingDashboard(QMainWindow):
         self._fetcher.history_updated.connect(self.on_history)
         self._fetcher.hw_updated.connect(self.on_hw)
         self._fetcher.news_updated.connect(self.on_news)
+        self._fetcher.stocks_updated.connect(self.on_stocks)
+        self._fetcher.chart_updated.connect(self.on_chart)
         self._fetcher.error_occurred.connect(self.on_error)
         self._fetcher_thread.started.connect(self._fetcher.start_timers)
         self._fetcher_thread.start()
@@ -1271,7 +1458,8 @@ class TradingDashboard(QMainWindow):
 
         # Tables
         for table in [self._positions_table, self._open_orders_table,
-                       self._fills_table, self._model_table, self._news_table]:
+                       self._fills_table, self._model_table, self._news_table,
+                       self._stock_table]:
             table.setStyleSheet(table_style)
 
         # Group boxes
@@ -1279,11 +1467,23 @@ class TradingDashboard(QMainWindow):
             group.setStyleSheet(group_style)
 
         # Plots
-        for plot in [self._equity_plot, self._pnl_plot]:
+        for plot in [self._equity_plot, self._pnl_plot, self._stock_chart]:
             plot.setBackground(t["bg_dark"].name())
 
-        # Equity curve pen color
+        # Plot pen colors
         self._equity_curve.setPen(pg.mkPen(t["accent"].name(), width=2))
+        self._stock_chart_line.setPen(pg.mkPen(t["accent"].name(), width=2))
+
+        # Zoom buttons
+        for z, btn in self._stock_zoom_buttons.items():
+            if btn.isChecked():
+                btn.setStyleSheet(
+                    f"background-color: {t['accent'].name()}; color: {t['bg_dark'].name()};"
+                    f" font-weight: bold; border-radius: 4px;")
+            else:
+                btn.setStyleSheet(
+                    f"background-color: {t['bg_header'].name()}; color: {t['muted'].name()};"
+                    f" border: 1px solid {t['bg_border'].name()}; border-radius: 4px;")
 
         # Log display
         self._log_display.setStyleSheet(
@@ -1477,7 +1677,378 @@ class TradingDashboard(QMainWindow):
 
         self.tabs.addTab(tab, "News")
 
-    # ---- Tab 5: Models ---------------------------------------------------
+    # ---- Tab 5: Markets --------------------------------------------------
+    def _build_stocks_tab(self):
+        from stock_config import load_stock_universe, save_stock_universe
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+
+        # --- Top bar: symbol/timeframe selectors + universe management ---
+        top_layout = QHBoxLayout()
+
+        top_layout.addWidget(QLabel("Symbol:"))
+        self._stock_symbol_combo = QComboBox()
+        self._stock_symbol_combo.setMinimumWidth(100)
+        symbols = load_stock_universe()
+        self._stock_symbol_combo.addItems(symbols)
+        self._stock_symbol_combo.currentTextChanged.connect(self._on_stock_symbol_changed)
+        top_layout.addWidget(self._stock_symbol_combo)
+
+        # Zoom buttons — these just change the view range, no API call
+        self._stock_zoom = "1M"  # default zoom
+        self._stock_zoom_buttons = {}
+        for label in ["1Y", "3M", "1M", "1W", "1D"]:
+            btn = QPushButton(label)
+            btn.setFixedWidth(36)
+            btn.setCheckable(True)
+            btn.setChecked(label == self._stock_zoom)
+            btn.clicked.connect(lambda checked, z=label: self._on_zoom_clicked(z))
+            top_layout.addWidget(btn)
+            self._stock_zoom_buttons[label] = btn
+
+        top_layout.addStretch()
+
+        self._stock_universe_label = QLabel(f"Universe ({len(symbols)})")
+        self._stock_universe_label.setStyleSheet("font-weight: bold;")
+        top_layout.addWidget(self._stock_universe_label)
+
+        self._stock_add_input = QLineEdit()
+        self._stock_add_input.setPlaceholderText("AAPL or BTC/USD")
+        self._stock_add_input.setFixedWidth(110)
+        self._stock_add_input.returnPressed.connect(self._on_stock_add)
+        top_layout.addWidget(self._stock_add_input)
+
+        add_btn = QPushButton("+")
+        add_btn.setFixedWidth(30)
+        add_btn.clicked.connect(self._on_stock_add)
+        top_layout.addWidget(add_btn)
+
+        remove_btn = QPushButton("\u2212")  # minus sign
+        remove_btn.setFixedWidth(30)
+        remove_btn.setToolTip("Remove selected symbol from universe")
+        remove_btn.clicked.connect(self._on_stock_remove)
+        top_layout.addWidget(remove_btn)
+
+        main_layout.addLayout(top_layout)
+
+        # --- Middle: chart (left) + heatmap (right) via splitter ---
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Price chart with date axis
+        date_axis = pg.DateAxisItem(orientation='bottom')
+        self._stock_chart = pg.PlotWidget(axisItems={'bottom': date_axis})
+        self._stock_chart.showGrid(x=True, y=True, alpha=0.3)
+        self._stock_chart.setLabel("left", "Price ($)")
+        self._stock_chart_line = self._stock_chart.plot(pen=pg.mkPen(width=2))
+        self._stock_chart.setMouseEnabled(x=False, y=False)  # zoom via buttons only
+        self._stock_chart_data = {}  # resolution -> {closes, timestamps}
+        splitter.addWidget(self._stock_chart)
+
+        # Heatmap panel
+        heatmap_container = QWidget()
+        heatmap_outer = QVBoxLayout(heatmap_container)
+        heatmap_outer.setContentsMargins(4, 0, 4, 0)
+        hm_title = QLabel("Heatmap")
+        hm_title.setStyleSheet("font-size: 13px; font-weight: bold;")
+        heatmap_outer.addWidget(hm_title)
+
+        self._heatmap_widget = QWidget()
+        self._heatmap_layout = QGridLayout(self._heatmap_widget)
+        self._heatmap_layout.setSpacing(3)
+        self._heatmap_layout.setContentsMargins(0, 0, 0, 0)
+        self._heatmap_labels = {}  # sym -> QLabel
+        heatmap_outer.addWidget(self._heatmap_widget)
+        heatmap_outer.addStretch()
+        splitter.addWidget(heatmap_container)
+
+        splitter.setSizes([600, 300])
+        main_layout.addWidget(splitter, stretch=1)
+
+        # --- Bottom: metrics table ---
+        self._stock_table = QTableWidget(0, 8)
+        self._stock_table.setHorizontalHeaderLabels(
+            ["Symbol", "Price", "Day Chg%", "Volume", "Bear", "Bull", "Score", "Signal"]
+        )
+        self._stock_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._stock_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._stock_table.setAlternatingRowColors(True)
+        self._stock_table.setSortingEnabled(True)
+        self._stock_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._stock_table.cellDoubleClicked.connect(self._on_stock_table_dblclick)
+        main_layout.addWidget(self._stock_table, stretch=1)
+
+        self._stock_data_cache = {}  # latest data from fetch_stocks
+        self.tabs.addTab(tab, "Markets")
+
+    def _on_stock_add(self):
+        from stock_config import load_stock_universe, save_stock_universe
+        text = self._stock_add_input.text().strip().upper()
+        if not text:
+            return
+        symbols = load_stock_universe()
+        if text in symbols:
+            self._stock_add_input.clear()
+            return
+        symbols.append(text)
+        save_stock_universe(symbols)
+        symbols = load_stock_universe()  # re-read sorted
+        self._stock_symbol_combo.blockSignals(True)
+        self._stock_symbol_combo.clear()
+        self._stock_symbol_combo.addItems(symbols)
+        self._stock_symbol_combo.setCurrentText(text)
+        self._stock_symbol_combo.blockSignals(False)
+        self._stock_universe_label.setText(f"Universe ({len(symbols)})")
+        self._stock_add_input.clear()
+
+    def _on_stock_remove(self):
+        from stock_config import load_stock_universe, save_stock_universe
+        current = self._stock_symbol_combo.currentText()
+        if not current:
+            return
+        symbols = load_stock_universe()
+        if current in symbols:
+            symbols.remove(current)
+            save_stock_universe(symbols)
+            symbols = load_stock_universe()
+            self._stock_symbol_combo.blockSignals(True)
+            self._stock_symbol_combo.clear()
+            self._stock_symbol_combo.addItems(symbols)
+            self._stock_symbol_combo.blockSignals(False)
+            self._stock_universe_label.setText(f"Universe ({len(symbols)})")
+
+    def _on_stock_symbol_changed(self, sym):
+        """Symbol changed — clear old data and fetch for current zoom."""
+        self._stock_chart_data = {}
+        self._stock_chart_line.clear()
+        self._request_chart()
+
+    def _zoom_resolution(self, zoom=None):
+        """Map zoom level to the API resolution needed."""
+        z = zoom or self._stock_zoom
+        if z in ('1Y', '3M', '1M'):
+            return 'daily'
+        elif z == '1W':
+            return 'hourly'
+        else:  # '1D'
+            return '15min'
+
+    def _on_zoom_clicked(self, zoom):
+        self._stock_zoom = zoom
+        t = T
+        for z, btn in self._stock_zoom_buttons.items():
+            checked = (z == zoom)
+            btn.setChecked(checked)
+            if checked:
+                btn.setStyleSheet(
+                    f"background-color: {t['accent'].name()}; color: {t['bg_dark'].name()};"
+                    f" font-weight: bold; border-radius: 4px;")
+            else:
+                btn.setStyleSheet(
+                    f"background-color: {t['bg_header'].name()}; color: {t['muted'].name()};"
+                    f" border: 1px solid {t['bg_border'].name()}; border-radius: 4px;")
+
+        # Check if we already have cached data for this resolution
+        res = self._zoom_resolution(zoom)
+        data = self._stock_chart_data.get(res)
+        if data and data.get('closes'):
+            self._apply_chart_zoom()
+        else:
+            self._request_chart()
+
+    def _on_stock_table_dblclick(self, row, _col):
+        item = self._stock_table.item(row, 0)
+        if item:
+            sym = item.text()
+            self._stock_symbol_combo.setCurrentText(sym)
+
+    def _on_heatmap_clicked(self, sym):
+        self._stock_symbol_combo.setCurrentText(sym)
+
+    def _request_chart(self):
+        """Ask DataFetcher to fetch bars at the resolution needed for current zoom."""
+        sym = self._stock_symbol_combo.currentText()
+        if not sym:
+            return
+        res = self._zoom_resolution()
+        self._stock_chart.setTitle(f"{sym} — Loading...")
+        from PySide6.QtCore import QMetaObject, Q_ARG
+        QMetaObject.invokeMethod(
+            self._fetcher, "fetch_chart", Qt.QueuedConnection,
+            Q_ARG(str, sym), Q_ARG(str, res),
+        )
+
+    def _apply_chart_zoom(self):
+        """Slice cached data to the zoom window and autoscale."""
+        res = self._zoom_resolution()
+        data = self._stock_chart_data.get(res)
+        if not data:
+            return
+        closes = data.get('closes', [])
+        timestamps = data.get('timestamps', [])
+        if not closes or not timestamps:
+            return
+
+        import datetime as _dt
+        now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
+        zoom_days = {"1Y": 365, "3M": 90, "1M": 30, "1W": 7, "1D": 1}
+        cutoff = now_ts - zoom_days.get(self._stock_zoom, 30) * 86400
+
+        # Find first index >= cutoff
+        start_idx = 0
+        for i, ts in enumerate(timestamps):
+            if ts >= cutoff:
+                start_idx = i
+                break
+
+        vis_ts = timestamps[start_idx:]
+        vis_closes = closes[start_idx:]
+
+        if vis_closes:
+            self._stock_chart_line.setData(vis_ts, vis_closes)
+            y_min = min(vis_closes)
+            y_max = max(vis_closes)
+            pad = (y_max - y_min) * 0.05 if y_max > y_min else y_max * 0.02
+            self._stock_chart.setXRange(vis_ts[0], vis_ts[-1], padding=0.02)
+            self._stock_chart.setYRange(y_min - pad, y_max + pad, padding=0)
+        else:
+            self._stock_chart_line.clear()
+
+        sym = self._stock_symbol_combo.currentText()
+        self._stock_chart.setTitle(f"{sym} ({self._stock_zoom})")
+
+    @Slot(dict)
+    def on_chart(self, data):
+        """Handle chart_updated signal — store into resolution slot, apply zoom."""
+        sym = data.get('symbol', '')
+        res = data.get('resolution', 'daily')
+        closes = data.get('closes', [])
+        timestamps = data.get('timestamps', [])
+        error = data.get('error')
+
+        # Only update if this symbol is still selected
+        if self._stock_symbol_combo.currentText() != sym:
+            return
+
+        if error:
+            self._stock_chart_line.clear()
+            self._stock_chart.setTitle(f"{sym} — Error: {error}")
+            return
+
+        if closes and timestamps:
+            self._stock_chart_data[res] = {
+                'closes': closes, 'timestamps': timestamps,
+            }
+            # Only apply if this resolution matches current zoom
+            if self._zoom_resolution() == res:
+                self._apply_chart_zoom()
+        else:
+            self._stock_chart_line.clear()
+            self._stock_chart.setTitle(f"{sym} — No data")
+
+    @Slot(dict)
+    def on_stocks(self, data):
+        """Handle stocks_updated signal — update heatmap, table, chart."""
+        self._stock_data_cache = data
+        symbols = data.get('symbols', [])
+        snapshots = data.get('snapshots', {})
+        predictions = data.get('predictions', {})
+
+        # --- Heatmap ---
+        cols = 7  # grid columns
+        for idx, sym in enumerate(symbols):
+            snap = snapshots.get(sym, {})
+            chg = snap.get('change_pct', 0)
+
+            if sym not in self._heatmap_labels:
+                lbl = QLabel()
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setFixedSize(62, 38)
+                lbl.setCursor(Qt.PointingHandCursor)
+                lbl.mousePressEvent = lambda _, s=sym: self._on_heatmap_clicked(s)
+                self._heatmap_labels[sym] = lbl
+                r, c = divmod(idx, cols)
+                self._heatmap_layout.addWidget(lbl, r, c)
+
+            lbl = self._heatmap_labels[sym]
+            # Color intensity scales with magnitude (max ±5%)
+            intensity = min(abs(chg) / 5.0, 1.0)
+            if chg > 0:
+                r_val = int(20 + 20 * (1 - intensity))
+                g_val = int(80 + 175 * intensity)
+                b_val = int(20 + 20 * (1 - intensity))
+            elif chg < 0:
+                r_val = int(80 + 175 * intensity)
+                g_val = int(20 + 20 * (1 - intensity))
+                b_val = int(20 + 20 * (1 - intensity))
+            else:
+                r_val, g_val, b_val = 60, 60, 60
+
+            short = sym.split('/')[0] if '/' in sym else sym
+            lbl.setText(f"{short}\n{chg:+.1f}%")
+            lbl.setStyleSheet(
+                f"background-color: rgb({r_val},{g_val},{b_val});"
+                f" color: white; font-size: 10px; font-weight: bold;"
+                f" border-radius: 4px; padding: 2px;"
+            )
+
+        # Remove stale heatmap labels
+        for sym in list(self._heatmap_labels):
+            if sym not in symbols:
+                lbl = self._heatmap_labels.pop(sym)
+                self._heatmap_layout.removeWidget(lbl)
+                lbl.deleteLater()
+
+        # --- Metrics table ---
+        tbl = self._stock_table
+        tbl.setSortingEnabled(False)
+        tbl.setUpdatesEnabled(False)
+        tbl.setRowCount(len(symbols))
+
+        for row, sym in enumerate(symbols):
+            snap = snapshots.get(sym, {})
+            pred = predictions.get(sym, {})
+
+            price = snap.get('price', 0)
+            chg = snap.get('change_pct', 0)
+            vol = snap.get('volume', 0)
+            bear = pred.get('bear')
+            bull = pred.get('bull')
+            score = pred.get('score')
+            signal = pred.get('signal', '')
+
+            chg_color = T['green'] if chg > 0 else (T['red'] if chg < 0 else T['white'])
+
+            items_data = [
+                (sym, T['white']),
+                (f"${price:.2f}" if price else "\u2014", T['white']),
+                (f"{chg:+.2f}%", chg_color),
+                (f"{vol:,}" if vol else "\u2014", T['muted']),
+                (f"{bear:+.4f}" if bear is not None else "\u2014",
+                 T['red'] if bear is not None and bear < 0 else T['muted']),
+                (f"{bull:+.4f}" if bull is not None else "\u2014",
+                 T['green'] if bull is not None and bull > 0 else T['muted']),
+                (f"{score:+.4f}" if score is not None else "\u2014",
+                 T['green'] if score is not None and score > 0 else
+                 (T['red'] if score is not None and score < 0 else T['muted'])),
+                (signal, T['green'] if signal == 'BULL' else
+                 (T['red'] if signal == 'BEAR' else T['muted'])),
+            ]
+
+            for col, (val, color) in enumerate(items_data):
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setForeground(color)
+                tbl.setItem(row, col, item)
+
+        tbl.setUpdatesEnabled(True)
+        tbl.setSortingEnabled(True)
+
+        # Refresh chart if no data yet
+        if not hasattr(self, '_stock_chart_loaded'):
+            self._stock_chart_loaded = True
+            self._request_chart()
+
+    # ---- Tab 6: Models ---------------------------------------------------
     def _build_models_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1563,7 +2134,7 @@ class TradingDashboard(QMainWindow):
         layout.addStretch()
         self.tabs.addTab(tab, "Models")
 
-    # ---- Tab 5: Logs -----------------------------------------------------
+    # ---- Tab 7: Logs -----------------------------------------------------
     def _build_logs_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1826,14 +2397,14 @@ class TradingDashboard(QMainWindow):
         """Filter cached news articles based on combo selection."""
         import datetime as _dt
         from crypto_loop import CRYPTO_SYMBOLS
-        from stock_loop import STOCK_UNIVERSE
+        from stock_config import load_stock_universe
 
         idx = self._news_filter_combo.currentIndex()
         articles = getattr(self, '_news_articles', [])
 
         if idx == 0:  # My Universe
             crypto_bases = {s.split('/')[0] for s in CRYPTO_SYMBOLS}
-            stock_set = set(STOCK_UNIVERSE)
+            stock_set = set(load_stock_universe())
             universe = crypto_bases | stock_set
             filtered = []
             for a in articles:
