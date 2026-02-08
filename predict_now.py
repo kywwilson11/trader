@@ -79,6 +79,14 @@ def load_model(model_type='default', inference_device=None, prefix=''):
     model.load_state_dict(torch.load(model_path, map_location=dev, weights_only=True))
     model.eval()
 
+    # Try to JIT-trace for faster inference (LSTM compatible with trace)
+    try:
+        dummy = torch.randn(1, config['seq_len'], config['input_dim']).to(dev)
+        model = torch.jit.trace(model, dummy)
+        print(f"  [JIT] Model traced successfully ({model_type})")
+    except Exception as e:
+        print(f"  [JIT] Trace failed ({model_type}): {e}, using eager mode")
+
     return model, scaler_X, config, config['seq_len'], feature_cols
 
 

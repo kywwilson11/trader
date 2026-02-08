@@ -1,0 +1,1786 @@
+#!/usr/bin/env python3
+"""PySide6 Trading Dashboard for Alpaca paper trading system.
+
+Monitors positions, P&L, trade history, account balance, tax estimation,
+model status, evolve.py progress, and hardware health — all in one window.
+
+Themes: Bubblegum Goth, Batman, Joker, Harley Quinn, Dark, Space, Money
+All timestamps displayed in US/Central time.
+"""
+
+import os
+import sys
+import re
+import pickle
+import datetime as dt
+from pathlib import Path
+from collections import defaultdict
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+import alpaca_trade_api as tradeapi
+
+from PySide6.QtCore import (
+    Qt, QTimer, QThread, Signal, Slot, QObject,
+)
+from PySide6.QtGui import QColor, QPalette, QFont, QAction, QPainter, QPixmap
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QTabWidget, QWidget,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+    QTableWidget, QTableWidgetItem, QHeaderView,
+    QPlainTextEdit, QComboBox, QCheckBox, QFrame,
+    QSplitter, QGroupBox, QProgressBar, QToolBar,
+    QSizePolicy,
+)
+import pyqtgraph as pg
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+TZ_CENTRAL = ZoneInfo("America/Chicago")
+
+LOG_FILES = {
+    "Evolve": BASE_DIR / "evolve_full_run.log",
+    "Monitor": BASE_DIR / "monitor.log",
+    "Alternating Search": BASE_DIR / "alternating_search.log",
+    "Hypersearch": BASE_DIR / "hypersearch_output.log",
+    "Hypersearch Bear": BASE_DIR / "hypersearch_bear_full.log",
+    "Pipeline": BASE_DIR / "pipeline_output.log",
+    "Watchdog": BASE_DIR / "watchdog.log",
+}
+
+CONFIG_FILES = {
+    "Crypto Bear": BASE_DIR / "bear_config.pkl",
+    "Crypto Bull": BASE_DIR / "bull_config.pkl",
+    "Stock Bear": BASE_DIR / "stock_bear_config.pkl",
+    "Stock Bull": BASE_DIR / "stock_bull_config.pkl",
+}
+
+MODEL_FILES = {
+    "Crypto Bear": BASE_DIR / "bear_model.pt",
+    "Crypto Bull": BASE_DIR / "bull_model.pt",
+    "Stock Bear": BASE_DIR / "stock_bear_model.pt",
+    "Stock Bull": BASE_DIR / "stock_bull_model.pt",
+}
+
+# Tax rates
+FED_SHORT_TERM = 0.37
+FED_LONG_TERM = 0.20
+STATE_RATE = 0.05
+
+
+# ---------------------------------------------------------------------------
+# Theme System
+# ---------------------------------------------------------------------------
+THEMES = {
+    "Bubblegum Goth": {
+        "green":     QColor(0, 230, 118),
+        "red":       QColor(255, 56, 96),
+        "yellow":    QColor(255, 170, 230),
+        "white":     QColor(240, 210, 245),
+        "muted":     QColor(170, 130, 190),
+        "bg_dark":   QColor(18, 10, 26),
+        "bg_card":   QColor(35, 20, 50),
+        "bg_table":  QColor(28, 16, 40),
+        "accent":    QColor(255, 105, 180),
+        "bg_header": QColor(45, 25, 60),
+        "bg_border": QColor(80, 40, 100),
+        "bg_hover":  QColor(55, 30, 75),
+        "bg_log":    QColor(12, 6, 18),
+    },
+    "Batman": {
+        "green":     QColor(76, 175, 80),
+        "red":       QColor(244, 67, 54),
+        "yellow":    QColor(255, 215, 0),
+        "white":     QColor(224, 224, 224),
+        "muted":     QColor(136, 136, 136),
+        "bg_dark":   QColor(10, 10, 10),
+        "bg_card":   QColor(26, 26, 26),
+        "bg_table":  QColor(20, 20, 20),
+        "accent":    QColor(255, 215, 0),
+        "bg_header": QColor(34, 34, 34),
+        "bg_border": QColor(58, 58, 58),
+        "bg_hover":  QColor(42, 42, 42),
+        "bg_log":    QColor(5, 5, 5),
+    },
+    "Dark": {
+        "green":     QColor(0, 200, 83),
+        "red":       QColor(255, 68, 68),
+        "yellow":    QColor(255, 193, 7),
+        "white":     QColor(220, 220, 220),
+        "muted":     QColor(160, 160, 160),
+        "bg_dark":   QColor(43, 43, 43),
+        "bg_card":   QColor(55, 55, 55),
+        "bg_table":  QColor(50, 50, 50),
+        "accent":    QColor(100, 181, 246),
+        "bg_header": QColor(58, 58, 58),
+        "bg_border": QColor(85, 85, 85),
+        "bg_hover":  QColor(69, 69, 69),
+        "bg_log":    QColor(30, 30, 30),
+    },
+    "Space": {
+        "green":     QColor(0, 230, 118),
+        "red":       QColor(255, 82, 82),
+        "yellow":    QColor(255, 171, 64),
+        "white":     QColor(210, 225, 255),
+        "muted":     QColor(110, 130, 170),
+        "bg_dark":   QColor(8, 12, 21),
+        "bg_card":   QColor(16, 24, 42),
+        "bg_table":  QColor(12, 18, 32),
+        "accent":    QColor(0, 229, 255),
+        "bg_header": QColor(22, 32, 56),
+        "bg_border": QColor(36, 52, 86),
+        "bg_hover":  QColor(26, 40, 68),
+        "bg_log":    QColor(4, 8, 16),
+    },
+    "Money": {
+        "green":     QColor(0, 230, 118),
+        "red":       QColor(255, 107, 107),
+        "yellow":    QColor(255, 215, 0),
+        "white":     QColor(212, 232, 212),
+        "muted":     QColor(122, 154, 122),
+        "bg_dark":   QColor(10, 18, 10),
+        "bg_card":   QColor(20, 32, 20),
+        "bg_table":  QColor(15, 26, 15),
+        "accent":    QColor(255, 215, 0),
+        "bg_header": QColor(26, 46, 26),
+        "bg_border": QColor(42, 74, 42),
+        "bg_hover":  QColor(34, 54, 34),
+        "bg_log":    QColor(6, 12, 6),
+    },
+    "Joker": {
+        "green":     QColor(0, 255, 102),
+        "red":       QColor(255, 34, 68),
+        "yellow":    QColor(170, 255, 170),
+        "white":     QColor(220, 210, 240),
+        "muted":     QColor(140, 120, 180),
+        "bg_dark":   QColor(13, 10, 24),
+        "bg_card":   QColor(31, 16, 53),
+        "bg_table":  QColor(22, 12, 38),
+        "accent":    QColor(0, 255, 102),
+        "bg_header": QColor(40, 20, 66),
+        "bg_border": QColor(70, 40, 110),
+        "bg_hover":  QColor(50, 28, 82),
+        "bg_log":    QColor(8, 5, 16),
+    },
+    "Harley Quinn": {
+        "green":     QColor(0, 200, 150),
+        "red":       QColor(255, 23, 68),
+        "yellow":    QColor(255, 224, 232),
+        "white":     QColor(240, 230, 235),
+        "muted":     QColor(160, 120, 140),
+        "bg_dark":   QColor(10, 10, 10),
+        "bg_card":   QColor(42, 16, 24),
+        "bg_table":  QColor(30, 12, 18),
+        "accent":    QColor(255, 23, 68),
+        "bg_header": QColor(50, 20, 30),
+        "bg_border": QColor(90, 40, 55),
+        "bg_hover":  QColor(65, 28, 40),
+        "bg_log":    QColor(5, 5, 5),
+    },
+}
+
+# Active theme — module-level so helpers can reference it
+T = THEMES["Bubblegum Goth"]
+
+
+def set_theme(name):
+    """Switch the active theme colors."""
+    global T
+    T = THEMES[name]
+
+
+_THEME_SVGS = {
+    "Batman": """\
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#141420"/>
+      <stop offset="100%" stop-color="#08080c"/>
+    </radialGradient>
+  </defs>
+  <circle cx="100" cy="100" r="97" fill="url(#bg)" stroke="#ffd700" stroke-width="3"/>
+  <ellipse cx="100" cy="102" rx="68" ry="44" fill="#ffd700"/>
+  <path d="
+    M 100,66
+    L 94,54  L 97,68
+    L 38,62
+    L 46,84  L 54,74
+    L 60,90  L 70,78
+    L 78,96
+    L 100,126
+    L 122,96
+    L 130,78  L 140,90
+    L 146,74  L 154,84
+    L 162,62
+    L 103,68  L 106,54
+    Z" fill="#0a0a0a"/>
+</svg>""",
+
+    "Joker": """\
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#301055"/>
+      <stop offset="100%" stop-color="#180830"/>
+    </radialGradient>
+  </defs>
+  <circle cx="100" cy="100" r="97" fill="url(#bg)" stroke="#00ff66" stroke-width="3"/>
+  <path d="
+    M 45,105 Q 42,50 70,35 Q 85,28 100,32 Q 115,28 130,35 Q 158,50 155,105
+    Q 140,70 120,62 Q 108,58 100,62 Q 92,58 80,62 Q 60,70 45,105 Z" fill="#00bb44"/>
+  <ellipse cx="100" cy="118" rx="42" ry="52" fill="#e8e4e0"/>
+  <circle cx="82" cy="105" r="6" fill="#1a1a1a"/>
+  <circle cx="118" cy="105" r="6" fill="#1a1a1a"/>
+  <path d="M 68,135 Q 84,158 100,155 Q 116,158 132,135"
+        fill="none" stroke="#dd1133" stroke-width="5" stroke-linecap="round"/>
+</svg>""",
+
+    "Harley Quinn": """\
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1a0a10"/>
+      <stop offset="100%" stop-color="#0a0408"/>
+    </radialGradient>
+  </defs>
+  <circle cx="100" cy="100" r="97" fill="url(#bg)" stroke="#ff1744" stroke-width="3"/>
+  <path d="M 50,100 L 78,58 L 106,100 L 78,142 Z" fill="#dd1133"/>
+  <path d="M 94,100 L 122,58 L 150,100 L 122,142 Z" fill="#151515" stroke="#333"
+        stroke-width="1.5"/>
+</svg>""",
+
+    "Bubblegum Goth": """\
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1a0c22"/>
+      <stop offset="100%" stop-color="#0a0510"/>
+    </radialGradient>
+  </defs>
+  <circle cx="100" cy="100" r="97" fill="url(#bg)" stroke="#ff69b4" stroke-width="3"/>
+  <ellipse cx="100" cy="92" rx="44" ry="40" fill="#ff7eb3"/>
+  <rect x="68" y="122" width="64" height="28" rx="14" fill="#ff7eb3"/>
+  <ellipse cx="82" cy="90" rx="14" ry="15" fill="#1a0c22"/>
+  <ellipse cx="118" cy="90" rx="14" ry="15" fill="#1a0c22"/>
+  <ellipse cx="100" cy="112" rx="5" ry="6" fill="#1a0c22"/>
+  <path d="M 80,142 Q 90,138 100,140 Q 110,138 120,142"
+        fill="none" stroke="#1a0c22" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 78,58 Q 62,40 68,52 Q 72,60 78,58 Z" fill="#ff1493"/>
+  <path d="M 78,58 Q 92,42 88,54 Q 84,60 78,58 Z" fill="#ff1493"/>
+  <circle cx="78" cy="58" r="3.5" fill="#ff69b4"/>
+</svg>""",
+
+    "Dark": """\
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#2a2a35"/>
+      <stop offset="100%" stop-color="#141418"/>
+    </radialGradient>
+    <radialGradient id="moon" cx="35%" cy="35%" r="50%">
+      <stop offset="0%" stop-color="#fffff0"/>
+      <stop offset="60%" stop-color="#f0e8d0"/>
+      <stop offset="100%" stop-color="#ddd0b0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="100" cy="100" r="97" fill="url(#bg)" stroke="#64b5f6" stroke-width="3"/>
+  <circle cx="35" cy="42" r="2" fill="white" opacity="0.9"/>
+  <circle cx="155" cy="35" r="1.5" fill="white" opacity="0.7"/>
+  <circle cx="165" cy="85" r="2" fill="white" opacity="0.8"/>
+  <circle cx="40" cy="145" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="160" cy="150" r="1.8" fill="white" opacity="0.7"/>
+  <circle cx="50" cy="70" r="1" fill="white" opacity="0.5"/>
+  <circle cx="145" cy="170" r="1.2" fill="white" opacity="0.5"/>
+  <circle cx="88" cy="95" r="50" fill="url(#moon)"/>
+  <circle cx="112" cy="82" r="42" fill="url(#bg)"/>
+  <circle cx="62" cy="85" r="7" fill="#d8ccaa" opacity="0.4"/>
+  <circle cx="72" cy="115" r="5" fill="#d8ccaa" opacity="0.35"/>
+  <circle cx="55" cy="105" r="4" fill="#d8ccaa" opacity="0.3"/>
+  <circle cx="80" cy="130" r="3.5" fill="#d8ccaa" opacity="0.3"/>
+  <circle cx="88" cy="95" r="55" fill="none" stroke="#fffff0" stroke-width="2"
+          opacity="0.1"/>
+</svg>""",
+
+    "Space": """\
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#0c1428"/>
+      <stop offset="100%" stop-color="#040810"/>
+    </radialGradient>
+    <radialGradient id="planet" cx="40%" cy="35%" r="55%">
+      <stop offset="0%" stop-color="#e8c870"/>
+      <stop offset="40%" stop-color="#c8a050"/>
+      <stop offset="100%" stop-color="#886830"/>
+    </radialGradient>
+  </defs>
+  <circle cx="100" cy="100" r="97" fill="url(#bg)" stroke="#00e5ff" stroke-width="3"/>
+  <circle cx="25" cy="35" r="2" fill="white" opacity="0.9"/>
+  <circle cx="170" cy="28" r="1.5" fill="white" opacity="0.7"/>
+  <circle cx="172" cy="78" r="2" fill="white" opacity="0.8"/>
+  <circle cx="30" cy="155" r="1.5" fill="white" opacity="0.6"/>
+  <circle cx="55" cy="55" r="1" fill="white" opacity="0.5"/>
+  <circle cx="160" cy="158" r="1.5" fill="white" opacity="0.5"/>
+  <ellipse cx="100" cy="105" rx="75" ry="18" fill="none" stroke="#c8a050"
+           stroke-width="10" opacity="0.4"/>
+  <circle cx="100" cy="98" r="38" fill="url(#planet)"/>
+  <path d="M 63,90 Q 100,86 137,90" fill="none" stroke="#d4b060" stroke-width="2"
+        opacity="0.4"/>
+  <path d="M 62,100 Q 100,96 138,100" fill="none" stroke="#b89040" stroke-width="3"
+        opacity="0.3"/>
+  <path d="M 65,108 Q 100,112 135,108" fill="none" stroke="#d4b060" stroke-width="2"
+        opacity="0.3"/>
+  <path d="M 25,105 Q 55,126 100,128 Q 145,126 175,105"
+        fill="none" stroke="#c8a050" stroke-width="9" stroke-linecap="round" opacity="0.8"/>
+  <path d="M 28,105 Q 58,122 100,124 Q 142,122 172,105"
+        fill="none" stroke="#040810" stroke-width="2" opacity="0.5"/>
+</svg>""",
+
+    "Money": """\
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#0f1e0f"/>
+      <stop offset="100%" stop-color="#060c06"/>
+    </radialGradient>
+    <radialGradient id="coin" cx="42%" cy="38%" r="55%">
+      <stop offset="0%" stop-color="#ffe680"/>
+      <stop offset="40%" stop-color="#ffd700"/>
+      <stop offset="100%" stop-color="#aa8800"/>
+    </radialGradient>
+    <radialGradient id="shine" cx="35%" cy="30%" r="40%">
+      <stop offset="0%" stop-color="white" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="white" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="100" cy="100" r="97" fill="url(#bg)" stroke="#ffd700" stroke-width="3"/>
+  <circle cx="100" cy="100" r="58" fill="url(#coin)" stroke="#c8a800" stroke-width="3"/>
+  <circle cx="100" cy="100" r="50" fill="none" stroke="#b89900" stroke-width="2"/>
+  <circle cx="100" cy="100" r="56" fill="none" stroke="#ddbb22" stroke-width="1"
+          stroke-dasharray="5,3"/>
+  <text x="100" y="125" text-anchor="middle" font-family="serif" font-size="80"
+        font-weight="bold" fill="#8a6e00">$</text>
+  <circle cx="100" cy="100" r="55" fill="url(#shine)"/>
+</svg>""",
+}
+
+
+_THEME_IMAGES = {
+    "Batman": BASE_DIR / "logos" / "batman.jpeg",
+    "Joker": BASE_DIR / "logos" / "joker.png",
+    "Harley Quinn": BASE_DIR / "logos" / "harley.jpeg",
+}
+
+
+def generate_theme_logo(theme_name, size=80):
+    """Generate a logo icon for the given theme.
+
+    Character themes load image files from logos/.
+    Other themes use SVG rendering.
+    Returns a QPixmap of the requested size.
+    """
+    # Try image file first
+    img_path = _THEME_IMAGES.get(theme_name)
+    if img_path and img_path.exists():
+        pix = QPixmap(str(img_path))
+        if not pix.isNull():
+            return pix.scaled(size, size, Qt.KeepAspectRatio,
+                              Qt.SmoothTransformation)
+
+    # Fall back to SVG
+    from PySide6.QtSvg import QSvgRenderer
+    from PySide6.QtCore import QByteArray
+
+    svg_data = _THEME_SVGS.get(theme_name)
+    if not svg_data:
+        pix = QPixmap(size, size)
+        pix.fill(QColor(0, 0, 0, 0))
+        return pix
+
+    renderer = QSvgRenderer(QByteArray(svg_data.encode("utf-8")))
+    pix = QPixmap(size, size)
+    pix.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pix)
+    renderer.render(painter)
+    painter.end()
+    return pix
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def fmt_money(val):
+    """Format a numeric value as $X,XXX.XX."""
+    try:
+        v = float(val)
+        sign = "-" if v < 0 else ""
+        return f"{sign}${abs(v):,.2f}"
+    except (TypeError, ValueError):
+        return "$0.00"
+
+
+def fmt_pct(val):
+    """Format as percentage."""
+    try:
+        return f"{float(val):+.2f}%"
+    except (TypeError, ValueError):
+        return "0.00%"
+
+
+def fmt_time(ts_str):
+    """Convert an ISO timestamp string to Central Time display."""
+    if not ts_str:
+        return ""
+    try:
+        parsed = dt.datetime.fromisoformat(str(ts_str))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        central = parsed.astimezone(TZ_CENTRAL)
+        return central.strftime("%m/%d %I:%M:%S %p")
+    except Exception:
+        return str(ts_str)[:19] if len(str(ts_str)) >= 19 else str(ts_str)
+
+
+def fmt_time_short(ts_str):
+    """Convert an ISO timestamp to short Central Time (no seconds)."""
+    if not ts_str:
+        return ""
+    try:
+        parsed = dt.datetime.fromisoformat(str(ts_str))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        central = parsed.astimezone(TZ_CENTRAL)
+        return central.strftime("%m/%d %I:%M %p")
+    except Exception:
+        return str(ts_str)[:16] if len(str(ts_str)) >= 16 else str(ts_str)
+
+
+def pnl_color(val):
+    """Return green/red/white QColor based on sign."""
+    try:
+        v = float(val)
+        if v > 0:
+            return T["green"]
+        elif v < 0:
+            return T["red"]
+    except (TypeError, ValueError):
+        pass
+    return T["white"]
+
+
+def make_card(title, value="\u2014", parent=None):
+    """Create a styled info card widget."""
+    frame = QFrame(parent)
+    frame.setProperty("card", True)
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(12, 8, 12, 8)
+
+    lbl_title = QLabel(title)
+    lbl_title.setProperty("card_title", True)
+    lbl_title.setAlignment(Qt.AlignLeft)
+
+    lbl_value = QLabel(str(value))
+    lbl_value.setAlignment(Qt.AlignLeft)
+    lbl_value.setObjectName("card_value")
+
+    layout.addWidget(lbl_title)
+    layout.addWidget(lbl_value)
+    return frame
+
+
+def read_config(path):
+    """Safely read a pickle config file."""
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Data Fetcher Thread
+# ---------------------------------------------------------------------------
+class DataFetcher(QObject):
+    """Fetches data from Alpaca API on background timers."""
+
+    account_updated = Signal(dict)
+    positions_updated = Signal(list)
+    orders_updated = Signal(list)
+    history_updated = Signal(dict)
+    hw_updated = Signal(dict)
+    error_occurred = Signal(str)
+
+    def __init__(self, api):
+        super().__init__()
+        self.api = api
+
+    @Slot()
+    def start_timers(self):
+        """Create and start all polling timers (called after moveToThread)."""
+        self._timer_account = QTimer(self)
+        self._timer_account.timeout.connect(self.fetch_account)
+        self._timer_account.start(10_000)
+
+        self._timer_positions = QTimer(self)
+        self._timer_positions.timeout.connect(self.fetch_positions)
+        self._timer_positions.start(10_000)
+
+        self._timer_orders = QTimer(self)
+        self._timer_orders.timeout.connect(self.fetch_orders)
+        self._timer_orders.start(30_000)
+
+        self._timer_history = QTimer(self)
+        self._timer_history.timeout.connect(self.fetch_history)
+        self._timer_history.start(300_000)
+
+        self._timer_hw = QTimer(self)
+        self._timer_hw.timeout.connect(self.fetch_hw)
+        self._timer_hw.start(5_000)
+
+        # Immediate first fetch
+        self.fetch_account()
+        self.fetch_positions()
+        self.fetch_orders()
+        self.fetch_history()
+        self.fetch_hw()
+
+    @Slot()
+    def stop_timers(self):
+        """Stop all timers (must be called from this object's thread)."""
+        for attr in ("_timer_account", "_timer_positions", "_timer_orders",
+                      "_timer_history", "_timer_hw"):
+            timer = getattr(self, attr, None)
+            if timer:
+                timer.stop()
+
+    @Slot()
+    def fetch_account(self):
+        try:
+            acct = self.api.get_account()
+            self.account_updated.emit({
+                "equity": acct.equity,
+                "cash": acct.cash,
+                "buying_power": acct.buying_power,
+                "last_equity": acct.last_equity,
+                "portfolio_value": acct.portfolio_value,
+            })
+        except Exception as e:
+            self.error_occurred.emit(f"Account fetch: {e}")
+
+    @Slot()
+    def fetch_positions(self):
+        try:
+            positions = self.api.list_positions()
+            data = []
+            for p in positions:
+                data.append({
+                    "symbol": p.symbol,
+                    "qty": p.qty,
+                    "side": p.side,
+                    "avg_entry_price": p.avg_entry_price,
+                    "current_price": p.current_price,
+                    "unrealized_pl": p.unrealized_pl,
+                    "unrealized_plpc": p.unrealized_plpc,
+                    "market_value": p.market_value,
+                })
+            self.positions_updated.emit(data)
+        except Exception as e:
+            self.error_occurred.emit(f"Positions fetch: {e}")
+
+    @Slot()
+    def fetch_orders(self):
+        try:
+            orders = self.api.list_orders(status="all", limit=100)
+            data = []
+            for o in orders:
+                data.append({
+                    "symbol": o.symbol,
+                    "side": o.side,
+                    "qty": o.qty,
+                    "type": o.type,
+                    "status": o.status,
+                    "submitted_at": str(o.submitted_at) if o.submitted_at else "",
+                    "filled_at": str(o.filled_at) if o.filled_at else "",
+                    "filled_avg_price": o.filled_avg_price,
+                    "notional": getattr(o, "notional", None),
+                    "filled_qty": o.filled_qty,
+                })
+            self.orders_updated.emit(data)
+        except Exception as e:
+            self.error_occurred.emit(f"Orders fetch: {e}")
+
+    @Slot()
+    def fetch_history(self):
+        try:
+            hist = self.api.get_portfolio_history(period="1M", timeframe="1D")
+            self.history_updated.emit({
+                "equity": list(hist.equity),
+                "timestamp": list(hist.timestamp),
+                "profit_loss": list(hist.profit_loss) if hist.profit_loss else [],
+                "profit_loss_pct": list(hist.profit_loss_pct) if hist.profit_loss_pct else [],
+            })
+        except Exception as e:
+            self.error_occurred.emit(f"History fetch: {e}")
+
+    @Slot()
+    def fetch_hw(self):
+        """Read hardware stats without importing torch (avoids GIL/CUDA hangs)."""
+        try:
+            temp = self._read_gpu_temp()
+            used, total = self._read_ram()
+            self.hw_updated.emit({
+                "gpu_temp": temp,
+                "ram_used": used,
+                "ram_total": total,
+                "gpu_available": None,
+            })
+        except Exception as e:
+            self.error_occurred.emit(f"HW fetch: {e}")
+
+    @staticmethod
+    def _read_gpu_temp():
+        """Read GPU temp from thermal zone (no torch, no tegrastats)."""
+        for zone in ("/sys/devices/virtual/thermal/thermal_zone1/temp",
+                     "/sys/devices/virtual/thermal/thermal_zone0/temp"):
+            try:
+                with open(zone) as f:
+                    return int(f.read().strip()) / 1000.0
+            except (FileNotFoundError, ValueError, OSError):
+                continue
+        try:
+            import subprocess
+            proc = subprocess.run(
+                ["tegrastats", "--interval", "100"],
+                capture_output=True, text=True, timeout=2,
+            )
+            m = re.search(r"GPU@(\d+(?:\.\d+)?)C", proc.stdout + proc.stderr, re.IGNORECASE)
+            if m:
+                return float(m.group(1))
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _read_ram():
+        """Read RAM from /proc/meminfo (no torch)."""
+        try:
+            with open("/proc/meminfo") as f:
+                info = f.read()
+            total = int(re.search(r"MemTotal:\s+(\d+)", info).group(1)) / 1024.0
+            avail = int(re.search(r"MemAvailable:\s+(\d+)", info).group(1)) / 1024.0
+            return round(total - avail, 1), round(total, 1)
+        except Exception:
+            return None, None
+
+
+# ---------------------------------------------------------------------------
+# Log Tailer Thread
+# ---------------------------------------------------------------------------
+class LogTailer(QObject):
+    """Tails log files and emits new lines."""
+
+    new_lines = Signal(str, str)  # (log_name, text)
+
+    def __init__(self):
+        super().__init__()
+        self._positions = {}
+
+    @Slot()
+    def start_timer(self):
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.check_logs)
+        self._timer.start(2_000)
+        for name, path in LOG_FILES.items():
+            try:
+                self._positions[name] = path.stat().st_size
+            except OSError:
+                self._positions[name] = 0
+
+    @Slot()
+    def stop_timer(self):
+        if hasattr(self, "_timer"):
+            self._timer.stop()
+
+    @Slot()
+    def check_logs(self):
+        for name, path in LOG_FILES.items():
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            last_pos = self._positions.get(name, 0)
+            if size < last_pos:
+                last_pos = 0
+            if size > last_pos:
+                with open(path, "r", errors="replace") as f:
+                    f.seek(last_pos)
+                    text = f.read(size - last_pos)
+                self._positions[name] = size
+                if text.strip():
+                    self.new_lines.emit(name, text)
+
+
+# ---------------------------------------------------------------------------
+# Tax Estimator
+# ---------------------------------------------------------------------------
+def estimate_taxes(orders):
+    """FIFO lot matching from filled orders. Returns dict of tax info."""
+    buys = defaultdict(list)
+    realized = []
+
+    filled = [o for o in orders if o.get("status") == "filled" and o.get("filled_avg_price")]
+    filled.sort(key=lambda o: o.get("filled_at", ""))
+
+    for o in filled:
+        sym = o["symbol"]
+        try:
+            qty = abs(float(o.get("filled_qty") or o.get("qty") or 0))
+            price = float(o["filled_avg_price"])
+        except (TypeError, ValueError):
+            continue
+        if qty == 0:
+            continue
+
+        filled_at = o.get("filled_at", "")
+
+        if o["side"] == "buy":
+            buys[sym].append({"qty": qty, "price": price, "time": filled_at})
+        elif o["side"] == "sell":
+            remaining = qty
+            while remaining > 0 and buys[sym]:
+                lot = buys[sym][0]
+                matched = min(remaining, lot["qty"])
+                gain = (price - lot["price"]) * matched
+                try:
+                    buy_time = dt.datetime.fromisoformat(lot["time"].replace("Z", "+00:00"))
+                    sell_time = dt.datetime.fromisoformat(filled_at.replace("Z", "+00:00"))
+                    days_held = (sell_time - buy_time).days
+                except Exception:
+                    days_held = 0
+                realized.append({
+                    "symbol": sym, "gain": gain, "qty": matched,
+                    "long_term": days_held >= 365,
+                })
+                lot["qty"] -= matched
+                remaining -= matched
+                if lot["qty"] <= 0:
+                    buys[sym].pop(0)
+
+    total_gain = sum(r["gain"] for r in realized)
+    st_gain = sum(r["gain"] for r in realized if not r["long_term"])
+    lt_gain = sum(r["gain"] for r in realized if r["long_term"])
+    st_tax = max(0, st_gain) * (FED_SHORT_TERM + STATE_RATE)
+    lt_tax = max(0, lt_gain) * (FED_LONG_TERM + STATE_RATE)
+
+    return {
+        "realized_gain": total_gain,
+        "short_term_gain": st_gain,
+        "long_term_gain": lt_gain,
+        "estimated_tax": st_tax + lt_tax,
+        "net_after_tax": total_gain - (st_tax + lt_tax),
+        "num_trades": len(realized),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Parse evolve log for status
+# ---------------------------------------------------------------------------
+def parse_evolve_status(log_path):
+    """Parse evolve_full_run.log for current status info."""
+    info = {
+        "cycle_start": None, "current_group": None,
+        "trial_current": 0, "trial_total": 0,
+        "best_score": 0.0, "best_trial": 0, "status": "idle",
+    }
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError:
+        return info
+
+    for m in re.finditer(r"\[EVOLVE\] CYCLE START: (.+)", text):
+        info["cycle_start"] = m.group(1).strip()
+    for m in re.finditer(r"\[EVOLVE\] GROUP: (\w+)", text):
+        info["current_group"] = m.group(1)
+
+    trials = re.findall(r"\[\s*(\d+)\]", text)
+    if trials:
+        info["trial_current"] = int(trials[-1])
+
+    m = re.search(r"(\d+) trials/model", text)
+    if m:
+        info["trial_total"] = int(m.group(1))
+
+    bests = re.findall(r"Best is trial (\d+) with value: (\d+\.\d+)", text)
+    if bests:
+        info["best_trial"] = int(bests[-1][0])
+        info["best_score"] = float(bests[-1][1])
+
+    try:
+        mtime = log_path.stat().st_mtime
+        age = dt.datetime.now().timestamp() - mtime
+        info["status"] = "running" if age < 600 else "idle"
+    except OSError:
+        pass
+
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Theme Application
+# ---------------------------------------------------------------------------
+def apply_theme(app):
+    """Apply the current theme's QPalette and global stylesheet."""
+    t = T
+    palette = QPalette()
+    palette.setColor(QPalette.Window, t["bg_dark"])
+    palette.setColor(QPalette.WindowText, t["white"])
+    palette.setColor(QPalette.Base, t["bg_log"])
+    palette.setColor(QPalette.AlternateBase, t["bg_card"])
+    palette.setColor(QPalette.ToolTipBase, t["bg_card"])
+    palette.setColor(QPalette.ToolTipText, t["white"])
+    palette.setColor(QPalette.Text, t["white"])
+    palette.setColor(QPalette.Button, t["bg_header"])
+    palette.setColor(QPalette.ButtonText, t["white"])
+    palette.setColor(QPalette.BrightText, t["accent"])
+    palette.setColor(QPalette.Link, t["accent"])
+    palette.setColor(QPalette.Highlight, t["accent"])
+    palette.setColor(QPalette.HighlightedText, t["bg_dark"])
+    app.setPalette(palette)
+
+    app.setStyleSheet(f"""
+        QToolTip {{ color: {t["white"].name()}; background-color: {t["bg_card"].name()};
+                    border: 1px solid {t["accent"].name()}; }}
+        QTabWidget::pane {{ border: 1px solid {t["bg_border"].name()}; }}
+        QTabBar::tab {{
+            background: {t["bg_header"].name()}; color: {t["muted"].name()};
+            padding: 8px 16px; border: 1px solid {t["bg_border"].name()};
+            border-bottom: none; border-top-left-radius: 4px;
+            border-top-right-radius: 4px; margin-right: 2px;
+        }}
+        QTabBar::tab:selected {{
+            background: {t["bg_dark"].name()}; color: {t["accent"].name()};
+            border-bottom: 2px solid {t["accent"].name()};
+        }}
+        QTabBar::tab:hover {{ background: {t["bg_hover"].name()}; color: {t["white"].name()}; }}
+        QComboBox {{
+            background: {t["bg_header"].name()}; color: {t["white"].name()};
+            border: 1px solid {t["bg_border"].name()}; padding: 4px 8px; border-radius: 4px;
+        }}
+        QComboBox::drop-down {{ border: none; }}
+        QComboBox QAbstractItemView {{
+            background: {t["bg_header"].name()};
+            selection-background-color: {t["accent"].name()};
+        }}
+        QCheckBox {{ spacing: 6px; color: {t["white"].name()}; }}
+        QCheckBox::indicator:checked {{
+            background-color: {t["accent"].name()};
+            border: 1px solid {t["accent"].name()}; border-radius: 2px;
+        }}
+        QCheckBox::indicator:unchecked {{
+            background-color: {t["bg_header"].name()};
+            border: 1px solid {t["bg_border"].name()}; border-radius: 2px;
+        }}
+        QProgressBar {{
+            background: {t["bg_header"].name()};
+            border: 1px solid {t["bg_border"].name()}; border-radius: 4px;
+        }}
+        QProgressBar::chunk {{ border-radius: 3px; }}
+        QStatusBar {{
+            background: {t["bg_dark"].name()}; color: {t["muted"].name()};
+            border-top: 1px solid {t["bg_border"].name()};
+        }}
+        QGroupBox {{ color: {t["accent"].name()}; }}
+        QScrollBar:vertical {{ background: {t["bg_dark"].name()}; width: 10px; margin: 0; }}
+        QScrollBar::handle:vertical {{
+            background: {t["bg_border"].name()}; border-radius: 4px; min-height: 20px;
+        }}
+        QScrollBar::handle:vertical:hover {{ background: {t["accent"].name()}; }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        QToolBar {{
+            background: {t["bg_dark"].name()}; border-bottom: 1px solid {t["bg_border"].name()};
+            spacing: 8px; padding: 4px;
+        }}
+        QLabel#toolbar_label {{ color: {t["muted"].name()}; font-size: 11px; }}
+    """)
+
+
+# ---------------------------------------------------------------------------
+# Main Window
+# ---------------------------------------------------------------------------
+class TradingDashboard(QMainWindow):
+    def __init__(self, api, app):
+        super().__init__()
+        self.api = api
+        self._app = app
+        self.setWindowTitle("Trader Dashboard")
+        self.setMinimumSize(1100, 700)
+        self.resize(1280, 800)
+
+        self._orders_cache = []
+        self._hw_cache = {}
+        self._current_theme = "Bubblegum Goth"
+
+        # Toolbar with theme selector and clock
+        self._build_toolbar()
+
+        # Central tab widget
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        # Build tabs
+        self._build_dashboard_tab()
+        self._build_trading_tab()
+        self._build_performance_tab()
+        self._build_models_tab()
+        self._build_logs_tab()
+
+        # Status bar
+        self._status_conn = QLabel("API: \u2014")
+        self._status_positions = QLabel("Pos: 0")
+        self._status_sentiment = QLabel("FnG: \u2014")
+        self._status_gpu = QLabel("GPU: \u2014")
+        self._status_ram = QLabel("RAM: \u2014")
+        self._status_gpu_avail = QLabel("CUDA: \u2014")
+        self._status_updated = QLabel("")
+        self._error_count = 0
+        self.statusBar().addWidget(self._status_updated)
+        self.statusBar().addWidget(self._status_positions)
+        self.statusBar().addWidget(self._status_sentiment)
+        self.statusBar().addPermanentWidget(self._status_conn)
+        self.statusBar().addPermanentWidget(self._status_gpu)
+        self.statusBar().addPermanentWidget(self._status_ram)
+        self.statusBar().addPermanentWidget(self._status_gpu_avail)
+
+        # Apply initial styling
+        self._restyle()
+
+        # Data fetcher on background thread
+        self._fetcher_thread = QThread()
+        self._fetcher = DataFetcher(api)
+        self._fetcher.moveToThread(self._fetcher_thread)
+        self._fetcher.account_updated.connect(self.on_account)
+        self._fetcher.positions_updated.connect(self.on_positions)
+        self._fetcher.orders_updated.connect(self.on_orders)
+        self._fetcher.history_updated.connect(self.on_history)
+        self._fetcher.hw_updated.connect(self.on_hw)
+        self._fetcher.error_occurred.connect(self.on_error)
+        self._fetcher_thread.started.connect(self._fetcher.start_timers)
+        self._fetcher_thread.start()
+
+        # Log tailer on background thread
+        self._tailer_thread = QThread()
+        self._tailer = LogTailer()
+        self._tailer.moveToThread(self._tailer_thread)
+        self._tailer.new_lines.connect(self.on_log_lines)
+        self._tailer_thread.started.connect(self._tailer.start_timer)
+        self._tailer_thread.start()
+
+        # Model refresh timer (every 60s)
+        self._model_timer = QTimer(self)
+        self._model_timer.timeout.connect(self._refresh_models_tab)
+        self._model_timer.start(60_000)
+        self._refresh_models_tab()
+
+        # Clock timer (every 1s)
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_clock)
+        self._clock_timer.start(1_000)
+        self._update_clock()
+
+    # ---- Toolbar ---------------------------------------------------------
+    def _build_toolbar(self):
+        toolbar = QToolBar("Settings")
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        self._logo_label = QLabel()
+        self._logo_label.setFixedSize(80, 80)
+        self._logo_label.setPixmap(generate_theme_logo(self._current_theme))
+        toolbar.addWidget(self._logo_label)
+
+        theme_label = QLabel(" Theme: ")
+        theme_label.setObjectName("toolbar_label")
+        toolbar.addWidget(theme_label)
+
+        self._theme_combo = QComboBox()
+        self._theme_combo.addItems(list(THEMES.keys()))
+        self._theme_combo.setCurrentText(self._current_theme)
+        self._theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        toolbar.addWidget(self._theme_combo)
+
+        toolbar.addSeparator()
+
+        self._clock_label = QLabel("")
+        self._clock_label.setStyleSheet("font-size: 12px; padding: 0 12px;")
+        toolbar.addWidget(self._clock_label)
+
+        # Spacer to push clock right
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
+
+        self._clock_label_right = QLabel("")
+        self._clock_label_right.setStyleSheet("font-size: 12px; font-weight: bold; padding: 0 8px;")
+        toolbar.addWidget(self._clock_label_right)
+
+    def _update_clock(self):
+        now = dt.datetime.now(TZ_CENTRAL)
+        self._clock_label_right.setText(now.strftime("%a %b %d, %I:%M:%S %p CT"))
+
+    def _on_theme_changed(self, name):
+        if name in THEMES:
+            self._current_theme = name
+            set_theme(name)
+            apply_theme(self._app)
+            self._logo_label.setPixmap(generate_theme_logo(name))
+            self.setWindowTitle(f"Trader Dashboard \u2014 {name}")
+            self._restyle()
+
+    # ---- Restyle (called on theme change) --------------------------------
+    def _restyle(self):
+        """Re-apply all inline widget styles from current theme."""
+        t = T
+
+        # Table styling helper
+        table_style = (
+            f"QTableWidget {{ background-color: {t['bg_table'].name()};"
+            f" gridline-color: {t['bg_border'].name()}; }}"
+            f" QTableWidget::item {{ padding: 4px; }}"
+            f" QHeaderView::section {{ background-color: {t['bg_header'].name()};"
+            f" padding: 6px; border: 1px solid {t['bg_border'].name()}; }}"
+        )
+        group_style = (
+            f"QGroupBox {{ font-weight: bold; border: 1px solid {t['bg_border'].name()};"
+            f" border-radius: 6px; margin-top: 8px; padding-top: 16px; }}"
+            f" QGroupBox::title {{ subcontrol-position: top left; padding: 0 6px; }}"
+        )
+        card_style = (
+            f"QFrame {{ background-color: {t['bg_card'].name()};"
+            f" border-radius: 8px; padding: 12px; }}"
+        )
+
+        # Cards
+        all_cards = [
+            self._card_equity, self._card_cash, self._card_buying_power,
+            self._card_day_pl, self._card_total_pl,
+            self._tax_realized, self._tax_st, self._tax_lt,
+            self._tax_owed, self._tax_net,
+            self._stat_return, self._stat_best, self._stat_worst, self._stat_drawdown,
+        ]
+        for card in all_cards:
+            card.setStyleSheet(card_style)
+            title_lbl = card.layout().itemAt(0).widget()
+            if title_lbl:
+                title_lbl.setStyleSheet(f"color: {t['muted'].name()}; font-size: 11px;")
+            val_lbl = card.findChild(QLabel, "card_value")
+            if val_lbl:
+                val_lbl.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {t['white'].name()};")
+
+        # Tables
+        for table in [self._positions_table, self._open_orders_table,
+                       self._fills_table, self._model_table]:
+            table.setStyleSheet(table_style)
+
+        # Group boxes
+        for group in self.findChildren(QGroupBox):
+            group.setStyleSheet(group_style)
+
+        # Plots
+        for plot in [self._equity_plot, self._pnl_plot]:
+            plot.setBackground(t["bg_dark"].name())
+
+        # Equity curve pen color
+        self._equity_curve.setPen(pg.mkPen(t["accent"].name(), width=2))
+
+        # Log display
+        self._log_display.setStyleSheet(
+            f"QPlainTextEdit {{ background-color: {t['bg_log'].name()};"
+            f" color: {t['white'].name()};"
+            f" border: 1px solid {t['bg_border'].name()}; }}"
+        )
+
+        # Clock
+        self._clock_label_right.setStyleSheet(
+            f"font-size: 12px; font-weight: bold; padding: 0 8px; color: {t['accent'].name()};"
+        )
+
+    # ---- Tab 1: Dashboard ------------------------------------------------
+    def _build_dashboard_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        cards_layout = QHBoxLayout()
+        self._card_equity = make_card("Equity")
+        self._card_cash = make_card("Cash")
+        self._card_buying_power = make_card("Buying Power")
+        self._card_day_pl = make_card("Day P&L")
+        self._card_total_pl = make_card("Total P&L")
+        for c in [self._card_equity, self._card_cash, self._card_buying_power,
+                   self._card_day_pl, self._card_total_pl]:
+            cards_layout.addWidget(c)
+        layout.addLayout(cards_layout)
+
+        pos_label = QLabel("Open Positions")
+        pos_label.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 8px;")
+        layout.addWidget(pos_label)
+
+        self._positions_table = QTableWidget(0, 7)
+        self._positions_table.setHorizontalHeaderLabels(
+            ["Symbol", "Qty", "Side", "Avg Entry", "Current Price", "Unrealized P&L", "P&L %"]
+        )
+        self._positions_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._positions_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._positions_table.setAlternatingRowColors(True)
+        layout.addWidget(self._positions_table)
+
+        tax_group = QGroupBox("Tax Estimation (FIFO)")
+        tax_layout = QHBoxLayout(tax_group)
+        self._tax_realized = make_card("Realized Gains")
+        self._tax_st = make_card("Short-Term Gains")
+        self._tax_lt = make_card("Long-Term Gains")
+        self._tax_owed = make_card("Est. Tax Owed")
+        self._tax_net = make_card("Net After Tax")
+        for c in [self._tax_realized, self._tax_st, self._tax_lt, self._tax_owed, self._tax_net]:
+            tax_layout.addWidget(c)
+        layout.addWidget(tax_group)
+
+        self.tabs.addTab(tab, "Dashboard")
+
+    # ---- Tab 2: Trading --------------------------------------------------
+    def _build_trading_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Filter:"))
+        self._trade_filter = QComboBox()
+        self._trade_filter.addItems(["All", "Crypto", "Stock"])
+        self._trade_filter.currentTextChanged.connect(self._apply_trade_filter)
+        filter_layout.addWidget(self._trade_filter)
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
+
+        open_label = QLabel("Open Orders")
+        open_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(open_label)
+
+        self._open_orders_table = QTableWidget(0, 6)
+        self._open_orders_table.setHorizontalHeaderLabels(
+            ["Symbol", "Side", "Qty", "Type", "Status", "Submitted (CT)"]
+        )
+        self._open_orders_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._open_orders_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._open_orders_table.setAlternatingRowColors(True)
+        layout.addWidget(self._open_orders_table)
+
+        fills_label = QLabel("Recent Fills")
+        fills_label.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 8px;")
+        layout.addWidget(fills_label)
+
+        self._fills_table = QTableWidget(0, 6)
+        self._fills_table.setHorizontalHeaderLabels(
+            ["Symbol", "Side", "Qty", "Filled Price", "Notional", "Filled At (CT)"]
+        )
+        self._fills_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._fills_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._fills_table.setAlternatingRowColors(True)
+        layout.addWidget(self._fills_table)
+
+        self.tabs.addTab(tab, "Trading")
+
+    # ---- Tab 3: Performance ----------------------------------------------
+    def _build_performance_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        eq_label = QLabel("Equity Curve (1M Daily)")
+        eq_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(eq_label)
+
+        self._equity_plot = pg.PlotWidget()
+        self._equity_plot.showGrid(x=True, y=True, alpha=0.3)
+        self._equity_plot.setLabel("left", "Equity ($)")
+        self._equity_plot.setLabel("bottom", "Date")
+        self._equity_curve = self._equity_plot.plot(pen=pg.mkPen(width=2))
+        layout.addWidget(self._equity_plot)
+
+        pl_label = QLabel("Daily P&L")
+        pl_label.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 8px;")
+        layout.addWidget(pl_label)
+
+        self._pnl_plot = pg.PlotWidget()
+        self._pnl_plot.showGrid(x=True, y=True, alpha=0.3)
+        self._pnl_plot.setLabel("left", "P&L ($)")
+        self._pnl_plot.setLabel("bottom", "Date")
+        layout.addWidget(self._pnl_plot)
+
+        stats_group = QGroupBox("Performance Stats")
+        stats_layout = QHBoxLayout(stats_group)
+        self._stat_return = make_card("Total Return")
+        self._stat_best = make_card("Best Day")
+        self._stat_worst = make_card("Worst Day")
+        self._stat_drawdown = make_card("Max Drawdown")
+        for c in [self._stat_return, self._stat_best, self._stat_worst, self._stat_drawdown]:
+            stats_layout.addWidget(c)
+        layout.addWidget(stats_group)
+
+        self.tabs.addTab(tab, "Performance")
+
+    # ---- Tab 4: Models ---------------------------------------------------
+    def _build_models_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        model_label = QLabel("Model Status")
+        model_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(model_label)
+
+        self._model_table = QTableWidget(0, 8)
+        self._model_table.setHorizontalHeaderLabels(
+            ["Model", "Status", "Last Trained", "Age",
+             "Hidden Dim", "Layers", "Seq Len", "Threshold"]
+        )
+        self._model_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._model_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._model_table.setAlternatingRowColors(True)
+        layout.addWidget(self._model_table)
+
+        evolve_group = QGroupBox("Evolve.py Status")
+        evolve_layout = QGridLayout(evolve_group)
+        self._evolve_status = QLabel("Status: \u2014")
+        self._evolve_group = QLabel("Group: \u2014")
+        self._evolve_trial = QLabel("Trial: \u2014")
+        self._evolve_best = QLabel("Best Score: \u2014")
+        self._evolve_cycle = QLabel("Cycle Start: \u2014")
+
+        self._evolve_progress = QProgressBar()
+        self._evolve_progress.setRange(0, 100)
+        self._evolve_progress.setFixedHeight(16)
+        self._evolve_progress.setTextVisible(True)
+        self._evolve_progress.setFormat("%v / %m trials")
+
+        evolve_layout.addWidget(self._evolve_status, 0, 0)
+        evolve_layout.addWidget(self._evolve_group, 0, 1)
+        evolve_layout.addWidget(self._evolve_trial, 1, 0)
+        evolve_layout.addWidget(self._evolve_best, 1, 1)
+        evolve_layout.addWidget(self._evolve_progress, 2, 0, 1, 2)
+        evolve_layout.addWidget(self._evolve_cycle, 3, 0, 1, 2)
+        layout.addWidget(evolve_group)
+
+        hw_group = QGroupBox("Hardware")
+        hw_layout = QHBoxLayout(hw_group)
+
+        gpu_frame = QFrame()
+        gpu_inner = QVBoxLayout(gpu_frame)
+        gpu_inner.addWidget(QLabel("GPU Temperature"))
+        self._gpu_temp_label = QLabel("\u2014")
+        self._gpu_temp_label.setStyleSheet("font-size: 28px; font-weight: bold;")
+        gpu_inner.addWidget(self._gpu_temp_label)
+        self._gpu_temp_bar = QProgressBar()
+        self._gpu_temp_bar.setRange(0, 100)
+        self._gpu_temp_bar.setTextVisible(False)
+        self._gpu_temp_bar.setFixedHeight(12)
+        gpu_inner.addWidget(self._gpu_temp_bar)
+        hw_layout.addWidget(gpu_frame)
+
+        ram_frame = QFrame()
+        ram_inner = QVBoxLayout(ram_frame)
+        ram_inner.addWidget(QLabel("RAM Usage"))
+        self._ram_label = QLabel("\u2014")
+        self._ram_label.setStyleSheet("font-size: 28px; font-weight: bold;")
+        ram_inner.addWidget(self._ram_label)
+        self._ram_bar = QProgressBar()
+        self._ram_bar.setRange(0, 100)
+        self._ram_bar.setTextVisible(False)
+        self._ram_bar.setFixedHeight(12)
+        ram_inner.addWidget(self._ram_bar)
+        hw_layout.addWidget(ram_frame)
+
+        gpu_avail_frame = QFrame()
+        gpu_avail_inner = QVBoxLayout(gpu_avail_frame)
+        gpu_avail_inner.addWidget(QLabel("GPU Available"))
+        self._gpu_avail_label = QLabel("\u2014")
+        self._gpu_avail_label.setStyleSheet("font-size: 28px; font-weight: bold;")
+        gpu_avail_inner.addWidget(self._gpu_avail_label)
+        hw_layout.addWidget(gpu_avail_frame)
+
+        layout.addWidget(hw_group)
+        layout.addStretch()
+        self.tabs.addTab(tab, "Models")
+
+    # ---- Tab 5: Logs -----------------------------------------------------
+    def _build_logs_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        ctrl_layout = QHBoxLayout()
+        ctrl_layout.addWidget(QLabel("Log File:"))
+        self._log_selector = QComboBox()
+        self._log_selector.addItems(list(LOG_FILES.keys()))
+        self._log_selector.currentTextChanged.connect(self._on_log_selected)
+        ctrl_layout.addWidget(self._log_selector)
+
+        self._auto_scroll = QCheckBox("Auto-scroll")
+        self._auto_scroll.setChecked(True)
+        ctrl_layout.addWidget(self._auto_scroll)
+        ctrl_layout.addStretch()
+        layout.addLayout(ctrl_layout)
+
+        self._log_display = QPlainTextEdit()
+        self._log_display.setReadOnly(True)
+        self._log_display.setFont(QFont("Monospace", 10))
+        self._log_display.setMaximumBlockCount(5000)
+        layout.addWidget(self._log_display)
+
+        self._log_buffers = {name: "" for name in LOG_FILES}
+        self._on_log_selected(self._log_selector.currentText())
+
+        self.tabs.addTab(tab, "Logs")
+
+    # ---- Signal Handlers -------------------------------------------------
+    @Slot(dict)
+    def on_account(self, data):
+        equity = float(data["equity"])
+        cash = float(data["cash"])
+        buying_power = float(data["buying_power"])
+        last_equity = float(data["last_equity"])
+        day_pl = equity - last_equity
+        total_pl = equity - 100_000
+
+        self._set_card(self._card_equity, fmt_money(equity))
+        self._set_card(self._card_cash, fmt_money(cash))
+        self._set_card(self._card_buying_power, fmt_money(buying_power))
+        self._set_card(self._card_day_pl, fmt_money(day_pl), pnl_color(day_pl))
+        self._set_card(self._card_total_pl, fmt_money(total_pl), pnl_color(total_pl))
+
+        now = dt.datetime.now(TZ_CENTRAL).strftime("%I:%M:%S %p")
+        self._status_updated.setText(f"Last update: {now}")
+        self._status_conn.setText("API: OK")
+        self._status_conn.setStyleSheet(f"color: {T['green'].name()};")
+        self._error_count = 0
+
+        # Update sentiment indicator
+        try:
+            from sentiment import get_fear_greed
+            fng = get_fear_greed()
+            if fng is not None:
+                val = fng['value']
+                label = fng['label']
+                if val <= 25:
+                    color = T['red'].name()
+                elif val <= 45:
+                    color = T.get('yellow', T['white']).name()
+                elif val >= 75:
+                    color = T['green'].name()
+                elif val >= 55:
+                    color = T.get('yellow', T['white']).name()
+                else:
+                    color = T['white'].name()
+                self._status_sentiment.setText(f"FnG: {val} ({label})")
+                self._status_sentiment.setStyleSheet(f"color: {color};")
+        except Exception:
+            pass
+
+    @Slot(list)
+    def on_positions(self, positions):
+        tbl = self._positions_table
+        tbl.setUpdatesEnabled(False)
+        tbl.setRowCount(len(positions))
+        total_unr = 0.0
+        for row, p in enumerate(positions):
+            try:
+                unr = float(p["unrealized_pl"])
+            except (TypeError, ValueError):
+                unr = 0.0
+            total_unr += unr
+            items = [
+                p["symbol"], p["qty"], p["side"],
+                fmt_money(p["avg_entry_price"]),
+                fmt_money(p["current_price"]),
+                fmt_money(p["unrealized_pl"]),
+                fmt_pct(float(p["unrealized_plpc"]) * 100),
+            ]
+            color = pnl_color(p["unrealized_pl"])
+            for col, val in enumerate(items):
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(Qt.AlignCenter)
+                if col >= 5:
+                    item.setForeground(color)
+                tbl.setItem(row, col, item)
+        tbl.setUpdatesEnabled(True)
+        self._status_positions.setText(
+            f"Pos: {len(positions)} | Unr: {fmt_money(total_unr)}")
+
+    @Slot(list)
+    def on_orders(self, orders):
+        self._orders_cache = orders
+        self._apply_trade_filter(self._trade_filter.currentText())
+        self._update_tax(orders)
+
+    @Slot(dict)
+    def on_history(self, data):
+        equities = data.get("equity", [])
+        timestamps = data.get("timestamp", [])
+        pnl = data.get("profit_loss", [])
+
+        if equities and timestamps:
+            x = np.arange(len(equities))
+            self._equity_curve.setData(x, equities)
+
+            axis = self._equity_plot.getPlotItem().getAxis("bottom")
+            ticks = []
+            for i, ts in enumerate(timestamps):
+                try:
+                    d = dt.datetime.fromtimestamp(ts, tz=TZ_CENTRAL)
+                    ticks.append((i, d.strftime("%m/%d")))
+                except Exception:
+                    pass
+            axis.setTicks([ticks])
+
+        if pnl:
+            self._pnl_plot.clear()
+            pos_x = [i for i, v in enumerate(pnl) if v >= 0]
+            pos_h = [v for v in pnl if v >= 0]
+            neg_x = [i for i, v in enumerate(pnl) if v < 0]
+            neg_h = [v for v in pnl if v < 0]
+            if pos_x:
+                self._pnl_plot.addItem(pg.BarGraphItem(
+                    x=pos_x, height=pos_h, width=0.6, brush=T["green"].name()))
+            if neg_x:
+                self._pnl_plot.addItem(pg.BarGraphItem(
+                    x=neg_x, height=neg_h, width=0.6, brush=T["red"].name()))
+
+            if timestamps and len(timestamps) == len(pnl):
+                axis = self._pnl_plot.getPlotItem().getAxis("bottom")
+                ticks = []
+                for i, ts in enumerate(timestamps):
+                    try:
+                        d = dt.datetime.fromtimestamp(ts, tz=TZ_CENTRAL)
+                        ticks.append((i, d.strftime("%m/%d")))
+                    except Exception:
+                        pass
+                axis.setTicks([ticks])
+
+            total_return = sum(pnl)
+            best_day = max(pnl) if pnl else 0
+            worst_day = min(pnl) if pnl else 0
+
+            self._set_card(self._stat_return, fmt_money(total_return), pnl_color(total_return))
+            self._set_card(self._stat_best, fmt_money(best_day), T["green"])
+            self._set_card(self._stat_worst, fmt_money(worst_day), T["red"])
+
+            if equities:
+                peak = equities[0]
+                max_dd = 0
+                for eq in equities:
+                    if eq > peak:
+                        peak = eq
+                    dd = (peak - eq) / peak * 100 if peak else 0
+                    if dd > max_dd:
+                        max_dd = dd
+                self._set_card(self._stat_drawdown, f"-{max_dd:.2f}%",
+                               T["red"] if max_dd > 0 else T["white"])
+
+    @Slot(dict)
+    def on_hw(self, data):
+        self._hw_cache = data
+        temp = data.get("gpu_temp")
+        used = data.get("ram_used")
+        total = data.get("ram_total")
+        gpu_ok = data.get("gpu_available")
+
+        if temp is not None:
+            self._status_gpu.setText(f"GPU: {temp:.0f}C")
+        else:
+            self._status_gpu.setText("GPU: N/A")
+
+        if used is not None and total is not None:
+            self._status_ram.setText(f"RAM: {used:.0f}/{total:.0f} MB")
+        else:
+            self._status_ram.setText("RAM: N/A")
+
+        self._status_gpu_avail.setText(f"CUDA: {'OK' if gpu_ok else 'N/A'}")
+
+        # Models tab hardware gauges
+        if temp is not None:
+            self._gpu_temp_label.setText(f"{temp:.0f}C")
+            self._gpu_temp_bar.setValue(int(min(temp, 100)))
+            if temp < 60:
+                color = T["green"].name()
+            elif temp < 70:
+                color = T["yellow"].name()
+            else:
+                color = T["red"].name()
+            self._gpu_temp_label.setStyleSheet(
+                f"font-size: 28px; font-weight: bold; color: {color};")
+            self._gpu_temp_bar.setStyleSheet(
+                f"QProgressBar::chunk {{ background-color: {color}; }}")
+
+        if used is not None and total is not None:
+            pct = int(used / total * 100) if total else 0
+            self._ram_label.setText(f"{used:.0f}/{total:.0f} MB")
+            self._ram_bar.setValue(pct)
+            color = T["green"].name() if pct < 80 else (T["yellow"].name() if pct < 90 else T["red"].name())
+            self._ram_bar.setStyleSheet(
+                f"QProgressBar::chunk {{ background-color: {color}; }}")
+
+        if gpu_ok is not None:
+            if gpu_ok:
+                self._gpu_avail_label.setText("Available")
+                self._gpu_avail_label.setStyleSheet(
+                    f"font-size: 28px; font-weight: bold; color: {T['green'].name()};")
+            else:
+                self._gpu_avail_label.setText("Unavailable")
+                self._gpu_avail_label.setStyleSheet(
+                    f"font-size: 28px; font-weight: bold; color: {T['red'].name()};")
+
+    @Slot(str)
+    def on_error(self, msg):
+        self._error_count += 1
+        self._status_conn.setText(f"API: ERR({self._error_count})")
+        self._status_conn.setStyleSheet(f"color: {T['red'].name()};")
+        self.statusBar().showMessage(f"Error: {msg}", 10_000)
+
+    @Slot(str, str)
+    def on_log_lines(self, name, text):
+        self._log_buffers[name] = self._log_buffers.get(name, "") + text
+        if len(self._log_buffers[name]) > 200_000:
+            self._log_buffers[name] = self._log_buffers[name][-150_000:]
+
+        if self._log_selector.currentText() == name:
+            self._log_display.appendPlainText(text.rstrip("\n"))
+            if self._auto_scroll.isChecked():
+                self._log_display.verticalScrollBar().setValue(
+                    self._log_display.verticalScrollBar().maximum())
+
+    # ---- Private Helpers -------------------------------------------------
+    def _set_card(self, card, value, color=None):
+        lbl = card.findChild(QLabel, "card_value")
+        if lbl:
+            lbl.setText(str(value))
+            if color:
+                lbl.setStyleSheet(
+                    f"font-size: 22px; font-weight: bold; color: {color.name()};")
+
+    def _apply_trade_filter(self, filter_text):
+        orders = self._orders_cache
+        crypto_symbols = {
+            "BTCUSD", "ETHUSD", "XRPUSD", "SOLUSD", "DOGEUSD",
+            "LINKUSD", "AVAXUSD", "DOTUSD", "LTCUSD", "BCHUSD",
+            "BTC/USD", "ETH/USD", "XRP/USD", "SOL/USD", "DOGE/USD",
+            "LINK/USD", "AVAX/USD", "DOT/USD", "LTC/USD", "BCH/USD",
+        }
+        if filter_text == "Crypto":
+            orders = [o for o in orders if o["symbol"] in crypto_symbols]
+        elif filter_text == "Stock":
+            orders = [o for o in orders if o["symbol"] not in crypto_symbols]
+
+        open_orders = [o for o in orders if o["status"] in
+                       ("new", "accepted", "partially_filled", "pending_new")]
+        filled_orders = [o for o in orders if o["status"] == "filled"]
+
+        self._open_orders_table.setUpdatesEnabled(False)
+        self._open_orders_table.setRowCount(len(open_orders))
+        for row, o in enumerate(open_orders):
+            vals = [o["symbol"], o["side"], str(o["qty"]), o["type"],
+                    o["status"], fmt_time_short(o["submitted_at"])]
+            for col, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setForeground(T["green"] if o["side"] == "buy" else T["red"])
+                self._open_orders_table.setItem(row, col, item)
+        self._open_orders_table.setUpdatesEnabled(True)
+
+        filled_orders = filled_orders[:50]
+        self._fills_table.setUpdatesEnabled(False)
+        self._fills_table.setRowCount(len(filled_orders))
+        for row, o in enumerate(filled_orders):
+            notional = o.get("notional") or ""
+            if notional:
+                notional = fmt_money(notional)
+            vals = [
+                o["symbol"], o["side"],
+                str(o.get("filled_qty") or o["qty"]),
+                fmt_money(o["filled_avg_price"]) if o["filled_avg_price"] else "\u2014",
+                notional,
+                fmt_time(o["filled_at"]),
+            ]
+            for col, v in enumerate(vals):
+                item = QTableWidgetItem(str(v))
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setForeground(T["green"] if o["side"] == "buy" else T["red"])
+                self._fills_table.setItem(row, col, item)
+        self._fills_table.setUpdatesEnabled(True)
+
+    def _update_tax(self, orders):
+        tax = estimate_taxes(orders)
+        self._set_card(self._tax_realized, fmt_money(tax["realized_gain"]),
+                       pnl_color(tax["realized_gain"]))
+        self._set_card(self._tax_st, fmt_money(tax["short_term_gain"]),
+                       pnl_color(tax["short_term_gain"]))
+        self._set_card(self._tax_lt, fmt_money(tax["long_term_gain"]),
+                       pnl_color(tax["long_term_gain"]))
+        self._set_card(self._tax_owed, fmt_money(tax["estimated_tax"]), T["red"])
+        self._set_card(self._tax_net, fmt_money(tax["net_after_tax"]),
+                       pnl_color(tax["net_after_tax"]))
+
+    def _on_log_selected(self, name):
+        self._log_display.clear()
+        buf = self._log_buffers.get(name, "")
+        if not buf:
+            path = LOG_FILES.get(name)
+            if path and path.exists():
+                try:
+                    text = path.read_text(errors="replace")
+                    if len(text) > 100_000:
+                        text = text[-100_000:]
+                    self._log_buffers[name] = text
+                    buf = text
+                except OSError:
+                    pass
+        if buf:
+            self._log_display.setPlainText(buf)
+            if self._auto_scroll.isChecked():
+                self._log_display.verticalScrollBar().setValue(
+                    self._log_display.verticalScrollBar().maximum())
+
+    def _refresh_models_tab(self):
+        now_ts = dt.datetime.now().timestamp()
+        configs = []
+        for name, cfg_path in CONFIG_FILES.items():
+            cfg = read_config(cfg_path)
+            model_path = MODEL_FILES.get(name)
+            mod_time = "\u2014"
+            age_hours = None
+            if model_path and model_path.exists():
+                try:
+                    mtime = model_path.stat().st_mtime
+                    age_hours = (now_ts - mtime) / 3600
+                    d = dt.datetime.fromtimestamp(mtime, tz=TZ_CENTRAL)
+                    mod_time = d.strftime("%Y-%m-%d %I:%M %p")
+                except OSError:
+                    pass
+            configs.append((name, cfg, mod_time, age_hours))
+
+        self._model_table.setUpdatesEnabled(False)
+        self._model_table.setRowCount(len(configs))
+        for row, (name, cfg, mod_time, age_hours) in enumerate(configs):
+            # Determine status and age display
+            if age_hours is None:
+                status, age_str = "Missing", "\u2014"
+                status_color = T["red"]
+            elif age_hours < 24:
+                status, age_str = "Fresh", f"{age_hours:.0f}h"
+                status_color = T["green"]
+            elif age_hours < 168:
+                status = "OK"
+                age_str = f"{age_hours / 24:.0f}d"
+                status_color = T["yellow"]
+            else:
+                status = "Stale"
+                age_str = f"{age_hours / 24:.0f}d"
+                status_color = T["red"]
+
+            if cfg:
+                vals = [name, status, mod_time, age_str,
+                        str(cfg.get("hidden_dim", "?")),
+                        str(cfg.get("num_layers", "?")),
+                        str(cfg.get("seq_len", "?")),
+                        str(cfg.get("bull_threshold", "?"))]
+            else:
+                vals = [name, status, "Not found", age_str,
+                        "\u2014", "\u2014", "\u2014", "\u2014"]
+            for col, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                item.setTextAlignment(Qt.AlignCenter)
+                if col == 1:
+                    item.setForeground(status_color)
+                self._model_table.setItem(row, col, item)
+        self._model_table.setUpdatesEnabled(True)
+
+        evolve_info = parse_evolve_status(
+            LOG_FILES.get("Evolve", BASE_DIR / "evolve_full_run.log"))
+        status_color = T["green"].name() if evolve_info["status"] == "running" else T["muted"].name()
+        self._evolve_status.setText(
+            f"Status: <span style='color:{status_color}'>{evolve_info['status'].upper()}</span>")
+        self._evolve_group.setText(f"Group: {evolve_info['current_group'] or '\u2014'}")
+
+        trial_cur = evolve_info["trial_current"]
+        trial_tot = evolve_info["trial_total"] or 0
+        trial_text = f"Trial: {trial_cur}"
+        if trial_tot:
+            trial_text += f" / {trial_tot}"
+        self._evolve_trial.setText(trial_text)
+
+        if trial_tot > 0:
+            self._evolve_progress.setRange(0, trial_tot)
+            self._evolve_progress.setValue(min(trial_cur, trial_tot))
+            pct = trial_cur / trial_tot
+            if pct < 0.5:
+                bar_color = T["accent"].name()
+            elif pct < 0.9:
+                bar_color = T["yellow"].name()
+            else:
+                bar_color = T["green"].name()
+            self._evolve_progress.setStyleSheet(
+                f"QProgressBar::chunk {{ background-color: {bar_color}; }}")
+        else:
+            self._evolve_progress.setRange(0, 1)
+            self._evolve_progress.setValue(0)
+
+        self._evolve_best.setText(
+            f"Best Score: {evolve_info['best_score']:.4f} (trial {evolve_info['best_trial']})")
+        self._evolve_cycle.setText(f"Cycle Start: {evolve_info['cycle_start'] or '\u2014'}")
+
+    def closeEvent(self, event):
+        self._model_timer.stop()
+        self._clock_timer.stop()
+        from PySide6.QtCore import QMetaObject
+        QMetaObject.invokeMethod(self._fetcher, "stop_timers", Qt.QueuedConnection)
+        QMetaObject.invokeMethod(self._tailer, "stop_timer", Qt.QueuedConnection)
+        self._fetcher_thread.quit()
+        self._tailer_thread.quit()
+        self._fetcher_thread.wait(3000)
+        self._tailer_thread.wait(3000)
+        super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    load_dotenv(BASE_DIR / ".env")
+
+    api_key = os.getenv("ALPACA_API_KEY")
+    api_secret = os.getenv("ALPACA_API_SECRET")
+    base_url = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+    if not api_key or not api_secret:
+        print("ERROR: ALPACA_API_KEY and ALPACA_API_SECRET must be set in .env")
+        sys.exit(1)
+
+    api = tradeapi.REST(api_key, api_secret, base_url, api_version="v2")
+
+    try:
+        acct = api.get_account()
+        print(f"Connected to Alpaca. Equity: ${float(acct.equity):,.2f}")
+    except Exception as e:
+        print(f"ERROR: Cannot connect to Alpaca API: {e}")
+        sys.exit(1)
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Trader Dashboard")
+
+    set_theme("Bubblegum Goth")
+    apply_theme(app)
+
+    window = TradingDashboard(api, app)
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

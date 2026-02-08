@@ -2,6 +2,7 @@
 
 import time
 import math
+import datetime
 
 
 # --- SPREAD / QUOTE HELPERS ---
@@ -243,3 +244,81 @@ def cancel_all_open_orders(api):
             print("  [CLEANUP] No open orders to cancel.")
     except Exception as e:
         print(f"  [CLEANUP] Error canceling orders: {e}")
+
+
+# --- POSITION RECONSTRUCTION ---
+
+def reconstruct_positions(api, symbols, asset_type='crypto'):
+    """Rebuild position dict from Alpaca API (survive restarts).
+    Returns: {symbol: {qty, entry_price, high_water_mark, stop_order_id, trailing_activated}}
+    """
+    positions = {}
+    for sym in symbols:
+        candidates = [sym]
+        if '/' in sym:
+            candidates.append(sym.replace('/', ''))
+        for candidate in candidates:
+            try:
+                pos = api.get_position(candidate)
+                qty = float(pos.qty)
+                if qty > 0:
+                    entry_price = float(pos.avg_entry_price)
+                    current_price = float(pos.current_price)
+                    positions[sym] = {
+                        'qty': qty,
+                        'entry_price': entry_price,
+                        'high_water_mark': max(entry_price, current_price),
+                        'stop_order_id': None,
+                        'trailing_activated': False,
+                    }
+                    break
+            except Exception:
+                continue
+    return positions
+
+
+# --- CIRCUIT BREAKER ---
+
+def check_circuit_breaker(api, max_drawdown_pct=0.05):
+    """Check if daily equity drawdown exceeds threshold.
+    Returns (tripped: bool, drawdown_pct: float).
+    """
+    account = api.get_account()
+    equity = float(account.equity)
+    last_equity = float(account.last_equity)  # previous close
+    if last_equity <= 0:
+        return False, 0.0
+    drawdown = (last_equity - equity) / last_equity
+    return drawdown >= max_drawdown_pct, drawdown
+
+
+# --- EMERGENCY FLATTEN ---
+
+def emergency_flatten(api):
+    """Market-sell all positions immediately."""
+    print("[EMERGENCY] Flattening all positions...")
+    try:
+        api.cancel_all_orders()
+        time.sleep(1)
+    except Exception as e:
+        print(f"  [EMERGENCY] Cancel orders error: {e}")
+
+    try:
+        all_positions = api.list_positions()
+    except Exception as e:
+        print(f"  [EMERGENCY] List positions error: {e}")
+        return
+
+    for pos in all_positions:
+        try:
+            side = 'sell' if float(pos.qty) > 0 else 'buy'
+            api.submit_order(
+                symbol=pos.symbol,
+                qty=abs(float(pos.qty)),
+                side=side,
+                type='market',
+                time_in_force='gtc',
+            )
+            print(f"  [EMERGENCY] {pos.symbol}: Market {side} {pos.qty}")
+        except Exception as e:
+            print(f"  [EMERGENCY] {pos.symbol}: {e}")

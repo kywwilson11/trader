@@ -1,8 +1,223 @@
 import pandas as pd
 import numpy as np
 
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
+
+# ── Numba-accelerated core functions ─────────────────────────────────────────
+# These operate on raw numpy arrays for maximum speed.
+# Each has a pure-numpy fallback if Numba is unavailable.
+
+if _HAS_NUMBA:
+    @njit(cache=True)
+    def _ewm_alpha(arr, alpha, min_periods):
+        """EWM with alpha parameter, matching pandas ewm(alpha=..., min_periods=...)."""
+        n = len(arr)
+        out = np.empty(n)
+        out[:] = np.nan
+        # Seed with first non-NaN value after min_periods
+        s = np.nan
+        count = 0
+        for i in range(n):
+            v = arr[i]
+            if np.isnan(v):
+                out[i] = np.nan
+                continue
+            count += 1
+            if np.isnan(s):
+                s = v
+            else:
+                s = alpha * v + (1.0 - alpha) * s
+            if count >= min_periods:
+                out[i] = s
+        return out
+
+    @njit(cache=True)
+    def _ewm_span(arr, span):
+        """EWM with span parameter (adjust=False), matching pandas ewm(span=..., adjust=False)."""
+        n = len(arr)
+        out = np.empty(n)
+        alpha = 2.0 / (span + 1.0)
+        out[0] = arr[0]
+        for i in range(1, n):
+            out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
+        return out
+
+    @njit(cache=True)
+    def _rolling_mean(arr, window):
+        n = len(arr)
+        out = np.empty(n)
+        out[:window - 1] = np.nan
+        s = 0.0
+        for i in range(window):
+            s += arr[i]
+        out[window - 1] = s / window
+        for i in range(window, n):
+            s += arr[i] - arr[i - window]
+            out[i] = s / window
+        return out
+
+    @njit(cache=True)
+    def _rolling_std(arr, window):
+        n = len(arr)
+        out = np.empty(n)
+        out[:window - 1] = np.nan
+        for i in range(window - 1, n):
+            s = 0.0
+            s2 = 0.0
+            for j in range(i - window + 1, i + 1):
+                s += arr[j]
+                s2 += arr[j] * arr[j]
+            mean = s / window
+            var = s2 / window - mean * mean
+            # Bessel correction (ddof=1) to match pandas default
+            out[i] = np.sqrt(var * window / (window - 1)) if window > 1 else 0.0
+        return out
+
+    @njit(cache=True)
+    def _rolling_min(arr, window):
+        n = len(arr)
+        out = np.empty(n)
+        out[:window - 1] = np.nan
+        for i in range(window - 1, n):
+            m = arr[i]
+            for j in range(i - window + 1, i):
+                if arr[j] < m:
+                    m = arr[j]
+            out[i] = m
+        return out
+
+    @njit(cache=True)
+    def _rolling_max(arr, window):
+        n = len(arr)
+        out = np.empty(n)
+        out[:window - 1] = np.nan
+        for i in range(window - 1, n):
+            m = arr[i]
+            for j in range(i - window + 1, i):
+                if arr[j] > m:
+                    m = arr[j]
+            out[i] = m
+        return out
+
+    @njit(cache=True)
+    def _rsi_core(close, length):
+        n = len(close)
+        rsi = np.empty(n)
+        rsi[0] = np.nan
+
+        gain = np.empty(n)
+        loss = np.empty(n)
+        gain[0] = 0.0
+        loss[0] = 0.0
+        for i in range(1, n):
+            d = close[i] - close[i - 1]
+            gain[i] = d if d > 0 else 0.0
+            loss[i] = -d if d < 0 else 0.0
+
+        alpha = 1.0 / length
+        avg_gain = _ewm_alpha(gain, alpha, length)
+        avg_loss = _ewm_alpha(loss, alpha, length)
+
+        for i in range(n):
+            if np.isnan(avg_gain[i]) or np.isnan(avg_loss[i]) or avg_loss[i] == 0:
+                rsi[i] = np.nan
+            else:
+                rs = avg_gain[i] / avg_loss[i]
+                rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+        return rsi
+
+    @njit(cache=True)
+    def _macd_core(close, fast, slow, signal):
+        ema_fast = _ewm_span(close, fast)
+        ema_slow = _ewm_span(close, slow)
+        n = len(close)
+        macd_line = np.empty(n)
+        for i in range(n):
+            macd_line[i] = ema_fast[i] - ema_slow[i]
+        signal_line = _ewm_span(macd_line, signal)
+        histogram = np.empty(n)
+        for i in range(n):
+            histogram[i] = macd_line[i] - signal_line[i]
+        return macd_line, histogram, signal_line
+
+    @njit(cache=True)
+    def _atr_core(high, low, close, length):
+        n = len(high)
+        tr = np.empty(n)
+        tr[0] = high[0] - low[0]
+        for i in range(1, n):
+            hl = high[i] - low[i]
+            hc = abs(high[i] - close[i - 1])
+            lc = abs(low[i] - close[i - 1])
+            tr[i] = max(hl, max(hc, lc))
+        return _rolling_mean(tr, length)
+
+    @njit(cache=True)
+    def _bbands_core(close, length, num_std):
+        sma = _rolling_mean(close, length)
+        std_dev = _rolling_std(close, length)
+        n = len(close)
+        upper = np.empty(n)
+        lower = np.empty(n)
+        bandwidth = np.empty(n)
+        pct_b = np.empty(n)
+        for i in range(n):
+            upper[i] = sma[i] + num_std * std_dev[i]
+            lower[i] = sma[i] - num_std * std_dev[i]
+            if np.isnan(sma[i]) or sma[i] == 0:
+                bandwidth[i] = np.nan
+            else:
+                bandwidth[i] = (upper[i] - lower[i]) / sma[i]
+            diff = upper[i] - lower[i]
+            if np.isnan(diff) or diff == 0:
+                pct_b[i] = np.nan
+            else:
+                pct_b[i] = (close[i] - lower[i]) / diff
+        return lower, sma, upper, bandwidth, pct_b
+
+    @njit(cache=True)
+    def _stoch_core(high, low, close, k, d, smooth_k):
+        lowest = _rolling_min(low, k)
+        highest = _rolling_max(high, k)
+        n = len(close)
+        raw_k = np.empty(n)
+        for i in range(n):
+            diff = highest[i] - lowest[i]
+            if np.isnan(diff) or diff == 0:
+                raw_k[i] = np.nan
+            else:
+                raw_k[i] = 100.0 * (close[i] - lowest[i]) / diff
+        stoch_k = _rolling_mean(raw_k, smooth_k)
+        stoch_d = _rolling_mean(stoch_k, d)
+        return stoch_k, stoch_d
+
+    @njit(cache=True)
+    def _obv_core(close, volume):
+        n = len(close)
+        out = np.empty(n)
+        out[0] = 0.0
+        for i in range(1, n):
+            d = close[i] - close[i - 1]
+            if d > 0:
+                out[i] = out[i - 1] + volume[i]
+            elif d < 0:
+                out[i] = out[i - 1] - volume[i]
+            else:
+                out[i] = out[i - 1]
+        return out
+
+
+# ── Public API (unchanged signatures) ────────────────────────────────────────
 
 def compute_rsi(series, length=14):
+    if _HAS_NUMBA:
+        result = _rsi_core(series.values.astype(np.float64), length)
+        return pd.Series(result, index=series.index)
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -13,6 +228,10 @@ def compute_rsi(series, length=14):
 
 
 def compute_macd(series, fast=12, slow=26, signal=9):
+    if _HAS_NUMBA:
+        ml, hist, sl = _macd_core(series.values.astype(np.float64), fast, slow, signal)
+        idx = series.index
+        return pd.Series(ml, index=idx), pd.Series(hist, index=idx), pd.Series(sl, index=idx)
     ema_fast = series.ewm(span=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
@@ -22,6 +241,11 @@ def compute_macd(series, fast=12, slow=26, signal=9):
 
 
 def compute_atr(high, low, close, length=14):
+    if _HAS_NUMBA:
+        result = _atr_core(high.values.astype(np.float64),
+                           low.values.astype(np.float64),
+                           close.values.astype(np.float64), length)
+        return pd.Series(result, index=close.index)
     tr = pd.concat([
         high - low,
         (high - close.shift(1)).abs(),
@@ -31,6 +255,12 @@ def compute_atr(high, low, close, length=14):
 
 
 def compute_bbands(close, length=20, std=2):
+    if _HAS_NUMBA:
+        lo, mid, up, bw, pb = _bbands_core(close.values.astype(np.float64), length, std)
+        idx = close.index
+        return (pd.Series(lo, index=idx), pd.Series(mid, index=idx),
+                pd.Series(up, index=idx), pd.Series(bw, index=idx),
+                pd.Series(pb, index=idx))
     sma = close.rolling(window=length).mean()
     std_dev = close.rolling(window=length).std()
     upper = sma + std * std_dev
@@ -41,6 +271,12 @@ def compute_bbands(close, length=20, std=2):
 
 
 def compute_stoch(high, low, close, k=14, d=3, smooth_k=3):
+    if _HAS_NUMBA:
+        sk, sd = _stoch_core(high.values.astype(np.float64),
+                             low.values.astype(np.float64),
+                             close.values.astype(np.float64), k, d, smooth_k)
+        idx = close.index
+        return pd.Series(sk, index=idx), pd.Series(sd, index=idx)
     lowest_low = low.rolling(window=k).min()
     highest_high = high.rolling(window=k).max()
     stoch_k = 100 * (close - lowest_low) / (highest_high - lowest_low)
@@ -50,6 +286,10 @@ def compute_stoch(high, low, close, k=14, d=3, smooth_k=3):
 
 
 def compute_obv(close, volume):
+    if _HAS_NUMBA:
+        result = _obv_core(close.values.astype(np.float64),
+                           volume.values.astype(np.float64))
+        return pd.Series(result, index=close.index)
     sign = np.sign(close.diff())
     sign.iloc[0] = 0
     return (sign * volume).cumsum()

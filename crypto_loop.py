@@ -8,10 +8,12 @@ from dotenv import load_dotenv
 from order_utils import (
     get_crypto_quote, place_limit_order, manage_order_lifecycle,
     verify_position, get_all_positions, should_trade,
-    cancel_all_open_orders,
+    cancel_all_open_orders, reconstruct_positions,
+    check_circuit_breaker, emergency_flatten,
 )
 from predict_now import load_dual_models, get_live_prediction
 from hw_monitor import get_gpu_temp, is_gpu_available
+from sentiment import sentiment_gate, get_fear_greed
 
 load_dotenv()
 
@@ -34,13 +36,19 @@ CRYPTO_SYMBOLS = [
     'BCH/USD',
 ]
 
-NOTIONAL_PER_SYMBOL = 25  # $25 per symbol per cycle
+NOTIONAL_PER_SYMBOL = 250  # $250 per symbol per cycle
 ORDER_TIMEOUT = 30  # seconds to wait for limit fill
 LOOP_INTERVAL = 30  # seconds between checks
 COOLDOWN_MINUTES = 30  # min time between trades on same symbol
 MAX_PREDICTION_WORKERS = 5
 TEMP_LOG_EVERY_N_CYCLES = 10
 THERMAL_THROTTLE_TEMP = 75  # increase sleep if GPU above this
+
+# Stop-loss / trailing stop settings
+CRYPTO_STOP_LOSS_PCT = 0.04       # 4% hard stop-loss from entry
+CRYPTO_TRAIL_ACTIVATE_PCT = 0.01  # Activate trailing after 1% profit
+CRYPTO_TRAIL_PCT = 0.03           # 3% trailing stop from high water mark
+CIRCUIT_BREAKER_PCT = 0.05        # 5% daily equity drawdown triggers flatten
 
 
 def get_api():
@@ -145,13 +153,11 @@ def run_crypto_bot():
     cancel_all_open_orders(api)
 
     # Reconstruct positions from API (survive restarts)
-    positions = set()
-    existing = get_all_positions(api)
-    for sym in CRYPTO_SYMBOLS:
-        if sym in existing or sym.replace('/', '') in existing:
-            positions.add(sym)
+    positions = reconstruct_positions(api, CRYPTO_SYMBOLS, asset_type='crypto')
     if positions:
         print(f"Existing positions found: {', '.join(positions)}")
+        for sym, info in positions.items():
+            print(f"  {sym}: qty={info['qty']}, entry=${info['entry_price']:.4f}, hwm=${info['high_water_mark']:.4f}")
 
     # Per-symbol cooldown tracking: symbol -> datetime of last trade
     last_trade_time = {}
@@ -161,11 +167,17 @@ def run_crypto_bot():
     print(f"Notional: ${NOTIONAL_PER_SYMBOL} per symbol per trade")
     print(f"Loop interval: {LOOP_INTERVAL}s | Cooldown: {COOLDOWN_MINUTES} min")
     print(f"Parallel workers: {MAX_PREDICTION_WORKERS}")
+    print(f"Sentiment gating: ENABLED")
 
     cycle = 0
     while True:
         cycle += 1
         print(f"\n--- CYCLE {cycle}: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+
+        # --- Sentiment check (once per cycle, cached 5 min) ---
+        fng = get_fear_greed()
+        if fng is not None and cycle % TEMP_LOG_EVERY_N_CYCLES == 1:
+            print(f"[SENTIMENT] Fear & Greed: {fng['value']} ({fng['label']})")
 
         # --- Hot-reload check ---
         new_bear_mt = _get_model_mtime('bear_model.pth')
@@ -189,11 +201,54 @@ def run_crypto_bot():
             except Exception as e:
                 print(f"[HOT-RELOAD] Failed: {e}, keeping current models")
 
+        # --- Circuit breaker check ---
+        tripped, dd = check_circuit_breaker(api, max_drawdown_pct=CIRCUIT_BREAKER_PCT)
+        if tripped:
+            print(f"[CIRCUIT BREAKER] Daily drawdown {dd:.1%} >= {CIRCUIT_BREAKER_PCT:.0%}, flattening all positions!")
+            emergency_flatten(api)
+            positions.clear()
+            print("[CIRCUIT BREAKER] Sleeping 1 hour before resuming...")
+            time.sleep(3600)
+            continue
+
         # --- Log GPU temp periodically ---
         if cycle % TEMP_LOG_EVERY_N_CYCLES == 0:
             temp = get_gpu_temp()
             if temp is not None:
                 print(f"[HW] GPU temp: {temp:.0f}C")
+
+        # --- Software stop-loss / trailing stop checks ---
+        for symbol in list(positions):
+            quote = get_crypto_quote(api, symbol)
+            if quote is None:
+                continue
+            current_price = quote['midpoint']
+            info = positions[symbol]
+            entry_price = info['entry_price']
+            info['high_water_mark'] = max(info['high_water_mark'], current_price)
+            hwm = info['high_water_mark']
+
+            stop_reason = None
+            # Hard stop-loss
+            if current_price <= entry_price * (1 - CRYPTO_STOP_LOSS_PCT):
+                stop_reason = 'hard_stop'
+            # Trailing stop (only if profit target reached)
+            elif (hwm >= entry_price * (1 + CRYPTO_TRAIL_ACTIVATE_PCT)
+                  and current_price <= hwm * (1 - CRYPTO_TRAIL_PCT)):
+                stop_reason = 'trailing'
+
+            if stop_reason:
+                print(f"  [STOP] {symbol}: STOPPED OUT at ${current_price:.4f} "
+                      f"(entry=${entry_price:.4f}, hwm=${hwm:.4f}, reason={stop_reason})")
+                try:
+                    api.submit_order(
+                        symbol=symbol, qty=info['qty'],
+                        side='sell', type='market', time_in_force='gtc',
+                    )
+                    del positions[symbol]
+                    last_trade_time[symbol] = datetime.datetime.now()
+                except Exception as e:
+                    print(f"  [STOP] {symbol}: Sell error: {e}")
 
         # 1. Get predictions for all symbols in parallel
         bear_preds = {}
@@ -230,7 +285,7 @@ def run_crypto_bot():
             pos = verify_position(api, symbol)
             if pos is None:
                 print(f"  {symbol}: No actual position found, removing from tracking")
-                positions.discard(symbol)
+                del positions[symbol]
                 continue
 
             bear_pred = bear_preds.get(symbol)
@@ -248,8 +303,9 @@ def run_crypto_bot():
             print(f"  {symbol}: SELLING ({reason})")
 
             quote = get_crypto_quote(api, symbol)
+            info = positions[symbol]
             if quote is not None:
-                qty = float(pos.qty)
+                qty = info['qty']
                 try:
                     order = api.submit_order(
                         symbol=symbol,
@@ -262,15 +318,15 @@ def run_crypto_bot():
                     result = manage_order_lifecycle(api, order.id, timeout=ORDER_TIMEOUT,
                                                    fallback_to_market=True)
                     if result:
-                        positions.discard(symbol)
+                        del positions[symbol]
                         last_trade_time[symbol] = datetime.datetime.now()
                 except Exception as e:
                     print(f"  {symbol}: Sell error: {e}")
             else:
                 try:
-                    api.submit_order(symbol=symbol, qty=float(pos.qty),
+                    api.submit_order(symbol=symbol, qty=info['qty'],
                                      side='sell', type='market', time_in_force='gtc')
-                    positions.discard(symbol)
+                    del positions[symbol]
                     last_trade_time[symbol] = datetime.datetime.now()
                 except Exception as e:
                     print(f"  {symbol}: Market sell error: {e}")
@@ -299,8 +355,32 @@ def run_crypto_bot():
                     print(f"  {symbol}: Bull pred {bull_pred:+.4f}% < {bull_threshold:.2f}, skipping")
                     continue
 
-            if place_smart_order(api, symbol, 'buy', NOTIONAL_PER_SYMBOL):
-                positions.add(symbol)
+            # Sentiment gate: adjust notional or block trade
+            gate, gate_reasons = sentiment_gate(symbol, 'crypto')
+            if gate <= 0:
+                print(f"  {symbol}: BLOCKED by sentiment ({', '.join(gate_reasons)})")
+                continue
+            adjusted_notional = int(NOTIONAL_PER_SYMBOL * gate)
+            if gate != 1.0:
+                print(f"  {symbol}: Sentiment gate {gate:.2f}x -> ${adjusted_notional} "
+                      f"({', '.join(gate_reasons)})")
+
+            if place_smart_order(api, symbol, 'buy', adjusted_notional):
+                # Get fill info for position tracking
+                fill_price = None
+                quote = get_crypto_quote(api, symbol)
+                if quote:
+                    fill_price = quote['midpoint']
+                pos = verify_position(api, symbol)
+                if pos:
+                    fill_price = float(pos.avg_entry_price)
+                    positions[symbol] = {
+                        'qty': float(pos.qty),
+                        'entry_price': fill_price,
+                        'high_water_mark': fill_price,
+                        'stop_order_id': None,
+                        'trailing_activated': False,
+                    }
                 last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(1)
 
