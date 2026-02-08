@@ -190,6 +190,15 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         print(f"  Not enough data for sequence (need {seq_len}, have {len(df)})")
         return None
 
+    # Inject live sentiment if the model was trained with it
+    if 'Daily_Sentiment' in feature_cols and 'Daily_Sentiment' not in df.columns:
+        try:
+            from sentiment_history import get_live_daily_sentiment
+            df['Daily_Sentiment'] = get_live_daily_sentiment(symbol, asset_type)
+        except Exception as e:
+            print(f"  [SENTIMENT] Live sentiment unavailable: {e}")
+            df['Daily_Sentiment'] = 0.0
+
     try:
         current_features = df[feature_cols].values
     except KeyError as e:

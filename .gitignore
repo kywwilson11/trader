@@ -41,6 +41,9 @@ llm_config.json
 # Indicator preset config
 indicator_config.json
 
+# Sentiment cache
+sentiment_cache.db
+
 # Trade journal logs
 journals/
 

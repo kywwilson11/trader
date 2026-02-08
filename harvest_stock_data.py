@@ -60,6 +60,24 @@ def main():
     # Combine and save — sort chronologically for time-series split in training
     final_df = pd.concat(all_data)
     final_df = final_df.sort_index()
+
+    # Add historical sentiment (Finnhub company news for stocks)
+    try:
+        from sentiment_history import fetch_stock_sentiment_history
+        stock_tickers = [t for t in STOCK_TICKERS if '/' not in t and '-USD' not in t]
+        start_date = str(final_df.index.min().date())
+        end_date = str(final_df.index.max().date())
+        sentiment = fetch_stock_sentiment_history(stock_tickers, start_date, end_date)
+        final_df['Daily_Sentiment'] = [
+            sentiment.get((ticker, str(date)), 0.0)
+            for ticker, date in zip(final_df['Ticker'], final_df.index.date)
+        ]
+        filled = sum(1 for v in final_df['Daily_Sentiment'] if v != 0.0)
+        print(f"Daily_Sentiment: {filled}/{len(final_df)} bars have sentiment")
+    except Exception as e:
+        print(f"WARNING: Could not fetch stock sentiment history: {e}")
+        final_df['Daily_Sentiment'] = 0.0
+
     final_df.to_csv('stock_training_data.csv')
     print(f"Done! Saved {len(final_df)} rows of stock training data to stock_training_data.csv")
 

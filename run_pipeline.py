@@ -477,6 +477,27 @@ def main():
         status['bots_running'] = True
         write_status(status, force=True)
 
+        # Start sentiment backfill worker (LLM-scores historical articles)
+        backfill_proc = None
+        try:
+            from sentiment_history import set_live_mode
+            set_live_mode(True)
+            backfill_proc = subprocess.Popen(
+                [PYTHON, '-u', 'sentiment_history.py', '--backfill'],
+                stdout=open(os.path.join(BASE_DIR, 'backfill_output.log'), 'a'),
+                stderr=subprocess.STDOUT,
+                env=ENV, cwd=BASE_DIR,
+            )
+            msg = f"Backfill worker started (PID {backfill_proc.pid})\n"
+            log_fh.write(msg)
+            log_fh.flush()
+            print(msg, end='')
+        except Exception as e:
+            msg = f"Backfill worker failed to start: {e}\n"
+            log_fh.write(msg)
+            log_fh.flush()
+            print(msg, end='')
+
         # --- No retrain: wait forever ---
         if args.no_retrain:
             msg = "Retrain disabled, bots running until manually stopped.\n"
@@ -517,6 +538,13 @@ def main():
                 write_status(status)
 
             # --- Retrain (bots keep trading with current models) ---
+            # Pause backfill during retrain to free LLM quota
+            try:
+                from sentiment_history import set_live_mode
+                set_live_mode(False)
+            except Exception:
+                pass
+
             retrain_phases = (
                 _build_harvest_phases(False, train_crypto, train_stock)
                 + _build_training_phases(args.retrain_trials, train_crypto, train_stock)
@@ -543,6 +571,13 @@ def main():
             print(banner, end='')
 
             _run_training(retrain_phases, log_fh, status, is_retrain=True)
+
+            # Resume live mode after retrain (backfill pauses)
+            try:
+                from sentiment_history import set_live_mode
+                set_live_mode(True)
+            except Exception:
+                pass
 
             msg = f"\nRetrain cycle {cycle} complete.\n"
             log_fh.write(msg)

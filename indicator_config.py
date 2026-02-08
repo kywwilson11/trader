@@ -41,6 +41,8 @@ _MINIMAL_FEATURES = [
     "Hour_sin", "Hour_cos", "Day_sin", "Day_cos",
     # Rate of change
     "ROC",
+    # Sentiment
+    "Daily_Sentiment",
 ]
 
 _STANDARD_FEATURES = _MINIMAL_FEATURES + [

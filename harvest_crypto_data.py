@@ -62,6 +62,21 @@ def main():
     # Combine and save — sort chronologically for time-series split in training
     final_df = pd.concat(all_data)
     final_df = final_df.sort_index()
+
+    # Add historical sentiment (Fear & Greed Index for crypto)
+    try:
+        from sentiment_history import fetch_crypto_sentiment_history
+        start_date = str(final_df.index.min().date())
+        end_date = str(final_df.index.max().date())
+        sentiment = fetch_crypto_sentiment_history(start_date, end_date)
+        final_df['Daily_Sentiment'] = (
+            final_df.index.date.astype(str).map(sentiment).fillna(0.0).values
+        )
+        print(f"Daily_Sentiment: {(final_df['Daily_Sentiment'] != 0).sum()}/{len(final_df)} bars have sentiment")
+    except Exception as e:
+        print(f"WARNING: Could not fetch crypto sentiment history: {e}")
+        final_df['Daily_Sentiment'] = 0.0
+
     final_df.to_csv('training_data.csv')
     print(f"Done! Saved {len(final_df)} rows of training data to training_data.csv")
     print(f"\nCryptos harvested: {len(all_data)}/{len(CRYPTO_TICKERS)}")
