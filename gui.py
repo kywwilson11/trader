@@ -771,15 +771,26 @@ class DataFetcher(QObject):
 
     @Slot()
     def fetch_hw(self):
-        """Read hardware stats without importing torch (avoids GIL/CUDA hangs)."""
+        """Read hardware stats from sysfs (no torch, no sudo)."""
         try:
-            temp = self._read_gpu_temp()
-            used, total = self._read_ram()
+            gpu_temp = self._read_gpu_temp()
+            cpu_temp = self._read_cpu_temp()
+            ram_used, ram_total = self._read_ram()
+            gpu_load = self._read_gpu_load()
+            gpu_freq, gpu_max_freq = self._read_gpu_freq()
+            cpu_usage = self._read_cpu_usage()
+            cpu_freq, cpu_max_freq = self._read_cpu_freq()
             self.hw_updated.emit({
-                "gpu_temp": temp,
-                "ram_used": used,
-                "ram_total": total,
-                "gpu_available": None,
+                "gpu_temp": gpu_temp,
+                "cpu_temp": cpu_temp,
+                "ram_used": ram_used,
+                "ram_total": ram_total,
+                "gpu_load": gpu_load,
+                "gpu_freq_mhz": gpu_freq,
+                "gpu_max_freq_mhz": gpu_max_freq,
+                "cpu_usage": cpu_usage,
+                "cpu_freq_mhz": cpu_freq,
+                "cpu_max_freq_mhz": cpu_max_freq,
             })
         except Exception as e:
             self.error_occurred.emit(f"HW fetch: {e}")
@@ -1078,6 +1089,68 @@ class DataFetcher(QObject):
         except Exception:
             return None, None
 
+    @staticmethod
+    def _read_gpu_load():
+        """Read GPU load % from Jetson sysfs (0-1000 scale -> 0-100%)."""
+        try:
+            with open("/sys/devices/platform/bus@0/17000000.gpu/load") as f:
+                return int(f.read().strip()) / 10.0
+        except (FileNotFoundError, ValueError, OSError):
+            return None
+
+    @staticmethod
+    def _read_gpu_freq():
+        """Read GPU current/max frequency in MHz from devfreq."""
+        try:
+            with open("/sys/class/devfreq/17000000.gpu/cur_freq") as f:
+                cur = int(f.read().strip()) / 1e6
+            with open("/sys/class/devfreq/17000000.gpu/max_freq") as f:
+                mx = int(f.read().strip()) / 1e6
+            return cur, mx
+        except (FileNotFoundError, ValueError, OSError):
+            return None, None
+
+    def _read_cpu_usage(self):
+        """Read CPU usage % from /proc/stat (diff of two snapshots)."""
+        try:
+            with open("/proc/stat") as f:
+                line = f.readline()  # first line: cpu  user nice system idle ...
+            parts = list(map(int, line.split()[1:]))
+            idle = parts[3] + (parts[4] if len(parts) > 4 else 0)  # idle + iowait
+            total = sum(parts)
+            prev = getattr(self, '_cpu_prev', None)
+            self._cpu_prev = (idle, total)
+            if prev is None:
+                return None
+            d_idle = idle - prev[0]
+            d_total = total - prev[1]
+            if d_total == 0:
+                return 0.0
+            return (1.0 - d_idle / d_total) * 100.0
+        except (FileNotFoundError, ValueError, OSError):
+            return None
+
+    @staticmethod
+    def _read_cpu_freq():
+        """Read CPU current/max frequency in MHz from cpu0 cpufreq."""
+        try:
+            with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") as f:
+                cur = int(f.read().strip()) / 1000.0
+            with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq") as f:
+                mx = int(f.read().strip()) / 1000.0
+            return cur, mx
+        except (FileNotFoundError, ValueError, OSError):
+            return None, None
+
+    @staticmethod
+    def _read_cpu_temp():
+        """Read CPU temp from thermal_zone0."""
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                return int(f.read().strip()) / 1000.0
+        except (FileNotFoundError, ValueError, OSError):
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Log Tailer Thread
@@ -1129,8 +1202,32 @@ class LogTailer(QObject):
 # ---------------------------------------------------------------------------
 # Tax Estimator
 # ---------------------------------------------------------------------------
+def _mintax_sort_key(lot, sell_price, sell_time_str):
+    """Sort key: losses first (highest cost), then LT gains, then ST gains."""
+    gain = sell_price - lot["price"]
+    is_loss = gain < 0
+    try:
+        buy_t = dt.datetime.fromisoformat(lot["time"].replace("Z", "+00:00"))
+        sell_t = dt.datetime.fromisoformat(sell_time_str.replace("Z", "+00:00"))
+        long_term = (sell_t - buy_t).days >= 365
+    except Exception:
+        long_term = False
+    if is_loss:
+        tier = 0
+    elif long_term:
+        tier = 1
+    else:
+        tier = 2
+    return (tier, -lot["price"])
+
+
 def estimate_taxes(orders):
-    """FIFO lot matching from filled orders. Returns dict of tax info."""
+    """MinTax lot matching from filled orders. Returns dict of tax info.
+
+    Lots are matched in tax-optimal order: losses first (highest cost basis),
+    then long-term gains, then short-term gains — each sub-sorted by highest
+    cost basis to minimize realized gain within the tier.
+    """
     buys = defaultdict(list)
     realized = []
 
@@ -1153,6 +1250,7 @@ def estimate_taxes(orders):
             buys[sym].append({"qty": qty, "price": price, "time": filled_at})
         elif o["side"] == "sell":
             remaining = qty
+            buys[sym].sort(key=lambda lot: _mintax_sort_key(lot, price, filled_at))
             while remaining > 0 and buys[sym]:
                 lot = buys[sym][0]
                 matched = min(remaining, lot["qty"])
@@ -1313,7 +1411,7 @@ class TradingDashboard(QMainWindow):
         self._status_sentiment = QLabel("FnG: \u2014")
         self._status_gpu = QLabel("GPU: \u2014")
         self._status_ram = QLabel("RAM: \u2014")
-        self._status_gpu_avail = QLabel("CUDA: \u2014")
+        self._status_gpu_info = QLabel("GPU: \u2014")
         self._status_updated = QLabel("")
         self._error_count = 0
         self.statusBar().addWidget(self._status_updated)
@@ -1322,7 +1420,7 @@ class TradingDashboard(QMainWindow):
         self.statusBar().addPermanentWidget(self._status_conn)
         self.statusBar().addPermanentWidget(self._status_gpu)
         self.statusBar().addPermanentWidget(self._status_ram)
-        self.statusBar().addPermanentWidget(self._status_gpu_avail)
+        self.statusBar().addPermanentWidget(self._status_gpu_info)
 
         # Apply initial styling
         self._restyle()
@@ -1528,7 +1626,7 @@ class TradingDashboard(QMainWindow):
         self._positions_table.setAlternatingRowColors(True)
         layout.addWidget(self._positions_table)
 
-        tax_group = QGroupBox("Tax Estimation (FIFO)")
+        tax_group = QGroupBox("Tax Estimation (MinTax)")
         tax_layout = QHBoxLayout(tax_group)
         self._tax_realized = make_card("Realized Gains")
         self._tax_st = make_card("Short-Term Gains")
@@ -2095,41 +2193,30 @@ class TradingDashboard(QMainWindow):
         layout.addWidget(pipeline_group)
 
         hw_group = QGroupBox("Hardware")
-        hw_layout = QHBoxLayout(hw_group)
+        hw_grid = QGridLayout(hw_group)
 
-        gpu_frame = QFrame()
-        gpu_inner = QVBoxLayout(gpu_frame)
-        gpu_inner.addWidget(QLabel("GPU Temperature"))
-        self._gpu_temp_label = QLabel("\u2014")
-        self._gpu_temp_label.setStyleSheet("font-size: 28px; font-weight: bold;")
-        gpu_inner.addWidget(self._gpu_temp_label)
-        self._gpu_temp_bar = QProgressBar()
-        self._gpu_temp_bar.setRange(0, 100)
-        self._gpu_temp_bar.setTextVisible(False)
-        self._gpu_temp_bar.setFixedHeight(12)
-        gpu_inner.addWidget(self._gpu_temp_bar)
-        hw_layout.addWidget(gpu_frame)
+        def _hw_gauge(label_text, row, col):
+            frame = QFrame()
+            inner = QVBoxLayout(frame)
+            inner.setContentsMargins(4, 2, 4, 2)
+            inner.addWidget(QLabel(label_text))
+            val = QLabel("\u2014")
+            val.setStyleSheet("font-size: 22px; font-weight: bold;")
+            inner.addWidget(val)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(10)
+            inner.addWidget(bar)
+            hw_grid.addWidget(frame, row, col)
+            return val, bar
 
-        ram_frame = QFrame()
-        ram_inner = QVBoxLayout(ram_frame)
-        ram_inner.addWidget(QLabel("RAM Usage"))
-        self._ram_label = QLabel("\u2014")
-        self._ram_label.setStyleSheet("font-size: 28px; font-weight: bold;")
-        ram_inner.addWidget(self._ram_label)
-        self._ram_bar = QProgressBar()
-        self._ram_bar.setRange(0, 100)
-        self._ram_bar.setTextVisible(False)
-        self._ram_bar.setFixedHeight(12)
-        ram_inner.addWidget(self._ram_bar)
-        hw_layout.addWidget(ram_frame)
-
-        gpu_avail_frame = QFrame()
-        gpu_avail_inner = QVBoxLayout(gpu_avail_frame)
-        gpu_avail_inner.addWidget(QLabel("GPU Available"))
-        self._gpu_avail_label = QLabel("\u2014")
-        self._gpu_avail_label.setStyleSheet("font-size: 28px; font-weight: bold;")
-        gpu_avail_inner.addWidget(self._gpu_avail_label)
-        hw_layout.addWidget(gpu_avail_frame)
+        self._gpu_temp_label, self._gpu_temp_bar = _hw_gauge("GPU Temp", 0, 0)
+        self._gpu_load_label, self._gpu_load_bar = _hw_gauge("GPU Load", 0, 1)
+        self._gpu_clock_label, self._gpu_clock_bar = _hw_gauge("GPU Clock", 0, 2)
+        self._cpu_temp_label, self._cpu_temp_bar = _hw_gauge("CPU Temp", 1, 0)
+        self._cpu_load_label, self._cpu_load_bar = _hw_gauge("CPU Load", 1, 1)
+        self._ram_label, self._ram_bar = _hw_gauge("Shared Memory", 1, 2)
 
         layout.addWidget(hw_group)
         layout.addStretch()
@@ -2316,13 +2403,66 @@ class TradingDashboard(QMainWindow):
     @Slot(dict)
     def on_hw(self, data):
         self._hw_cache = data
-        temp = data.get("gpu_temp")
+
+        def _temp_color(t):
+            if t < 60: return T["green"].name()
+            if t < 70: return T["yellow"].name()
+            return T["red"].name()
+
+        def _pct_color(p):
+            if p < 80: return T["green"].name()
+            if p < 90: return T["yellow"].name()
+            return T["red"].name()
+
+        def _set_gauge(label, bar, text, pct, color, font_size=22):
+            label.setText(text)
+            label.setStyleSheet(f"font-size: {font_size}px; font-weight: bold; color: {color};")
+            bar.setValue(int(min(max(pct, 0), 100)))
+            bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: {color}; }}")
+
+        # --- GPU Temp ---
+        gpu_temp = data.get("gpu_temp")
+        if gpu_temp is not None:
+            _set_gauge(self._gpu_temp_label, self._gpu_temp_bar,
+                       f"{gpu_temp:.0f}\u00b0C", gpu_temp, _temp_color(gpu_temp))
+
+        # --- GPU Load ---
+        gpu_load = data.get("gpu_load")
+        if gpu_load is not None:
+            _set_gauge(self._gpu_load_label, self._gpu_load_bar,
+                       f"{gpu_load:.0f}%", gpu_load, _pct_color(gpu_load))
+
+        # --- GPU Clock ---
+        gpu_freq = data.get("gpu_freq_mhz")
+        gpu_max = data.get("gpu_max_freq_mhz")
+        if gpu_freq is not None and gpu_max:
+            pct = gpu_freq / gpu_max * 100
+            _set_gauge(self._gpu_clock_label, self._gpu_clock_bar,
+                       f"{gpu_freq:.0f}/{gpu_max:.0f} MHz", pct, T["accent"].name())
+
+        # --- CPU Temp ---
+        cpu_temp = data.get("cpu_temp")
+        if cpu_temp is not None:
+            _set_gauge(self._cpu_temp_label, self._cpu_temp_bar,
+                       f"{cpu_temp:.0f}\u00b0C", cpu_temp, _temp_color(cpu_temp))
+
+        # --- CPU Load ---
+        cpu_usage = data.get("cpu_usage")
+        if cpu_usage is not None:
+            _set_gauge(self._cpu_load_label, self._cpu_load_bar,
+                       f"{cpu_usage:.0f}%", cpu_usage, _pct_color(cpu_usage))
+
+        # --- Shared Memory ---
         used = data.get("ram_used")
         total = data.get("ram_total")
-        gpu_ok = data.get("gpu_available")
+        if used is not None and total is not None:
+            pct = int(used / total * 100) if total else 0
+            _set_gauge(self._ram_label, self._ram_bar,
+                       f"{used:.0f}/{total:.0f} MB", pct, _pct_color(pct))
 
-        if temp is not None:
-            self._status_gpu.setText(f"GPU: {temp:.0f}C")
+        # --- Status bar ---
+        if gpu_temp is not None:
+            self._status_gpu.setText(f"GPU: {gpu_temp:.0f}\u00b0C")
         else:
             self._status_gpu.setText("GPU: N/A")
 
@@ -2331,40 +2471,13 @@ class TradingDashboard(QMainWindow):
         else:
             self._status_ram.setText("RAM: N/A")
 
-        self._status_gpu_avail.setText(f"CUDA: {'OK' if gpu_ok else 'N/A'}")
-
-        # Models tab hardware gauges
-        if temp is not None:
-            self._gpu_temp_label.setText(f"{temp:.0f}C")
-            self._gpu_temp_bar.setValue(int(min(temp, 100)))
-            if temp < 60:
-                color = T["green"].name()
-            elif temp < 70:
-                color = T["yellow"].name()
-            else:
-                color = T["red"].name()
-            self._gpu_temp_label.setStyleSheet(
-                f"font-size: 28px; font-weight: bold; color: {color};")
-            self._gpu_temp_bar.setStyleSheet(
-                f"QProgressBar::chunk {{ background-color: {color}; }}")
-
-        if used is not None and total is not None:
-            pct = int(used / total * 100) if total else 0
-            self._ram_label.setText(f"{used:.0f}/{total:.0f} MB")
-            self._ram_bar.setValue(pct)
-            color = T["green"].name() if pct < 80 else (T["yellow"].name() if pct < 90 else T["red"].name())
-            self._ram_bar.setStyleSheet(
-                f"QProgressBar::chunk {{ background-color: {color}; }}")
-
-        if gpu_ok is not None:
-            if gpu_ok:
-                self._gpu_avail_label.setText("Available")
-                self._gpu_avail_label.setStyleSheet(
-                    f"font-size: 28px; font-weight: bold; color: {T['green'].name()};")
-            else:
-                self._gpu_avail_label.setText("Unavailable")
-                self._gpu_avail_label.setStyleSheet(
-                    f"font-size: 28px; font-weight: bold; color: {T['red'].name()};")
+        # GPU load + clock in status bar
+        if gpu_load is not None and gpu_freq is not None:
+            self._status_gpu_info.setText(f"GPU: {gpu_load:.0f}% @ {gpu_freq:.0f}MHz")
+        elif gpu_load is not None:
+            self._status_gpu_info.setText(f"GPU: {gpu_load:.0f}%")
+        else:
+            self._status_gpu_info.setText("GPU: idle")
 
     @Slot(dict)
     def on_news(self, data):

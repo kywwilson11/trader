@@ -26,6 +26,7 @@ evolve.py                         3-day retraining orchestrator (alternative to 
 - **ATR-based adaptive risk** — stop-loss, trailing stops, and take-profit scaled to current volatility
 - **Sentiment gating** — Fear & Greed Index + Finnhub news scores modulate position sizing (0x–1.5x)
 - **Confidence-based sizing** — trade notional scaled by prediction strength
+- **MinTax lot selection** — tax-optimized lot matching: losses first, then long-term gains, then short-term gains (minimizes estimated tax vs FIFO)
 - **Numba JIT indicators** — RSI, MACD, ATR, Bollinger Bands, Stochastic, OBV (~1.8x speedup)
 - **Cross-asset features** — BTC prices for crypto correlations, SPY for stock relative strength
 - **Circuit breaker** — auto-flattens all positions on 5% daily drawdown
@@ -300,7 +301,7 @@ Desktop monitoring app with live updates (2-second polling of `pipeline_status.j
 
 **Tabs:**
 - **Positions** — open positions, P&L, exposure, recent fills
-- **Performance** — equity curve, daily P&L, drawdown
+- **Performance** — equity curve, daily P&L, drawdown, MinTax lot-matched tax estimation
 - **News** — Fear & Greed Index, Finnhub headlines (My Universe / All News / Global Macro filters)
 - **Markets** — combined stocks + crypto universe with heatmap, price chart (1Y/3M/1M/1W/1D zoom), metrics table with live model predictions (bear/bull/score/signal from both bots), add/remove symbols
 - **Models** — model scores (C-Bear, C-Bull, S-Bear, S-Bull), trial progress, pipeline phase, next retrain time
