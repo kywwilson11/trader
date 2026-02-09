@@ -32,7 +32,7 @@ _MINIMAL_FEATURES = [
     # Volatility
     "ATR",
     # Trend
-    "SMA_20", "EMA_12", "Price_SMA20_Ratio",
+    "SMA_20", "Price_SMA20_Ratio",
     # Volume
     "Volume_Ratio", "OBV",
     # Oscillator
@@ -41,6 +41,8 @@ _MINIMAL_FEATURES = [
     "Hour_sin", "Hour_cos", "Day_sin", "Day_cos",
     # Rate of change
     "ROC",
+    # Return-based
+    "Return_4h", "Return_12h", "Volatility_12h",
     # Sentiment
     "Daily_Sentiment",
 ]
@@ -48,10 +50,8 @@ _MINIMAL_FEATURES = [
 _STANDARD_FEATURES = _MINIMAL_FEATURES + [
     # MACD signal line
     "MACDs_12_26_9",
-    # Bollinger Bands
-    "BBL_20_2.0", "BBM_20_2.0", "BBU_20_2.0", "BBB_20_2.0", "BBP_20_2.0",
-    # Longer-term trend
-    "SMA_50", "Price_SMA50_Ratio",
+    # Bollinger Bands (no BBM — identical to SMA_20)
+    "BBL_20_2.0", "BBU_20_2.0", "BBB_20_2.0", "BBP_20_2.0",
     # Volume moving average
     "Volume_SMA_20",
     # Stochastic %D

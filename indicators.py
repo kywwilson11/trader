@@ -389,19 +389,15 @@ def compute_features(df, btc_close=None):
 
     df['ATR'] = compute_atr(df['High'], df['Low'], df['Close'], length=14)
 
-    bb_lower, bb_mid, bb_upper, bb_bw, bb_pct = compute_bbands(df['Close'], length=20, std=2)
+    bb_lower, _bb_mid, bb_upper, bb_bw, bb_pct = compute_bbands(df['Close'], length=20, std=2)
     df['BBL_20_2.0'] = bb_lower
-    df['BBM_20_2.0'] = bb_mid
     df['BBU_20_2.0'] = bb_upper
     df['BBB_20_2.0'] = bb_bw
     df['BBP_20_2.0'] = bb_pct
 
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
-    df['SMA_50'] = df['Close'].rolling(window=50).mean()
-    df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
 
     df['Price_SMA20_Ratio'] = df['Close'] / df['SMA_20']
-    df['Price_SMA50_Ratio'] = df['Close'] / df['SMA_50']
 
     df['Volume_SMA_20'] = df['Volume'].rolling(window=20).mean()
     df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA_20']
@@ -420,6 +416,11 @@ def compute_features(df, btc_close=None):
     df['Hour_cos'] = np.cos(2 * np.pi * hour / 24)
     df['Day_sin'] = np.sin(2 * np.pi * day / 7)
     df['Day_cos'] = np.cos(2 * np.pi * day / 7)
+
+    # --- Return-based features (higher predictive power for multi-hour moves) ---
+    df['Return_4h'] = df['Close'].pct_change(4) * 100
+    df['Return_12h'] = df['Close'].pct_change(12) * 100
+    df['Volatility_12h'] = df['Close'].pct_change(1).rolling(12).std() * 100
 
     # --- New indicators (Phase C) ---
 
