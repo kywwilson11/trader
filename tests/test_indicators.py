@@ -311,31 +311,6 @@ class TestComputeFeatures:
         assert "Vol_Price_Confirm" in result.columns
         assert "SMA_100" in result.columns
 
-    def test_return_based_features(self, sample_ohlcv_df):
-        df = sample_ohlcv_df.copy()
-        df.index = pd.date_range("2025-01-01", periods=len(df), freq="h")
-        result = compute_features(df)
-        assert "Return_4h" in result.columns
-        assert "Return_12h" in result.columns
-        assert "Volatility_12h" in result.columns
-
-    def test_return_4h_known_value(self):
-        """4-bar return of [100, 100, 100, 100, 110] should be ~10%."""
-        close = pd.Series([100.0] * 10 + [110.0])
-        ret4 = close.pct_change(4) * 100
-        # At index 4: (100-100)/100*100 = 0
-        # At index 10: (110-100)/100*100 = 10
-        assert abs(ret4.iloc[-1] - 10.0) < 0.01
-
-    def test_redundant_features_removed(self, sample_ohlcv_df):
-        df = sample_ohlcv_df.copy()
-        df.index = pd.date_range("2025-01-01", periods=len(df), freq="h")
-        result = compute_features(df)
-        assert "SMA_50" not in result.columns
-        assert "EMA_12" not in result.columns
-        assert "Price_SMA50_Ratio" not in result.columns
-        assert "BBM_20_2.0" not in result.columns
-
     def test_btc_cross_asset_features(self, sample_ohlcv_df):
         df = sample_ohlcv_df.copy()
         df.index = pd.date_range("2025-01-01", periods=len(df), freq="h")

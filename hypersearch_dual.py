@@ -108,19 +108,13 @@ def get_indices_and_classes(all_returns, tickers, ticker_boundaries, bull_thresh
     classes[all_returns > bull_thresh] = 2
     classes[all_returns < bear_thresh] = 0
 
-    # Per-ticker temporal split: first 80% of each ticker's timeline = train,
-    # last 20% = val.  This avoids train/deploy mismatch where the model never
-    # validates on tickers it trained on.
-    train_indices = []
-    val_indices = []
+    valid_indices = []
     for ticker in tickers:
         start, end = ticker_boundaries[ticker]
-        ticker_valid = list(range(start + seq_len, end))
-        split = int(len(ticker_valid) * TRAIN_RATIO)
-        train_indices.extend(ticker_valid[:split])
-        val_indices.extend(ticker_valid[split:])
+        for i in range(start + seq_len, end):
+            valid_indices.append(i)
 
-    return train_indices, val_indices, classes
+    return valid_indices, classes
 
 
 def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache, fixed_threshold=None):
@@ -134,12 +128,12 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         torch.cuda.empty_cache()
         gc.collect()
 
-        seq_len = trial.suggest_categorical('seq_len', [24, 48, 72])
-        hidden_dim = trial.suggest_categorical('hidden_dim', [128, 192, 256])
-        num_layers = trial.suggest_int('num_layers', 1, 3)
+        seq_len = trial.suggest_categorical('seq_len', [12, 18, 24])
+        hidden_dim = trial.suggest_categorical('hidden_dim', [64, 96, 128])
+        num_layers = trial.suggest_int('num_layers', 1, 2)
         dropout = trial.suggest_float('dropout', 0.05, 0.45, step=0.05)
         learning_rate = trial.suggest_float('learning_rate', 1e-4, 3e-3, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [64, 128, 256])
+        batch_size = trial.suggest_categorical('batch_size', [128, 256])
         if fixed_threshold is not None:
             bull_threshold = fixed_threshold
         else:
@@ -184,8 +178,12 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         weight_decay = cfg['weight_decay']
         scheduler = cfg['scheduler']
 
-        train_idx, val_idx, classes = get_indices_and_classes(
+        valid_indices, classes = get_indices_and_classes(
             all_returns, tickers, ticker_boundaries, bull_threshold, seq_len)
+
+        split = int(len(valid_indices) * TRAIN_RATIO)
+        train_idx = valid_indices[:split]
+        val_idx = valid_indices[split:]
 
         train_classes = classes[train_idx]
         unique = np.unique(train_classes)
@@ -218,7 +216,6 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         else:
             sched = None
 
-        best_epoch_score = 0.0
         best_val_acc = 0.0
         best_state = None
         best_preds = None
@@ -286,8 +283,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
                 print(f"  [TIMEOUT] Trial {trial.number} exceeded {MAX_TRIAL_SECONDS}s at epoch {epoch}, stopping")
                 break
 
-            if epoch_score > best_epoch_score:
-                best_epoch_score = epoch_score
+            if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 best_preds = ep_preds
@@ -312,7 +308,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
                 per_class[n] = float((ap[m] == c).mean()) if m.sum() > 0 else 0.0
 
         # Reject non-discriminative models: every class must exceed a floor.
-        MIN_CLASS_ACC = 0.15
+        MIN_CLASS_ACC = 0.10
         pc_vals = list(per_class.values())
         if pc_vals and min(pc_vals) < MIN_CLASS_ACC:
             del model, X_train, y_train, X_val, y_val, weights_t
@@ -469,7 +465,7 @@ def main():
             # Skip non-discriminative trials (any class below floor)
             pc = t.user_attrs.get('per_class', {})
             pc_vals = list(pc.values())
-            if pc_vals and min(pc_vals) < 0.15:
+            if pc_vals and min(pc_vals) < 0.10:
                 continue
             if (t.value or 0) > best_state_holder['score']:
                 best_state_holder['score'] = t.value

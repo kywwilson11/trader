@@ -217,13 +217,11 @@ def _next_retrain_time(retrain_day, retrain_hour):
 # Phase list builders
 # ---------------------------------------------------------------------------
 
-def _build_harvest_phases(skip_harvest, train_crypto, train_stock, forward_bars=4):
+def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
     """Build harvest phases, skipping if data is fresh."""
     phases = []
     if skip_harvest:
         return phases
-
-    fwd_args = ['--forward-bars', str(forward_bars)]
 
     if train_crypto:
         csv_path = os.path.join(BASE_DIR, 'training_data.csv')
@@ -235,13 +233,13 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock, forward_bars=
                 phases.append({
                     'id': 'crypto_harvest',
                     'label': 'Harvesting Crypto Data',
-                    'cmd': [PYTHON, '-u', 'harvest_crypto_data.py'] + fwd_args,
+                    'cmd': [PYTHON, '-u', 'harvest_crypto_data.py'],
                 })
         else:
             phases.append({
                 'id': 'crypto_harvest',
                 'label': 'Harvesting Crypto Data',
-                'cmd': [PYTHON, '-u', 'harvest_crypto_data.py'] + fwd_args,
+                'cmd': [PYTHON, '-u', 'harvest_crypto_data.py'],
             })
 
     if train_stock:
@@ -254,13 +252,13 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock, forward_bars=
                 phases.append({
                     'id': 'stock_harvest',
                     'label': 'Harvesting Stock Data',
-                    'cmd': [PYTHON, '-u', 'harvest_stock_data.py'] + fwd_args,
+                    'cmd': [PYTHON, '-u', 'harvest_stock_data.py'],
                 })
         else:
             phases.append({
                 'id': 'stock_harvest',
                 'label': 'Harvesting Stock Data',
-                'cmd': [PYTHON, '-u', 'harvest_stock_data.py'] + fwd_args,
+                'cmd': [PYTHON, '-u', 'harvest_stock_data.py'],
             })
 
     return phases
@@ -398,8 +396,6 @@ def main():
                         help='Hour to start retrain (0-23, default: 2)')
     parser.add_argument('--retrain-trials', type=int, default=100,
                         help='Trials per model for weekly retrain (default: 100)')
-    parser.add_argument('--forward-bars', type=int, default=4,
-                        help='Forward bars for target return in harvest (default: 4)')
     args = parser.parse_args()
 
     train_crypto = not args.stock_only
@@ -431,8 +427,7 @@ def main():
         # PHASE A: Initial training (cycle 0)
         # =============================================================
         if not args.bot_only:
-            phases = (_build_harvest_phases(args.skip_harvest, train_crypto, train_stock,
-                                           forward_bars=args.forward_bars)
+            phases = (_build_harvest_phases(args.skip_harvest, train_crypto, train_stock)
                       + _build_training_phases(args.trials, train_crypto, train_stock))
             for i, p in enumerate(phases):
                 p['idx'] = i
@@ -570,8 +565,7 @@ def main():
                 pass
 
             retrain_phases = (
-                _build_harvest_phases(False, train_crypto, train_stock,
-                                     forward_bars=args.forward_bars)
+                _build_harvest_phases(False, train_crypto, train_stock)
                 + _build_training_phases(args.retrain_trials, train_crypto, train_stock)
             )
             for i, p in enumerate(retrain_phases):

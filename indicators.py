@@ -417,7 +417,7 @@ def compute_features(df, btc_close=None):
     df['Day_sin'] = np.sin(2 * np.pi * day / 7)
     df['Day_cos'] = np.cos(2 * np.pi * day / 7)
 
-    # --- Return-based features (higher predictive power for multi-hour moves) ---
+    # --- Return-based features ---
     df['Return_4h'] = df['Close'].pct_change(4) * 100
     df['Return_12h'] = df['Close'].pct_change(12) * 100
     df['Volatility_12h'] = df['Close'].pct_change(1).rolling(12).std() * 100
