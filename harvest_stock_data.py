@@ -40,7 +40,7 @@ def prepare_stock_data(ticker, spy_close=None):
     df = compute_stock_features(df, spy_close=spy_close)
 
     # Target: next bar's return as a percentage
-    df['NextClose'] = df['Close'].shift(-1)
+    df['NextClose'] = df['Close'].shift(-4)
     df['Target_Return'] = (df['NextClose'] - df['Close']) / df['Close'] * 100
 
     df = df.dropna()

@@ -137,7 +137,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         if fixed_threshold is not None:
             bull_threshold = fixed_threshold
         else:
-            bull_threshold = trial.suggest_float('bull_threshold', 0.10, 0.35, step=0.01)
+            bull_threshold = trial.suggest_float('bull_threshold', 0.20, 0.50, step=0.01)
         weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
         scheduler = trial.suggest_categorical('scheduler', ['cosine', 'plateau', 'none'])
 
