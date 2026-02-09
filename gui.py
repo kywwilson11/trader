@@ -865,16 +865,34 @@ class DataFetcher(QObject):
                     unique.append(a)
             articles = unique
 
-            # Batch score all articles (LLM when available, keyword fallback)
-            scores = score_article_batch(articles)
-            for a, score in zip(articles, scores):
-                a['_sentiment'] = score
+            # Build cache of already-scored headlines to avoid re-scoring
+            cache = _load_news_cache()
+            cached_scores = {}
+            if cache and cache.get('articles'):
+                for ca in cache['articles']:
+                    key = ca.get('headline', '').strip().lower()
+                    if key and '_sentiment' in ca:
+                        cached_scores[key] = ca['_sentiment']
+
+            # Split articles into already-scored (from cache) and new
+            need_scoring = []
+            for a in articles:
+                key = a.get('headline', '').strip().lower()
+                if key in cached_scores:
+                    a['_sentiment'] = cached_scores[key]
+                else:
+                    need_scoring.append(a)
+
+            # Only score genuinely new articles
+            if need_scoring:
+                scores = score_article_batch(need_scoring)
+                for a, score in zip(need_scoring, scores):
+                    a['_sentiment'] = score
 
             # Sort by datetime descending
             articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
 
             # Merge with cache: keep new articles + older cached ones not in this fetch
-            cache = _load_news_cache()
             if cache and cache.get('articles'):
                 # Deduplicate by normalized headline — new articles take priority
                 seen = {a.get('headline', '').strip().lower() for a in articles}
