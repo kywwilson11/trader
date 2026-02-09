@@ -5,6 +5,12 @@
 <h1 align="center">Trader</h1>
 
 <p align="center">
+  <a href="https://github.com/kywwilson11/trader/actions/workflows/ci.yml">
+    <img src="https://github.com/kywwilson11/trader/actions/workflows/ci.yml/badge.svg" alt="CI">
+  </a>
+</p>
+
+<p align="center">
   Autonomous paper trading system for stocks and crypto, powered by dual bear/bull LSTM models with Numba-accelerated technical indicators and sentiment-gated risk management.
 </p>
 
@@ -496,6 +502,47 @@ python connection_test.py
 ```
 
 ### Testing
+
+#### CI Pipeline (GitHub Actions)
+
+Automated on every push and PR to `master`. Python 3.10 + 3.12 matrix on Ubuntu.
+
+| Stage | What it checks |
+|---|---|
+| `py_compile` | Syntax check all 26+ `.py` files (catches broken imports in gui.py too) |
+| `test_sentiment.py` | Existing 1,035-headline custom test suite |
+| `pytest tests/` | 221 unit tests across 18 test files |
+
+```bash
+# Run locally
+pytest tests/ -v --tb=short
+python test_sentiment.py
+```
+
+#### `tests/` -- pytest Suite (221 tests)
+
+| File | Tests | Module Under Test |
+|---|---|---|
+| `test_imports.py` | 25 | All modules except gui.py (parametrized import check) |
+| `test_indicators.py` | 42 | RSI, MACD, ATR, BBands, Stoch, OBV, ROC, VWAP, Gap, slopes, features |
+| `test_sentiment.py` | 27 | `_score_text`, `_validate_text`, `_deduplicate_articles` |
+| `test_fundamentals.py` | 18 | `format_fundamentals_for_llm`, `_cache_get`/`_cache_set` |
+| `test_sentiment_history.py` | 13 | `_fng_value_to_score`, `_keyword_score` |
+| `test_llm_analyst.py` | 11 | `_parse_response`, `_build_prompt` |
+| `test_order_utils.py` | 10 | `compute_limit_price`, `should_trade` |
+| `test_trading_utils.py` | 9 | `cooldown_ok`, `get_model_mtime` |
+| `test_evolve.py` | 9 | `get_next_version`, `load_scores`, `save_scores` |
+| `test_indicator_config.py` | 9 | Presets, feature lists, config loading |
+| `test_pipeline.py` | 9 | `_next_retrain_time`, `_build_harvest_phases` |
+| `test_stock_config.py` | 8 | `_clean`, `load_stock_universe`, defaults |
+| `test_llm_client.py` | 7 | `call_llm`, `_dispatch`, `_call_gemini` (mocked) |
+| `test_model.py` | 5 | CryptoLSTM forward pass, softmax, JIT trace |
+| `test_predict_now.py` | 4 | `_prefixed_paths` |
+| `test_llm_config.py` | 4 | `load_llm_config` defaults |
+| `test_trade_journal.py` | 3 | `log_decision`, `get_journal_summary` |
+| `test_market_data.py` | 2 | `flatten_yfinance_columns` |
+
+All tests run CPU-only with mocked external APIs — safe to run alongside live trading bots.
 
 #### `test_sentiment.py` -- Sentiment Test Suite
 

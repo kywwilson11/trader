@@ -1,8 +1,8 @@
-"""Tests for sentiment.py — keyword scoring and text validation."""
+"""Tests for sentiment.py — keyword scoring, text validation, and article dedup."""
 
 import pytest
 
-from sentiment import _score_text, _validate_text
+from sentiment import _score_text, _validate_text, _deduplicate_articles
 
 
 class TestScoreText:
@@ -33,6 +33,17 @@ class TestScoreText:
     def test_empty_string(self):
         score = _score_text("")
         assert abs(score) < 0.01
+
+    def test_death_cross_negative(self):
+        assert _score_text("Analysts warn of death cross pattern forming") < 0
+
+    def test_rate_cut_positive(self):
+        assert _score_text("Fed cuts interest rates by 50 basis points") > 0
+
+    def test_mixed_sentiment(self):
+        # Both positive and negative signals — should not saturate
+        score = _score_text("Stock surges on earnings beat but faces regulatory risk")
+        assert -1 < score < 1
 
 
 class TestValidateText:
@@ -65,3 +76,68 @@ class TestValidateText:
 
     def test_non_string_input(self):
         assert _validate_text(12345) is None
+
+    def test_exactly_10_chars_valid(self):
+        result = _validate_text("1234567890")
+        assert result is not None
+
+    def test_9_chars_too_short(self):
+        assert _validate_text("123456789") is None
+
+
+class TestDeduplicateArticles:
+    def test_removes_duplicates(self):
+        articles = [
+            {"headline": "Bitcoin surges today"},
+            {"headline": "Bitcoin surges today"},
+            {"headline": "Ethereum drops sharply"},
+        ]
+        result = _deduplicate_articles(articles)
+        assert len(result) == 2
+
+    def test_case_insensitive(self):
+        articles = [
+            {"headline": "Bitcoin SURGES Today"},
+            {"headline": "bitcoin surges today"},
+        ]
+        result = _deduplicate_articles(articles)
+        assert len(result) == 1
+
+    def test_preserves_order(self):
+        articles = [
+            {"headline": "First headline here"},
+            {"headline": "Second headline here"},
+            {"headline": "First headline here"},
+        ]
+        result = _deduplicate_articles(articles)
+        assert result[0]["headline"] == "First headline here"
+        assert result[1]["headline"] == "Second headline here"
+
+    def test_empty_list(self):
+        assert _deduplicate_articles([]) == []
+
+    def test_none_headline_skipped(self):
+        articles = [
+            {"headline": None},
+            {"headline": "Valid headline text"},
+        ]
+        result = _deduplicate_articles(articles)
+        assert len(result) == 1
+        assert result[0]["headline"] == "Valid headline text"
+
+    def test_empty_headline_skipped(self):
+        articles = [
+            {"headline": ""},
+            {"headline": "   "},
+            {"headline": "Actual headline here"},
+        ]
+        result = _deduplicate_articles(articles)
+        assert len(result) == 1
+
+    def test_missing_headline_key(self):
+        articles = [
+            {"summary": "no headline key"},
+            {"headline": "Has a headline here"},
+        ]
+        result = _deduplicate_articles(articles)
+        assert len(result) == 1
