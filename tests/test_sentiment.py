@@ -1,8 +1,15 @@
-"""Tests for sentiment.py — keyword scoring, text validation, and article dedup."""
+"""Tests for sentiment.py — keyword scoring, text validation, article dedup, and LLM retry queue."""
+
+import time
+from unittest.mock import patch
 
 import pytest
 
-from sentiment import _score_text, _validate_text, _deduplicate_articles
+from sentiment import (
+    _score_text, _validate_text, _deduplicate_articles,
+    _score_articles, _aggregate_scores, _try_llm_retry,
+    _llm_retry_queue, _cache, CACHE_TTL,
+)
 
 
 class TestScoreText:
@@ -141,3 +148,110 @@ class TestDeduplicateArticles:
         ]
         result = _deduplicate_articles(articles)
         assert len(result) == 1
+
+
+class TestScoreArticlesReturnType:
+    """Test that _score_articles returns (result_dict, used_llm) tuple."""
+
+    @patch("sentiment._llm_score_batch", return_value=None)
+    def test_keyword_fallback_sets_used_llm_false(self, mock_llm):
+        articles = [{"headline": "Bitcoin surges on bullish momentum"}]
+        result, used_llm = _score_articles(articles)
+        assert used_llm is False
+        assert isinstance(result, dict)
+        assert "sentiment_score" in result
+
+    @patch("sentiment._llm_score_batch", return_value=[0.5])
+    def test_llm_success_sets_used_llm_true(self, mock_llm):
+        articles = [{"headline": "Bitcoin surges on bullish momentum"}]
+        result, used_llm = _score_articles(articles)
+        assert used_llm is True
+        assert isinstance(result, dict)
+        assert result["sentiment_score"] == pytest.approx(0.5)
+
+    def test_empty_articles_returns_used_llm_true(self):
+        result, used_llm = _score_articles([])
+        assert used_llm is True
+        assert result["article_count"] == 0
+
+
+class TestAggregateScores:
+    def test_empty_scores(self):
+        result = _aggregate_scores([])
+        assert result["sentiment_score"] == 0.0
+        assert result["article_count"] == 0
+
+    def test_positive_scores(self):
+        result = _aggregate_scores([0.5, 0.3, 0.7])
+        assert result["sentiment_score"] == pytest.approx(0.5)
+        assert result["article_count"] == 3
+        assert result["positive_ratio"] == pytest.approx(1.0)
+        assert result["negative_ratio"] == pytest.approx(0.0)
+
+    def test_mixed_scores(self):
+        result = _aggregate_scores([0.5, -0.5])
+        assert result["sentiment_score"] == pytest.approx(0.0)
+        assert result["positive_ratio"] == pytest.approx(0.5)
+        assert result["negative_ratio"] == pytest.approx(0.5)
+
+
+class TestTryLlmRetry:
+    """Test _try_llm_retry queue draining behavior."""
+
+    def setup_method(self):
+        """Clear queue and cache before each test."""
+        _llm_retry_queue.clear()
+        # Save and restore cache keys we touch
+        self._saved_cache_keys = []
+
+    def teardown_method(self):
+        _llm_retry_queue.clear()
+        for key in self._saved_cache_keys:
+            _cache.pop(key, None)
+
+    def test_empty_queue_is_noop(self):
+        _try_llm_retry()  # should not raise
+
+    def test_discards_stale_entry(self):
+        stale_time = time.time() - CACHE_TTL - 10
+        _llm_retry_queue.append(("test_stale", [], stale_time))
+        _try_llm_retry()
+        assert len(_llm_retry_queue) == 0  # consumed and discarded
+
+    def test_discards_superseded_entry(self):
+        queued_at = time.time() - 60
+        cache_key = "_test_superseded"
+        self._saved_cache_keys.append(cache_key)
+        # Simulate a newer cache update after queuing
+        _cache[cache_key] = (queued_at + 30, {"sentiment_score": 0.1})
+        _llm_retry_queue.append((cache_key, [], queued_at))
+        _try_llm_retry()
+        assert len(_llm_retry_queue) == 0  # consumed and discarded
+
+    @patch("sentiment._llm_score_batch", return_value=None)
+    def test_pushes_back_on_failure(self, mock_llm):
+        now = time.time()
+        articles = [{"headline": "Test article headline here"}]
+        _llm_retry_queue.append(("_test_pushback", articles, now))
+        self._saved_cache_keys.append("_test_pushback")
+        _try_llm_retry()
+        assert len(_llm_retry_queue) == 1
+        assert _llm_retry_queue[0][0] == "_test_pushback"
+
+    @patch("sentiment._llm_score_batch", return_value=[0.6])
+    def test_updates_cache_on_success(self, mock_llm):
+        now = time.time()
+        cache_key = "_test_upgrade"
+        self._saved_cache_keys.append(cache_key)
+        articles = [{"headline": "Bitcoin surges higher today"}]
+        _llm_retry_queue.append((cache_key, articles, now))
+        _try_llm_retry()
+        assert len(_llm_retry_queue) == 0
+        assert cache_key in _cache
+        _, result = _cache[cache_key]
+        assert result["sentiment_score"] == pytest.approx(0.6)
+
+    def test_queue_bounded(self):
+        for i in range(60):
+            _llm_retry_queue.append((f"key_{i}", [], time.time()))
+        assert len(_llm_retry_queue) == 50  # maxlen enforced
