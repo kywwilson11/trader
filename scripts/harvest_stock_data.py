@@ -30,7 +30,7 @@ BENCHMARK = 'SPY'
 ALPACA_START = '2016-01-01'
 
 # Multi-horizon forward returns (bars ahead) — must match harvest_crypto_data.py
-FORWARD_BARS = [4, 8, 12, 16, 24, 32]
+FORWARD_BARS = [4, 8, 12, 18, 24]
 
 
 def _get_alpaca_api():

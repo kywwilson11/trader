@@ -27,15 +27,15 @@ import optuna
 from optuna.pruners import MedianPruner
 
 NUM_TRIALS = 200
-MAX_EPOCHS = 80
-EARLY_STOP_PATIENCE = 12
-PRUNE_WARMUP_EPOCHS = 15       # don't prune until model has had time to learn
-PRUNE_STARTUP_TRIALS = 70      # ~12 random samples per forward_bars bucket
+MAX_EPOCHS = 60
+EARLY_STOP_PATIENCE = 10
+PRUNE_WARMUP_EPOCHS = 12       # don't prune until model has had time to learn
+PRUNE_STARTUP_TRIALS = 70      # ~14 random samples per forward_bars bucket
 TRAIN_RATIO = 0.8
 NUM_CLASSES = 3
 
 # Multi-horizon forward return targets (must match harvest scripts)
-FORWARD_BARS = [4, 8, 12, 16, 24, 32]
+FORWARD_BARS = [4, 8, 12, 18, 24]
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.backends.cudnn.benchmark = True
@@ -263,25 +263,25 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
         else:
             trial_returns = all_returns  # fallback to legacy
 
-        seq_len = trial.suggest_categorical('seq_len', [12, 18, 24])
+        seq_len = trial.suggest_categorical('seq_len', [12, 18, 24, 32])
         hidden_dim = trial.suggest_categorical('hidden_dim', [64, 96, 128])
         num_layers = trial.suggest_int('num_layers', 1, 2)
-        dropout = trial.suggest_float('dropout', 0.05, 0.45, step=0.05)
-        learning_rate = trial.suggest_float('learning_rate', 1e-4, 3e-3, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [128, 256, 512])
+        dropout = trial.suggest_float('dropout', 0.10, 0.40, step=0.05)
+        learning_rate = trial.suggest_float('learning_rate', 5e-4, 3e-3, log=True)
+        batch_size = trial.suggest_categorical('batch_size', [256, 512])
 
         # Adaptive threshold ranges based on forward_bars horizon
         if fixed_threshold is not None:
             bull_threshold = fixed_threshold
         elif forward_bars <= 4:
-            bull_threshold = trial.suggest_float('bull_threshold', 0.15, 0.50, step=0.01)
+            bull_threshold = trial.suggest_float('bull_threshold', 0.10, 0.50, step=0.01)
         elif forward_bars <= 12:
             bull_threshold = trial.suggest_float('bull_threshold', 0.30, 1.00, step=0.01)
-        else:  # 16, 24, 32
+        else:  # 18, 24
             bull_threshold = trial.suggest_float('bull_threshold', 0.50, 2.00, step=0.05)
 
-        weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
-        scheduler = trial.suggest_categorical('scheduler', ['cosine', 'plateau', 'none'])
+        weight_decay = trial.suggest_float('weight_decay', 1e-5, 5e-4, log=True)
+        scheduler = trial.suggest_categorical('scheduler', ['cosine', 'plateau'])
 
         cfg = {
             'seq_len': seq_len, 'hidden_dim': hidden_dim,
@@ -344,9 +344,9 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
                                weight_decay=weight_decay)
 
         if scheduler == 'cosine':
-            sched = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=2)
+            sched = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
         elif scheduler == 'plateau':
-            sched = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=8, factor=0.5)
+            sched = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=6, factor=0.5)
         else:
             sched = None
 
