@@ -400,7 +400,7 @@ def _deduplicate_articles(articles):
     return unique
 
 
-_LLM_CHUNK_SIZE = 25  # max articles per LLM call for reliable JSON output
+_LLM_CHUNK_SIZE = 80  # score all articles in one API call to minimize RPM usage
 
 
 def _llm_score_chunk(chunk_articles, full_texts):
