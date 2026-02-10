@@ -33,7 +33,7 @@ BENCHMARK = 'BTC-USD'
 ALPACA_START = '2021-01-01'
 
 # Multi-horizon forward returns (bars ahead)
-FORWARD_BARS = [1, 2, 4, 8, 12, 16, 24, 32]
+FORWARD_BARS = [4, 8, 12, 16, 24, 32]
 
 
 def _to_alpaca(yf_ticker):

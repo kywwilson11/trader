@@ -474,19 +474,31 @@ def _parse_llm_json(raw_text):
     return None
 
 
-def _llm_score_chunk(chunk_articles, full_texts):
-    """Score a single chunk of articles via LLM. Returns list[float] or None."""
-    try:
-        from llm_client import call_llm
-    except ImportError:
-        return None
+# --- Tiered Gemini scoring ---
+# Newest articles get the best model, older articles get cheaper models.
+# Tiers: (model, cumulative_fraction) — newest first
+_SCORING_TIERS = [
+    ("gemini-2.5-pro",        0.15),  # newest 15%
+    ("gemini-2.5-flash",      0.50),  # next 35%
+    ("gemini-2.5-flash-lite", 1.00),  # rest
+]
 
+# Model quality ranking (higher = better)
+_MODEL_RANK = {
+    "gemini-2.5-pro": 3,
+    "gemini-2.5-flash": 2,
+    "gemini-2.5-flash-lite": 1,
+}
+
+
+def _build_score_prompt(chunk_articles, full_texts):
+    """Build the scoring prompt for a chunk of articles."""
     n = len(chunk_articles)
     lines = []
     for i, a in enumerate(chunk_articles):
         h = ' '.join(a.get('headline', '').split())
         s = ' '.join(a.get('summary', '').split())
-        body = full_texts[i]
+        body = full_texts[i] if i < len(full_texts) else None
 
         parts = [f"{i + 1}. {h}"]
         if body:
@@ -495,20 +507,18 @@ def _llm_score_chunk(chunk_articles, full_texts):
             parts.append(s)
         lines.append(" — ".join(parts))
 
-    prompt = (
+    return (
         f"Score each article's financial sentiment from -1.00 (very bearish) "
         f"to 1.00 (very bullish). 0.00 = neutral.\n"
         f"Use the FULL continuous range — do NOT round to 0.05 or 0.10 increments.\n"
         f'Return ONLY a JSON object mapping article number to score, '
         f'e.g. {{"1": 0.37, "2": -0.63, "3": 0.08, "4": -0.21, "5": 0.54}}\n\n'
         + "\n".join(lines)
-    )
+    ), n
 
-    result = call_llm(
-        prompt,
-        system="Financial sentiment scorer. Return only a JSON object mapping article number strings to float scores. No explanation.",
-        max_tokens=max(256, n * 20),
-    )
+
+def _parse_scores(result, n):
+    """Parse LLM JSON response into a list of float scores."""
     if not result:
         return None
 
@@ -527,24 +537,28 @@ def _llm_score_chunk(chunk_articles, full_texts):
     return scores
 
 
-def _llm_score_batch(articles):
-    """Batch-score articles via the configured LLM. Returns list[float] or None.
+def _llm_score_chunk(chunk_articles, full_texts, model=None):
+    """Score a single chunk of articles via LLM. Returns list[float] or None.
 
-    For each article, uses the richest content available:
-      full article text > summary > headline (always included).
-    Article bodies are fetched in parallel with short timeouts.
-    Chunks articles into groups of _LLM_CHUNK_SIZE for reliable JSON output.
-    Falls back to None on any failure (caller should use keyword scoring).
+    If model is specified, uses that specific Gemini model (for tiered scoring).
+    If model is None, uses call_llm() with automatic fallback chain.
     """
-    try:
-        from llm_client import call_llm  # noqa: F401 — check availability
-    except ImportError:
-        return None
+    prompt, n = _build_score_prompt(chunk_articles, full_texts)
+    system = "Financial sentiment scorer. Return only a JSON object mapping article number strings to float scores. No explanation."
+    max_tokens = max(256, n * 20)
 
-    if not articles:
-        return None
+    if model:
+        from llm_client import call_gemini
+        result = call_gemini(prompt, system=system, model=model, max_tokens=max_tokens)
+    else:
+        from llm_client import call_llm
+        result = call_llm(prompt, system=system, max_tokens=max_tokens)
 
-    # Fetch full article text in parallel (cached, 5s timeout each)
+    return _parse_scores(result, n)
+
+
+def _fetch_full_texts(articles):
+    """Fetch article bodies in parallel. Returns list of text or None."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     urls = [a.get('url', '') for a in articles]
     full_texts = [None] * len(articles)
@@ -558,28 +572,91 @@ def _llm_score_batch(articles):
                 except Exception:
                     pass
         except TimeoutError:
-            # Some article fetches didn't finish — use what we got
             pass
+    return full_texts
 
+
+def _llm_score_batch(articles):
+    """Batch-score articles using tiered Gemini models.
+
+    Newest articles get the best model (pro), middle get flash, rest get lite.
+    Falls back to cheaper models when daily quota is exhausted.
+    Sets _scored_by_model on each article.
+    Returns list[float] or None if all models fail.
+    """
+    try:
+        from llm_client import call_gemini, get_budget  # noqa: F401
+    except ImportError:
+        return None
+
+    if not articles:
+        return None
+
+    full_texts = _fetch_full_texts(articles)
     n = len(articles)
     fetched = sum(1 for t in full_texts if t)
     print(f"[SENTIMENT] Fetched {fetched}/{n} article bodies for LLM")
 
-    # Score in chunks for reliable JSON output
-    # Pace between chunks to avoid blowing through per-minute API quotas
-    all_scores = []
-    n_chunks = (n + _LLM_CHUNK_SIZE - 1) // _LLM_CHUNK_SIZE
-    for chunk_i, start in enumerate(range(0, n, _LLM_CHUNK_SIZE)):
-        if chunk_i > 0:
-            time.sleep(8)  # ~7 RPM pace — fits within Gemini free-tier limits
-        end = min(start + _LLM_CHUNK_SIZE, n)
-        chunk_scores = _llm_score_chunk(articles[start:end], full_texts[start:end])
-        if chunk_scores is None:
-            # Any chunk failure → abort entire batch
-            return None
-        all_scores.extend(chunk_scores)
-        if n_chunks > 1:
-            print(f"[SENTIMENT] LLM chunk {chunk_i+1}/{n_chunks} scored")
+    all_scores = [None] * n
+    all_models = [None] * n
+
+    prev_end = 0
+    for tier_model, cum_frac in _SCORING_TIERS:
+        end = min(round(n * cum_frac), n)
+        if prev_end >= end:
+            prev_end = end
+            continue
+
+        chunk_articles = articles[prev_end:end]
+        chunk_texts = full_texts[prev_end:end]
+
+        # Try this tier's model, fall back to cheaper on budget/failure
+        scored = False
+        models_to_try = [tier_model] + [
+            m for m, _ in reversed(_SCORING_TIERS) if m != tier_model
+        ]
+
+        for try_model in models_to_try:
+            remaining, _ = get_budget(try_model)
+            if remaining <= 0:
+                continue
+
+            scores = _llm_score_chunk(chunk_articles, chunk_texts, model=try_model)
+            if scores is not None:
+                all_scores[prev_end:end] = scores
+                all_models[prev_end:end] = [try_model] * (end - prev_end)
+                scored = True
+                break
+
+            # 8s pace between model attempts (RPM limit)
+            time.sleep(8)
+
+        if not scored:
+            # This tier totally failed — try to cover with next tier's model
+            pass
+
+        prev_end = end
+
+    # Check if we scored anything
+    scored_count = sum(1 for s in all_scores if s is not None)
+    if scored_count == 0:
+        return None
+
+    # Fill any gaps with 0.0 (shouldn't happen but be safe)
+    for i in range(n):
+        if all_scores[i] is None:
+            all_scores[i] = 0.0
+
+    # Tag articles with model info
+    model_counts = {}
+    for i, a in enumerate(articles):
+        m = all_models[i]
+        a['_scored_by_model'] = m or 'none'
+        if m:
+            model_counts[m] = model_counts.get(m, 0) + 1
+
+    tier_summary = ", ".join(f"{m.split('-')[-1]}={c}" for m, c in model_counts.items())
+    print(f"[SENTIMENT] Tiered scoring: {tier_summary} ({scored_count}/{n} scored)")
 
     return all_scores
 
@@ -591,15 +668,14 @@ def score_article_batch(articles):
         scores: per-article float scores
         method: "LLM" if LLM scored, "KW" if keyword fallback
 
-    Uses LLM batch scoring when available (one API call for all articles).
-    Falls back to keyword scoring with full-text fetch for accuracy.
+    Uses tiered Gemini scoring: newest articles get the best model,
+    older articles get cheaper models. Falls back to keyword scoring.
     """
     if not articles:
         return [], "KW"
 
     llm_scores = _llm_score_batch(articles)
     if llm_scores is not None:
-        print(f"[SENTIMENT] LLM scored {len(articles)} articles")
         return llm_scores, "LLM"
 
     # Fallback: keyword scoring with full-text fetch
@@ -623,13 +699,70 @@ def score_article_batch(articles):
 
 
 def try_llm_upgrade(articles):
-    """Attempt to LLM-score articles (upgrade KW-scored articles to LLM).
+    """Upgrade articles to better LLM models.
 
-    Returns list of float scores on success, None if LLM unavailable.
+    Checks each article's _scored_by_model and attempts to re-score with a
+    better model if daily quota allows. Also upgrades KW-scored articles.
+    Returns list of float scores on any upgrade, None if no upgrades possible.
     """
     if not articles:
         return None
-    return _llm_score_batch(articles)
+
+    from llm_client import get_budget
+
+    # Find articles that can be upgraded
+    upgradeable = []
+    upgrade_indices = []
+    for i, a in enumerate(articles):
+        current_model = a.get('_scored_by_model', '')
+        current_rank = _MODEL_RANK.get(current_model, 0)
+        # KW articles (rank 0) or lower-tier models are upgradeable
+        if current_rank < 3:  # Not yet pro
+            upgradeable.append(a)
+            upgrade_indices.append(i)
+
+    if not upgradeable:
+        return None
+
+    # Find the best model with budget
+    best_model = None
+    for model in ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]:
+        remaining, _ = get_budget(model)
+        if remaining > 0:
+            # Only upgrade if this model is better than what articles already have
+            model_rank = _MODEL_RANK[model]
+            if any(_MODEL_RANK.get(a.get('_scored_by_model', ''), 0) < model_rank
+                   for a in upgradeable):
+                best_model = model
+                break
+
+    if not best_model:
+        return None
+
+    best_rank = _MODEL_RANK[best_model]
+    # Only upgrade articles that are actually lower rank
+    to_upgrade = [(i, a) for i, a in zip(upgrade_indices, upgradeable)
+                  if _MODEL_RANK.get(a.get('_scored_by_model', ''), 0) < best_rank]
+
+    if not to_upgrade:
+        return None
+
+    indices, arts = zip(*to_upgrade)
+    arts = list(arts)
+    full_texts = _fetch_full_texts(arts)
+    scores = _llm_score_chunk(arts, full_texts, model=best_model)
+
+    if scores is not None:
+        # Build full scores list (None for non-upgraded articles)
+        result = [None] * len(articles)
+        for idx, score in zip(indices, scores):
+            result[idx] = score
+            articles[idx]['_scored_by_model'] = best_model
+        n_upgraded = len(scores)
+        print(f"[SENTIMENT] Upgraded {n_upgraded} articles to {best_model.split('-')[-1]}")
+        return result
+
+    return None
 
 
 def _aggregate_scores(scores):

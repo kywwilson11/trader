@@ -35,7 +35,7 @@ TRAIN_RATIO = 0.8
 NUM_CLASSES = 3
 
 # Multi-horizon forward return targets (must match harvest scripts)
-FORWARD_BARS = [1, 2, 4, 8, 12, 16, 24, 32]
+FORWARD_BARS = [4, 8, 12, 16, 24, 32]
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.backends.cudnn.benchmark = True
@@ -206,8 +206,6 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
         # Adaptive threshold ranges based on forward_bars horizon
         if fixed_threshold is not None:
             bull_threshold = fixed_threshold
-        elif forward_bars <= 2:
-            bull_threshold = trial.suggest_float('bull_threshold', 0.05, 0.25, step=0.01)
         elif forward_bars <= 4:
             bull_threshold = trial.suggest_float('bull_threshold', 0.15, 0.50, step=0.01)
         elif forward_bars <= 12:

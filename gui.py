@@ -133,6 +133,7 @@ def _save_news_cache(articles, fng):
                 '_symbol': a.get('_symbol', ''),
                 '_sentiment': a.get('_sentiment', 0.0),
                 '_sent_method': a.get('_sent_method', ''),
+                '_scored_by_model': a.get('_scored_by_model', ''),
             })
         with open(NEWS_CACHE_FILE, 'w') as f:
             json.dump({
@@ -874,14 +875,14 @@ class DataFetcher(QObject):
                 for ca in cache['articles']:
                     key = ca.get('headline', '').strip().lower()
                     if key and '_sentiment' in ca:
-                        cached_scores[key] = (ca['_sentiment'], ca.get('_sent_method', ''))
+                        cached_scores[key] = (ca['_sentiment'], ca.get('_sent_method', ''), ca.get('_scored_by_model', ''))
 
             # Split articles into already-scored (from cache) and new
             need_scoring = []
             for a in articles:
                 key = a.get('headline', '').strip().lower()
                 if key in cached_scores:
-                    a['_sentiment'], a['_sent_method'] = cached_scores[key]
+                    a['_sentiment'], a['_sent_method'], a['_scored_by_model'] = cached_scores[key]
                 else:
                     need_scoring.append(a)
 
@@ -906,14 +907,17 @@ class DataFetcher(QObject):
                         seen.add(key)
                 articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
 
-            # Try to upgrade any KW-scored articles to LLM
-            kw_articles = [a for a in articles if a.get('_sent_method', '') != 'LLM']
-            if kw_articles:
-                llm_scores = try_llm_upgrade(kw_articles)
-                if llm_scores is not None:
-                    for a, score in zip(kw_articles, llm_scores):
-                        a['_sentiment'] = score
-                        a['_sent_method'] = 'LLM'
+            # Try to upgrade KW-scored or lower-tier articles to better models
+            upgradeable = [a for a in articles
+                           if a.get('_sent_method', '') != 'LLM'
+                           or a.get('_scored_by_model', '') != 'gemini-2.5-pro']
+            if upgradeable:
+                upgrade_scores = try_llm_upgrade(upgradeable)
+                if upgrade_scores is not None:
+                    for a, score in zip(upgradeable, upgrade_scores):
+                        if score is not None:
+                            a['_sentiment'] = score
+                            a['_sent_method'] = 'LLM'
 
             # Save merged articles to cache
             _save_news_cache(articles, fng)

@@ -45,16 +45,20 @@ class TestTryLlmUpgrade:
         result = try_llm_upgrade([])
         assert result is None
 
-    @patch("sentiment._llm_score_batch", return_value=[0.4])
-    def test_delegates_to_llm_score_batch(self, mock_llm):
-        articles = [{"headline": "Test headline here"}]
+    @patch("sentiment._fetch_full_texts", return_value=[None])
+    @patch("sentiment._llm_score_chunk", return_value=[0.4])
+    @patch("llm_client.get_budget", return_value=(50, 80))
+    def test_upgrades_kw_articles(self, mock_budget, mock_chunk, mock_texts):
+        articles = [{"headline": "Test headline here", "_sent_method": "KW"}]
         result = try_llm_upgrade(articles)
         assert result == [0.4]
-        mock_llm.assert_called_once_with(articles)
+        mock_chunk.assert_called_once()
 
-    @patch("sentiment._llm_score_batch", return_value=None)
-    def test_returns_none_on_failure(self, mock_llm):
-        articles = [{"headline": "Test headline here"}]
+    @patch("sentiment._fetch_full_texts", return_value=[None])
+    @patch("sentiment._llm_score_chunk", return_value=None)
+    @patch("llm_client.get_budget", return_value=(50, 80))
+    def test_returns_none_on_failure(self, mock_budget, mock_chunk, mock_texts):
+        articles = [{"headline": "Test headline here", "_sent_method": "KW"}]
         result = try_llm_upgrade(articles)
         assert result is None
 
