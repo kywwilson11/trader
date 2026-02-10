@@ -16,7 +16,7 @@ if [[ "${1:-}" == "--jetson" ]]; then
     JETSON=true
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "========================================"
 echo "Trader Setup"

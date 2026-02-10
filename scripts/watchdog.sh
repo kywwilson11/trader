@@ -14,7 +14,7 @@ echo "[watchdog] $(date)" >> "$LOG"
 
 # Launch evolve.py in background (3-day retrain cycle for crypto + stock models)
 echo "[watchdog] Starting evolve.py..." >> "$LOG"
-nohup python -u /home/kyle/trader/evolve.py >> "$EVOLVE_LOG" 2>&1 &
+nohup python -u /home/kyle/trader/scripts/evolve.py >> "$EVOLVE_LOG" 2>&1 &
 EVOLVE_PID=$!
 echo "[watchdog] evolve.py PID: $EVOLVE_PID" >> "$LOG"
 

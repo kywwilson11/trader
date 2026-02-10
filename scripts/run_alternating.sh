@@ -19,11 +19,11 @@ echo "  Persistent studies: bear_study.db / bull_study.db" | tee -a "$LOG"
 for i in $(seq 1 $ROUNDS); do
     echo "" | tee -a "$LOG"
     echo "=== ROUND $i/$ROUNDS: BEAR ($BATCH trials) ===" | tee -a "$LOG"
-    python -u /home/kyle/trader/hypersearch_dual.py --target bear --trials $BATCH 2>&1 | tee -a "$LOG"
+    python -u /home/kyle/trader/scripts/hypersearch_dual.py --target bear --trials $BATCH 2>&1 | tee -a "$LOG"
 
     echo "" | tee -a "$LOG"
     echo "=== ROUND $i/$ROUNDS: BULL ($BATCH trials) ===" | tee -a "$LOG"
-    python -u /home/kyle/trader/hypersearch_dual.py --target bull --trials $BATCH 2>&1 | tee -a "$LOG"
+    python -u /home/kyle/trader/scripts/hypersearch_dual.py --target bull --trials $BATCH 2>&1 | tee -a "$LOG"
 done
 
 echo "" | tee -a "$LOG"
