@@ -806,7 +806,7 @@ class DataFetcher(QObject):
         """Fetch news headlines from Finnhub and Fear & Greed Index."""
         try:
             from sentiment import get_fear_greed, get_cnn_fear_greed, _get_finnhub, score_article_batch, try_llm_upgrade
-            from crypto_loop import CRYPTO_SYMBOLS
+            from stock_config import CRYPTO_SYMBOLS
             import datetime as _dt
 
             # Build base-symbol set for crypto headline matching
@@ -2947,7 +2947,7 @@ class TradingDashboard(QMainWindow):
     def _apply_news_filter(self):
         """Filter cached news articles based on combo selection."""
         import datetime as _dt
-        from crypto_loop import CRYPTO_SYMBOLS
+        from stock_config import CRYPTO_SYMBOLS
         from stock_config import load_stock_universe
 
         idx = self._news_filter_combo.currentIndex()

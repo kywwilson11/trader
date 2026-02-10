@@ -53,3 +53,14 @@ def save_stock_universe(symbols: list[str]) -> None:
     clean = _clean(symbols)
     with open(_FILE, 'w') as f:
         json.dump(clean, f, indent=2)
+
+
+# Top cryptos by market cap (USD pairs on Alpaca)
+CRYPTO_SYMBOLS = [
+    'BTC/USD',
+    'ETH/USD',
+    'XRP/USD',
+    'SOL/USD',
+    'DOGE/USD',
+    'LINK/USD',
+]

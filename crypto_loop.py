@@ -32,22 +32,9 @@ from llm_config import load_llm_config
 from llm_analyst import analyze_trades
 from fundamentals import get_fundamentals, format_fundamentals_for_llm
 from trade_journal import log_decision
+from stock_config import CRYPTO_SYMBOLS
 
 # --- CONFIGURATION ---
-
-# Top 10 cryptos by market cap (USD pairs on Alpaca)
-CRYPTO_SYMBOLS = [
-    'BTC/USD',
-    'ETH/USD',
-    'XRP/USD',
-    'SOL/USD',
-    'DOGE/USD',
-    'LINK/USD',
-    'AVAX/USD',
-    'DOT/USD',
-    'LTC/USD',
-    'BCH/USD',
-]
 
 NOTIONAL_PER_SYMBOL = 250  # $250 per symbol per cycle
 ORDER_TIMEOUT = 30  # seconds to wait for limit fill

@@ -3,7 +3,7 @@
 import json
 import pytest
 
-from stock_config import _clean, load_stock_universe, _DEFAULTS
+from stock_config import _clean, load_stock_universe, _DEFAULTS, CRYPTO_SYMBOLS
 
 
 class TestClean:
@@ -42,3 +42,13 @@ class TestLoadStockUniverse:
         crypto = [s for s in _DEFAULTS if "/" in s]
         assert len(stocks) > 0
         assert len(crypto) > 0
+
+
+class TestCryptoSymbols:
+    def test_non_empty(self):
+        assert isinstance(CRYPTO_SYMBOLS, list)
+        assert len(CRYPTO_SYMBOLS) > 0
+
+    def test_all_usd_pairs(self):
+        for sym in CRYPTO_SYMBOLS:
+            assert sym.endswith('/USD'), f"{sym} is not a /USD pair"
