@@ -37,6 +37,9 @@ def _get_alpaca_api():
     """Build Alpaca REST client, or None if credentials missing."""
     try:
         import alpaca_trade_api as tradeapi
+        # Increase SDK internal retry backoff (default 3s is too aggressive)
+        os.environ.setdefault('APCA_RETRY_WAIT', '5')
+        os.environ.setdefault('APCA_RETRY_MAX', '5')
         key = os.getenv('ALPACA_API_KEY')
         secret = os.getenv('ALPACA_API_SECRET')
         url = os.getenv('ALPACA_BASE_URL')
@@ -64,7 +67,7 @@ def fetch_ticker_data(ticker, api=None):
             else:
                 alpaca_df.index = alpaca_df.index.tz_convert('UTC')
             frames.append(alpaca_df)
-        time.sleep(1)  # pacing between API calls
+        time.sleep(2)  # pacing between tickers
 
     # 2. yfinance recent data (up to 730 days)
     print(f"  [YF] Fetching {ticker}...")

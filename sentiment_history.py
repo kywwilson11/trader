@@ -77,10 +77,19 @@ def _get_db():
     db = getattr(_db_local, 'conn', None)
     if db is not None:
         return db
-    db = sqlite3.connect(_DB_PATH, timeout=30)
+    db = sqlite3.connect(_DB_PATH, timeout=10)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
-    db.executescript(_SCHEMA)
+    # Schema creation needs exclusive lock — retry if another process holds it
+    for attempt in range(3):
+        try:
+            db.executescript(_SCHEMA)
+            break
+        except sqlite3.OperationalError:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                raise
     _db_local.conn = db
     return db
 

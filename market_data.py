@@ -127,62 +127,127 @@ def fetch_spy_bars_alpaca(api, limit=120):
 
 # --- HISTORICAL BAR FETCHING (for training data harvest) ---
 
+def _fetch_chunk(api, symbol, start_iso, end_iso, asset_type, max_retries=4):
+    """Fetch one date-range chunk with exponential backoff.
+
+    Returns list of (row_dict, timestamp) tuples, or None on failure.
+    """
+    for attempt in range(max_retries):
+        try:
+            if asset_type == 'crypto':
+                bars = api.get_crypto_bars(
+                    symbol, '1Hour', start=start_iso, end=end_iso)
+            else:
+                bars = api.get_bars(
+                    symbol, '1Hour', start=start_iso, end=end_iso)
+
+            rows = []
+            for bar in bars:
+                rows.append(({
+                    'Open': float(bar.o), 'High': float(bar.h),
+                    'Low': float(bar.l), 'Close': float(bar.c),
+                    'Volume': float(bar.v),
+                }, bar.t))
+            return rows
+
+        except Exception as e:
+            err_str = str(e).lower()
+            is_rate_limit = ('rate' in err_str or '429' in err_str
+                             or 'too many' in err_str)
+            if is_rate_limit and attempt < max_retries - 1:
+                wait = 2 ** (attempt + 2)  # 4, 8, 16, 32s
+                print(f"  [HIST] Rate limited on {symbol} chunk, "
+                      f"backoff {wait}s ({attempt+1}/{max_retries})")
+                time.sleep(wait)
+            elif is_rate_limit:
+                print(f"  [HIST] Rate limit exhausted for {symbol} chunk "
+                      f"{start_iso[:10]}..{end_iso[:10]}")
+                return None
+            else:
+                print(f"  [HIST] Error fetching {symbol}: {e}")
+                return None
+    return None
+
+
 def fetch_historical_bars(api, symbol, start_date, asset_type='crypto',
-                          max_retries=3, backoff=3):
-    """Fetch historical hourly bars from Alpaca (auto-paginates).
+                          chunk_months=6):
+    """Fetch historical hourly bars from Alpaca in date-range chunks.
+
+    Breaks the full range into chunks to avoid triggering rate limits
+    on the SDK's internal pagination. Adds adaptive pacing between chunks.
 
     Args:
         api: Alpaca REST API object
         symbol: Alpaca format e.g. 'BTC/USD' or 'TSLA'
         start_date: ISO date string e.g. '2021-01-01'
         asset_type: 'crypto' or 'stock'
-        max_retries: Number of retries on rate-limit errors
-        backoff: Seconds to wait between retries
+        chunk_months: Size of each date chunk in months
 
     Returns:
         DataFrame with OHLCV columns and DatetimeIndex, or None on error.
     """
-    for attempt in range(max_retries):
-        try:
-            if asset_type == 'crypto':
-                bars = api.get_crypto_bars(symbol, '1Hour', start=start_date)
-            else:
-                bars = api.get_bars(symbol, '1Hour', start=start_date)
+    from datetime import datetime, timezone
 
-            rows = []
-            timestamps = []
-            for bar in bars:
-                rows.append({
-                    'Open': float(bar.o),
-                    'High': float(bar.h),
-                    'Low': float(bar.l),
-                    'Close': float(bar.c),
-                    'Volume': float(bar.v),
-                })
-                timestamps.append(bar.t)
+    start_dt = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
 
-            if not rows:
-                print(f"  [HIST] No bars returned for {symbol}")
-                return None
+    # Build chunk boundaries
+    chunks = []
+    chunk_start = start_dt
+    while chunk_start < now:
+        # Advance by chunk_months
+        m = chunk_start.month + chunk_months
+        y = chunk_start.year + (m - 1) // 12
+        m = (m - 1) % 12 + 1
+        chunk_end = chunk_start.replace(year=y, month=m)
+        if chunk_end > now:
+            chunk_end = now
+        chunks.append((chunk_start, chunk_end))
+        chunk_start = chunk_end
 
-            df = pd.DataFrame(rows)
-            df.index = pd.DatetimeIndex(timestamps)
-            df.index.name = 'Datetime'
-            print(f"  [HIST] {symbol}: {len(df)} bars from Alpaca ({df.index.min().date()} to {df.index.max().date()})")
-            return df
+    all_rows = []
+    pace = 0.5  # seconds between chunks, adapts on rate limits
 
-        except Exception as e:
-            err_str = str(e).lower()
-            if 'rate' in err_str or '429' in err_str or 'too many' in err_str:
-                wait = backoff * (attempt + 1)
-                print(f"  [HIST] Rate limited on {symbol}, retrying in {wait}s... ({attempt+1}/{max_retries})")
-                time.sleep(wait)
-            else:
-                print(f"  [HIST] Error fetching {symbol}: {e}")
-                return None
+    for i, (c_start, c_end) in enumerate(chunks):
+        result = _fetch_chunk(
+            api, symbol,
+            c_start.isoformat(), c_end.isoformat(),
+            asset_type,
+        )
+        if result is None:
+            # Rate limit failure on this chunk — increase pace and retry once
+            pace = min(pace * 3, 30)
+            print(f"  [HIST] Pacing increased to {pace:.0f}s, retrying chunk...")
+            time.sleep(pace)
+            result = _fetch_chunk(
+                api, symbol,
+                c_start.isoformat(), c_end.isoformat(),
+                asset_type,
+            )
+        if result:
+            all_rows.extend(result)
 
-    print(f"  [HIST] Failed to fetch {symbol} after {max_retries} retries")
-    return None
+        # Adaptive pacing: slow down between chunks
+        if i < len(chunks) - 1:
+            time.sleep(pace)
+
+    if not all_rows:
+        print(f"  [HIST] No bars returned for {symbol}")
+        return None
+
+    rows_data = [r[0] for r in all_rows]
+    timestamps = [r[1] for r in all_rows]
+    df = pd.DataFrame(rows_data)
+    df.index = pd.DatetimeIndex(timestamps)
+    df.index.name = 'Datetime'
+    # Dedup in case chunk boundaries overlap
+    df = df[~df.index.duplicated(keep='last')]
+    df = df.sort_index()
+
+    print(f"  [HIST] {symbol}: {len(df)} bars from Alpaca "
+          f"({df.index.min().date()} to {df.index.max().date()}) "
+          f"[{len(chunks)} chunks]")
+    return df
 
 
 # --- ATR ---
