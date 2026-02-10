@@ -34,7 +34,6 @@ import pandas as pd
 import torch
 import joblib
 from sklearn.preprocessing import MinMaxScaler
-from torch.utils.data import DataLoader
 
 from model import CryptoLSTM
 from hw_monitor import wait_for_cool_gpu, get_gpu_temp, get_ram_usage
@@ -154,7 +153,8 @@ def evaluate_model(model_path, config_path, target, prefix='', data_csv='trainin
 
     # Load data for validation
     df = pd.read_csv(data_csv, index_col=0, parse_dates=True)
-    exclude_cols = ['Target_Return', 'Ticker', 'Date', 'Datetime', 'NextClose']
+    exclude_cols = ['Ticker', 'Date', 'Datetime', 'NextClose']
+    exclude_cols += [c for c in df.columns if c.startswith('Target_Return')]
     feat_cols = [c for c in df.columns if c not in exclude_cols]
     feat_cols = [c for c in feat_cols if df[c].dtype in ['float64', 'float32', 'int64', 'int32']]
 
@@ -192,29 +192,37 @@ def evaluate_model(model_path, config_path, target, prefix='', data_csv='trainin
     split = int(len(valid_indices) * 0.8)
     val_idx = valid_indices[split:]
 
-    # Import SequenceDataset from hypersearch_dual
-    from hypersearch_dual import SequenceDataset
-    val_ds = SequenceDataset(val_idx, all_scaled, classes, seq_len)
-    val_loader = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=0)
+    if not val_idx:
+        del model, all_scaled, all_returns, df
+        gc.collect()
+        torch.cuda.empty_cache()
+        return 0.0
+
+    # Pre-allocate tensors (same approach as hypersearch_dual.py)
+    X_val = torch.stack([torch.from_numpy(all_scaled[i - seq_len:i]) for i in val_idx]).to(device)
+    y_val = torch.tensor(classes[val_idx], dtype=torch.long, device=device)
 
     target_class = 0 if target == 'bear' else 2
-    all_preds, all_labels = [], []
+    batch_size = 256
+    all_preds_list = []
     with torch.inference_mode():
-        for X_b, y_b in val_loader:
-            X_b = X_b.to(device)
-            _, p = torch.max(model(X_b), 1)
-            all_preds.extend(p.cpu().numpy())
-            all_labels.extend(y_b.numpy())
+        for i in range(0, len(val_idx), batch_size):
+            X_b = X_val[i:i + batch_size]
+            out = model(X_b)
+            all_preds_list.append(out.argmax(1))
 
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
+    all_preds = torch.cat(all_preds_list).cpu().numpy()
+    all_labels = y_val.cpu().numpy()
     mask = all_labels == target_class
     if mask.sum() == 0:
+        del model, X_val, y_val, all_scaled, all_returns, df
+        gc.collect()
+        torch.cuda.empty_cache()
         return 0.0
 
     accuracy = float((all_preds[mask] == target_class).mean())
 
-    del model, val_ds, val_loader, all_scaled, all_returns, df
+    del model, X_val, y_val, all_scaled, all_returns, df
     gc.collect()
     torch.cuda.empty_cache()
 

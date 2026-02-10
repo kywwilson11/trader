@@ -116,8 +116,11 @@ def load_dual_models(inference_device=None, prefix=''):
     if has_dual:
         bear_model, scaler_X, bear_config, _, feature_cols = load_model('bear', inference_device, prefix)
         bull_model, _, bull_config, _, _ = load_model('bull', inference_device, prefix)
-        print(f"{pfx_label}Dual models loaded: bear(seq={bear_config['seq_len']}, th={bear_config.get('bull_threshold', 0.15):.2f}) "
-              f"bull(seq={bull_config['seq_len']}, th={bull_config.get('bull_threshold', 0.15):.2f})")
+        bear_fb = bear_config.get('forward_bars', 4)
+        bull_fb = bull_config.get('forward_bars', 4)
+        print(f"{pfx_label}Dual models loaded: "
+              f"bear(seq={bear_config['seq_len']}, th={bear_config.get('bull_threshold', 0.15):.2f}, fb={bear_fb}) "
+              f"bull(seq={bull_config['seq_len']}, th={bull_config.get('bull_threshold', 0.15):.2f}, fb={bull_fb})")
     else:
         print(f"No {pfx_label}dual models found, falling back to default model for both")
         model, scaler_X, config, _, feature_cols = load_model('default', inference_device, prefix)
@@ -261,7 +264,7 @@ if __name__ == "__main__":
 
     symbols = [
         'BTC-USD', 'ETH-USD', 'XRP-USD', 'SOL-USD', 'DOGE-USD',
-        'LINK-USD', 'AVAX-USD', 'DOT-USD', 'LTC-USD', 'BCH-USD',
+        'LINK-USD',
     ]
     for sym in symbols:
         if dual:

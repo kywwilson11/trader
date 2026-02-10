@@ -4,6 +4,8 @@ Provides bar-fetching functions for both Alpaca (crypto + stock) and yfinance,
 plus a live ATR helper used by the trading loops for adaptive stop-losses.
 """
 
+import time
+
 import pandas as pd
 
 # NOTE: yfinance must be imported BEFORE torch to avoid CUDA's bundled
@@ -121,6 +123,66 @@ def fetch_stock_bars_alpaca(api, symbol, limit=120):
 def fetch_spy_bars_alpaca(api, limit=120):
     """Fetch SPY hourly bars for relative strength calculation."""
     return fetch_stock_bars_alpaca(api, 'SPY', limit)
+
+
+# --- HISTORICAL BAR FETCHING (for training data harvest) ---
+
+def fetch_historical_bars(api, symbol, start_date, asset_type='crypto',
+                          max_retries=3, backoff=3):
+    """Fetch historical hourly bars from Alpaca (auto-paginates).
+
+    Args:
+        api: Alpaca REST API object
+        symbol: Alpaca format e.g. 'BTC/USD' or 'TSLA'
+        start_date: ISO date string e.g. '2021-01-01'
+        asset_type: 'crypto' or 'stock'
+        max_retries: Number of retries on rate-limit errors
+        backoff: Seconds to wait between retries
+
+    Returns:
+        DataFrame with OHLCV columns and DatetimeIndex, or None on error.
+    """
+    for attempt in range(max_retries):
+        try:
+            if asset_type == 'crypto':
+                bars = api.get_crypto_bars(symbol, '1Hour', start=start_date)
+            else:
+                bars = api.get_bars(symbol, '1Hour', start=start_date)
+
+            rows = []
+            timestamps = []
+            for bar in bars:
+                rows.append({
+                    'Open': float(bar.o),
+                    'High': float(bar.h),
+                    'Low': float(bar.l),
+                    'Close': float(bar.c),
+                    'Volume': float(bar.v),
+                })
+                timestamps.append(bar.t)
+
+            if not rows:
+                print(f"  [HIST] No bars returned for {symbol}")
+                return None
+
+            df = pd.DataFrame(rows)
+            df.index = pd.DatetimeIndex(timestamps)
+            df.index.name = 'Datetime'
+            print(f"  [HIST] {symbol}: {len(df)} bars from Alpaca ({df.index.min().date()} to {df.index.max().date()})")
+            return df
+
+        except Exception as e:
+            err_str = str(e).lower()
+            if 'rate' in err_str or '429' in err_str or 'too many' in err_str:
+                wait = backoff * (attempt + 1)
+                print(f"  [HIST] Rate limited on {symbol}, retrying in {wait}s... ({attempt+1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                print(f"  [HIST] Error fetching {symbol}: {e}")
+                return None
+
+    print(f"  [HIST] Failed to fetch {symbol} after {max_retries} retries")
+    return None
 
 
 # --- ATR ---

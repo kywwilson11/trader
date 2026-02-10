@@ -34,6 +34,9 @@ PRUNE_STARTUP_TRIALS = 50      # match TPE's random exploration phase
 TRAIN_RATIO = 0.8
 NUM_CLASSES = 3
 
+# Multi-horizon forward return targets (must match harvest scripts)
+FORWARD_BARS = [1, 2, 4, 8, 12, 16, 24, 32]
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.backends.cudnn.benchmark = True
 print(f"Using device: {device}")
@@ -56,15 +59,26 @@ def parse_args():
                         help='Use a fixed bull_threshold instead of searching (for shared threshold between bear/bull)')
     parser.add_argument('--preset', type=str, default=None,
                         help='Indicator preset: minimal, standard, full')
+    parser.add_argument('--max-rows', type=int, default=500_000,
+                        help='Max total rows to load (default: 500000). Keeps most recent rows per ticker to prevent OOM.')
     return parser.parse_args()
 
 
-def load_data(data_path='training_data.csv', preset_override=None):
+def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_000):
     print("Loading data...")
     df = pd.read_csv(data_path, index_col=0, parse_dates=True)
     print(f"Dataset: {len(df)} rows")
 
-    exclude_cols = ['Target_Return', 'Ticker', 'Date', 'Datetime', 'NextClose']
+    # Detect multi-horizon columns
+    has_multi_horizon = any(c.startswith('Target_Return_') for c in df.columns)
+    if has_multi_horizon:
+        print(f"Multi-horizon targets detected: {[c for c in df.columns if c.startswith('Target_Return_')]}")
+    else:
+        print("Legacy single-horizon dataset (Target_Return only, treated as forward_bars=4)")
+
+    exclude_cols = ['Ticker', 'Date', 'Datetime', 'NextClose']
+    # Exclude ALL target return columns from features
+    exclude_cols += [c for c in df.columns if c.startswith('Target_Return')]
     feature_cols = [c for c in df.columns if c not in exclude_cols]
     feature_cols = [c for c in feature_cols if df[c].dtype in ['float64', 'float32', 'int64', 'int32']]
 
@@ -76,33 +90,65 @@ def load_data(data_path='training_data.csv', preset_override=None):
         feature_cols = [c for c in feature_cols if c in preset_features]
     print(f"Preset: {preset_name} ({len(feature_cols)} features)")
 
+    # Apply --max-rows cap: keep most recent rows per ticker
+    tickers = df['Ticker'].unique()
+    n_tickers = len(tickers)
+    if len(df) > max_rows and n_tickers > 0:
+        rows_per_ticker = max_rows // n_tickers
+        print(f"Capping to {max_rows} rows ({rows_per_ticker}/ticker)...")
+        capped = []
+        for ticker in tickers:
+            tdf = df[df['Ticker'] == ticker].sort_index()
+            capped.append(tdf.tail(rows_per_ticker))
+        df = pd.concat(capped).sort_index()
+        print(f"After capping: {len(df)} rows")
+
     scaler_X = RobustScaler()
     scaler_X.fit(df[feature_cols].values)
 
-    tickers = df['Ticker'].unique()
     all_scaled_list = []
-    all_returns_list = []
+    # Dict of forward_bars -> returns array, for multi-horizon support
+    all_returns_dict = {fb: [] for fb in FORWARD_BARS}
+    # Also keep legacy Target_Return
+    all_returns_legacy = []
     ticker_boundaries = {}
 
     offset = 0
     for ticker in tickers:
         tdf = df[df['Ticker'] == ticker].sort_index()
         scaled = scaler_X.transform(tdf[feature_cols].values).astype(np.float32)
-        returns = tdf['Target_Return'].values.astype(np.float32)
         all_scaled_list.append(scaled)
-        all_returns_list.append(returns)
+
+        # Collect returns for each horizon
+        for fb in FORWARD_BARS:
+            col = f'Target_Return_{fb}'
+            if col in tdf.columns:
+                all_returns_dict[fb].append(tdf[col].values.astype(np.float32))
+            else:
+                # Legacy dataset: only Target_Return exists, map to fb=4
+                all_returns_dict[fb].append(tdf['Target_Return'].values.astype(np.float32))
+
+        all_returns_legacy.append(tdf['Target_Return'].values.astype(np.float32))
         ticker_boundaries[ticker] = (offset, offset + len(scaled))
         offset += len(scaled)
 
     all_scaled = np.vstack(all_scaled_list)
-    all_returns = np.concatenate(all_returns_list)
-    del all_scaled_list, all_returns_list, df
+    # Concatenate per-horizon returns
+    all_returns_by_fb = {}
+    for fb in FORWARD_BARS:
+        if all_returns_dict[fb]:
+            all_returns_by_fb[fb] = np.concatenate(all_returns_dict[fb])
+    all_returns_legacy = np.concatenate(all_returns_legacy)
+
+    del all_scaled_list, all_returns_dict, df
     gc.collect()
 
     print(f"Contiguous arrays: {all_scaled.shape}, {all_scaled.nbytes / 1e6:.1f} MB")
     input_dim = all_scaled.shape[1]
 
-    return all_scaled, all_returns, tickers, ticker_boundaries, scaler_X, feature_cols, input_dim, preset_name
+    return (all_scaled, all_returns_legacy, all_returns_by_fb, tickers,
+            ticker_boundaries, scaler_X, feature_cols, input_dim, preset_name,
+            has_multi_horizon)
 
 
 def get_indices_and_classes(all_returns, tickers, ticker_boundaries, bull_thresh, seq_len):
@@ -125,7 +171,9 @@ def get_indices_and_classes(all_returns, tickers, ticker_boundaries, bull_thresh
     return train_indices, val_indices, classes
 
 
-def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache, fixed_threshold=None):
+def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
+                     tickers, ticker_boundaries, input_dim, _state_cache,
+                     fixed_threshold=None, has_multi_horizon=True):
     # target class index: bear=0, bull=2
     target_class = 0 if target == 'bear' else 2
 
@@ -136,16 +184,37 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         torch.cuda.empty_cache()
         gc.collect()
 
+        # Forward bars horizon (searchable if multi-horizon data available)
+        if has_multi_horizon:
+            forward_bars = trial.suggest_categorical('forward_bars', FORWARD_BARS)
+        else:
+            forward_bars = 4  # legacy single-horizon
+
+        # Select returns for this horizon
+        if forward_bars in all_returns_by_fb:
+            trial_returns = all_returns_by_fb[forward_bars]
+        else:
+            trial_returns = all_returns  # fallback to legacy
+
         seq_len = trial.suggest_categorical('seq_len', [12, 18, 24])
         hidden_dim = trial.suggest_categorical('hidden_dim', [64, 96, 128])
         num_layers = trial.suggest_int('num_layers', 1, 2)
         dropout = trial.suggest_float('dropout', 0.05, 0.45, step=0.05)
         learning_rate = trial.suggest_float('learning_rate', 1e-4, 3e-3, log=True)
         batch_size = trial.suggest_categorical('batch_size', [128, 256])
+
+        # Adaptive threshold ranges based on forward_bars horizon
         if fixed_threshold is not None:
             bull_threshold = fixed_threshold
-        else:
-            bull_threshold = trial.suggest_float('bull_threshold', 0.20, 0.50, step=0.01)
+        elif forward_bars <= 2:
+            bull_threshold = trial.suggest_float('bull_threshold', 0.05, 0.25, step=0.01)
+        elif forward_bars <= 4:
+            bull_threshold = trial.suggest_float('bull_threshold', 0.15, 0.50, step=0.01)
+        elif forward_bars <= 12:
+            bull_threshold = trial.suggest_float('bull_threshold', 0.30, 1.00, step=0.01)
+        else:  # 16, 24, 32
+            bull_threshold = trial.suggest_float('bull_threshold', 0.50, 2.00, step=0.05)
+
         weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
         scheduler = trial.suggest_categorical('scheduler', ['cosine', 'plateau', 'none'])
 
@@ -154,7 +223,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
             'num_layers': num_layers, 'dropout': dropout,
             'learning_rate': learning_rate, 'batch_size': batch_size,
             'bull_threshold': bull_threshold, 'weight_decay': weight_decay,
-            'scheduler': scheduler,
+            'scheduler': scheduler, 'forward_bars': forward_bars,
         }
 
         # Store config early so callback can log params even on rejected/failed trials
@@ -163,7 +232,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         try:
             return _train_and_evaluate(
                 trial, trial_start, cfg, target_class,
-                all_scaled, all_returns, tickers, ticker_boundaries,
+                all_scaled, trial_returns, tickers, ticker_boundaries,
                 input_dim, _state_cache,
             )
         except RuntimeError as e:
@@ -174,7 +243,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
             return 0.0
 
     def _train_and_evaluate(trial, trial_start, cfg, target_class,
-                            all_scaled, all_returns, tickers, ticker_boundaries,
+                            all_scaled, trial_returns, tickers, ticker_boundaries,
                             input_dim, _state_cache):
         seq_len = cfg['seq_len']
         hidden_dim = cfg['hidden_dim']
@@ -187,7 +256,7 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         scheduler = cfg['scheduler']
 
         train_idx, val_idx, classes = get_indices_and_classes(
-            all_returns, tickers, ticker_boundaries, bull_threshold, seq_len)
+            trial_returns, tickers, ticker_boundaries, bull_threshold, seq_len)
 
         train_classes = classes[train_idx]
         unique = np.unique(train_classes)
@@ -372,7 +441,10 @@ def main():
 
     storage = f'sqlite:///{db_path}'
 
-    all_scaled, all_returns, tickers, ticker_boundaries, scaler_X, feature_cols, input_dim, preset_name = load_data(args.data, preset_override=args.preset)
+    (all_scaled, all_returns, all_returns_by_fb, tickers, ticker_boundaries,
+     scaler_X, feature_cols, input_dim, preset_name,
+     has_multi_horizon) = load_data(args.data, preset_override=args.preset,
+                                     max_rows=args.max_rows)
 
     # Track best model weights in memory (can't store in SQLite efficiently)
     best_state_holder = {'state': None, 'score': 0.0, 'cfg': None, 'val_acc': 0.0, 'per_class': {}}
@@ -414,11 +486,12 @@ def main():
         d = cfg.get('dropout', '')
         lr = cfg.get('learning_rate', '')
         th = cfg.get('bull_threshold', '')
+        fb = cfg.get('forward_bars', 4)
         f1 = trial.user_attrs.get('target_f1', 0.0)
         cat = trial.user_attrs.get('catastrophic_rate', 0.0)
         print(f"[{n:3d}] score={score:.3f} F1={f1:.2f} cat={cat:.2f} "
               f"B:{pc.get('bear',0):.0%} N:{pc.get('neutral',0):.0%} U:{pc.get('bull',0):.0%} "
-              f"| s={cfg.get('seq_len','')} h={cfg.get('hidden_dim','')} "
+              f"| fb={fb} s={cfg.get('seq_len','')} h={cfg.get('hidden_dim','')} "
               f"l={cfg.get('num_layers','')} d={d if d == '' else f'{d:.2f}'} "
               f"lr={lr if lr == '' else f'{lr:.4f}'} th={th if th == '' else f'{th:.2f}'}"
               f"{tag}")
@@ -454,6 +527,9 @@ def main():
     print(f"\n{'='*70}")
     print(f"OPTUNA {target.upper()} MODEL SEARCH: {num_trials} new trials (TPE + pruning)")
     print(f"Optimizing: F1 * 0.5 + balanced_acc * 0.2 - catastrophic * 0.3 (target={target})")
+    if has_multi_horizon:
+        print(f"Multi-horizon: forward_bars in {FORWARD_BARS}")
+    print(f"Max rows: {args.max_rows:,}")
     print(f"Resuming from {prior_trials} prior trials in {db_path}")
     if args.fixed_threshold is not None:
         print(f"Using FIXED threshold: {args.fixed_threshold:.2f} (shared from bear model)")
@@ -482,7 +558,10 @@ def main():
                   f"B:{pc.get('bear',0):.0%} N:{pc.get('neutral',0):.0%} U:{pc.get('bull',0):.0%} "
                   f"— new trials must beat this")
 
-    objective_fn = create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache, fixed_threshold=args.fixed_threshold)
+    objective_fn = create_objective(target, all_scaled, all_returns, all_returns_by_fb,
+                                    tickers, ticker_boundaries, input_dim, _state_cache,
+                                    fixed_threshold=args.fixed_threshold,
+                                    has_multi_horizon=has_multi_horizon)
     study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback],
                    catch=(Exception,))
 
@@ -520,6 +599,7 @@ def main():
             'mode': 'classification',
             'bull_threshold': best_cfg['bull_threshold'],
             'bear_threshold': -best_cfg['bull_threshold'],
+            'forward_bars': best_cfg.get('forward_bars', 4),
             'target': target,
             'prefix': args.prefix,
             'shared_threshold': args.fixed_threshold is not None,
