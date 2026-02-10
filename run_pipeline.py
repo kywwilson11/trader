@@ -333,7 +333,7 @@ def _build_training_phases(trials, train_crypto, train_stock):
             'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
                     '--target', 'bear', '--trials', str(trials),
                     '--data', 'stock_training_data.csv', '--prefix', 'stock',
-                    '--preset', preset],
+                    '--preset', preset, '--max-rows', '350000'],
             'trials': trials,
         })
         phases.append({
@@ -342,7 +342,7 @@ def _build_training_phases(trials, train_crypto, train_stock):
             'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
                     '--target', 'bull', '--trials', str(trials),
                     '--data', 'stock_training_data.csv', '--prefix', 'stock',
-                    '--preset', preset],
+                    '--preset', preset, '--max-rows', '350000'],
             'trials': trials,
         })
 
@@ -401,8 +401,8 @@ def _run_training(phases, log_fh, status, is_retrain):
 
 def main():
     parser = argparse.ArgumentParser(description='Trading pipeline orchestrator')
-    parser.add_argument('--trials', type=int, default=300,
-                        help='Trials per model on first run (default: 300)')
+    parser.add_argument('--trials', type=int, default=200,
+                        help='Trials per model on first run (default: 200)')
     parser.add_argument('--bot-only', action='store_true',
                         help='Skip training, start bots immediately')
     parser.add_argument('--skip-harvest', action='store_true',

@@ -26,10 +26,10 @@ import time
 import optuna
 from optuna.pruners import MedianPruner
 
-NUM_TRIALS = 300
+NUM_TRIALS = 200
 MAX_EPOCHS = 80
-EARLY_STOP_PATIENCE = 15
-PRUNE_WARMUP_EPOCHS = 20       # don't prune until model has had time to learn
+EARLY_STOP_PATIENCE = 12
+PRUNE_WARMUP_EPOCHS = 15       # don't prune until model has had time to learn
 PRUNE_STARTUP_TRIALS = 50      # match TPE's random exploration phase
 TRAIN_RATIO = 0.8
 NUM_CLASSES = 3
@@ -69,10 +69,17 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
     df = pd.read_csv(data_path, index_col=0, parse_dates=True)
     print(f"Dataset: {len(df)} rows")
 
-    # Detect multi-horizon columns
-    has_multi_horizon = any(c.startswith('Target_Return_') for c in df.columns)
+    # Detect multi-horizon columns — only keep columns matching FORWARD_BARS
+    valid_target_cols = {f'Target_Return_{fb}' for fb in FORWARD_BARS}
+    csv_target_cols = [c for c in df.columns if c.startswith('Target_Return_') and c in valid_target_cols]
+    # Drop stale horizon columns not in FORWARD_BARS (e.g. Target_Return_1, _2)
+    stale = [c for c in df.columns if c.startswith('Target_Return_') and c not in valid_target_cols and c != 'Target_Return']
+    if stale:
+        df = df.drop(columns=stale)
+        print(f"Dropped stale target columns: {stale}")
+    has_multi_horizon = len(csv_target_cols) > 0
     if has_multi_horizon:
-        print(f"Multi-horizon targets detected: {[c for c in df.columns if c.startswith('Target_Return_')]}")
+        print(f"Multi-horizon targets: {sorted(csv_target_cols)}")
     else:
         print("Legacy single-horizon dataset (Target_Return only, treated as forward_bars=4)")
 
@@ -151,12 +158,8 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
             has_multi_horizon)
 
 
-def get_indices_and_classes(all_returns, tickers, ticker_boundaries, bull_thresh, seq_len):
-    bear_thresh = -bull_thresh
-    classes = np.ones(len(all_returns), dtype=np.int64)
-    classes[all_returns > bull_thresh] = 2
-    classes[all_returns < bear_thresh] = 0
-
+def get_split_indices(tickers, ticker_boundaries, seq_len):
+    """Get train/val indices — depends only on seq_len, not threshold."""
     train_indices = []
     val_indices = []
     for ticker in tickers:
@@ -167,8 +170,71 @@ def get_indices_and_classes(all_returns, tickers, ticker_boundaries, bull_thresh
         # Embargo gap: skip seq_len bars to prevent sequence overlap leakage
         val_start = min(split + seq_len, len(ticker_valid))
         val_indices.extend(ticker_valid[val_start:])
+    return np.array(train_indices), np.array(val_indices)
 
-    return train_indices, val_indices, classes
+
+def classify_returns(all_returns, bull_thresh):
+    """Assign bear/neutral/bull classes based on threshold."""
+    classes = np.ones(len(all_returns), dtype=np.int64)
+    classes[all_returns > bull_thresh] = 2
+    classes[all_returns < -bull_thresh] = 0
+    return classes
+
+
+class SeqCache:
+    """Cache numpy sequence arrays by seq_len.
+
+    Train/val indices depend only on seq_len (not threshold or forward_bars),
+    so X_train and X_val numpy arrays can be reused across trials with the
+    same seq_len. Only labels change per trial (cheap to rebuild).
+
+    On Jetson unified memory, keeping data in numpy and transferring per-batch
+    via torch.from_numpy().to(device) is faster than GPU-resident tensors
+    (avoids GPU scatter-gather kernel overhead on small GPU).
+    """
+    def __init__(self, all_scaled, tickers, ticker_boundaries):
+        self._all_scaled = all_scaled
+        self._tickers = tickers
+        self._boundaries = ticker_boundaries
+        self._cached_seq_len = None
+        self._X_train = None
+        self._X_val = None
+        self._train_arr = None
+        self._val_arr = None
+
+    def get(self, seq_len):
+        """Return (X_train_np, X_val_np, train_arr, val_arr) — numpy arrays."""
+        if seq_len == self._cached_seq_len:
+            return self._X_train, self._X_val, self._train_arr, self._val_arr
+
+        # Free old cache
+        self._X_train = None
+        self._X_val = None
+        gc.collect()
+
+        t0 = time.time()
+        train_arr, val_arr = get_split_indices(
+            self._tickers, self._boundaries, seq_len)
+
+        offsets = np.arange(-seq_len, 0)
+
+        # Vectorized numpy gather — stays on CPU, transferred per-batch
+        self._X_train = np.ascontiguousarray(
+            self._all_scaled[train_arr[:, None] + offsets[None, :]])
+        self._X_val = np.ascontiguousarray(
+            self._all_scaled[val_arr[:, None] + offsets[None, :]])
+
+        self._train_arr = train_arr
+        self._val_arr = val_arr
+        self._cached_seq_len = seq_len
+
+        elapsed = time.time() - t0
+        print(f"  [CACHE] Built seq_len={seq_len}: "
+              f"{len(train_arr)} train + {len(val_arr)} val "
+              f"({self._X_train.nbytes / 1e6:.0f}+{self._X_val.nbytes / 1e6:.0f} MB, "
+              f"{elapsed:.1f}s)")
+
+        return self._X_train, self._X_val, self._train_arr, self._val_arr
 
 
 def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
@@ -177,12 +243,13 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
     # target class index: bear=0, bull=2
     target_class = 0 if target == 'bear' else 2
 
-    MAX_TRIAL_SECONDS = 600  # kill any trial running longer than 10 min
+    MAX_TRIAL_SECONDS = 900  # kill any trial running longer than 15 min
+
+    # Persistent cache: numpy sequence arrays reused across trials with same seq_len
+    seq_cache = SeqCache(all_scaled, tickers, ticker_boundaries)
 
     def objective(trial):
         trial_start = time.time()
-        torch.cuda.empty_cache()
-        gc.collect()
 
         # Forward bars horizon (searchable if multi-horizon data available)
         if has_multi_horizon:
@@ -201,7 +268,7 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
         num_layers = trial.suggest_int('num_layers', 1, 2)
         dropout = trial.suggest_float('dropout', 0.05, 0.45, step=0.05)
         learning_rate = trial.suggest_float('learning_rate', 1e-4, 3e-3, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [128, 256])
+        batch_size = trial.suggest_categorical('batch_size', [128, 256, 512])
 
         # Adaptive threshold ranges based on forward_bars horizon
         if fixed_threshold is not None:
@@ -230,8 +297,7 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
         try:
             return _train_and_evaluate(
                 trial, trial_start, cfg, target_class,
-                all_scaled, trial_returns, tickers, ticker_boundaries,
-                input_dim, _state_cache,
+                trial_returns, input_dim, _state_cache, seq_cache,
             )
         except RuntimeError as e:
             # CUDA OOM or other GPU errors — clean up and return 0
@@ -241,8 +307,7 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
             return 0.0
 
     def _train_and_evaluate(trial, trial_start, cfg, target_class,
-                            all_scaled, trial_returns, tickers, ticker_boundaries,
-                            input_dim, _state_cache):
+                            trial_returns, input_dim, _state_cache, seq_cache):
         seq_len = cfg['seq_len']
         hidden_dim = cfg['hidden_dim']
         num_layers = cfg['num_layers']
@@ -253,26 +318,24 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
         weight_decay = cfg['weight_decay']
         scheduler = cfg['scheduler']
 
-        train_idx, val_idx, classes = get_indices_and_classes(
-            trial_returns, tickers, ticker_boundaries, bull_threshold, seq_len)
+        # Get cached numpy arrays (instant if seq_len unchanged, ~1s on cache miss)
+        X_train_np, X_val_np, train_arr, val_arr = seq_cache.get(seq_len)
+        n_train = len(train_arr)
+        n_val = len(val_arr)
 
-        train_classes = classes[train_idx]
-        unique = np.unique(train_classes)
+        # Compute labels per trial (cheap — only depends on threshold + forward_bars)
+        classes = classify_returns(trial_returns, bull_threshold)
+        train_labels = classes[train_arr]
+        unique = np.unique(train_labels)
         if len(unique) < 3:
             return 0.0
 
-        counts = np.bincount(train_classes, minlength=3).astype(np.float64)
+        counts = np.bincount(train_labels, minlength=3).astype(np.float64)
         total = counts.sum()
         weights = total / (3.0 * counts)
         weights_t = torch.tensor(weights, dtype=torch.float32).to(device)
-
-        # Pre-allocate full sequence tensors on GPU (avoids per-batch numpy→torch→GPU)
-        X_train = torch.stack([torch.from_numpy(all_scaled[i - seq_len:i]) for i in train_idx]).to(device)
-        y_train = torch.tensor(classes[train_idx], dtype=torch.long, device=device)
-        X_val = torch.stack([torch.from_numpy(all_scaled[i - seq_len:i]) for i in val_idx]).to(device)
-        y_val = torch.tensor(classes[val_idx], dtype=torch.long, device=device)
-        n_train = X_train.size(0)
-        n_val = X_val.size(0)
+        val_labels = classes[val_arr]
+        y_val_t = torch.tensor(val_labels, dtype=torch.long, device=device)
 
         model = CryptoLSTM(input_dim, hidden_dim, num_layers,
                             dropout, NUM_CLASSES).to(device)
@@ -292,14 +355,18 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
         best_preds = None
         best_labels = None
         counter = 0
+        best_epoch_score = 0.0  # track best intermediate score for timeout recovery
+        timed_out = False
 
         for epoch in range(MAX_EPOCHS):
             model.train()
-            perm = torch.randperm(n_train, device=device)
+            perm = np.random.permutation(n_train)
             for i in range(0, n_train, batch_size):
-                idx = perm[i:i + batch_size]
-                out = model(X_train[idx])
-                loss = criterion(out, y_train[idx])
+                bi = perm[i:i + batch_size]
+                xb = torch.from_numpy(X_train_np[bi]).to(device)
+                yb = torch.tensor(train_labels[bi], dtype=torch.long, device=device)
+                out = model(xb)
+                loss = criterion(out, yb)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -310,18 +377,17 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
 
             model.eval()
             with torch.inference_mode():
-                # Single forward pass over entire val set (batched to avoid OOM on large sets)
                 all_preds_list = []
                 val_loss_sum = 0.0
                 for i in range(0, n_val, batch_size):
-                    X_vb = X_val[i:i + batch_size]
-                    y_vb = y_val[i:i + batch_size]
-                    vo = model(X_vb)
-                    val_loss_sum += criterion(vo, y_vb).item() * X_vb.size(0)
+                    xvb = torch.from_numpy(X_val_np[i:i + batch_size]).to(device)
+                    yvb = torch.tensor(val_labels[i:i + batch_size], dtype=torch.long, device=device)
+                    vo = model(xvb)
+                    val_loss_sum += criterion(vo, yvb).item() * xvb.size(0)
                     all_preds_list.append(vo.argmax(1))
                 ep_preds_t = torch.cat(all_preds_list)
 
-            val_acc = (ep_preds_t == y_val).float().mean().item()
+            val_acc = (ep_preds_t == y_val_t).float().mean().item()
             val_loss = val_loss_sum / n_val
 
             if scheduler == 'plateau' and sched:
@@ -329,36 +395,39 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
 
             # Compute epoch composite_score for pruner (same metric as final objective)
             ep_preds = ep_preds_t.cpu().numpy()
-            ep_labels = y_val.cpu().numpy()
-            ep_tp = int(((ep_preds == target_class) & (ep_labels == target_class)).sum())
-            ep_fp = int(((ep_preds == target_class) & (ep_labels != target_class)).sum())
-            ep_fn = int(((ep_preds != target_class) & (ep_labels == target_class)).sum())
+            ep_tp = int(((ep_preds == target_class) & (val_labels == target_class)).sum())
+            ep_fp = int(((ep_preds == target_class) & (val_labels != target_class)).sum())
+            ep_fn = int(((ep_preds != target_class) & (val_labels == target_class)).sum())
             ep_prec = ep_tp / (ep_tp + ep_fp) if (ep_tp + ep_fp) > 0 else 0.0
             ep_rec = ep_tp / (ep_tp + ep_fn) if (ep_tp + ep_fn) > 0 else 0.0
             ep_f1 = 2 * ep_prec * ep_rec / (ep_prec + ep_rec) if (ep_prec + ep_rec) > 0 else 0.0
-            ep_bal = sum((ep_preds[ep_labels == c] == c).mean() if (ep_labels == c).sum() > 0 else 0.0
+            ep_bal = sum((ep_preds[val_labels == c] == c).mean() if (val_labels == c).sum() > 0 else 0.0
                          for c in range(NUM_CLASSES)) / NUM_CLASSES
-            ep_cat = (int(((ep_labels == 0) & (ep_preds == 2)).sum()) +
-                      int(((ep_labels == 2) & (ep_preds == 0)).sum())) / n_val
+            ep_cat = (int(((val_labels == 0) & (ep_preds == 2)).sum()) +
+                      int(((val_labels == 2) & (ep_preds == 0)).sum())) / n_val
             epoch_score = max(ep_f1 * 0.5 + ep_bal * 0.2 - ep_cat * 0.3, 0.0)
+            if epoch_score > best_epoch_score:
+                best_epoch_score = epoch_score
 
             trial.report(epoch_score, epoch)
             if epoch >= PRUNE_WARMUP_EPOCHS and trial.should_prune():
-                del model, X_train, y_train, X_val, y_val, weights_t
+                del model, weights_t
                 gc.collect()
                 torch.cuda.empty_cache()
                 raise optuna.TrialPruned()
 
             # Hard time limit per trial
             if time.time() - trial_start > MAX_TRIAL_SECONDS:
-                print(f"  [TIMEOUT] Trial {trial.number} exceeded {MAX_TRIAL_SECONDS}s at epoch {epoch}, stopping")
+                print(f"  [TIMEOUT] Trial {trial.number} exceeded {MAX_TRIAL_SECONDS}s at epoch {epoch}, "
+                      f"best_epoch_score={best_epoch_score:.3f}")
+                timed_out = True
                 break
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 best_preds = ep_preds
-                best_labels = ep_labels
+                best_labels = val_labels
                 counter = 0
             else:
                 counter += 1
@@ -371,6 +440,11 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
         n_samples = 0
         target_f1 = 0.0
         catastrophic_rate = 1.0
+        if best_preds is None and timed_out and best_epoch_score > 0:
+            # Timeout before any val_acc improvement — use last epoch's preds
+            print(f"  [TIMEOUT-RECOVER] No best_preds saved, using last epoch preds (score={best_epoch_score:.3f})")
+            best_preds = ep_preds
+            best_labels = val_labels
         if best_preds is not None:
             ap, al = best_preds, best_labels
             n_samples = len(al)
@@ -382,9 +456,13 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
         MIN_CLASS_ACC = 0.10
         pc_vals = list(per_class.values())
         if pc_vals and min(pc_vals) < MIN_CLASS_ACC:
-            del model, X_train, y_train, X_val, y_val, weights_t
+            del model, weights_t
             gc.collect()
             torch.cuda.empty_cache()
+            # On timeout, return best intermediate score instead of 0
+            if timed_out and best_epoch_score > 0:
+                print(f"  [TIMEOUT-RECOVER] Using best_epoch_score={best_epoch_score:.3f}")
+                return best_epoch_score
             return 0.0
 
         # --- Confusion-matrix scoring for real-world trading ---
@@ -414,7 +492,7 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
 
         _state_cache[trial.number] = best_state
 
-        del model, X_train, y_train, X_val, y_val, weights_t
+        del model, weights_t
         gc.collect()
         torch.cuda.empty_cache()
 
