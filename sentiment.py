@@ -403,6 +403,77 @@ def _deduplicate_articles(articles):
 _LLM_CHUNK_SIZE = 80  # score all articles in one API call to minimize RPM usage
 
 
+def _parse_llm_json(raw_text):
+    """Robustly parse JSON from LLM output. Handles common issues:
+    - Markdown code fences (```json ... ```)
+    - Single quotes instead of double quotes
+    - Trailing text after JSON object
+    - Extra whitespace and newlines
+    Returns parsed dict or None.
+    """
+    import ast
+
+    text = raw_text.strip()
+
+    # Reject obviously non-JSON responses
+    if len(text) < 5 or '{' not in text:
+        print(f"[SENTIMENT] LLM returned non-JSON ({len(text)} chars): {text[:80]}")
+        return None
+
+    # Strip markdown code fences
+    if '```' in text:
+        for part in text.split('```')[1:]:
+            stripped = part.strip()
+            if stripped.startswith('json'):
+                stripped = stripped[4:].strip()
+            if stripped.startswith('{'):
+                text = stripped
+                break
+
+    # Extract just the JSON object if there's surrounding text
+    brace_start = text.find('{')
+    if brace_start > 0:
+        text = text[brace_start:]
+    # Find matching closing brace
+    depth = 0
+    for i, c in enumerate(text):
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                text = text[:i + 1]
+                break
+
+    # Attempt 1: standard JSON
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Attempt 2: ast.literal_eval (handles single quotes, trailing commas)
+    try:
+        data = ast.literal_eval(text)
+        if isinstance(data, dict):
+            return data
+    except (ValueError, SyntaxError):
+        pass
+
+    # Attempt 3: brute-force fix single quotes
+    try:
+        fixed = text.replace("'", '"')
+        data = json.loads(fixed)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    print(f"[SENTIMENT] LLM JSON parse failed: {text[:120]}")
+    return None
+
+
 def _llm_score_chunk(chunk_articles, full_texts):
     """Score a single chunk of articles via LLM. Returns list[float] or None."""
     try:
@@ -441,41 +512,19 @@ def _llm_score_chunk(chunk_articles, full_texts):
     if not result:
         return None
 
-    try:
-        text = result.strip()
-        if len(text) < 5 or not any(c in text for c in '{}'):
-            print(f"[SENTIMENT] LLM returned non-JSON ({len(text)} chars): {text[:80]}")
-            return None
-        # Strip markdown code fences if present
-        if '```' in text:
-            for part in text.split('```')[1:]:
-                stripped = part.strip()
-                if stripped.startswith('json'):
-                    stripped = stripped[4:].strip()
-                if stripped.startswith('{'):
-                    text = stripped
-                    break
+    data = _parse_llm_json(result)
+    if not isinstance(data, dict):
+        return None
 
-        # Fix single-quoted JSON (common from smaller LLMs)
-        if text.startswith("{") and "'" in text and '"' not in text:
-            text = text.replace("'", '"')
-
-        data = json.loads(text)
-        if isinstance(data, dict):
-            scores = []
-            for i in range(1, n + 1):
-                raw = data.get(str(i), data.get(i, 0.0))
-                scores.append(max(-1.0, min(1.0, float(raw))))
-            matched = sum(1 for i in range(1, n + 1) if str(i) in data or i in data)
-            if matched < n * 0.5:
-                print(f"[SENTIMENT] LLM chunk only scored {matched}/{n}, failing chunk")
-                return None
-            return scores
-        print(f"[SENTIMENT] LLM returned {type(data).__name__}, expected dict")
-    except (ValueError, TypeError, json.JSONDecodeError) as e:
-        print(f"[SENTIMENT] LLM score parse failed: {e}")
-
-    return None
+    scores = []
+    for i in range(1, n + 1):
+        raw = data.get(str(i), data.get(i, 0.0))
+        scores.append(max(-1.0, min(1.0, float(raw))))
+    matched = sum(1 for i in range(1, n + 1) if str(i) in data or i in data)
+    if matched < n * 0.5:
+        print(f"[SENTIMENT] LLM chunk only scored {matched}/{n}, failing chunk")
+        return None
+    return scores
 
 
 def _llm_score_batch(articles):

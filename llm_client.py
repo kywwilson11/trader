@@ -3,16 +3,15 @@
 Reads provider + API key from llm_config.json. Returns raw text or None on failure.
 Never blocks trades: all errors result in None return.
 
-Fallback chain:
-  1. Try the configured provider/model
-  2. On 429 (rate-limited), parse server retry delay and wait (up to 45s), then retry once
-  3. On transient/billing/auth errors (or failed 429 retry), fall back to
-     Gemini free tier (gemini-2.5-flash) using the stored Gemini API key
-  4. If Gemini also fails or no key exists, return None (keyword fallback)
+Fallback chain (Gemini):
+  1. Try the configured model (e.g. gemini-2.5-pro)
+  2. On 429, parse server "retry in Xs" and wait (up to 45s), then retry once
+  3. If still failing, try each remaining Gemini model in priority order
+     (pro → flash → flash-lite), each with its own per-model quota
+  4. If all Gemini models fail, return None (keyword fallback)
 
 Rate limiting:
   Client-side sliding window (10 RPM) prevents hitting provider limits.
-  Both primary and fallback calls count against the same window.
 """
 
 import collections
@@ -24,24 +23,23 @@ import urllib.error
 
 from llm_config import load_llm_config
 
-# Best free-tier model: 15 RPM, 1000 RPD, no billing required
-_GEMINI_FREE_MODEL = "gemini-2.5-flash"
+# Gemini fallback chain — ordered by daily quota (most generous first)
+# Free tier RPD: flash-lite=1000, flash=250, pro=100
+# Primary model is tried first (user's quality preference), then this chain
+_GEMINI_FALLBACK_CHAIN = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+]
 
-# HTTP codes that trigger immediate fallback to free tier:
-#   402 = billing/payment required
-#   403 = forbidden / auth error
-#   500 = internal server error
-#   502 = bad gateway
-#   503 = service unavailable
-#   504 = gateway timeout
+# HTTP codes that trigger immediate fallback:
 _FALLBACK_CODES = {402, 403, 500, 502, 503, 504}
 
-# 429 retry: parse "retry in Xs" from Gemini error body for smart wait,
-# then retry once. Falls back to free tier if retry also fails.
-_429_MAX_WAIT = 45  # cap wait at 45s to avoid blocking too long
+# 429 retry: parse "retry in Xs" from error body for smart wait
+_429_MAX_WAIT_PRIMARY = 45   # wait up to 45s for the primary model
+_429_MAX_WAIT_FALLBACK = 45  # wait up to 45s for each fallback model
 
 # --- Sliding-window rate limiter (10 RPM) ---
-# Gemini 2.5 pro free tier is ~10 RPM; keep under to avoid constant 429s
 _RATE_LIMIT_RPM = 10
 _call_timestamps: collections.deque = collections.deque()
 
@@ -50,10 +48,13 @@ def _parse_retry_after(http_error) -> float | None:
     """Extract retry delay from a 429 error response body.
 
     Gemini includes 'Please retry in 38.05s' in the JSON error message.
-    Returns seconds to wait, or None if unparseable.
+    Returns seconds to wait, or None if unparseable / daily limit exhausted.
     """
     try:
         body = http_error.read().decode("utf-8", errors="replace")
+        # Daily token quota exhausted (limit: 0) — no point retrying
+        if "limit: 0" in body:
+            return None
         match = re.search(r"retry in (\d+(?:\.\d+)?)s", body, re.IGNORECASE)
         if match:
             return float(match.group(1))
@@ -66,7 +67,6 @@ def _rate_limit_ok() -> bool:
     """Check if we're within the rate limit. Returns True if call is allowed."""
     now = time.time()
     cutoff = now - 60.0
-    # Purge timestamps older than 60 seconds
     while _call_timestamps and _call_timestamps[0] < cutoff:
         _call_timestamps.popleft()
     if len(_call_timestamps) >= _RATE_LIMIT_RPM:
@@ -78,7 +78,7 @@ def _rate_limit_ok() -> bool:
 def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | None:
     """Send prompt to the configured LLM provider. Returns text or None.
 
-    On transient/billing/rate-limit errors, automatically falls back to Gemini free tier.
+    On failure, automatically falls back through all available Gemini models.
     """
     config = load_llm_config()
 
@@ -96,8 +96,8 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | Non
     timeout = config.get("max_llm_latency_sec", 15)
 
     if not api_key:
-        # No key for primary — try Gemini free tier directly
-        return _try_gemini_free(config, prompt, system, max_tokens, timeout)
+        # No key for primary — try Gemini fallback chain directly
+        return _try_gemini_chain(config, prompt, system, max_tokens, timeout)
 
     start = time.time()
     try:
@@ -113,29 +113,29 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | Non
         if e.code == 429:
             # Parse "retry in Xs" from error body for smart wait
             wait = _parse_retry_after(e)
-            if wait and wait <= _429_MAX_WAIT:
+            if wait and wait <= _429_MAX_WAIT_PRIMARY:
                 print(f"[LLM] {provider}/{model}: HTTP 429 ({elapsed:.0f}ms), "
-                      f"waiting {wait:.0f}s (server-requested)")
+                      f"waiting {wait:.0f}s")
                 time.sleep(wait)
                 try:
                     start2 = time.time()
                     result = _dispatch(provider, prompt, system, api_key, model, max_tokens, timeout)
                     elapsed2 = (time.time() - start2) * 1000
                     if result:
-                        print(f"[LLM] {provider}/{model}: {elapsed2:.0f}ms, {len(result)} chars (after retry)")
+                        print(f"[LLM] {provider}/{model}: {elapsed2:.0f}ms, {len(result)} chars (after wait)")
                     return result
                 except Exception:
-                    pass  # Retry failed, fall through to fallback
+                    pass  # Retry failed, fall through to chain
 
-            # Fall back to free tier (different model = separate quota)
-            print(f"[LLM] {provider}/{model}: 429, trying Gemini free tier")
-            return _try_gemini_free(config, prompt, system, max_tokens, timeout,
-                                    skip_model=model if provider == "gemini" else None)
+            # Try other Gemini models (each has its own per-model quota)
+            print(f"[LLM] {provider}/{model}: 429, trying other models")
+            return _try_gemini_chain(config, prompt, system, max_tokens, timeout,
+                                     skip_model=model if provider == "gemini" else None)
 
         if e.code in _FALLBACK_CODES:
-            print(f"[LLM] {provider}/{model}: HTTP {e.code} ({elapsed:.0f}ms), trying Gemini free tier")
-            return _try_gemini_free(config, prompt, system, max_tokens, timeout,
-                                    skip_model=model if provider == "gemini" else None)
+            print(f"[LLM] {provider}/{model}: HTTP {e.code} ({elapsed:.0f}ms), trying other models")
+            return _try_gemini_chain(config, prompt, system, max_tokens, timeout,
+                                     skip_model=model if provider == "gemini" else None)
         print(f"[LLM] ERROR ({provider}/{model}): HTTP {e.code} ({elapsed:.0f}ms)")
         return None
 
@@ -145,49 +145,56 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | Non
         return None
 
 
-def _try_gemini_free(config, prompt, system, max_tokens, timeout, skip_model=None):
-    """Attempt Gemini free tier as fallback. Returns result or None."""
+def _try_gemini_chain(config, prompt, system, max_tokens, timeout, skip_model=None):
+    """Try each Gemini model in priority order. Returns result or None.
+
+    Each model has its own per-model quota on the free tier, so if one is
+    rate-limited, the next may still have capacity.
+    """
     gemini_key = config.get("models", {}).get("gemini", {}).get("api_key", "")
     if not gemini_key:
         return None
 
-    # Don't retry the same model that just failed
-    if skip_model == _GEMINI_FREE_MODEL:
-        return None
+    for model in _GEMINI_FALLBACK_CHAIN:
+        if model == skip_model:
+            continue
 
-    if not _rate_limit_ok():
-        print("[LLM] Rate limit reached (10 RPM), skipping fallback")
-        return None
+        start = time.time()
+        try:
+            result = _call_gemini(prompt, system, gemini_key, model, max_tokens, timeout)
+            elapsed = (time.time() - start) * 1000
+            if result:
+                print(f"[LLM] gemini/{model}: {elapsed:.0f}ms, {len(result)} chars")
+            return result
 
-    start = time.time()
-    try:
-        result = _call_gemini(prompt, system, gemini_key, _GEMINI_FREE_MODEL, max_tokens, timeout)
-        elapsed = (time.time() - start) * 1000
-        if result:
-            print(f"[LLM] fallback gemini/{_GEMINI_FREE_MODEL}: {elapsed:.0f}ms, {len(result)} chars")
-        return result
-    except urllib.error.HTTPError as e:
-        elapsed = (time.time() - start) * 1000
-        if e.code == 429:
-            wait = _parse_retry_after(e)
-            if wait and wait <= _429_MAX_WAIT:
-                print(f"[LLM] fallback gemini/{_GEMINI_FREE_MODEL}: 429, waiting {wait:.0f}s")
-                time.sleep(wait)
-                try:
-                    start2 = time.time()
-                    result = _call_gemini(prompt, system, gemini_key, _GEMINI_FREE_MODEL, max_tokens, timeout)
-                    elapsed2 = (time.time() - start2) * 1000
-                    if result:
-                        print(f"[LLM] fallback gemini/{_GEMINI_FREE_MODEL}: {elapsed2:.0f}ms, {len(result)} chars (after retry)")
-                    return result
-                except Exception:
-                    pass
-        print(f"[LLM] Gemini free-tier fallback failed: HTTP {e.code} ({elapsed:.0f}ms)")
-        return None
-    except Exception as e:
-        elapsed = (time.time() - start) * 1000
-        print(f"[LLM] Gemini free-tier fallback failed: {e} ({elapsed:.0f}ms)")
-        return None
+        except urllib.error.HTTPError as e:
+            elapsed = (time.time() - start) * 1000
+            if e.code == 429:
+                wait = _parse_retry_after(e)
+                if wait and wait <= _429_MAX_WAIT_FALLBACK:
+                    print(f"[LLM] gemini/{model}: 429, waiting {wait:.0f}s")
+                    time.sleep(wait)
+                    try:
+                        start2 = time.time()
+                        result = _call_gemini(prompt, system, gemini_key, model, max_tokens, timeout)
+                        elapsed2 = (time.time() - start2) * 1000
+                        if result:
+                            print(f"[LLM] gemini/{model}: {elapsed2:.0f}ms, {len(result)} chars (after wait)")
+                        return result
+                    except Exception:
+                        pass  # This model exhausted, try next
+                print(f"[LLM] gemini/{model}: 429 ({elapsed:.0f}ms), trying next")
+                continue
+            print(f"[LLM] gemini/{model}: HTTP {e.code} ({elapsed:.0f}ms), trying next")
+            continue
+
+        except Exception as e:
+            elapsed = (time.time() - start) * 1000
+            print(f"[LLM] gemini/{model}: {e} ({elapsed:.0f}ms), trying next")
+            continue
+
+    print("[LLM] All Gemini models exhausted")
+    return None
 
 
 def _dispatch(provider, prompt, system, api_key, model, max_tokens, timeout):
