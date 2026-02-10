@@ -152,6 +152,9 @@ def _fetch_chunk(api, symbol, start_iso, end_iso, asset_type, max_retries=4):
 
         except Exception as e:
             err_str = str(e).lower()
+            # Subscription errors are permanent — no point retrying
+            if 'subscription' in err_str or 'not permit' in err_str:
+                return None
             is_rate_limit = ('rate' in err_str or '429' in err_str
                              or 'too many' in err_str)
             if is_rate_limit and attempt < max_retries - 1:
@@ -215,15 +218,17 @@ def fetch_historical_bars(api, symbol, start_date, asset_type='crypto',
             asset_type,
         )
         if result is None:
-            # Rate limit failure on this chunk — increase pace and retry once
-            pace = min(pace * 3, 30)
-            print(f"  [HIST] Pacing increased to {pace:.0f}s, retrying chunk...")
-            time.sleep(pace)
-            result = _fetch_chunk(
-                api, symbol,
-                c_start.isoformat(), c_end.isoformat(),
-                asset_type,
-            )
+            # Skip retry for the last chunk — likely a subscription limit on
+            # recent data; yfinance will cover it
+            if i < len(chunks) - 1:
+                pace = min(pace * 3, 30)
+                print(f"  [HIST] Pacing increased to {pace:.0f}s, retrying chunk...")
+                time.sleep(pace)
+                result = _fetch_chunk(
+                    api, symbol,
+                    c_start.isoformat(), c_end.isoformat(),
+                    asset_type,
+                )
         if result:
             all_rows.extend(result)
 

@@ -918,14 +918,30 @@ class DataFetcher(QObject):
             # Save merged articles to cache
             _save_news_cache(articles, fng)
 
-            # Compute 24h / 7d aggregate sentiment from cached articles
+            # Compute 24h / 7d aggregate sentiment — combined + per asset class
             now_ts = _dt.datetime.now().timestamp()
-            sent_24h = [a['_sentiment'] for a in articles
-                        if '_sentiment' in a and now_ts - a.get('datetime', 0) <= 86400]
-            sent_7d = [a['_sentiment'] for a in articles
-                       if '_sentiment' in a and now_ts - a.get('datetime', 0) <= 7 * 86400]
-            avg_24h = sum(sent_24h) / len(sent_24h) if sent_24h else None
-            avg_7d = sum(sent_7d) / len(sent_7d) if sent_7d else None
+
+            def _avg(vals):
+                return sum(vals) / len(vals) if vals else None
+
+            def _sent_by_window(secs):
+                all_s, crypto_s, stock_s = [], [], []
+                for a in articles:
+                    if '_sentiment' not in a:
+                        continue
+                    if now_ts - a.get('datetime', 0) > secs:
+                        continue
+                    s = a['_sentiment']
+                    cat = a.get('_category', '')
+                    all_s.append(s)
+                    if cat in ('Crypto', 'Market'):
+                        crypto_s.append(s)
+                    if cat in ('Stock', 'Market'):
+                        stock_s.append(s)
+                return _avg(all_s), _avg(crypto_s), _avg(stock_s)
+
+            avg_24h, crypto_24h, stock_24h = _sent_by_window(86400)
+            avg_7d, crypto_7d, stock_7d = _sent_by_window(7 * 86400)
 
             self.news_updated.emit({
                 'articles': articles,
@@ -933,6 +949,10 @@ class DataFetcher(QObject):
                 'cnn_fng': cnn_fng,
                 'sent_24h': avg_24h,
                 'sent_7d': avg_7d,
+                'crypto_24h': crypto_24h,
+                'crypto_7d': crypto_7d,
+                'stock_24h': stock_24h,
+                'stock_7d': stock_7d,
             })
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -1814,33 +1834,73 @@ class TradingDashboard(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        # Multi-indicator header row
-        indicator_layout = QHBoxLayout()
-        indicator_style = "font-size: 13px; font-weight: bold;"
-        self._news_crypto_fng = QLabel("Crypto FnG: —")
-        self._news_crypto_fng.setStyleSheet(indicator_style)
-        indicator_layout.addWidget(self._news_crypto_fng)
-        indicator_layout.addWidget(QLabel(" | "))
-        self._news_stock_fng = QLabel("Stock FnG: —")
-        self._news_stock_fng.setStyleSheet(indicator_style)
-        indicator_layout.addWidget(self._news_stock_fng)
-        indicator_layout.addWidget(QLabel(" | "))
+        # Sentiment indicator rows — grouped by asset class
+        s = "font-size: 13px; font-weight: bold;"
+        lbl_style = "font-size: 13px; font-weight: bold; color: gray;"
+        sep = " | "
+
+        # Row 1: Crypto
+        crypto_row = QHBoxLayout()
+        lbl = QLabel("CRYPTO")
+        lbl.setStyleSheet(lbl_style)
+        lbl.setFixedWidth(60)
+        crypto_row.addWidget(lbl)
+        self._news_crypto_fng = QLabel("FnG: —")
+        self._news_crypto_fng.setStyleSheet(s)
+        crypto_row.addWidget(self._news_crypto_fng)
+        crypto_row.addWidget(QLabel(sep))
+        self._news_crypto_24h = QLabel("24h: —")
+        self._news_crypto_24h.setStyleSheet(s)
+        crypto_row.addWidget(self._news_crypto_24h)
+        crypto_row.addWidget(QLabel(sep))
+        self._news_crypto_7d = QLabel("7d: —")
+        self._news_crypto_7d.setStyleSheet(s)
+        crypto_row.addWidget(self._news_crypto_7d)
+        crypto_row.addStretch()
+        layout.addLayout(crypto_row)
+
+        # Row 2: Stocks
+        stock_row = QHBoxLayout()
+        lbl = QLabel("STOCKS")
+        lbl.setStyleSheet(lbl_style)
+        lbl.setFixedWidth(60)
+        stock_row.addWidget(lbl)
+        self._news_stock_fng = QLabel("FnG: —")
+        self._news_stock_fng.setStyleSheet(s)
+        stock_row.addWidget(self._news_stock_fng)
+        stock_row.addWidget(QLabel(sep))
         self._news_vix = QLabel("VIX: —")
-        self._news_vix.setStyleSheet(indicator_style)
-        indicator_layout.addWidget(self._news_vix)
-        indicator_layout.addWidget(QLabel(" | "))
-        self._news_sent_24h = QLabel("24h Sent: —")
-        self._news_sent_24h.setStyleSheet(indicator_style)
-        indicator_layout.addWidget(self._news_sent_24h)
-        indicator_layout.addWidget(QLabel(" | "))
-        self._news_sent_7d = QLabel("7d Sent: —")
-        self._news_sent_7d.setStyleSheet(indicator_style)
-        indicator_layout.addWidget(self._news_sent_7d)
-        indicator_layout.addStretch()
+        self._news_vix.setStyleSheet(s)
+        stock_row.addWidget(self._news_vix)
+        stock_row.addWidget(QLabel(sep))
+        self._news_stock_24h = QLabel("24h: —")
+        self._news_stock_24h.setStyleSheet(s)
+        stock_row.addWidget(self._news_stock_24h)
+        stock_row.addWidget(QLabel(sep))
+        self._news_stock_7d = QLabel("7d: —")
+        self._news_stock_7d.setStyleSheet(s)
+        stock_row.addWidget(self._news_stock_7d)
+        stock_row.addStretch()
+        layout.addLayout(stock_row)
+
+        # Row 3: Combined + refresh timestamp
+        combined_row = QHBoxLayout()
+        lbl = QLabel("ALL")
+        lbl.setStyleSheet(lbl_style)
+        lbl.setFixedWidth(60)
+        combined_row.addWidget(lbl)
+        self._news_sent_24h = QLabel("24h: —")
+        self._news_sent_24h.setStyleSheet(s)
+        combined_row.addWidget(self._news_sent_24h)
+        combined_row.addWidget(QLabel(sep))
+        self._news_sent_7d = QLabel("7d: —")
+        self._news_sent_7d.setStyleSheet(s)
+        combined_row.addWidget(self._news_sent_7d)
+        combined_row.addStretch()
         self._news_refresh_label = QLabel("")
         self._news_refresh_label.setStyleSheet("font-size: 11px;")
-        indicator_layout.addWidget(self._news_refresh_label)
-        layout.addLayout(indicator_layout)
+        combined_row.addWidget(self._news_refresh_label)
+        layout.addLayout(combined_row)
 
         # Filter combo
         filter_layout = QHBoxLayout()
@@ -1848,7 +1908,7 @@ class TradingDashboard(QMainWindow):
         filter_label.setStyleSheet("font-size: 13px; font-weight: bold;")
         filter_layout.addWidget(filter_label)
         self._news_filter_combo = QComboBox()
-        self._news_filter_combo.addItems(["My Universe", "All News", "Global / Macro"])
+        self._news_filter_combo.addItems(["My Universe", "All News", "Global / Macro", "Crypto", "Stocks"])
         self._news_filter_combo.setCurrentIndex(0)
         self._news_filter_combo.currentIndexChanged.connect(self._apply_news_filter)
         self._news_filter_combo.setFixedWidth(180)
@@ -2903,19 +2963,26 @@ class TradingDashboard(QMainWindow):
                 return T['red'].name()
             return T.get('yellow', T['white']).name()
 
-        # Crypto Fear & Greed
+        def _update_sent(label, prefix, val):
+            if val is not None:
+                c = _sent_color(val)
+                label.setText(f"{prefix}: <span style='color:{c};'>{val:+.2f}</span>")
+
+        # Crypto row: FnG + 24h + 7d
         if fng is not None:
             val = fng['value']
             c = _fng_color(val)
             self._news_crypto_fng.setText(
-                f"Crypto FnG: <span style='color:{c};'>{val} ({fng['label']})</span>")
+                f"FnG: <span style='color:{c};'>{val} ({fng['label']})</span>")
+        _update_sent(self._news_crypto_24h, "24h", data.get('crypto_24h'))
+        _update_sent(self._news_crypto_7d, "7d", data.get('crypto_7d'))
 
-        # CNN Stock Fear & Greed + VIX
+        # Stock row: FnG + VIX + 24h + 7d
         if cnn_fng is not None:
             sv = cnn_fng['score']
             sc = _fng_color(sv)
             self._news_stock_fng.setText(
-                f"Stock FnG: <span style='color:{sc};'>{sv:.0f} ({cnn_fng['rating']})</span>")
+                f"FnG: <span style='color:{sc};'>{sv:.0f} ({cnn_fng['rating']})</span>")
             vix = cnn_fng.get('vix', 0)
             if vix > 25:
                 vc = T['red'].name()
@@ -2925,16 +2992,12 @@ class TradingDashboard(QMainWindow):
                 vc = T.get('yellow', T['white']).name()
             self._news_vix.setText(
                 f"VIX: <span style='color:{vc};'>{vix:.1f}</span>")
+        _update_sent(self._news_stock_24h, "24h", data.get('stock_24h'))
+        _update_sent(self._news_stock_7d, "7d", data.get('stock_7d'))
 
-        # 24h / 7d aggregate sentiment
-        if sent_24h is not None:
-            c24 = _sent_color(sent_24h)
-            self._news_sent_24h.setText(
-                f"24h Sent: <span style='color:{c24};'>{sent_24h:+.2f}</span>")
-        if sent_7d is not None:
-            c7 = _sent_color(sent_7d)
-            self._news_sent_7d.setText(
-                f"7d Sent: <span style='color:{c7};'>{sent_7d:+.2f}</span>")
+        # Combined row
+        _update_sent(self._news_sent_24h, "24h", sent_24h)
+        _update_sent(self._news_sent_7d, "7d", sent_7d)
 
         now = _dt.datetime.now(TZ_CENTRAL).strftime("%I:%M %p")
         self._news_refresh_label.setText(f"Updated {now}")
@@ -2973,6 +3036,12 @@ class TradingDashboard(QMainWindow):
             articles = filtered
         elif idx == 2:  # Global / Macro
             articles = [a for a in articles if a.get('_category') == 'Market']
+        elif idx == 3:  # Crypto (crypto-specific + global/macro)
+            articles = [a for a in articles
+                        if a.get('_category') in ('Crypto', 'Market')]
+        elif idx == 4:  # Stocks (stock-specific + global/macro)
+            articles = [a for a in articles
+                        if a.get('_category') in ('Stock', 'Market')]
         # idx == 1 (All News) — no filtering
 
         self._news_filtered = articles  # store for click lookup
