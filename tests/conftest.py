@@ -13,6 +13,9 @@ _ROOT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, str(Path(_ROOT) / 'scripts'))
 
+# Exclude the headline test suite from pytest (uses its own custom runner)
+collect_ignore = [str(Path(__file__).resolve().parent / 'test_sentiment_headlines.py')]
+
 
 @pytest.fixture
 def sample_ohlcv_df():

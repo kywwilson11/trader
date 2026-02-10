@@ -3,10 +3,13 @@
 
 Tests both _score_text (raw scoring) and _validate_text (article validation).
 
-Run:  python test_sentiment.py
+Run:  python tests/test_sentiment_headlines.py
 """
+import sys; from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import itertools
-from sentiment import _score_text, _validate_text, _score_articles
+from sentiment import _score_text, _validate_text, _score_articles, _aggregate_scores
 
 # ---------------------------------------------------------------------------
 # Hand-written edge cases (the originals + new additions)
@@ -348,7 +351,7 @@ def run_article_validation_tests():
     passed = 0
     failed = 0
     for articles, expected_score in cases:
-        result = _score_articles(articles)
+        result, _ = _score_articles(articles)
         if expected_score is not None:
             ok = abs(result['sentiment_score'] - expected_score) < 0.01
         else:

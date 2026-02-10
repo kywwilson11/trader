@@ -37,10 +37,12 @@ jobs:
             requests PyYAML pytest
 
       - name: Compile all .py files (syntax check)
-        run: python -m py_compile $(find . -maxdepth 1 -name '*.py' | sort)
+        run: |
+          python -m py_compile $(find . -maxdepth 1 -name '*.py' | sort)
+          python -m py_compile $(find scripts/ -name '*.py' | sort)
 
       - name: Run sentiment test suite (1060 tests)
-        run: python test_sentiment.py
+        run: python tests/test_sentiment_headlines.py
 
       - name: Run pytest
         run: pytest tests/ -v --tb=short -x
