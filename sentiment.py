@@ -443,6 +443,9 @@ def _llm_score_chunk(chunk_articles, full_texts):
 
     try:
         text = result.strip()
+        if len(text) < 5 or not any(c in text for c in '{}'):
+            print(f"[SENTIMENT] LLM returned non-JSON ({len(text)} chars): {text[:80]}")
+            return None
         # Strip markdown code fences if present
         if '```' in text:
             for part in text.split('```')[1:]:
@@ -452,6 +455,10 @@ def _llm_score_chunk(chunk_articles, full_texts):
                 if stripped.startswith('{'):
                     text = stripped
                     break
+
+        # Fix single-quoted JSON (common from smaller LLMs)
+        if text.startswith("{") and "'" in text and '"' not in text:
+            text = text.replace("'", '"')
 
         data = json.loads(text)
         if isinstance(data, dict):
