@@ -30,7 +30,7 @@ NUM_TRIALS = 200
 MAX_EPOCHS = 80
 EARLY_STOP_PATIENCE = 12
 PRUNE_WARMUP_EPOCHS = 15       # don't prune until model has had time to learn
-PRUNE_STARTUP_TRIALS = 50      # match TPE's random exploration phase
+PRUNE_STARTUP_TRIALS = 70      # ~12 random samples per forward_bars bucket
 TRAIN_RATIO = 0.8
 NUM_CLASSES = 3
 
