@@ -6,6 +6,7 @@ Data sources:
 
 Provides sentiment scoring and trade gating for crypto_loop.py and stock_loop.py.
 """
+import collections
 import json
 import os
 import time
@@ -21,6 +22,9 @@ _finnhub_client = None
 # --- Cache: key -> (timestamp, result) ---
 _cache = {}
 CACHE_TTL = 300  # 5 minutes
+
+# --- LLM retry queue: (cache_key, articles, queued_at) ---
+_llm_retry_queue: collections.deque = collections.deque(maxlen=50)
 
 
 def _get_finnhub():
@@ -156,6 +160,12 @@ _NEGATIVE_PHRASES = [
     ('slashes price target', -2.0), ('slashed price target', -2.0),
     ('price target slashed', -2.0),
     ('slowing momentum', -1.0), ('slowing growth', -1.0),
+    # Nuanced bearish phrases (avoid false positives from "growth" mentions)
+    ("wouldn't touch", -1.5), ("wouldn't buy", -1.5),
+    ("wouldn't invest", -1.5),
+    ('stay away', -1.0), ('10-foot pole', -1.5),
+    ('too much of a premium', -1.0),
+    ('too expensive', -1.0), ('overpriced', -1.0),
 ]
 
 # Negation words — flip sentiment of the next keyword within 3 words
@@ -390,66 +400,43 @@ def _deduplicate_articles(articles):
     return unique
 
 
-def _llm_score_batch(articles):
-    """Batch-score articles via the configured LLM. Returns list[float] or None.
+_LLM_CHUNK_SIZE = 25  # max articles per LLM call for reliable JSON output
 
-    For each article, uses the richest content available:
-      full article text > summary > headline (always included).
-    Article bodies are fetched in parallel with short timeouts.
-    Falls back to None on any failure (caller should use keyword scoring).
-    """
+
+def _llm_score_chunk(chunk_articles, full_texts):
+    """Score a single chunk of articles via LLM. Returns list[float] or None."""
     try:
         from llm_client import call_llm
     except ImportError:
         return None
 
-    if not articles:
-        return None
-
-    # Fetch full article text in parallel (cached, 5s timeout each)
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    urls = [a.get('url', '') for a in articles]
-    full_texts = [None] * len(articles)
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {pool.submit(_fetch_article_text, u): i
-                   for i, u in enumerate(urls) if u}
-        for fut in as_completed(futures, timeout=15):
-            try:
-                full_texts[futures[fut]] = fut.result()
-            except Exception:
-                pass
-
-    n = len(articles)
-    fetched = sum(1 for t in full_texts if t)
-    print(f"[SENTIMENT] Fetched {fetched}/{n} article bodies for LLM")
-
+    n = len(chunk_articles)
     lines = []
-    for i, a in enumerate(articles):
+    for i, a in enumerate(chunk_articles):
         h = ' '.join(a.get('headline', '').split())
         s = ' '.join(a.get('summary', '').split())
         body = full_texts[i]
 
-        # Build best-available content: headline is always first
         parts = [f"{i + 1}. {h}"]
         if body:
-            # Full text already has summary content; cap at 500 chars
             parts.append(body[:500])
         elif s:
             parts.append(s)
         lines.append(" — ".join(parts))
 
     prompt = (
-        f"Score each article's financial sentiment from -1.0 (very bearish) "
-        f"to 1.0 (very bullish). 0.0 = neutral.\n"
+        f"Score each article's financial sentiment from -1.00 (very bearish) "
+        f"to 1.00 (very bullish). 0.00 = neutral.\n"
+        f"Use the FULL continuous range — do NOT round to 0.05 or 0.10 increments.\n"
         f'Return ONLY a JSON object mapping article number to score, '
-        f'e.g. {{"1": 0.3, "2": -0.5, "3": 0.0}}\n\n'
+        f'e.g. {{"1": 0.37, "2": -0.63, "3": 0.08, "4": -0.21, "5": 0.54}}\n\n'
         + "\n".join(lines)
     )
 
     result = call_llm(
         prompt,
         system="Financial sentiment scorer. Return only a JSON object mapping article number strings to float scores. No explanation.",
-        max_tokens=max(256, n * 12),
+        max_tokens=max(256, n * 20),
     )
     if not result:
         return None
@@ -468,17 +455,14 @@ def _llm_score_batch(articles):
 
         data = json.loads(text)
         if isinstance(data, dict):
-            # Look up each article by its 1-based number; default 0.0 if missing
             scores = []
             for i in range(1, n + 1):
                 raw = data.get(str(i), data.get(i, 0.0))
                 scores.append(max(-1.0, min(1.0, float(raw))))
             matched = sum(1 for i in range(1, n + 1) if str(i) in data or i in data)
             if matched < n * 0.5:
-                print(f"[SENTIMENT] LLM only scored {matched}/{n} articles, falling back")
+                print(f"[SENTIMENT] LLM chunk only scored {matched}/{n}, failing chunk")
                 return None
-            if matched < n:
-                print(f"[SENTIMENT] LLM scored {matched}/{n} articles (missing default to 0.0)")
             return scores
         print(f"[SENTIMENT] LLM returned {type(data).__name__}, expected dict")
     except (ValueError, TypeError, json.JSONDecodeError) as e:
@@ -487,19 +471,74 @@ def _llm_score_batch(articles):
     return None
 
 
+def _llm_score_batch(articles):
+    """Batch-score articles via the configured LLM. Returns list[float] or None.
+
+    For each article, uses the richest content available:
+      full article text > summary > headline (always included).
+    Article bodies are fetched in parallel with short timeouts.
+    Chunks articles into groups of _LLM_CHUNK_SIZE for reliable JSON output.
+    Falls back to None on any failure (caller should use keyword scoring).
+    """
+    try:
+        from llm_client import call_llm  # noqa: F401 — check availability
+    except ImportError:
+        return None
+
+    if not articles:
+        return None
+
+    # Fetch full article text in parallel (cached, 5s timeout each)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    urls = [a.get('url', '') for a in articles]
+    full_texts = [None] * len(articles)
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_fetch_article_text, u): i
+                   for i, u in enumerate(urls) if u}
+        try:
+            for fut in as_completed(futures, timeout=15):
+                try:
+                    full_texts[futures[fut]] = fut.result()
+                except Exception:
+                    pass
+        except TimeoutError:
+            # Some article fetches didn't finish — use what we got
+            pass
+
+    n = len(articles)
+    fetched = sum(1 for t in full_texts if t)
+    print(f"[SENTIMENT] Fetched {fetched}/{n} article bodies for LLM")
+
+    # Score in chunks for reliable JSON output
+    all_scores = []
+    for start in range(0, n, _LLM_CHUNK_SIZE):
+        end = min(start + _LLM_CHUNK_SIZE, n)
+        chunk_scores = _llm_score_chunk(articles[start:end], full_texts[start:end])
+        if chunk_scores is None:
+            # Any chunk failure → abort entire batch
+            return None
+        all_scores.extend(chunk_scores)
+
+    return all_scores
+
+
 def score_article_batch(articles):
-    """Score articles for display. Returns list of per-article float scores.
+    """Score articles for display.
+
+    Returns tuple: (scores: list[float], method: str)
+        scores: per-article float scores
+        method: "LLM" if LLM scored, "KW" if keyword fallback
 
     Uses LLM batch scoring when available (one API call for all articles).
     Falls back to keyword scoring with full-text fetch for accuracy.
     """
     if not articles:
-        return []
+        return [], "KW"
 
     llm_scores = _llm_score_batch(articles)
     if llm_scores is not None:
         print(f"[SENTIMENT] LLM scored {len(articles)} articles")
-        return llm_scores
+        return llm_scores, "LLM"
 
     # Fallback: keyword scoring with full-text fetch
     print(f"[SENTIMENT] Keyword scoring {len(articles)} articles (LLM unavailable)")
@@ -518,7 +557,41 @@ def score_article_batch(articles):
             scores.append(h * 0.25 + s * 0.25 + f * 0.50)
         else:
             scores.append(h * 0.6 + s * 0.4)
-    return scores
+    return scores, "KW"
+
+
+def try_llm_upgrade(articles):
+    """Attempt to LLM-score articles (upgrade KW-scored articles to LLM).
+
+    Returns list of float scores on success, None if LLM unavailable.
+    """
+    if not articles:
+        return None
+    return _llm_score_batch(articles)
+
+
+def _aggregate_scores(scores):
+    """Aggregate a list of per-article scores into a sentiment result dict.
+
+    Returns dict with sentiment_score, article_count, positive_ratio, negative_ratio.
+    """
+    if not scores:
+        return {
+            'sentiment_score': 0.0,
+            'article_count': 0,
+            'positive_ratio': 0.5,
+            'negative_ratio': 0.5,
+        }
+    avg = sum(scores) / len(scores)
+    pos_count = sum(1 for s in scores if s > 0.05)
+    neg_count = sum(1 for s in scores if s < -0.05)
+    n = len(scores)
+    return {
+        'sentiment_score': avg,
+        'article_count': n,
+        'positive_ratio': pos_count / n,
+        'negative_ratio': neg_count / n,
+    }
 
 
 def _score_articles(articles):
@@ -528,24 +601,18 @@ def _score_articles(articles):
     Tries LLM batch scoring first. Falls back to keyword scoring with
     full-text article fetch for higher accuracy.
 
-    Returns dict:
-        sentiment_score: float in (-1, 1), average across articles
-        article_count: int
-        positive_ratio: float in [0, 1]
-        negative_ratio: float in [0, 1]
+    Returns tuple: (result_dict, used_llm)
+        result_dict: sentiment_score, article_count, positive_ratio, negative_ratio
+        used_llm: True if LLM scored successfully, False if keyword fallback
     """
     articles = _deduplicate_articles(articles)
 
     if not articles:
-        return {
-            'sentiment_score': 0.0,
-            'article_count': 0,
-            'positive_ratio': 0.5,
-            'negative_ratio': 0.5,
-        }
+        return _aggregate_scores([]), True  # nothing to retry
 
     # Try LLM batch scoring first (one API call, cost-efficient)
     scores = _llm_score_batch(articles)
+    used_llm = scores is not None
 
     if scores is None:
         # Fallback: keyword scoring with full-text fetch for accuracy
@@ -569,25 +636,41 @@ def _score_articles(articles):
 
             scores.append(combined)
 
-    if not scores:
-        return {
-            'sentiment_score': 0.0,
-            'article_count': 0,
-            'positive_ratio': 0.5,
-            'negative_ratio': 0.5,
-        }
+    return _aggregate_scores(scores), used_llm
 
-    avg = sum(scores) / len(scores)
-    pos_count = sum(1 for s in scores if s > 0.05)
-    neg_count = sum(1 for s in scores if s < -0.05)
-    n = len(scores)
 
-    return {
-        'sentiment_score': avg,
-        'article_count': n,
-        'positive_ratio': pos_count / n,
-        'negative_ratio': neg_count / n,
-    }
+def _try_llm_retry():
+    """Drain ONE queued item from _llm_retry_queue.
+
+    Discards stale entries (older than CACHE_TTL) and entries whose cache
+    was already updated by a newer call. On LLM success, updates the cache.
+    On failure, pushes the item back to the front of the queue.
+    """
+    if not _llm_retry_queue:
+        return
+
+    cache_key, articles, queued_at = _llm_retry_queue.popleft()
+    now = time.time()
+
+    # Stale: cache will be refreshed by normal flow anyway
+    if now - queued_at > CACHE_TTL:
+        return
+
+    # Superseded: a newer call already updated the cache
+    if cache_key in _cache:
+        cached_ts, _ = _cache[cache_key]
+        if cached_ts > queued_at:
+            return
+
+    scores = _llm_score_batch(articles)
+    if scores is None:
+        # LLM still unavailable — push back to front for next attempt
+        _llm_retry_queue.appendleft((cache_key, articles, queued_at))
+        return
+
+    result = _aggregate_scores(scores)
+    _cache[cache_key] = (now, result)
+    print(f"[SENTIMENT] LLM retry upgraded {cache_key}")
 
 
 # --- Fear & Greed Index (crypto only, free) ---
@@ -618,6 +701,58 @@ def get_fear_greed():
         return None
 
 
+# --- CNN Fear & Greed Index (stocks + VIX) ---
+
+def get_cnn_fear_greed():
+    """Fetch CNN Fear & Greed Index (stocks) and VIX.
+
+    Returns dict with 'score' (0-100), 'rating' (str),
+    'previous_close', 'previous_1_week', 'vix', 'vix_rating',
+    or None on error.  Cached for 5 minutes.
+    """
+    now = time.time()
+    if '__cnn_fng__' in _cache:
+        ts, result = _cache['__cnn_fng__']
+        if now - ts < CACHE_TTL:
+            return result
+
+    try:
+        resp = requests.get(
+            'https://production.dataviz.cnn.io/index/fearandgreed/graphdata',
+            headers={
+                'User-Agent': _USER_AGENT,
+                'Referer': 'https://www.cnn.com/markets/fear-and-greed',
+            },
+            timeout=8,
+        )
+        data = resp.json()
+        fg = data.get('fear_and_greed', {})
+        result = {
+            'score': round(fg.get('score', 0), 1),
+            'rating': fg.get('rating', '').replace('_', ' ').title(),
+            'previous_close': round(fg.get('previous_close', 0), 1),
+            'previous_1_week': round(fg.get('previous_1_week', 0), 1),
+        }
+        # Extract VIX: data[-1].y is actual VIX value, score is CNN's 0-100 rating
+        vix_section = data.get('market_volatility_vix', {})
+        if isinstance(vix_section, dict):
+            vix_ts = vix_section.get('data', [])
+            if vix_ts and isinstance(vix_ts[-1], dict):
+                result['vix'] = round(float(vix_ts[-1].get('y', 0)), 2)
+                result['vix_rating'] = vix_ts[-1].get('rating', '').replace('_', ' ').title()
+            else:
+                result['vix'] = 0.0
+                result['vix_rating'] = ''
+        else:
+            result['vix'] = 0.0
+            result['vix_rating'] = ''
+        _cache['__cnn_fng__'] = (now, result)
+        return result
+    except Exception as e:
+        print(f"[SENTIMENT] CNN Fear & Greed error: {e}")
+        return None
+
+
 # --- Finnhub news ---
 
 def get_news_sentiment(symbol, asset_type='crypto'):
@@ -631,9 +766,12 @@ def get_news_sentiment(symbol, asset_type='crypto'):
     """
     now = time.time()
     cache_key = f'news_{symbol}'
+    # Per-symbol jitter: spread cache expiries across 2 minutes to avoid
+    # all symbols hitting the LLM simultaneously when caches expire together
+    symbol_ttl = CACHE_TTL + (hash(cache_key) % 120)
     if cache_key in _cache:
         ts, result = _cache[cache_key]
-        if now - ts < CACHE_TTL:
+        if now - ts < symbol_ttl:
             return result
 
     client = _get_finnhub()
@@ -664,8 +802,12 @@ def get_news_sentiment(symbol, asset_type='crypto'):
             )
             relevant = articles[:30]
 
-        result = _score_articles(relevant)
+        result, used_llm = _score_articles(relevant)
         _cache[cache_key] = (now, result)
+        if not used_llm:
+            _llm_retry_queue.append((cache_key, relevant, now))
+        else:
+            _try_llm_retry()
         return result
 
     except Exception as e:
@@ -690,8 +832,12 @@ def get_market_sentiment():
 
     try:
         articles = client.general_news('general', min_id=0)
-        result = _score_articles(articles[:30])
+        result, used_llm = _score_articles(articles[:30])
         _cache['__market__'] = (now, result)
+        if not used_llm:
+            _llm_retry_queue.append(('__market__', articles[:30], now))
+        else:
+            _try_llm_retry()
         return result
     except Exception as e:
         print(f"[SENTIMENT] Market sentiment error: {e}")

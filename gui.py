@@ -132,6 +132,7 @@ def _save_news_cache(articles, fng):
                 '_category': a.get('_category', ''),
                 '_symbol': a.get('_symbol', ''),
                 '_sentiment': a.get('_sentiment', 0.0),
+                '_sent_method': a.get('_sent_method', ''),
             })
         with open(NEWS_CACHE_FILE, 'w') as f:
             json.dump({
@@ -804,7 +805,7 @@ class DataFetcher(QObject):
     def fetch_news(self):
         """Fetch news headlines from Finnhub and Fear & Greed Index."""
         try:
-            from sentiment import get_fear_greed, _get_finnhub, score_article_batch
+            from sentiment import get_fear_greed, get_cnn_fear_greed, _get_finnhub, score_article_batch, try_llm_upgrade
             from crypto_loop import CRYPTO_SYMBOLS
             import datetime as _dt
 
@@ -813,6 +814,7 @@ class DataFetcher(QObject):
 
             articles = []
             fng = get_fear_greed()
+            cnn_fng = get_cnn_fear_greed()
 
             client = _get_finnhub()
             if client is not None:
@@ -872,22 +874,23 @@ class DataFetcher(QObject):
                 for ca in cache['articles']:
                     key = ca.get('headline', '').strip().lower()
                     if key and '_sentiment' in ca:
-                        cached_scores[key] = ca['_sentiment']
+                        cached_scores[key] = (ca['_sentiment'], ca.get('_sent_method', ''))
 
             # Split articles into already-scored (from cache) and new
             need_scoring = []
             for a in articles:
                 key = a.get('headline', '').strip().lower()
                 if key in cached_scores:
-                    a['_sentiment'] = cached_scores[key]
+                    a['_sentiment'], a['_sent_method'] = cached_scores[key]
                 else:
                     need_scoring.append(a)
 
             # Only score genuinely new articles
             if need_scoring:
-                scores = score_article_batch(need_scoring)
+                scores, method = score_article_batch(need_scoring)
                 for a, score in zip(need_scoring, scores):
                     a['_sentiment'] = score
+                    a['_sent_method'] = method
 
             # Sort by datetime descending
             articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
@@ -903,14 +906,36 @@ class DataFetcher(QObject):
                         seen.add(key)
                 articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
 
+            # Try to upgrade any KW-scored articles to LLM
+            kw_articles = [a for a in articles if a.get('_sent_method', '') != 'LLM']
+            if kw_articles:
+                llm_scores = try_llm_upgrade(kw_articles)
+                if llm_scores is not None:
+                    for a, score in zip(kw_articles, llm_scores):
+                        a['_sentiment'] = score
+                        a['_sent_method'] = 'LLM'
+
             # Save merged articles to cache
             _save_news_cache(articles, fng)
+
+            # Compute 24h / 7d aggregate sentiment from cached articles
+            now_ts = _dt.datetime.now().timestamp()
+            sent_24h = [a['_sentiment'] for a in articles
+                        if '_sentiment' in a and now_ts - a.get('datetime', 0) <= 86400]
+            sent_7d = [a['_sentiment'] for a in articles
+                       if '_sentiment' in a and now_ts - a.get('datetime', 0) <= 7 * 86400]
+            avg_24h = sum(sent_24h) / len(sent_24h) if sent_24h else None
+            avg_7d = sum(sent_7d) / len(sent_7d) if sent_7d else None
 
             self.news_updated.emit({
                 'articles': articles,
                 'fng': fng,
+                'cnn_fng': cnn_fng,
+                'sent_24h': avg_24h,
+                'sent_7d': avg_7d,
             })
         except Exception as e:
+            import traceback; traceback.print_exc()
             self.error_occurred.emit(f"News fetch: {e}")
 
     @Slot(str, str)
@@ -1789,16 +1814,33 @@ class TradingDashboard(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        # Fear & Greed header
-        fng_layout = QHBoxLayout()
-        self._news_fng_label = QLabel("Crypto Fear & Greed Index: —")
-        self._news_fng_label.setStyleSheet("font-size: 16px; font-weight: bold;")
-        fng_layout.addWidget(self._news_fng_label)
-        fng_layout.addStretch()
+        # Multi-indicator header row
+        indicator_layout = QHBoxLayout()
+        indicator_style = "font-size: 13px; font-weight: bold;"
+        self._news_crypto_fng = QLabel("Crypto FnG: —")
+        self._news_crypto_fng.setStyleSheet(indicator_style)
+        indicator_layout.addWidget(self._news_crypto_fng)
+        indicator_layout.addWidget(QLabel(" | "))
+        self._news_stock_fng = QLabel("Stock FnG: —")
+        self._news_stock_fng.setStyleSheet(indicator_style)
+        indicator_layout.addWidget(self._news_stock_fng)
+        indicator_layout.addWidget(QLabel(" | "))
+        self._news_vix = QLabel("VIX: —")
+        self._news_vix.setStyleSheet(indicator_style)
+        indicator_layout.addWidget(self._news_vix)
+        indicator_layout.addWidget(QLabel(" | "))
+        self._news_sent_24h = QLabel("24h Sent: —")
+        self._news_sent_24h.setStyleSheet(indicator_style)
+        indicator_layout.addWidget(self._news_sent_24h)
+        indicator_layout.addWidget(QLabel(" | "))
+        self._news_sent_7d = QLabel("7d Sent: —")
+        self._news_sent_7d.setStyleSheet(indicator_style)
+        indicator_layout.addWidget(self._news_sent_7d)
+        indicator_layout.addStretch()
         self._news_refresh_label = QLabel("")
         self._news_refresh_label.setStyleSheet("font-size: 11px;")
-        fng_layout.addWidget(self._news_refresh_label)
-        layout.addLayout(fng_layout)
+        indicator_layout.addWidget(self._news_refresh_label)
+        layout.addLayout(indicator_layout)
 
         # Filter combo
         filter_layout = QHBoxLayout()
@@ -2843,21 +2885,56 @@ class TradingDashboard(QMainWindow):
         import datetime as _dt
         articles = data.get('articles', [])
         fng = data.get('fng')
+        cnn_fng = data.get('cnn_fng')
+        sent_24h = data.get('sent_24h')
+        sent_7d = data.get('sent_7d')
 
-        # Update Fear & Greed
+        def _fng_color(val):
+            if val <= 25:
+                return T['red'].name()
+            elif val >= 75:
+                return T['green'].name()
+            return T.get('yellow', T['white']).name()
+
+        def _sent_color(val):
+            if val > 0.05:
+                return T['green'].name()
+            elif val < -0.05:
+                return T['red'].name()
+            return T.get('yellow', T['white']).name()
+
+        # Crypto Fear & Greed
         if fng is not None:
             val = fng['value']
-            label = fng['label']
-            if val <= 25:
-                color = T['red'].name()
-            elif val >= 75:
-                color = T['green'].name()
+            c = _fng_color(val)
+            self._news_crypto_fng.setText(
+                f"Crypto FnG: <span style='color:{c};'>{val} ({fng['label']})</span>")
+
+        # CNN Stock Fear & Greed + VIX
+        if cnn_fng is not None:
+            sv = cnn_fng['score']
+            sc = _fng_color(sv)
+            self._news_stock_fng.setText(
+                f"Stock FnG: <span style='color:{sc};'>{sv:.0f} ({cnn_fng['rating']})</span>")
+            vix = cnn_fng.get('vix', 0)
+            if vix > 25:
+                vc = T['red'].name()
+            elif vix < 15:
+                vc = T['green'].name()
             else:
-                color = T.get('yellow', T['white']).name()
-            self._news_fng_label.setText(
-                f"Crypto Fear & Greed Index: "
-                f"<span style='color:{color}; font-size:20px;'>{val}</span> "
-                f"<span style='color:{color};'>({label})</span>")
+                vc = T.get('yellow', T['white']).name()
+            self._news_vix.setText(
+                f"VIX: <span style='color:{vc};'>{vix:.1f}</span>")
+
+        # 24h / 7d aggregate sentiment
+        if sent_24h is not None:
+            c24 = _sent_color(sent_24h)
+            self._news_sent_24h.setText(
+                f"24h Sent: <span style='color:{c24};'>{sent_24h:+.2f}</span>")
+        if sent_7d is not None:
+            c7 = _sent_color(sent_7d)
+            self._news_sent_7d.setText(
+                f"7d Sent: <span style='color:{c7};'>{sent_7d:+.2f}</span>")
 
         now = _dt.datetime.now(TZ_CENTRAL).strftime("%I:%M %p")
         self._news_refresh_label.setText(f"Updated {now}")
@@ -2915,6 +2992,7 @@ class TradingDashboard(QMainWindow):
             headline = a.get('headline', '—')
             summary = a.get('summary', '')
             sentiment = a.get('_sentiment', 0.0)
+            sent_method = a.get('_sent_method', '')
 
             if sentiment > 0.1:
                 sent_color = T['green']
@@ -2925,6 +3003,8 @@ class TradingDashboard(QMainWindow):
             else:
                 sent_color = T.get('yellow', T['white'])
                 sent_text = f"{sentiment:.2f}"
+            if sent_method:
+                sent_text = f"{sent_text} ({sent_method})"
 
             # Tooltip: show summary on hover for every cell in the row
             tooltip = summary if summary else ''
