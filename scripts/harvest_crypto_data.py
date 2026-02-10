@@ -4,16 +4,18 @@ Computes technical features (indicators.compute_features), labels each bar with
 the next-bar return, and saves the combined dataset to training_data.csv for use
 by hypersearch_dual.py.
 """
+import sys; from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yfinance as yf
 import pandas as pd
 from indicators import compute_features
 from market_data import flatten_yfinance_columns
 
-# Crypto-only tickers matching crypto_loop.py (BCH not UNI)
+# Top 6 cryptos by market cap, matching crypto_loop.py
 CRYPTO_TICKERS = [
     'BTC-USD', 'ETH-USD', 'XRP-USD', 'SOL-USD', 'DOGE-USD',
-    'LINK-USD', 'AVAX-USD', 'DOT-USD', 'LTC-USD', 'BCH-USD',
+    'LINK-USD',
 ]
 
 BENCHMARK = 'BTC-USD'

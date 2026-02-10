@@ -7,6 +7,9 @@ Usage:
 
 Each mode runs 250 trials and saves to {target}_model.pth / {target}_config.pkl.
 """
+import sys; from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import pandas as pd
 import numpy as np
@@ -14,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from model import CryptoLSTM
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import RobustScaler
 import joblib
 import gc
 import json
@@ -23,7 +26,7 @@ import time
 import optuna
 from optuna.pruners import MedianPruner
 
-NUM_TRIALS = 500
+NUM_TRIALS = 300
 MAX_EPOCHS = 80
 EARLY_STOP_PATIENCE = 15
 PRUNE_WARMUP_EPOCHS = 20       # don't prune until model has had time to learn
@@ -73,7 +76,7 @@ def load_data(data_path='training_data.csv', preset_override=None):
         feature_cols = [c for c in feature_cols if c in preset_features]
     print(f"Preset: {preset_name} ({len(feature_cols)} features)")
 
-    scaler_X = MinMaxScaler()
+    scaler_X = RobustScaler()
     scaler_X.fit(df[feature_cols].values)
 
     tickers = df['Ticker'].unique()
@@ -108,13 +111,18 @@ def get_indices_and_classes(all_returns, tickers, ticker_boundaries, bull_thresh
     classes[all_returns > bull_thresh] = 2
     classes[all_returns < bear_thresh] = 0
 
-    valid_indices = []
+    train_indices = []
+    val_indices = []
     for ticker in tickers:
         start, end = ticker_boundaries[ticker]
-        for i in range(start + seq_len, end):
-            valid_indices.append(i)
+        ticker_valid = list(range(start + seq_len, end))
+        split = int(len(ticker_valid) * TRAIN_RATIO)
+        train_indices.extend(ticker_valid[:split])
+        # Embargo gap: skip seq_len bars to prevent sequence overlap leakage
+        val_start = min(split + seq_len, len(ticker_valid))
+        val_indices.extend(ticker_valid[val_start:])
 
-    return valid_indices, classes
+    return train_indices, val_indices, classes
 
 
 def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache, fixed_threshold=None):
@@ -178,12 +186,8 @@ def create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries
         weight_decay = cfg['weight_decay']
         scheduler = cfg['scheduler']
 
-        valid_indices, classes = get_indices_and_classes(
+        train_idx, val_idx, classes = get_indices_and_classes(
             all_returns, tickers, ticker_boundaries, bull_threshold, seq_len)
-
-        split = int(len(valid_indices) * TRAIN_RATIO)
-        train_idx = valid_indices[:split]
-        val_idx = valid_indices[split:]
 
         train_classes = classes[train_idx]
         unique = np.unique(train_classes)
@@ -473,7 +477,10 @@ def main():
                 best_state_holder['val_acc'] = t.user_attrs.get('val_acc', 0)
                 best_state_holder['per_class'] = t.user_attrs.get('per_class', {})
         if best_state_holder['score'] > 0:
-            print(f"Prior best score={best_state_holder['score']:.3f} — new trials must beat this")
+            pc = best_state_holder['per_class']
+            print(f"Prior best score={best_state_holder['score']:.3f} "
+                  f"B:{pc.get('bear',0):.0%} N:{pc.get('neutral',0):.0%} U:{pc.get('bull',0):.0%} "
+                  f"— new trials must beat this")
 
     objective_fn = create_objective(target, all_scaled, all_returns, tickers, ticker_boundaries, input_dim, _state_cache, fixed_threshold=args.fixed_threshold)
     study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback],

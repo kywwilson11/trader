@@ -5,6 +5,8 @@ Run standalone to check:
   - Account equity and PDT status
   - Whether the account is in unlimited (>$25k) or conservative mode
 """
+import sys; from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import alpaca_trade_api as tradeapi
 import os

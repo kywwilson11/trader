@@ -88,6 +88,7 @@ def run_phase(phase, log_fh, status):
     status['phase_idx'] = phase_idx
     status['phase_started_at'] = datetime.datetime.now().isoformat()
     status['trial_current'] = 0
+    status['trial_prior'] = 0
     status['best_score'] = status.get('best_score', 0.0) if 'search' not in phase_id else 0.0
     status['best_per_class'] = {} if 'search' in phase_id else status.get('best_per_class', {})
 
@@ -124,11 +125,33 @@ def run_phase(phase, log_fh, status):
         sys.stdout.write(line)
         sys.stdout.flush()
 
+        # Parse prior trials: "Resuming from 119 prior trials in bear_study.db"
+        # Store prior offset so we can show new-trial progress (not absolute)
+        m = re.match(r'Resuming from (\d+) prior trials', line)
+        if m:
+            status['trial_prior'] = int(m.group(1))
+            write_status(status, force=True)
+
+        # Parse prior best: "Prior best score=0.396 B:61% N:54% U:56% — ..."
+        m = re.match(r'Prior best score=(\d+\.\d+)', line)
+        if m:
+            status['best_score'] = float(m.group(1))
+            mc = re.search(r'B:(\d+)% N:(\d+)% U:(\d+)%', line)
+            if mc:
+                status['best_per_class'] = {
+                    'bear': int(mc.group(1)) / 100,
+                    'neutral': int(mc.group(2)) / 100,
+                    'bull': int(mc.group(3)) / 100,
+                }
+            write_status(status, force=True)
+
         # Parse trial progress: "[  45] score=0.543 ..."
+        # Subtract prior trials so GUI shows new-run progress (e.g. 50/300 not 178/428)
         force = False
         m = re.match(r'\[\s*(\d+)\]', line)
         if m:
-            status['trial_current'] = int(m.group(1))
+            absolute = int(m.group(1))
+            status['trial_current'] = absolute - status.get('trial_prior', 0)
             force = True
 
         # Parse best score on "** BEST **" lines
@@ -233,13 +256,13 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
                 phases.append({
                     'id': 'crypto_harvest',
                     'label': 'Harvesting Crypto Data',
-                    'cmd': [PYTHON, '-u', 'harvest_crypto_data.py'],
+                    'cmd': [PYTHON, '-u', os.path.join('scripts', 'harvest_crypto_data.py')],
                 })
         else:
             phases.append({
                 'id': 'crypto_harvest',
                 'label': 'Harvesting Crypto Data',
-                'cmd': [PYTHON, '-u', 'harvest_crypto_data.py'],
+                'cmd': [PYTHON, '-u', os.path.join('scripts', 'harvest_crypto_data.py')],
             })
 
     if train_stock:
@@ -252,13 +275,13 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
                 phases.append({
                     'id': 'stock_harvest',
                     'label': 'Harvesting Stock Data',
-                    'cmd': [PYTHON, '-u', 'harvest_stock_data.py'],
+                    'cmd': [PYTHON, '-u', os.path.join('scripts', 'harvest_stock_data.py')],
                 })
         else:
             phases.append({
                 'id': 'stock_harvest',
                 'label': 'Harvesting Stock Data',
-                'cmd': [PYTHON, '-u', 'harvest_stock_data.py'],
+                'cmd': [PYTHON, '-u', os.path.join('scripts', 'harvest_stock_data.py')],
             })
 
     return phases
@@ -289,7 +312,7 @@ def _build_training_phases(trials, train_crypto, train_stock):
         phases.append({
             'id': 'bear_search',
             'label': 'Training Crypto Bear Model',
-            'cmd': [PYTHON, '-u', 'hypersearch_dual.py',
+            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
                     '--target', 'bear', '--trials', str(trials),
                     '--preset', preset],
             'trials': trials,
@@ -297,7 +320,7 @@ def _build_training_phases(trials, train_crypto, train_stock):
         phases.append({
             'id': 'bull_search',
             'label': 'Training Crypto Bull Model',
-            'cmd': [PYTHON, '-u', 'hypersearch_dual.py',
+            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
                     '--target', 'bull', '--trials', str(trials),
                     '--preset', preset],
             'trials': trials,
@@ -307,7 +330,7 @@ def _build_training_phases(trials, train_crypto, train_stock):
         phases.append({
             'id': 'stock_bear_search',
             'label': 'Training Stock Bear Model',
-            'cmd': [PYTHON, '-u', 'hypersearch_dual.py',
+            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
                     '--target', 'bear', '--trials', str(trials),
                     '--data', 'stock_training_data.csv', '--prefix', 'stock',
                     '--preset', preset],
@@ -316,7 +339,7 @@ def _build_training_phases(trials, train_crypto, train_stock):
         phases.append({
             'id': 'stock_bull_search',
             'label': 'Training Stock Bull Model',
-            'cmd': [PYTHON, '-u', 'hypersearch_dual.py',
+            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
                     '--target', 'bull', '--trials', str(trials),
                     '--data', 'stock_training_data.csv', '--prefix', 'stock',
                     '--preset', preset],
@@ -378,8 +401,8 @@ def _run_training(phases, log_fh, status, is_retrain):
 
 def main():
     parser = argparse.ArgumentParser(description='Trading pipeline orchestrator')
-    parser.add_argument('--trials', type=int, default=500,
-                        help='Trials per model on first run (default: 500)')
+    parser.add_argument('--trials', type=int, default=300,
+                        help='Trials per model on first run (default: 300)')
     parser.add_argument('--bot-only', action='store_true',
                         help='Skip training, start bots immediately')
     parser.add_argument('--skip-harvest', action='store_true',

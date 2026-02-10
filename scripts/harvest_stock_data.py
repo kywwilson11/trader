@@ -5,6 +5,8 @@ including SPY relative strength, labels each bar with the next-bar return, and
 saves the combined dataset to stock_training_data.csv for use by
 hypersearch_dual.py --prefix stock.
 """
+import sys; from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yfinance as yf
 import pandas as pd

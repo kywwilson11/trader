@@ -16,6 +16,9 @@ Usage:
     python evolve.py --dry-run    # One cycle, no actual training
     python evolve.py --once       # One full cycle then exit
 """
+import sys; from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import json
 import os
@@ -35,6 +38,8 @@ from torch.utils.data import DataLoader
 
 from model import CryptoLSTM
 from hw_monitor import wait_for_cool_gpu, get_gpu_temp, get_ram_usage
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODELS_DIR = 'models'
 SCORES_FILE = os.path.join(MODELS_DIR, 'scores.json')
@@ -99,7 +104,7 @@ def harvest_data(script='harvest_crypto_data.py'):
     """Run a harvest script to get fresh training data."""
     print(f"\n[EVOLVE] Harvesting fresh data ({script})...")
     result = subprocess.run(
-        [sys.executable, '-u', script],
+        [sys.executable, '-u', os.path.join(_SCRIPT_DIR, script)],
         capture_output=False,
     )
     if result.returncode != 0:
@@ -112,7 +117,7 @@ def run_hypersearch(target, trials, prefix='', data_csv='training_data.csv'):
     """Run hypersearch_dual.py for a target (bear/bull) with optional prefix."""
     label = f"{prefix + ' ' if prefix else ''}{target}"
     print(f"\n[EVOLVE] Running {label} hypersearch ({trials} trials)...")
-    cmd = [sys.executable, '-u', 'hypersearch_dual.py',
+    cmd = [sys.executable, '-u', os.path.join(_SCRIPT_DIR, 'hypersearch_dual.py'),
            '--target', target, '--trials', str(trials),
            '--data', data_csv]
     if prefix:

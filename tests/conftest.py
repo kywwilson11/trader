@@ -8,8 +8,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-# Ensure the project root is on sys.path so imports work
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Ensure the project root and scripts/ are on sys.path so imports work
+_ROOT = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, str(Path(_ROOT) / 'scripts'))
 
 
 @pytest.fixture
