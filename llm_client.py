@@ -166,9 +166,27 @@ def _try_gemini_free(config, prompt, system, max_tokens, timeout, skip_model=Non
         if result:
             print(f"[LLM] fallback gemini/{_GEMINI_FREE_MODEL}: {elapsed:.0f}ms, {len(result)} chars")
         return result
+    except urllib.error.HTTPError as e:
+        elapsed = (time.time() - start) * 1000
+        if e.code == 429:
+            wait = _parse_retry_after(e)
+            if wait and wait <= _429_MAX_WAIT:
+                print(f"[LLM] fallback gemini/{_GEMINI_FREE_MODEL}: 429, waiting {wait:.0f}s")
+                time.sleep(wait)
+                try:
+                    start2 = time.time()
+                    result = _call_gemini(prompt, system, gemini_key, _GEMINI_FREE_MODEL, max_tokens, timeout)
+                    elapsed2 = (time.time() - start2) * 1000
+                    if result:
+                        print(f"[LLM] fallback gemini/{_GEMINI_FREE_MODEL}: {elapsed2:.0f}ms, {len(result)} chars (after retry)")
+                    return result
+                except Exception:
+                    pass
+        print(f"[LLM] Gemini free-tier fallback failed: HTTP {e.code} ({elapsed:.0f}ms)")
+        return None
     except Exception as e:
         elapsed = (time.time() - start) * 1000
-        print(f"[LLM] Gemini free-tier fallback also failed: {e} ({elapsed:.0f}ms)")
+        print(f"[LLM] Gemini free-tier fallback failed: {e} ({elapsed:.0f}ms)")
         return None
 
 

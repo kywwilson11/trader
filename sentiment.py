@@ -517,14 +517,20 @@ def _llm_score_batch(articles):
     print(f"[SENTIMENT] Fetched {fetched}/{n} article bodies for LLM")
 
     # Score in chunks for reliable JSON output
+    # Pace between chunks to avoid blowing through per-minute API quotas
     all_scores = []
-    for start in range(0, n, _LLM_CHUNK_SIZE):
+    n_chunks = (n + _LLM_CHUNK_SIZE - 1) // _LLM_CHUNK_SIZE
+    for chunk_i, start in enumerate(range(0, n, _LLM_CHUNK_SIZE)):
+        if chunk_i > 0:
+            time.sleep(8)  # ~7 RPM pace — fits within Gemini free-tier limits
         end = min(start + _LLM_CHUNK_SIZE, n)
         chunk_scores = _llm_score_chunk(articles[start:end], full_texts[start:end])
         if chunk_scores is None:
             # Any chunk failure → abort entire batch
             return None
         all_scores.extend(chunk_scores)
+        if n_chunks > 1:
+            print(f"[SENTIMENT] LLM chunk {chunk_i+1}/{n_chunks} scored")
 
     return all_scores
 
