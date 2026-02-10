@@ -77,7 +77,7 @@ def _get_db():
     db = getattr(_db_local, 'conn', None)
     if db is not None:
         return db
-    db = sqlite3.connect(_DB_PATH, timeout=10)
+    db = sqlite3.connect(_DB_PATH, timeout=60)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     # Schema creation needs exclusive lock — retry if another process holds it

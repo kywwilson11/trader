@@ -38,7 +38,7 @@ def _get_alpaca_api():
     try:
         import alpaca_trade_api as tradeapi
         # Increase SDK internal retry backoff (default 3s is too aggressive)
-        os.environ.setdefault('APCA_RETRY_WAIT', '5')
+        os.environ.setdefault('APCA_RETRY_WAIT', '10')
         os.environ.setdefault('APCA_RETRY_MAX', '5')
         key = os.getenv('ALPACA_API_KEY')
         secret = os.getenv('ALPACA_API_SECRET')
