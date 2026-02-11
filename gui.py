@@ -936,6 +936,8 @@ class DataFetcher(QObject):
                     if now_ts - a.get('datetime', 0) > secs:
                         continue
                     s = a['_sentiment']
+                    if s is None:
+                        continue
                     cat = a.get('_category', '')
                     all_s.append(s)
                     if cat in ('Crypto', 'Market'):
@@ -2743,9 +2745,11 @@ class TradingDashboard(QMainWindow):
             from sentiment import get_fear_greed
             fng = get_fear_greed()
             if fng is not None:
-                val = fng['value']
-                label = fng['label']
-                if val <= 25:
+                val = fng.get('value')
+                label = fng.get('label', '')
+                if val is None:
+                    pass
+                elif val <= 25:
                     color = T['red'].name()
                 elif val <= 45:
                     color = T.get('yellow', T['white']).name()
@@ -2974,19 +2978,23 @@ class TradingDashboard(QMainWindow):
 
         # Crypto row: FnG + 24h + 7d
         if fng is not None:
-            val = fng['value']
-            c = _fng_color(val)
-            self._news_crypto_fng.setText(
-                f"FnG: <span style='color:{c};'>{val} ({fng['label']})</span>")
+            val = fng.get('value')
+            label = fng.get('label', '')
+            if val is not None:
+                c = _fng_color(val)
+                self._news_crypto_fng.setText(
+                    f"FnG: <span style='color:{c};'>{val} ({label})</span>")
         _update_sent(self._news_crypto_24h, "24h", data.get('crypto_24h'))
         _update_sent(self._news_crypto_7d, "7d", data.get('crypto_7d'))
 
         # Stock row: FnG + VIX + 24h + 7d
         if cnn_fng is not None:
-            sv = cnn_fng['score']
-            sc = _fng_color(sv)
-            self._news_stock_fng.setText(
-                f"FnG: <span style='color:{sc};'>{sv:.0f} ({cnn_fng['rating']})</span>")
+            sv = cnn_fng.get('score')
+            rating = cnn_fng.get('rating', '')
+            if sv is not None:
+                sc = _fng_color(sv)
+                self._news_stock_fng.setText(
+                    f"FnG: <span style='color:{sc};'>{sv:.0f} ({rating})</span>")
             vix = cnn_fng.get('vix', 0)
             if vix > 25:
                 vc = T['red'].name()
@@ -3064,7 +3072,7 @@ class TradingDashboard(QMainWindow):
             category = a.get('_category', '—')
             headline = a.get('headline', '—')
             summary = a.get('summary', '')
-            sentiment = a.get('_sentiment', 0.0)
+            sentiment = a.get('_sentiment') or 0.0
             sent_method = a.get('_sent_method', '')
 
             if sentiment > 0.1:
@@ -3307,8 +3315,12 @@ class TradingDashboard(QMainWindow):
         if bots_running and phase != "trading":
             status_text += " + BOTS"
 
+        model_ver = pinfo.get("model_version", 1)
+        ver_label = "v2 regression" if model_ver == 2 else "v1 classification"
+
         self._pipeline_status.setText(
-            f"Status: <span style='color:{status_color}'>{status_text}</span>")
+            f"Status: <span style='color:{status_color}'>{status_text}</span>"
+            f"  [{ver_label}]")
 
         self._pipeline_phase.setText(f"Phase: {phase_label}")
 
@@ -3362,11 +3374,19 @@ class TradingDashboard(QMainWindow):
             self._pipeline_elapsed.setText("Elapsed: \u2014")
 
         # Show final scores from completed phases
+        scores_parts = []
+        # v2 regression scores
+        crypto_v2 = pinfo.get("crypto_v2_final_score")
+        stock_v2 = pinfo.get("stock_v2_final_score")
+        if crypto_v2 is not None:
+            scores_parts.append(f"Crypto: {crypto_v2:.4f}")
+        if stock_v2 is not None:
+            scores_parts.append(f"Stock: {stock_v2:.4f}")
+        # v1 classification scores
         bear_final = pinfo.get("bear_final_score")
         bull_final = pinfo.get("bull_final_score")
         stock_bear_final = pinfo.get("stock_bear_final_score")
         stock_bull_final = pinfo.get("stock_bull_final_score")
-        scores_parts = []
         if bear_final is not None:
             scores_parts.append(f"C-Bear: {bear_final:.4f}")
         if bull_final is not None:

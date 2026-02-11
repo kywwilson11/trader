@@ -132,8 +132,8 @@ def run_phase(phase, log_fh, status):
             status['trial_prior'] = int(m.group(1))
             write_status(status, force=True)
 
-        # Parse prior best: "Prior best score=0.396 B:61% N:54% U:56% — ..."
-        m = re.match(r'Prior best score=(\d+\.\d+)', line)
+        # Parse prior best: "Prior best score=0.396 ..." or "Prior best sharpe=0.396 ..."
+        m = re.match(r'Prior best (?:score|sharpe)=(-?\d+\.\d+)', line)
         if m:
             status['best_score'] = float(m.group(1))
             mc = re.search(r'B:(\d+)% N:(\d+)% U:(\d+)%', line)
@@ -156,7 +156,8 @@ def run_phase(phase, log_fh, status):
 
         # Parse best score on "** BEST **" lines
         if '** BEST **' in line:
-            m = re.search(r'score=(\d+\.\d+)', line)
+            # v1: "score=0.543" or v2: "sharpe=1.234"
+            m = re.search(r'(?:score|sharpe)=(-?\d+\.\d+)', line)
             if m:
                 status['best_score'] = float(m.group(1))
             m = re.search(r'F1=(\d+\.\d+)', line)
@@ -302,49 +303,71 @@ def _read_bear_threshold(prefix=''):
         return None
 
 
-def _build_training_phases(trials, train_crypto, train_stock):
+def _build_training_phases(trials, train_crypto, train_stock, use_v2=False):
     """Build model training phases."""
     from indicator_config import get_preset_name
     preset = get_preset_name()
     phases = []
 
-    if train_crypto:
-        phases.append({
-            'id': 'bear_search',
-            'label': 'Training Crypto Bear Model',
-            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
-                    '--target', 'bear', '--trials', str(trials),
-                    '--preset', preset],
-            'trials': trials,
-        })
-        phases.append({
-            'id': 'bull_search',
-            'label': 'Training Crypto Bull Model',
-            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
-                    '--target', 'bull', '--trials', str(trials),
-                    '--preset', preset],
-            'trials': trials,
-        })
+    if use_v2:
+        # v2 regression: single model per asset type
+        if train_crypto:
+            phases.append({
+                'id': 'crypto_v2_search',
+                'label': 'Training Crypto v2 Regression Model',
+                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
+                        '--trials', str(trials), '--preset', 'stationary'],
+                'trials': trials,
+            })
+        if train_stock:
+            phases.append({
+                'id': 'stock_v2_search',
+                'label': 'Training Stock v2 Regression Model',
+                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
+                        '--trials', str(trials),
+                        '--data', 'stock_training_data.csv', '--prefix', 'stock',
+                        '--preset', 'stationary', '--max-rows', '350000'],
+                'trials': trials,
+            })
+    else:
+        # v1 classification: dual bear/bull models
+        if train_crypto:
+            phases.append({
+                'id': 'bear_search',
+                'label': 'Training Crypto Bear Model',
+                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
+                        '--target', 'bear', '--trials', str(trials),
+                        '--preset', preset],
+                'trials': trials,
+            })
+            phases.append({
+                'id': 'bull_search',
+                'label': 'Training Crypto Bull Model',
+                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
+                        '--target', 'bull', '--trials', str(trials),
+                        '--preset', preset],
+                'trials': trials,
+            })
 
-    if train_stock:
-        phases.append({
-            'id': 'stock_bear_search',
-            'label': 'Training Stock Bear Model',
-            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
-                    '--target', 'bear', '--trials', str(trials),
-                    '--data', 'stock_training_data.csv', '--prefix', 'stock',
-                    '--preset', preset, '--max-rows', '350000'],
-            'trials': trials,
-        })
-        phases.append({
-            'id': 'stock_bull_search',
-            'label': 'Training Stock Bull Model',
-            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
-                    '--target', 'bull', '--trials', str(trials),
-                    '--data', 'stock_training_data.csv', '--prefix', 'stock',
-                    '--preset', preset, '--max-rows', '350000'],
-            'trials': trials,
-        })
+        if train_stock:
+            phases.append({
+                'id': 'stock_bear_search',
+                'label': 'Training Stock Bear Model',
+                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
+                        '--target', 'bear', '--trials', str(trials),
+                        '--data', 'stock_training_data.csv', '--prefix', 'stock',
+                        '--preset', preset, '--max-rows', '350000'],
+                'trials': trials,
+            })
+            phases.append({
+                'id': 'stock_bull_search',
+                'label': 'Training Stock Bull Model',
+                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
+                        '--target', 'bull', '--trials', str(trials),
+                        '--data', 'stock_training_data.csv', '--prefix', 'stock',
+                        '--preset', preset, '--max-rows', '350000'],
+                'trials': trials,
+            })
 
     return phases
 
@@ -374,6 +397,10 @@ def _run_training(phases, log_fh, status, is_retrain):
             status['stock_bear_final_score'] = status.get('best_score', 0)
         elif phase['id'] == 'stock_bull_search':
             status['stock_bull_final_score'] = status.get('best_score', 0)
+        elif phase['id'] == 'crypto_v2_search':
+            status['crypto_v2_final_score'] = status.get('best_score', 0)
+        elif phase['id'] == 'stock_v2_search':
+            status['stock_v2_final_score'] = status.get('best_score', 0)
 
         if rc != 0:
             if is_retrain:
@@ -419,12 +446,22 @@ def main():
                         help='Hour to start retrain (0-23, default: 2)')
     parser.add_argument('--retrain-trials', type=int, default=100,
                         help='Trials per model for weekly retrain (default: 100)')
+    parser.add_argument('--v2', action='store_true', default=True,
+                        help='Use v2 regression training (default: True)')
+    parser.add_argument('--v1', action='store_true',
+                        help='Use v1 classification training (overrides --v2)')
     args = parser.parse_args()
+
+    # --v1 explicitly overrides the default v2
+    if args.v1:
+        args.v2 = False
 
     train_crypto = not args.stock_only
     train_stock = not args.crypto_only
     run_crypto = not args.stock_only
     run_stock = not args.crypto_only
+
+    use_v2 = args.v2
 
     status = {
         'started_at': datetime.datetime.now().isoformat(),
@@ -442,6 +479,7 @@ def main():
         'stock_bull_final_score': None,
         'retrain_cycle': 0,
         'bots_running': False,
+        'model_version': 2 if use_v2 else 1,
     }
 
     with open(LOG_FILE, 'a') as log_fh:
@@ -451,7 +489,7 @@ def main():
         # =============================================================
         if not args.bot_only:
             phases = (_build_harvest_phases(args.skip_harvest, train_crypto, train_stock)
-                      + _build_training_phases(args.trials, train_crypto, train_stock))
+                      + _build_training_phases(args.trials, train_crypto, train_stock, use_v2=use_v2))
             for i, p in enumerate(phases):
                 p['idx'] = i
 
@@ -589,7 +627,7 @@ def main():
 
             retrain_phases = (
                 _build_harvest_phases(False, train_crypto, train_stock)
-                + _build_training_phases(args.retrain_trials, train_crypto, train_stock)
+                + _build_training_phases(args.retrain_trials, train_crypto, train_stock, use_v2=use_v2)
             )
             for i, p in enumerate(retrain_phases):
                 p['idx'] = i
