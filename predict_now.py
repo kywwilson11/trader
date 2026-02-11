@@ -1,8 +1,12 @@
 """ML prediction engine — model loading, dual bear/bull inference, live predictions.
 
-Loads CryptoLSTM models (bear + bull) from disk, optionally JIT-traces them
-for faster inference, and provides get_live_prediction() which fetches recent
-bars, computes features, and returns a predicted-return score.
+Supports two model versions:
+  v1: Dual CryptoLSTM classifiers (bear + bull) with softmax → score → predicted_return
+  v2: Single RegressionLSTM that directly outputs predicted return percentage
+
+Loads models from disk, optionally JIT-traces them for faster inference,
+and provides get_live_prediction() which fetches recent bars, computes features,
+and returns a predicted-return score.
 
 Bar-fetching and ATR logic live in market_data.py.
 """
@@ -13,6 +17,7 @@ import joblib
 import os
 import torch
 from model import CryptoLSTM
+from model_v2 import RegressionLSTM
 from indicators import compute_features, compute_stock_features
 from market_data import (
     fetch_bars_alpaca, fetch_bars_yfinance,
@@ -45,6 +50,11 @@ def _prefixed_paths(prefix):
         'feature_cols': f'{p}feature_cols.pkl',
         'default_model': MODEL_PATH,
         'default_config': MODEL_CONFIG_PATH,
+        # v2 regression model paths
+        'v2_model': f'{p}model_v2.pth',
+        'v2_config': f'{p}config_v2.pkl',
+        'v2_scaler': f'{p}scaler_v2.pkl',
+        'v2_features': f'{p}feature_cols_v2.pkl',
     }
 
 
@@ -132,6 +142,61 @@ def load_dual_models(inference_device=None, prefix=''):
     return bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols
 
 
+# --- V2 REGRESSION MODEL LOADING ---
+
+def load_model_v2(inference_device=None, prefix=''):
+    """Load a v2 regression model.
+
+    Returns:
+        (model, scaler_X, config, seq_len, feature_cols)
+    """
+    dev = torch.device(inference_device) if inference_device else device
+    paths = _prefixed_paths(prefix)
+
+    config = joblib.load(paths['v2_config'])
+    scaler_X = joblib.load(paths['v2_scaler'])
+    feature_cols = joblib.load(paths['v2_features'])
+
+    model = RegressionLSTM(
+        input_dim=config['input_dim'],
+        hidden_dim=config['hidden_dim'],
+        num_layers=config['num_layers'],
+        dropout=config['dropout'],
+        n_heads=config.get('n_heads', 4),
+    ).to(dev)
+    model.load_state_dict(torch.load(paths['v2_model'], map_location=dev, weights_only=True))
+    model.eval()
+
+    try:
+        dummy = torch.randn(1, config['seq_len'], config['input_dim']).to(dev)
+        model = torch.jit.trace(model, dummy, check_trace=False)
+        print(f"  [JIT] v2 model traced successfully")
+    except Exception as e:
+        print(f"  [JIT] v2 trace failed: {e}, using eager mode")
+
+    return model, scaler_X, config, config['seq_len'], feature_cols
+
+
+def load_v2_models(inference_device=None, prefix=''):
+    """Try to load v2 regression model. Returns None tuple if not found.
+
+    Returns:
+        (model, config, scaler_X, feature_cols) or (None, None, None, None)
+    """
+    paths = _prefixed_paths(prefix)
+    if not os.path.exists(paths['v2_model']):
+        return None, None, None, None
+
+    pfx_label = f"{prefix} " if prefix else ""
+    model, scaler_X, config, seq_len, feature_cols = load_model_v2(inference_device, prefix)
+    th = config.get('trade_threshold', 0.15)
+    fb = config.get('forward_bars', 4)
+    print(f"{pfx_label}v2 regression model loaded: "
+          f"seq={seq_len}, th={th:.2f}, fb={fb}, "
+          f"heads={config.get('n_heads', 4)}")
+    return model, config, scaler_X, feature_cols
+
+
 # --- LIVE PREDICTION ---
 
 def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
@@ -215,32 +280,45 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
     tensor_input = torch.tensor(sequence, dtype=torch.float32).to(dev)
 
     # --- Run inference ---
+    model_version = config.get('model_version', 1)
+
     with torch.inference_mode():
-        logits = model(tensor_input)
-        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-
-    # probs: [bearish, neutral, bullish]
-    bear_prob, neut_prob, bull_prob = probs
-
-    # Score = bull_prob - bear_prob, range [-1, +1]
-    score = bull_prob - bear_prob
-
-    # Scale by model's trained threshold so predicted_return is proportional
-    # to the magnitude the model was trained to detect
-    bull_threshold = config.get('bull_threshold', 0.15)
-    predicted_return = score * bull_threshold
+        output = model(tensor_input)
 
     price = df['Close'].iloc[-1]
-    print(f"Current Price:   ${price:.2f}")
-    print(f"Probabilities:   Bear={bear_prob:.1%}  Neut={neut_prob:.1%}  Bull={bull_prob:.1%}")
-    print(f"Score: {score:+.3f} -> Predicted Return: {predicted_return:+.4f}%")
 
-    if predicted_return > bull_threshold:
-        print("Recommendation:  [BUY]")
-    elif predicted_return < -bull_threshold:
-        print("Recommendation:  [SELL/AVOID]")
+    if model_version >= 2:
+        # v2 regression: model outputs predicted return directly
+        predicted_return = float(output.cpu().item())
+        trade_threshold = config.get('trade_threshold', 0.15)
+
+        print(f"Current Price:   ${price:.2f}")
+        print(f"Predicted Return: {predicted_return:+.4f}% (threshold={trade_threshold:.2f})")
+
+        if predicted_return > trade_threshold:
+            print("Recommendation:  [BUY]")
+        elif predicted_return < -trade_threshold:
+            print("Recommendation:  [SELL/AVOID]")
+        else:
+            print("Recommendation:  [HOLD/WEAK]")
     else:
-        print("Recommendation:  [HOLD/WEAK]")
+        # v1 classification: softmax → score → predicted_return
+        probs = torch.softmax(output, dim=1).cpu().numpy()[0]
+        bear_prob, neut_prob, bull_prob = probs
+        score = bull_prob - bear_prob
+        bull_threshold = config.get('bull_threshold', 0.15)
+        predicted_return = score * bull_threshold
+
+        print(f"Current Price:   ${price:.2f}")
+        print(f"Probabilities:   Bear={bear_prob:.1%}  Neut={neut_prob:.1%}  Bull={bull_prob:.1%}")
+        print(f"Score: {score:+.3f} -> Predicted Return: {predicted_return:+.4f}%")
+
+        if predicted_return > bull_threshold:
+            print("Recommendation:  [BUY]")
+        elif predicted_return < -bull_threshold:
+            print("Recommendation:  [SELL/AVOID]")
+        else:
+            print("Recommendation:  [HOLD/WEAK]")
 
     return predicted_return
 
