@@ -102,3 +102,24 @@ def predict_symbol(api, symbol, bear_model, bear_config, bull_model, bull_config
         asset_type=asset_type, **extra_kwargs,
     )
     return symbol, bear_pred, bull_pred
+
+
+def predict_symbol_v2(api, symbol, model, config, scaler_X, feature_cols,
+                      inference_device, asset_type='crypto', benchmark_close=None):
+    """Run a single v2 regression prediction for a symbol.
+
+    Returns:
+        (symbol, pred_return) tuple where pred_return is float or None
+    """
+    extra_kwargs = {}
+    if asset_type == 'stock':
+        extra_kwargs['spy_close'] = benchmark_close
+    else:
+        extra_kwargs['btc_close'] = benchmark_close
+
+    pred = get_live_prediction(
+        symbol, model, scaler_X, config, feature_cols,
+        api=api, inference_device=inference_device,
+        asset_type=asset_type, **extra_kwargs,
+    )
+    return symbol, pred

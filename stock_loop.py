@@ -23,9 +23,9 @@ from order_utils import (
     reconstruct_positions, check_circuit_breaker, emergency_flatten,
     compute_limit_price,
 )
-from predict_now import load_dual_models, get_live_prediction
+from predict_now import load_dual_models, load_v2_models, get_live_prediction
 from market_data import fetch_spy_bars_alpaca, get_live_atr
-from trading_utils import get_api, get_model_mtime, choose_inference_device, cooldown_ok, predict_symbol
+from trading_utils import get_api, get_model_mtime, choose_inference_device, cooldown_ok, predict_symbol, predict_symbol_v2
 from hw_monitor import get_gpu_temp
 from sentiment import sentiment_gate, get_market_sentiment
 from stock_config import load_stock_universe
@@ -75,8 +75,8 @@ FLATTEN_HOUR = 15
 FLATTEN_MINUTE = 50
 
 
-def _write_prediction_cache(bear_preds, bull_preds, top_symbols):
-    """Write prediction scores to JSON for GUI consumption (no torch needed)."""
+def _write_prediction_cache_v1(bear_preds, bull_preds, top_symbols):
+    """Write v1 prediction scores to JSON for GUI consumption."""
     try:
         data = {}
         all_syms = set(bear_preds) | set(bull_preds)
@@ -97,6 +97,31 @@ def _write_prediction_cache(bear_preds, bull_preds, top_symbols):
                 "bear": round(bear, 6) if bear is not None else None,
                 "bull": round(bull, 6) if bull is not None else None,
                 "score": round(score, 6),
+                "signal": signal,
+                "updated": datetime.datetime.now().isoformat(),
+            }
+        with open(_PRED_CACHE_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"  [CACHE] Error writing prediction cache: {e}")
+
+
+def _write_prediction_cache_v2(preds, top_symbols, trade_threshold):
+    """Write v2 regression prediction scores to JSON for GUI consumption."""
+    try:
+        data = {}
+        for sym in sorted(preds):
+            pred = preds[sym]
+            if sym in top_symbols:
+                signal = "BULL"
+            elif pred is not None and pred < -trade_threshold:
+                signal = "BEAR"
+            else:
+                signal = "NEUTRAL"
+            data[sym] = {
+                "bear": None,
+                "bull": round(pred, 6) if pred is not None else None,
+                "score": round(pred, 6) if pred is not None else 0,
                 "signal": signal,
                 "updated": datetime.datetime.now().isoformat(),
             }
@@ -195,22 +220,40 @@ def flatten_all_stocks(api, positions):
 def run_stock_bot():
     api = get_api()
 
-    # ── Load stock-specific dual models ──
+    # ── Load stock-specific models (try v2 first, fall back to v1 dual) ──
     print("Loading stock prediction models...")
+    model_version = 1
+    v2_model = v2_config = None
+    bear_model = bull_model = None
+    bear_config = bull_config = {}
+    bear_threshold = bull_threshold = 0.15
+    trade_threshold = 0.15
+    scaler_X = feature_cols = None
+    is_dual = False
+
     try:
         inference_device = choose_inference_device()
-        bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
-            load_dual_models(inference_device, prefix=MODEL_PREFIX)
-        bear_threshold = bear_config.get('bull_threshold', 0.15)
-        bull_threshold = bull_config.get('bull_threshold', 0.15)
-        is_dual = bear_model is not bull_model
-        print(f"Stock models loaded (dual={is_dual}, bear_th={bear_threshold:.2f}, bull_th={bull_threshold:.2f})")
+        v2_model, v2_config, v2_scaler, v2_features = load_v2_models(inference_device, prefix=MODEL_PREFIX)
+        if v2_model is not None:
+            model_version = 2
+            scaler_X = v2_scaler
+            feature_cols = v2_features
+            trade_threshold = v2_config.get('trade_threshold', 0.15)
+            print(f"Stock v2 regression model loaded (trade_threshold={trade_threshold:.2f})")
+        else:
+            bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
+                load_dual_models(inference_device, prefix=MODEL_PREFIX)
+            bear_threshold = bear_config.get('bull_threshold', 0.15)
+            bull_threshold = bull_config.get('bull_threshold', 0.15)
+            is_dual = bear_model is not bull_model
+            print(f"Stock v1 models loaded (dual={is_dual}, bear_th={bear_threshold:.2f}, bull_th={bull_threshold:.2f})")
     except FileNotFoundError:
-        print("WARNING: Stock model files not found. Run hypersearch_dual.py --prefix stock first.")
+        print("WARNING: Stock model files not found. Run hypersearch first.")
         print("Exiting.")
         return
 
     # Track model mtimes for hot-reload
+    v2_mtime = get_model_mtime(f'{MODEL_PREFIX}_model_v2.pth')
     bear_mtime = get_model_mtime(f'{MODEL_PREFIX}_bear_model.pth')
     bull_mtime = get_model_mtime(f'{MODEL_PREFIX}_bull_model.pth')
 
@@ -291,19 +334,32 @@ def run_stock_bot():
             continue
 
         # ── Hot-reload check (models + universe) ──
+        new_v2_mt = get_model_mtime(f'{MODEL_PREFIX}_model_v2.pth')
         new_bear_mt = get_model_mtime(f'{MODEL_PREFIX}_bear_model.pth')
         new_bull_mt = get_model_mtime(f'{MODEL_PREFIX}_bull_model.pth')
-        if new_bear_mt != bear_mtime or new_bull_mt != bull_mtime:
+        reload_needed = (new_v2_mt != v2_mtime or new_bear_mt != bear_mtime
+                         or new_bull_mt != bull_mtime)
+        if reload_needed:
             print("[HOT-RELOAD] Stock model files changed, reloading...")
             try:
                 inference_device = choose_inference_device()
-                bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
-                    load_dual_models(inference_device, prefix=MODEL_PREFIX)
-                bear_threshold = bear_config.get('bull_threshold', 0.15)
-                bull_threshold = bull_config.get('bull_threshold', 0.15)
+                _v2m, _v2c, _v2s, _v2f = load_v2_models(inference_device, prefix=MODEL_PREFIX)
+                if _v2m is not None:
+                    model_version = 2
+                    v2_model, v2_config = _v2m, _v2c
+                    scaler_X, feature_cols = _v2s, _v2f
+                    trade_threshold = v2_config.get('trade_threshold', 0.15)
+                    print(f"[HOT-RELOAD] v2 model (trade_threshold={trade_threshold:.2f})")
+                else:
+                    bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
+                        load_dual_models(inference_device, prefix=MODEL_PREFIX)
+                    bear_threshold = bear_config.get('bull_threshold', 0.15)
+                    bull_threshold = bull_config.get('bull_threshold', 0.15)
+                    model_version = 1
+                    print(f"[HOT-RELOAD] v1 (bear_th={bear_threshold:.2f}, bull_th={bull_threshold:.2f})")
+                v2_mtime = new_v2_mt
                 bear_mtime = new_bear_mt
                 bull_mtime = new_bull_mt
-                print(f"[HOT-RELOAD] Success (bear_th={bear_threshold:.2f}, bull_th={bull_threshold:.2f})")
             except Exception as e:
                 print(f"[HOT-RELOAD] Failed: {e}, keeping current models")
 
@@ -380,6 +436,7 @@ def run_stock_bot():
         # ── Get predictions for ALL stocks in parallel ──
         bear_preds = {}
         bull_preds = {}
+        v2_preds = {}
         inference_device = choose_inference_device()
         if inference_device == 'cpu':
             print("[HW] GPU unavailable, using CPU for inference")
@@ -387,40 +444,56 @@ def run_stock_bot():
         with ThreadPoolExecutor(max_workers=MAX_PREDICTION_WORKERS) as executor:
             futures = {}
             for symbol in STOCK_UNIVERSE:
-                f = executor.submit(
-                    predict_symbol, api, symbol,
-                    bear_model, bear_config, bull_model, bull_config,
-                    scaler_X, feature_cols, inference_device,
-                    asset_type='stock', benchmark_close=spy_close,
-                )
+                if model_version == 2:
+                    f = executor.submit(
+                        predict_symbol_v2, api, symbol,
+                        v2_model, v2_config, scaler_X, feature_cols,
+                        inference_device, asset_type='stock',
+                        benchmark_close=spy_close,
+                    )
+                else:
+                    f = executor.submit(
+                        predict_symbol, api, symbol,
+                        bear_model, bear_config, bull_model, bull_config,
+                        scaler_X, feature_cols, inference_device,
+                        asset_type='stock', benchmark_close=spy_close,
+                    )
                 futures[f] = symbol
 
             for future in as_completed(futures):
                 symbol = futures[future]
                 try:
-                    sym, bear_pred, bull_pred = future.result()
-                    if bear_pred is not None:
-                        bear_preds[sym] = bear_pred
-                    if bull_pred is not None:
-                        bull_preds[sym] = bull_pred
+                    if model_version == 2:
+                        sym, pred = future.result()
+                        if pred is not None:
+                            v2_preds[sym] = pred
+                    else:
+                        sym, bear_pred, bull_pred = future.result()
+                        if bear_pred is not None:
+                            bear_preds[sym] = bear_pred
+                        if bull_pred is not None:
+                            bull_preds[sym] = bull_pred
                 except Exception as e:
                     print(f"  {symbol}: Prediction error: {e}")
 
-        # Free temporary tensors from prediction batch
         gc.collect()
 
-        # ── Dynamic top N selection by bull signal strength (bear agreement filter) ──
-        agree_candidates = {sym: pred for sym, pred in bull_preds.items()
-                            if bear_preds.get(sym) is None or bear_preds[sym] >= -bear_threshold}
-        n_filtered = len(bull_preds) - len(agree_candidates)
-        if n_filtered:
-            print(f"[RANK] {n_filtered} symbol(s) excluded by bear disagreement")
-        ranked = sorted(agree_candidates.items(), key=lambda x: x[1], reverse=True)
-        top_symbols = [sym for sym, _ in ranked[:TOP_N]]
-        print(f"[RANK] Top {TOP_N}: {', '.join(f'{s}({bull_preds[s]:+.4f})' for s in top_symbols)}")
-
-        # Write prediction cache for GUI
-        _write_prediction_cache(bear_preds, bull_preds, top_symbols)
+        # ── Dynamic top N selection ──
+        if model_version == 2:
+            ranked = sorted(v2_preds.items(), key=lambda x: x[1], reverse=True)
+            top_symbols = [sym for sym, _ in ranked[:TOP_N]]
+            print(f"[RANK] Top {TOP_N}: {', '.join(f'{s}({v2_preds[s]:+.4f})' for s in top_symbols)}")
+            _write_prediction_cache_v2(v2_preds, top_symbols, trade_threshold)
+        else:
+            agree_candidates = {sym: pred for sym, pred in bull_preds.items()
+                                if bear_preds.get(sym) is None or bear_preds[sym] >= -bear_threshold}
+            n_filtered = len(bull_preds) - len(agree_candidates)
+            if n_filtered:
+                print(f"[RANK] {n_filtered} symbol(s) excluded by bear disagreement")
+            ranked = sorted(agree_candidates.items(), key=lambda x: x[1], reverse=True)
+            top_symbols = [sym for sym, _ in ranked[:TOP_N]]
+            print(f"[RANK] Top {TOP_N}: {', '.join(f'{s}({bull_preds[s]:+.4f})' for s in top_symbols)}")
+            _write_prediction_cache_v1(bear_preds, bull_preds, top_symbols)
 
         # ── LLM pre-trade analysis ──
         llm_scores = {}
@@ -430,9 +503,16 @@ def run_stock_bot():
             for symbol in top_symbols:
                 if symbol in positions:
                     continue
-                bp = bull_preds.get(symbol, 0)
-                if bp < bull_threshold:
-                    continue
+                if model_version == 2:
+                    bp = v2_preds.get(symbol, 0)
+                    if bp < trade_threshold:
+                        continue
+                    bear_p = None
+                else:
+                    bp = bull_preds.get(symbol, 0)
+                    if bp < bull_threshold:
+                        continue
+                    bear_p = bear_preds.get(symbol)
                 fund = get_fundamentals(symbol, 'stock')
                 insider = get_insider_activity(symbol)
                 filing_sum = get_filing_summary(symbol)
@@ -440,7 +520,7 @@ def run_stock_bot():
                 candidates.append({
                     'symbol': symbol,
                     'bull_pred': bp,
-                    'bear_pred': bear_preds.get(symbol),
+                    'bear_pred': bear_p if model_version == 1 else None,
                     'fundamentals_text': fund_text,
                 })
             if candidates:
@@ -464,12 +544,19 @@ def run_stock_bot():
                 del positions[symbol]
                 continue
 
-            bear_pred = bear_preds.get(symbol)
             sell_reason = None
-            if bear_pred is not None and bear_pred < -bear_threshold:
-                sell_reason = f"bear_pred={bear_pred:+.4f}%"
-            elif symbol not in top_symbols and bear_pred is not None and bear_pred < 0:
-                sell_reason = f"dropped from top {TOP_N} (bear={bear_pred:+.4f}%)"
+            if model_version == 2:
+                pred = v2_preds.get(symbol)
+                if pred is not None and pred < -trade_threshold:
+                    sell_reason = f"pred={pred:+.4f}%"
+                elif symbol not in top_symbols and pred is not None and pred < 0:
+                    sell_reason = f"dropped from top {TOP_N} (pred={pred:+.4f}%)"
+            else:
+                bear_pred = bear_preds.get(symbol)
+                if bear_pred is not None and bear_pred < -bear_threshold:
+                    sell_reason = f"bear_pred={bear_pred:+.4f}%"
+                elif symbol not in top_symbols and bear_pred is not None and bear_pred < 0:
+                    sell_reason = f"dropped from top {TOP_N} (bear={bear_pred:+.4f}%)"
 
             if sell_reason is None:
                 continue
@@ -519,30 +606,37 @@ def run_stock_bot():
                 print(f"  {symbol}: In cooldown ({remaining/60:.1f} min left)")
                 continue
 
-            bull_pred = bull_preds.get(symbol)
-            if bull_pred is None or bull_pred < bull_threshold:
+            if model_version == 2:
+                bull_pred = v2_preds.get(symbol)
+                active_threshold = trade_threshold
+            else:
+                bull_pred = bull_preds.get(symbol)
+                active_threshold = bull_threshold
+
+            if bull_pred is None or bull_pred < active_threshold:
                 if bull_pred is not None:
-                    print(f"  {symbol}: Bull pred {bull_pred:+.4f}% < {bull_threshold:.2f}, skipping")
+                    print(f"  {symbol}: Pred {bull_pred:+.4f}% < {active_threshold:.2f}, skipping")
                 continue
 
-            # Bear agreement check — skip if bear model disagrees
-            bear_pred = bear_preds.get(symbol)
-            if bear_pred is not None and bear_pred < -bear_threshold:
-                print(f"  {symbol}: Bull {bull_pred:+.4f}% but bear {bear_pred:+.4f}% disagrees, skipping")
-                continue
+            if model_version == 1:
+                # Bear agreement check — skip if bear model disagrees
+                bear_pred = bear_preds.get(symbol)
+                if bear_pred is not None and bear_pred < -bear_threshold:
+                    print(f"  {symbol}: Bull {bull_pred:+.4f}% but bear {bear_pred:+.4f}% disagrees, skipping")
+                    continue
 
             quote = get_stock_quote(api, symbol)
             if quote is None:
                 continue
 
             if not should_trade(bull_pred, quote['spread_pct']):
-                print(f"  {symbol}: Bull pred {bull_pred:+.4f}% too weak vs spread "
+                print(f"  {symbol}: Pred {bull_pred:+.4f}% too weak vs spread "
                       f"{quote['spread_pct']:.3f}%, skipping")
                 continue
 
             # Confidence-based sizing
-            if bull_pred is not None and bull_threshold > 0:
-                confidence = min(2.0, max(0.5, bull_pred / bull_threshold))
+            if bull_pred is not None and active_threshold > 0:
+                confidence = min(2.0, max(0.5, bull_pred / active_threshold))
             else:
                 confidence = 1.0
             sized_notional = int(NOTIONAL_PER_STOCK * confidence)
