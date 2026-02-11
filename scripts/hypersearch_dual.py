@@ -207,10 +207,11 @@ class SeqCache:
         if seq_len == self._cached_seq_len:
             return self._X_train, self._X_val, self._train_arr, self._val_arr
 
-        # Free old cache
+        # Free old cache and GPU memory before allocating
         self._X_train = None
         self._X_val = None
         gc.collect()
+        torch.cuda.empty_cache()
 
         t0 = time.time()
         train_arr, val_arr = get_split_indices(
@@ -250,6 +251,8 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
 
     def objective(trial):
         trial_start = time.time()
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Forward bars horizon (searchable if multi-horizon data available)
         if has_multi_horizon:
@@ -300,10 +303,13 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
                 trial_returns, input_dim, _state_cache, seq_cache,
             )
         except RuntimeError as e:
-            # CUDA OOM or other GPU errors — clean up and return 0
-            print(f"  [ERROR] Trial {trial.number}: {e}")
+            err_str = str(e)
+            print(f"  [ERROR] Trial {trial.number}: {err_str}")
             gc.collect()
             torch.cuda.empty_cache()
+            # CUDA allocator corruption is unrecoverable — abort the study
+            if 'INTERNAL ASSERT FAILED' in err_str:
+                raise RuntimeError(f"CUDA allocator corrupted, aborting: {err_str}") from e
             return 0.0
 
     def _train_and_evaluate(trial, trial_start, cfg, target_class,

@@ -527,13 +527,25 @@ def _parse_scores(result, n):
         return None
 
     scores = []
+    matched = 0
     for i in range(1, n + 1):
-        raw = data.get(str(i), data.get(i, 0.0))
-        scores.append(max(-1.0, min(1.0, float(raw))))
-    matched = sum(1 for i in range(1, n + 1) if str(i) in data or i in data)
+        key_str = str(i)
+        if key_str in data or i in data:
+            raw = data.get(key_str, data.get(i))
+            scores.append(max(-1.0, min(1.0, float(raw))))
+            matched += 1
+        else:
+            # Missing article — use None sentinel so caller can KW-fallback
+            scores.append(None)
     if matched < n * 0.5:
         print(f"[SENTIMENT] LLM chunk only scored {matched}/{n}, failing chunk")
         return None
+    # Fill missing with KW fallback marker (0.0 placeholder — caller handles)
+    for i in range(len(scores)):
+        if scores[i] is None:
+            scores[i] = 0.0
+    if matched < n:
+        print(f"[SENTIMENT] LLM scored {matched}/{n}, filled {n - matched} gaps with 0.0")
     return scores
 
 
@@ -642,10 +654,22 @@ def _llm_score_batch(articles):
     if scored_count == 0:
         return None
 
-    # Fill any gaps with 0.0 (shouldn't happen but be safe)
+    # Fill gaps with keyword scoring (articles where all LLM tiers failed)
+    gap_count = 0
     for i in range(n):
         if all_scores[i] is None:
-            all_scores[i] = 0.0
+            gap_count += 1
+            headline = _validate_text(articles[i].get('headline', ''))
+            summary = _validate_text(articles[i].get('summary', ''))
+            if headline or summary:
+                h = _score_text(headline) if headline else 0.0
+                s = _score_text(summary) if summary else 0.0
+                all_scores[i] = h * 0.6 + s * 0.4
+            else:
+                all_scores[i] = 0.0
+            all_models[i] = 'KW'
+    if gap_count > 0:
+        print(f"[SENTIMENT] {gap_count} articles fell back to KW scoring (LLM tier gaps)")
 
     # Tag articles with model info
     model_counts = {}
