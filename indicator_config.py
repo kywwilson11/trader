@@ -58,6 +58,24 @@ _STANDARD_FEATURES = _MINIMAL_FEATURES + [
     "STOCHd_14_3_3",
 ]
 
+# Stationary features only — no raw prices/volumes that trend over time.
+# Cross-asset columns (BTC_Return_1h, RS_vs_SPY, etc.) are already stationary
+# and get auto-included via asset-type filtering in hypersearch.
+_STATIONARY_FEATURES = [
+    # Returns (stationary by construction)
+    "Return_4h", "Return_12h", "Volatility_12h", "ROC",
+    # Ratios (price-normalized)
+    "Price_SMA20_Ratio", "Volume_Ratio", "BBP_20_2.0", "BBB_20_2.0",
+    # Oscillators (bounded)
+    "RSI", "STOCHk_14_3_3", "STOCHd_14_3_3",
+    # MACD (differenced, mean-reverting)
+    "MACD_12_26_9", "MACDh_12_26_9", "MACDs_12_26_9",
+    # Temporal (cyclical encoding, bounded [-1, 1])
+    "Hour_sin", "Hour_cos", "Day_sin", "Day_cos",
+    # Sentiment (bounded)
+    "Daily_Sentiment",
+]
+
 PRESETS = {
     "minimal": {
         "description": "Core signals only. Fastest training, lowest overfitting risk.",
@@ -66,6 +84,11 @@ PRESETS = {
     "standard": {
         "description": "Balanced set with Bollinger Bands and full oscillators. Recommended.",
         "features": _STANDARD_FEATURES,
+    },
+    "stationary": {
+        "description": "Stationary features only (returns, ratios, oscillators). "
+                       "Best for regression models — no raw price/volume drift.",
+        "features": _STATIONARY_FEATURES,
     },
     "full": {
         "description": "All indicators including divergence and cross-asset signals. "
