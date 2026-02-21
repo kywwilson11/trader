@@ -55,28 +55,29 @@ def get_fundamentals(symbol: str, asset_type: str = "stock") -> dict:
         "avg_volume": None,
     }
 
-    try:
-        import yfinance as yf
+    # Skip yfinance for crypto — no PE/sector/beta data, and yfinance's SQLite
+    # cache triggers driver conflicts in the jetson env.
+    if asset_type != "crypto":
+        try:
+            import yfinance as yf
 
-        # For crypto, strip /USD -> -USD for yfinance
-        yf_symbol = symbol.replace("/", "-") if asset_type == "crypto" else symbol
-        ticker = yf.Ticker(yf_symbol)
-        info = ticker.info or {}
+            ticker = yf.Ticker(symbol)
+            info = ticker.info or {}
 
-        result["pe_ratio"] = info.get("trailingPE") or info.get("forwardPE")
-        result["pb_ratio"] = info.get("priceToBook")
-        result["market_cap"] = info.get("marketCap")
-        result["revenue_growth"] = info.get("revenueGrowth")
-        result["eps"] = info.get("trailingEps")
-        result["dividend_yield"] = info.get("dividendYield")
-        result["week52_high"] = info.get("fiftyTwoWeekHigh")
-        result["week52_low"] = info.get("fiftyTwoWeekLow")
-        result["sector"] = info.get("sector")
-        result["beta"] = info.get("beta")
-        result["avg_volume"] = info.get("averageVolume")
+            result["pe_ratio"] = info.get("trailingPE") or info.get("forwardPE")
+            result["pb_ratio"] = info.get("priceToBook")
+            result["market_cap"] = info.get("marketCap")
+            result["revenue_growth"] = info.get("revenueGrowth")
+            result["eps"] = info.get("trailingEps")
+            result["dividend_yield"] = info.get("dividendYield")
+            result["week52_high"] = info.get("fiftyTwoWeekHigh")
+            result["week52_low"] = info.get("fiftyTwoWeekLow")
+            result["sector"] = info.get("sector")
+            result["beta"] = info.get("beta")
+            result["avg_volume"] = info.get("averageVolume")
 
-    except Exception as e:
-        print(f"[FUNDAMENTALS] yfinance error for {symbol}: {e}")
+        except Exception as e:
+            print(f"[FUNDAMENTALS] yfinance error for {symbol}: {e}")
 
     # Enrich stocks with FMP data
     if asset_type == "stock":

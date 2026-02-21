@@ -22,6 +22,7 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 from llm_config import load_llm_config
 
@@ -32,28 +33,44 @@ GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
 _GEMINI_FALLBACK_CHAIN = [
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
-    "gemini-2.5-pro",
+    # Pro excluded — too slow for fallback. Use call_gemini() directly for Pro.
 ]
 
 # HTTP codes that trigger immediate fallback:
 _FALLBACK_CODES = {402, 403, 500, 502, 503, 504}
 
 # 429 retry: parse "retry in Xs" from error body for smart wait
-_429_MAX_WAIT_PRIMARY = 45
-_429_MAX_WAIT_FALLBACK = 45
+_429_MAX_WAIT_PRIMARY = 10   # paid tier: brief wait usually clears it
+_429_MAX_WAIT_FALLBACK = 5   # fallback models: don't wait long
+
+# 429 circuit breaker: when all models fail with 429, skip LLM for a cooldown
+_429_COOLDOWN_SEC = 30   # short cooldown — paid tier rarely sustains 429s
+_429_cooldown_until: float = 0.0  # timestamp when cooldown expires
 
 # --- Sliding-window rate limiter (10 RPM) ---
-_RATE_LIMIT_RPM = 10
+_RATE_LIMIT_RPM = 30  # paid tier allows 60+ RPM for pro, 360 for flash
 _call_timestamps: collections.deque = collections.deque()
 
 # --- Daily quota tracking (resets at midnight Pacific) ---
 _DAILY_BUDGETS = {
-    "gemini-2.5-pro": 80,         # 100 RPD, leave 20 margin
-    "gemini-2.5-flash": 200,      # 250 RPD, leave 50 margin
-    "gemini-2.5-flash-lite": 800,  # 1000 RPD, leave 200 margin
+    "gemini-2.5-pro": 1000,       # paid tier: 1000 RPD
+    "gemini-2.5-flash": 2000,     # paid tier: generous
+    "gemini-2.5-flash-lite": 5000, # paid tier: very generous
 }
 _model_calls: dict[str, int] = {}
 _quota_reset_date: str = ""
+
+# --- Daily cost tracking (hard cap to prevent runaway spending) ---
+_DAILY_COST_LIMIT = 0.65  # ~$20/month
+_daily_cost: float = 0.0
+_cost_reset_date: str = ""
+
+# Per-million-token pricing (input, output) — conservative estimates
+_PRICING = {
+    "gemini-2.5-pro":        (1.25, 10.0),
+    "gemini-2.5-flash":      (0.15, 0.60),
+    "gemini-2.5-flash-lite": (0.075, 0.30),
+}
 
 
 def _parse_retry_after(http_error) -> float | None:
@@ -82,14 +99,62 @@ def _rate_limit_ok() -> bool:
     return True
 
 
+def _429_cooled_down() -> bool:
+    """Check if we're past the 429 cooldown period."""
+    global _429_cooldown_until
+    if time.time() < _429_cooldown_until:
+        return False
+    return True
+
+
+def _trigger_429_cooldown():
+    """All models 429'd — skip LLM calls for a cooldown period."""
+    global _429_cooldown_until
+    _429_cooldown_until = time.time() + _429_COOLDOWN_SEC
+    print(f"[LLM] All models rate-limited, cooling down {_429_COOLDOWN_SEC}s")
+
+
 def _maybe_reset_quota():
-    """Reset daily quota counters at midnight Pacific."""
-    global _quota_reset_date
-    pt = timezone(timedelta(hours=-8))
-    today = datetime.now(pt).strftime("%Y-%m-%d")
+    """Reset daily quota and cost counters at midnight Pacific."""
+    global _quota_reset_date, _cost_reset_date, _daily_cost
+    today = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
     if _quota_reset_date != today:
         _model_calls.clear()
         _quota_reset_date = today
+    if _cost_reset_date != today:
+        if _daily_cost > 0:
+            print(f"[LLM] Daily cost reset (yesterday: ${_daily_cost:.4f})")
+        _daily_cost = 0.0
+        _cost_reset_date = today
+
+
+def _estimate_cost(model: str, prompt_chars: int, response_chars: int) -> float:
+    """Estimate API cost from character counts (~4 chars per token)."""
+    input_tokens = prompt_chars / 4
+    output_tokens = response_chars / 4
+    price_in, price_out = _PRICING.get(model, (1.25, 10.0))
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+
+def _record_cost(model: str, prompt_chars: int, response_chars: int):
+    """Record estimated cost for this call."""
+    global _daily_cost
+    cost = _estimate_cost(model, prompt_chars, response_chars)
+    _daily_cost += cost
+
+
+def _cost_ok() -> bool:
+    """Check if we're under the daily cost limit."""
+    _maybe_reset_quota()
+    if _daily_cost >= _DAILY_COST_LIMIT:
+        return False
+    return True
+
+
+def get_daily_cost() -> tuple[float, float]:
+    """Return (spent_today, daily_limit) for monitoring."""
+    _maybe_reset_quota()
+    return _daily_cost, _DAILY_COST_LIMIT
 
 
 def get_budget(model: str) -> tuple[int, int]:
@@ -109,12 +174,19 @@ def record_call(model: str):
 # --- Public API ---
 
 def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
-                max_tokens: int = 2048) -> str | None:
+                max_tokens: int = 2048, json_mode: bool = False) -> str | None:
     """Call a specific Gemini model. Returns text or None.
 
     Used by tiered scoring to target a specific model. Handles 429 with
     retry-after parsing. Does NOT fall back to other models (caller decides).
     """
+    if not _429_cooled_down():
+        return None
+
+    if not _cost_ok():
+        print(f"[LLM] Daily cost limit reached (${_daily_cost:.2f}/${_DAILY_COST_LIMIT:.2f})")
+        return None
+
     config = load_llm_config()
     if not config.get("enabled"):
         return None
@@ -124,7 +196,7 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
         return None
 
     if not _rate_limit_ok():
-        print(f"[LLM] Rate limit reached (10 RPM), skipping {model}")
+        print(f"[LLM] Rate limit reached, skipping {model}")
         return None
 
     remaining, total = get_budget(model)
@@ -132,15 +204,18 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
         print(f"[LLM] {model}: daily budget exhausted ({total} RPD)")
         return None
 
+    prompt_chars = len(prompt) + len(system)
     timeout = config.get("max_llm_latency_sec", 30)
     start = time.time()
 
     try:
-        result = _call_gemini(prompt, system, gemini_key, model, max_tokens, timeout)
+        result = _call_gemini(prompt, system, gemini_key, model, max_tokens, timeout,
+                              json_mode=json_mode)
         elapsed = (time.time() - start) * 1000
         if result:
             record_call(model)
-            print(f"[LLM] {model}: {elapsed:.0f}ms, {len(result)} chars")
+            _record_cost(model, prompt_chars, len(result))
+            print(f"[LLM] {model}: {elapsed:.0f}ms, {len(result)} chars (${_daily_cost:.3f} today)")
         return result
 
     except urllib.error.HTTPError as e:
@@ -152,7 +227,8 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
                 time.sleep(wait)
                 try:
                     start2 = time.time()
-                    result = _call_gemini(prompt, system, gemini_key, model, max_tokens, timeout)
+                    result = _call_gemini(prompt, system, gemini_key, model, max_tokens,
+                                          timeout, json_mode=json_mode)
                     elapsed2 = (time.time() - start2) * 1000
                     if result:
                         record_call(model)
@@ -178,12 +254,19 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | Non
     Used by non-sentiment callers (fundamentals, llm_analyst) that don't
     need tiered scoring.
     """
+    if not _429_cooled_down():
+        return None
+
+    if not _cost_ok():
+        print(f"[LLM] Daily cost limit reached (${_daily_cost:.2f}/${_DAILY_COST_LIMIT:.2f})")
+        return None
+
     config = load_llm_config()
     if not config.get("enabled"):
         return None
 
     if not _rate_limit_ok():
-        print("[LLM] Rate limit reached (10 RPM), skipping")
+        print("[LLM] Rate limit reached, skipping")
         return None
 
     gemini_key = config.get("models", {}).get("gemini", {}).get("api_key", "")
@@ -191,6 +274,7 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | Non
         return None
 
     model = config.get("models", {}).get("gemini", {}).get("model", "gemini-2.5-flash")
+    prompt_chars = len(prompt) + len(system)
     timeout = config.get("max_llm_latency_sec", 30)
 
     # Try configured model first
@@ -200,7 +284,8 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | Non
         elapsed = (time.time() - start) * 1000
         if result:
             record_call(model)
-            print(f"[LLM] {model}: {elapsed:.0f}ms, {len(result)} chars")
+            _record_cost(model, prompt_chars, len(result))
+            print(f"[LLM] {model}: {elapsed:.0f}ms, {len(result)} chars (${_daily_cost:.3f} today)")
         return result
     except urllib.error.HTTPError as e:
         elapsed = (time.time() - start) * 1000
@@ -215,7 +300,8 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | Non
                     elapsed2 = (time.time() - start2) * 1000
                     if result:
                         record_call(model)
-                        print(f"[LLM] {model}: {elapsed2:.0f}ms, {len(result)} chars (after wait)")
+                        _record_cost(model, prompt_chars, len(result))
+                        print(f"[LLM] {model}: {elapsed2:.0f}ms, {len(result)} chars (after wait, ${_daily_cost:.3f} today)")
                     return result
                 except Exception:
                     pass
@@ -277,12 +363,14 @@ def _try_gemini_chain(api_key, prompt, system, max_tokens, timeout, skip_model=N
             continue
 
     print("[LLM] All Gemini models exhausted")
+    _trigger_429_cooldown()
     return None
 
 
 # --- Gemini API call ---
 
-def _call_gemini(prompt, system, api_key, model, max_tokens, timeout):
+def _call_gemini(prompt, system, api_key, model, max_tokens, timeout,
+                 json_mode=False):
     """Call Google Gemini API. Returns text or raises on error."""
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -294,9 +382,14 @@ def _call_gemini(prompt, system, api_key, model, max_tokens, timeout):
         contents.append({"role": "model", "parts": [{"text": "Understood."}]})
     contents.append({"role": "user", "parts": [{"text": prompt}]})
 
+    gen_config = {"maxOutputTokens": max_tokens}
+    if json_mode and "pro" not in model:
+        # Force structured JSON output (not supported by thinking models)
+        gen_config["responseMimeType"] = "application/json"
+
     body = {
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": max_tokens},
+        "generationConfig": gen_config,
     }
 
     req = urllib.request.Request(
@@ -311,7 +404,25 @@ def _call_gemini(prompt, system, api_key, model, max_tokens, timeout):
     resp = urllib.request.urlopen(req, timeout=timeout)
     data = json.loads(resp.read())
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        finish = data["candidates"][0].get("finishReason", "unknown")
+        parts = data["candidates"][0]["content"]["parts"]
+        # Thinking models: last part with "text" key is the actual output
+        # Earlier parts may be thinking/reasoning
+        for part in reversed(parts):
+            if "text" in part and part["text"].strip():
+                if finish != "STOP":
+                    print(f"[LLM] Gemini: finish={finish} ({len(part['text'])} chars)")
+                return part["text"]
+        # No text found in any part
+        finish = data["candidates"][0].get("finishReason", "unknown")
+        print(f"[LLM] Gemini: no text in {len(parts)} parts (finish={finish})")
+        return None
     except (KeyError, IndexError):
-        print(f"[LLM] Gemini: unexpected response shape")
+        # Debug: log what we got so we can fix parsing
+        finish = data.get("candidates", [{}])[0].get("finishReason", "unknown") if data.get("candidates") else "no_candidates"
+        blocked = data.get("promptFeedback", {}).get("blockReason", "")
+        detail = f"finish={finish}"
+        if blocked:
+            detail += f", blocked={blocked}"
+        print(f"[LLM] Gemini: unexpected response ({detail})")
         return None

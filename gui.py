@@ -38,6 +38,15 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 import numpy as np
 
+class NumericTableItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts by UserRole (numeric) when available."""
+    def __lt__(self, other):
+        v1 = self.data(Qt.UserRole)
+        v2 = other.data(Qt.UserRole) if other else None
+        if v1 is not None and v2 is not None:
+            return float(v1) < float(v2)
+        return super().__lt__(other)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -51,17 +60,13 @@ LOG_FILES = {
 }
 
 CONFIG_FILES = {
-    "Crypto Bear": BASE_DIR / "bear_config.pkl",
-    "Crypto Bull": BASE_DIR / "bull_config.pkl",
-    "Stock Bear": BASE_DIR / "stock_bear_config.pkl",
-    "Stock Bull": BASE_DIR / "stock_bull_config.pkl",
+    "Crypto": BASE_DIR / "config_v2.pkl",
+    "Stock": BASE_DIR / "stock_config_v2.pkl",
 }
 
 MODEL_FILES = {
-    "Crypto Bear": BASE_DIR / "bear_model.pth",
-    "Crypto Bull": BASE_DIR / "bull_model.pth",
-    "Stock Bear": BASE_DIR / "stock_bear_model.pth",
-    "Stock Bull": BASE_DIR / "stock_bull_model.pth",
+    "Crypto": BASE_DIR / "model_v2.pth",
+    "Stock": BASE_DIR / "stock_model_v2.pth",
 }
 
 # Tax rates
@@ -660,7 +665,7 @@ class DataFetcher(QObject):
         self._timer_orders.start(30_000)
 
         self._timer_history = QTimer(self)
-        self._timer_history.timeout.connect(self.fetch_history)
+        self._timer_history.timeout.connect(lambda: self.fetch_history())
         self._timer_history.start(300_000)
 
         self._timer_hw = QTimer(self)
@@ -763,15 +768,16 @@ class DataFetcher(QObject):
         except Exception as e:
             self.error_occurred.emit(f"Orders fetch: {e}")
 
-    @Slot()
-    def fetch_history(self):
+    @Slot(str, str)
+    def fetch_history(self, period="1M", timeframe="1D"):
         try:
-            hist = self.api.get_portfolio_history(period="1M", timeframe="1D")
+            hist = self.api.get_portfolio_history(period=period, timeframe=timeframe)
             self.history_updated.emit({
                 "equity": list(hist.equity),
                 "timestamp": list(hist.timestamp),
                 "profit_loss": list(hist.profit_loss) if hist.profit_loss else [],
                 "profit_loss_pct": list(hist.profit_loss_pct) if hist.profit_loss_pct else [],
+                "period": period,
             })
         except Exception as e:
             self.error_occurred.emit(f"History fetch: {e}")
@@ -906,12 +912,16 @@ class DataFetcher(QObject):
                         articles.append(cached_a)
                         seen.add(key)
                 articles.sort(key=lambda a: a.get('datetime', 0), reverse=True)
+            # Cap total articles to prevent unbounded growth (was 1000+ after days)
+            articles = articles[:200]
 
             # Try to upgrade KW-scored or lower-tier articles to better models
+            # Cap at 10 newest to avoid blocking the fetcher thread for minutes
             upgradeable = [a for a in articles
                            if a.get('_sent_method', '') != 'LLM'
                            or a.get('_scored_by_model', '') != 'gemini-2.5-pro']
             if upgradeable:
+                upgradeable = upgradeable[:10]
                 upgrade_scores = try_llm_upgrade(upgradeable)
                 if upgrade_scores is not None:
                     for a, score in zip(upgradeable, upgrade_scores):
@@ -1130,10 +1140,25 @@ class DataFetcher(QObject):
                 except (OSError, json.JSONDecodeError):
                     pass
 
+            # Read LLM analysis (written by llm_analyst.py)
+            llm_analysis = {}
+            analysis_file = BASE_DIR / "llm_analysis.json"
+            try:
+                if analysis_file.exists():
+                    with open(analysis_file) as f:
+                        raw = json.load(f)
+                    # Merge crypto + stock sections into flat dict
+                    for section in raw.values():
+                        if isinstance(section, dict):
+                            llm_analysis.update(section)
+            except (OSError, json.JSONDecodeError):
+                pass
+
             self.stocks_updated.emit({
                 'symbols': symbols,
                 'snapshots': snapshots,
                 'predictions': predictions,
+                'llm_analysis': llm_analysis,
             })
         except Exception as e:
             self.error_occurred.emit(f"Stocks fetch: {e}")
@@ -1659,15 +1684,16 @@ class TradingDashboard(QMainWindow):
         self._stock_chart_line.setPen(pg.mkPen(t["accent"].name(), width=2))
 
         # Zoom buttons
-        for z, btn in self._stock_zoom_buttons.items():
-            if btn.isChecked():
-                btn.setStyleSheet(
-                    f"background-color: {t['accent'].name()}; color: {t['bg_dark'].name()};"
-                    f" font-weight: bold; border-radius: 4px;")
-            else:
-                btn.setStyleSheet(
-                    f"background-color: {t['bg_header'].name()}; color: {t['muted'].name()};"
-                    f" border: 1px solid {t['bg_border'].name()}; border-radius: 4px;")
+        for buttons in [self._stock_zoom_buttons, self._perf_zoom_buttons]:
+            for z, btn in buttons.items():
+                if btn.isChecked():
+                    btn.setStyleSheet(
+                        f"background-color: {t['accent'].name()}; color: {t['bg_dark'].name()};"
+                        f" font-weight: bold; border-radius: 4px;")
+                else:
+                    btn.setStyleSheet(
+                        f"background-color: {t['bg_header'].name()}; color: {t['muted'].name()};"
+                        f" border: 1px solid {t['bg_border'].name()}; border-radius: 4px;")
 
         # Log display
         self._log_display.setStyleSheet(
@@ -1801,26 +1827,40 @@ class TradingDashboard(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        eq_label = QLabel("Equity Curve (1M Daily)")
+        # Zoom buttons row
+        zoom_row = QHBoxLayout()
+        eq_label = QLabel("Equity Curve")
         eq_label.setStyleSheet("font-size: 14px; font-weight: bold;")
-        layout.addWidget(eq_label)
+        zoom_row.addWidget(eq_label)
+        zoom_row.addStretch()
 
-        self._equity_plot = pg.PlotWidget()
+        self._perf_zoom = "1M"
+        self._perf_zoom_buttons = {}
+        self._perf_history_cache = {}  # period -> data dict
+        for label in ["1A", "6M", "3M", "1M", "1W"]:
+            btn = QPushButton(label)
+            btn.setFixedWidth(36)
+            btn.setCheckable(True)
+            btn.setChecked(label == self._perf_zoom)
+            btn.clicked.connect(lambda checked, z=label: self._on_perf_zoom_clicked(z))
+            zoom_row.addWidget(btn)
+            self._perf_zoom_buttons[label] = btn
+        layout.addLayout(zoom_row)
+
+        eq_axis = pg.DateAxisItem(orientation='bottom')
+        self._equity_plot = pg.PlotWidget(axisItems={'bottom': eq_axis})
         self._equity_plot.showGrid(x=True, y=True, alpha=0.3)
         self._equity_plot.setLabel("left", "Equity ($)")
-        self._equity_plot.setLabel("bottom", "Date")
         self._equity_curve = self._equity_plot.plot(pen=pg.mkPen(width=2))
-        layout.addWidget(self._equity_plot)
+        self._equity_plot.setMouseEnabled(x=False, y=False)
+        layout.addWidget(self._equity_plot, stretch=1)
 
-        pl_label = QLabel("Daily P&L")
-        pl_label.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 8px;")
-        layout.addWidget(pl_label)
-
-        self._pnl_plot = pg.PlotWidget()
+        pnl_axis = pg.DateAxisItem(orientation='bottom')
+        self._pnl_plot = pg.PlotWidget(axisItems={'bottom': pnl_axis})
         self._pnl_plot.showGrid(x=True, y=True, alpha=0.3)
         self._pnl_plot.setLabel("left", "P&L ($)")
-        self._pnl_plot.setLabel("bottom", "Date")
-        layout.addWidget(self._pnl_plot)
+        self._pnl_plot.setMouseEnabled(x=False, y=False)
+        layout.addWidget(self._pnl_plot, stretch=1)
 
         stats_group = QGroupBox("Performance Stats")
         stats_layout = QHBoxLayout(stats_group)
@@ -1833,6 +1873,48 @@ class TradingDashboard(QMainWindow):
         layout.addWidget(stats_group)
 
         self.tabs.addTab(tab, "Performance")
+
+    def _perf_api_period(self, zoom=None):
+        """Map zoom label to Alpaca API period and timeframe."""
+        z = zoom or self._perf_zoom
+        return {
+            "1A": ("1A", "1D"),
+            "6M": ("6M", "1D"),
+            "3M": ("3M", "1D"),
+            "1M": ("1M", "1D"),
+            "1W": ("1W", "1D"),
+        }.get(z, ("1M", "1D"))
+
+    def _on_perf_zoom_clicked(self, zoom):
+        self._perf_zoom = zoom
+        t = T
+        for z, btn in self._perf_zoom_buttons.items():
+            checked = (z == zoom)
+            btn.setChecked(checked)
+            if checked:
+                btn.setStyleSheet(
+                    f"background-color: {t['accent'].name()}; color: {t['bg_dark'].name()};"
+                    f" font-weight: bold; border-radius: 4px;")
+            else:
+                btn.setStyleSheet(
+                    f"background-color: {t['bg_header'].name()}; color: {t['muted'].name()};"
+                    f" border: 1px solid {t['bg_border'].name()}; border-radius: 4px;")
+
+        period, timeframe = self._perf_api_period(zoom)
+        cached = self._perf_history_cache.get(period)
+        if cached:
+            self._apply_perf_data(cached)
+        else:
+            self._request_perf_history()
+
+    def _request_perf_history(self):
+        """Ask DataFetcher to fetch portfolio history for the current zoom."""
+        period, timeframe = self._perf_api_period()
+        from PySide6.QtCore import QMetaObject, Q_ARG
+        QMetaObject.invokeMethod(
+            self._fetcher, "fetch_history", Qt.QueuedConnection,
+            Q_ARG(str, period), Q_ARG(str, timeframe),
+        )
 
     # ---- Tab 4: Models ---------------------------------------------------
     # ---- Tab 4: News ----------------------------------------------------
@@ -2039,7 +2121,7 @@ class TradingDashboard(QMainWindow):
         # --- Bottom: metrics table ---
         self._stock_table = QTableWidget(0, 8)
         self._stock_table.setHorizontalHeaderLabels(
-            ["Symbol", "Price", "Day Chg%", "Volume", "Bear", "Bull", "Score", "Signal"]
+            ["Symbol", "Price", "Day Chg%", "Volume", "Pred", "Score", "Signal", "LLM"]
         )
         self._stock_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._stock_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -2224,6 +2306,7 @@ class TradingDashboard(QMainWindow):
         symbols = data.get('symbols', [])
         snapshots = data.get('snapshots', {})
         predictions = data.get('predictions', {})
+        llm_analysis = data.get('llm_analysis', {})
 
         # --- Heatmap ---
         cols = 7  # grid columns
@@ -2279,14 +2362,25 @@ class TradingDashboard(QMainWindow):
         for row, sym in enumerate(symbols):
             snap = snapshots.get(sym, {})
             pred = predictions.get(sym, {})
+            llm = llm_analysis.get(sym, {})
 
             price = snap.get('price', 0)
             chg = snap.get('change_pct', 0)
             vol = snap.get('volume', 0)
-            bear = pred.get('bear')
-            bull = pred.get('bull')
+            pred_val = pred.get('pred')
             score = pred.get('score')
             signal = pred.get('signal', '')
+
+            # LLM multiplier + reasoning
+            llm_m = llm.get('m')
+            llm_r = llm.get('r', '')
+            if llm_m is not None:
+                llm_text = f"{llm_m:.1f}x"
+                llm_color = (T['green'] if llm_m >= 1.0 else
+                             (T['red'] if llm_m <= 0.5 else T.get('yellow', T['white'])))
+            else:
+                llm_text = "\u2014"
+                llm_color = T['muted']
 
             chg_color = T['green'] if chg > 0 else (T['red'] if chg < 0 else T['white'])
 
@@ -2295,22 +2389,44 @@ class TradingDashboard(QMainWindow):
                 (f"${price:.2f}" if price else "\u2014", T['white']),
                 (f"{chg:+.2f}%", chg_color),
                 (f"{vol:,}" if vol else "\u2014", T['muted']),
-                (f"{bear:+.4f}" if bear is not None else "\u2014",
-                 T['red'] if bear is not None and bear < 0 else T['muted']),
-                (f"{bull:+.4f}" if bull is not None else "\u2014",
-                 T['green'] if bull is not None and bull > 0 else T['muted']),
+                (f"{pred_val:+.4f}" if pred_val is not None else "\u2014",
+                 T['green'] if pred_val is not None and pred_val > 0 else
+                 (T['red'] if pred_val is not None and pred_val < 0 else T['muted'])),
                 (f"{score:+.4f}" if score is not None else "\u2014",
                  T['green'] if score is not None and score > 0 else
                  (T['red'] if score is not None and score < 0 else T['muted'])),
                 (signal, T['green'] if signal == 'BULL' else
-                 (T['red'] if signal == 'BEAR' else
-                  (T['yellow'] if signal == 'DISAGREE' else T['muted']))),
+                 (T['red'] if signal == 'BEAR' else T['muted'])),
+                (llm_text, llm_color),
+            ]
+
+            # Numeric sort values for columns that need numeric sorting
+            sort_values = [
+                None,       # 0: Symbol — text sort is fine
+                price,      # 1: Price
+                chg,        # 2: Day Chg%
+                vol,        # 3: Volume
+                pred_val if pred_val is not None else float('-inf'),  # 4: Pred
+                score if score is not None else float('-inf'),        # 5: Score
+                None,       # 6: Signal — text sort is fine
+                llm_m if llm_m is not None else float('-inf'),       # 7: LLM
             ]
 
             for col, (val, color) in enumerate(items_data):
-                item = QTableWidgetItem(str(val))
+                if sort_values[col] is not None:
+                    item = NumericTableItem(str(val))
+                    item.setData(Qt.UserRole, float(sort_values[col]))
+                else:
+                    item = QTableWidgetItem(str(val))
                 item.setTextAlignment(Qt.AlignCenter)
                 item.setForeground(color)
+                # LLM column (7): show reasoning as tooltip
+                if col == 7 and llm_r:
+                    ts = llm.get('timestamp', '')
+                    tip = llm_r
+                    if ts:
+                        tip += f"\n({ts})"
+                    item.setToolTip(tip)
                 tbl.setItem(row, col, item)
 
         tbl.setUpdatesEnabled(True)
@@ -2556,6 +2672,46 @@ class TradingDashboard(QMainWindow):
 
         llm_layout.addWidget(model_group)
 
+        # --- Trading Model Roles ---
+        role_group = QGroupBox("Trading Model Roles")
+        role_layout = QGridLayout(role_group)
+        role_layout.setColumnStretch(1, 1)
+        role_layout.setColumnMinimumWidth(0, 70)
+
+        # Analyst model: Pro or Flash (no Lite)
+        role_layout.addWidget(QLabel("Analyst:"), 0, 0)
+        self._settings_analyst_model = QComboBox()
+        self._settings_analyst_model.setMaximumWidth(320)
+        for mid, label in [
+            ("gemini-2.5-flash", "Flash (fast, low cost)"),
+            ("gemini-2.5-pro", "Pro (best reasoning, higher cost)"),
+        ]:
+            self._settings_analyst_model.addItem(label, mid)
+        cur_analyst = config.get("analyst_model", "gemini-2.5-flash")
+        idx = self._settings_analyst_model.findData(cur_analyst)
+        if idx >= 0:
+            self._settings_analyst_model.setCurrentIndex(idx)
+        self._settings_analyst_model.currentIndexChanged.connect(self._on_settings_changed)
+        role_layout.addWidget(self._settings_analyst_model, 0, 1)
+
+        # Sentiment model: Flash or Flash-Lite (no Pro)
+        role_layout.addWidget(QLabel("Sentiment:"), 1, 0)
+        self._settings_sentiment_model = QComboBox()
+        self._settings_sentiment_model.setMaximumWidth(320)
+        for mid, label in [
+            ("gemini-2.5-flash-lite", "Flash Lite (cheapest)"),
+            ("gemini-2.5-flash", "Flash (better accuracy)"),
+        ]:
+            self._settings_sentiment_model.addItem(label, mid)
+        cur_sentiment = config.get("sentiment_model", "gemini-2.5-flash")
+        idx = self._settings_sentiment_model.findData(cur_sentiment)
+        if idx >= 0:
+            self._settings_sentiment_model.setCurrentIndex(idx)
+        self._settings_sentiment_model.currentIndexChanged.connect(self._on_settings_changed)
+        role_layout.addWidget(self._settings_sentiment_model, 1, 1)
+
+        llm_layout.addWidget(role_group)
+
         # Latency + Test row
         bottom_row = QHBoxLayout()
         bottom_row.addWidget(QLabel("Max Latency:"))
@@ -2658,6 +2814,14 @@ class TradingDashboard(QMainWindow):
             model_id = combo.currentData()
             if model_id:
                 config.setdefault("models", {}).setdefault(provider, {})["model"] = model_id
+
+        # Trading model roles
+        analyst = self._settings_analyst_model.currentData()
+        if analyst:
+            config["analyst_model"] = analyst
+        sentiment = self._settings_sentiment_model.currentData()
+        if sentiment:
+            config["sentiment_model"] = sentiment
 
         save_llm_config(config)
 
@@ -2807,47 +2971,44 @@ class TradingDashboard(QMainWindow):
 
     @Slot(dict)
     def on_history(self, data):
+        period = data.get("period", "1M")
+        self._perf_history_cache[period] = data
+
+        # Only apply if this period matches the current zoom
+        api_period, _ = self._perf_api_period()
+        if period == api_period:
+            self._apply_perf_data(data)
+
+    def _apply_perf_data(self, data):
         equities = data.get("equity", [])
         timestamps = data.get("timestamp", [])
         pnl = data.get("profit_loss", [])
 
         if equities and timestamps:
-            x = np.arange(len(equities))
-            self._equity_curve.setData(x, equities)
+            ts_arr = [float(t) for t in timestamps]
+            self._equity_curve.setData(ts_arr, equities)
+            y_min = min(equities)
+            y_max = max(equities)
+            pad = (y_max - y_min) * 0.05 if y_max > y_min else y_max * 0.02
+            self._equity_plot.setXRange(ts_arr[0], ts_arr[-1], padding=0.02)
+            self._equity_plot.setYRange(y_min - pad, y_max + pad, padding=0)
 
-            axis = self._equity_plot.getPlotItem().getAxis("bottom")
-            ticks = []
-            for i, ts in enumerate(timestamps):
-                try:
-                    d = dt.datetime.fromtimestamp(ts, tz=TZ_CENTRAL)
-                    ticks.append((i, d.strftime("%m/%d")))
-                except Exception:
-                    pass
-            axis.setTicks([ticks])
-
-        if pnl:
+        if pnl and timestamps and len(timestamps) == len(pnl):
             self._pnl_plot.clear()
-            pos_x = [i for i, v in enumerate(pnl) if v >= 0]
+            ts_arr = [float(t) for t in timestamps]
+            # Bar width ~80% of interval between points
+            bar_w = (ts_arr[1] - ts_arr[0]) * 0.8 if len(ts_arr) > 1 else 86400 * 0.8
+            pos_x = [ts_arr[i] for i, v in enumerate(pnl) if v >= 0]
             pos_h = [v for v in pnl if v >= 0]
-            neg_x = [i for i, v in enumerate(pnl) if v < 0]
+            neg_x = [ts_arr[i] for i, v in enumerate(pnl) if v < 0]
             neg_h = [v for v in pnl if v < 0]
             if pos_x:
                 self._pnl_plot.addItem(pg.BarGraphItem(
-                    x=pos_x, height=pos_h, width=0.6, brush=T["green"].name()))
+                    x=pos_x, height=pos_h, width=bar_w, brush=T["green"].name()))
             if neg_x:
                 self._pnl_plot.addItem(pg.BarGraphItem(
-                    x=neg_x, height=neg_h, width=0.6, brush=T["red"].name()))
-
-            if timestamps and len(timestamps) == len(pnl):
-                axis = self._pnl_plot.getPlotItem().getAxis("bottom")
-                ticks = []
-                for i, ts in enumerate(timestamps):
-                    try:
-                        d = dt.datetime.fromtimestamp(ts, tz=TZ_CENTRAL)
-                        ticks.append((i, d.strftime("%m/%d")))
-                    except Exception:
-                        pass
-                axis.setTicks([ticks])
+                    x=neg_x, height=neg_h, width=bar_w, brush=T["red"].name()))
+            self._pnl_plot.setXRange(ts_arr[0], ts_arr[-1], padding=0.02)
 
             total_return = sum(pnl)
             best_day = max(pnl) if pnl else 0
@@ -3060,8 +3221,9 @@ class TradingDashboard(QMainWindow):
 
         tbl = self._news_table
         tbl.setUpdatesEnabled(False)
-        tbl.setRowCount(len(articles))
-        for row, a in enumerate(articles):
+        display_articles = articles[:150]  # cap table rows to avoid UI stall
+        tbl.setRowCount(len(display_articles))
+        for row, a in enumerate(display_articles):
             ts = a.get('datetime', 0)
             if ts:
                 time_str = _dt.datetime.fromtimestamp(ts, tz=TZ_CENTRAL).strftime("%m/%d %I:%M %p")
@@ -3263,7 +3425,7 @@ class TradingDashboard(QMainWindow):
                         str(cfg.get("hidden_dim", "?")),
                         str(cfg.get("num_layers", "?")),
                         str(cfg.get("seq_len", "?")),
-                        str(cfg.get("bull_threshold", "?")),
+                        str(cfg.get("trade_threshold", "?")),
                         str(cfg.get("indicator_preset", "N/A"))]
             else:
                 vals = [name, status, "Not found", age_str,
@@ -3315,12 +3477,8 @@ class TradingDashboard(QMainWindow):
         if bots_running and phase != "trading":
             status_text += " + BOTS"
 
-        model_ver = pinfo.get("model_version", 1)
-        ver_label = "v2 regression" if model_ver == 2 else "v1 classification"
-
         self._pipeline_status.setText(
-            f"Status: <span style='color:{status_color}'>{status_text}</span>"
-            f"  [{ver_label}]")
+            f"Status: <span style='color:{status_color}'>{status_text}</span>")
 
         self._pipeline_phase.setText(f"Phase: {phase_label}")
 
@@ -3375,26 +3533,12 @@ class TradingDashboard(QMainWindow):
 
         # Show final scores from completed phases
         scores_parts = []
-        # v2 regression scores
-        crypto_v2 = pinfo.get("crypto_v2_final_score")
-        stock_v2 = pinfo.get("stock_v2_final_score")
-        if crypto_v2 is not None:
-            scores_parts.append(f"Crypto: {crypto_v2:.4f}")
-        if stock_v2 is not None:
-            scores_parts.append(f"Stock: {stock_v2:.4f}")
-        # v1 classification scores
-        bear_final = pinfo.get("bear_final_score")
-        bull_final = pinfo.get("bull_final_score")
-        stock_bear_final = pinfo.get("stock_bear_final_score")
-        stock_bull_final = pinfo.get("stock_bull_final_score")
-        if bear_final is not None:
-            scores_parts.append(f"C-Bear: {bear_final:.4f}")
-        if bull_final is not None:
-            scores_parts.append(f"C-Bull: {bull_final:.4f}")
-        if stock_bear_final is not None:
-            scores_parts.append(f"S-Bear: {stock_bear_final:.4f}")
-        if stock_bull_final is not None:
-            scores_parts.append(f"S-Bull: {stock_bull_final:.4f}")
+        crypto_final = pinfo.get("crypto_final_score")
+        stock_final = pinfo.get("stock_final_score")
+        if crypto_final is not None:
+            scores_parts.append(f"Crypto: {crypto_final:.4f}")
+        if stock_final is not None:
+            scores_parts.append(f"Stock: {stock_final:.4f}")
         self._pipeline_scores.setText("  |  ".join(scores_parts) if scores_parts else "")
 
         # Next retrain time

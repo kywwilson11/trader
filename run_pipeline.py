@@ -31,8 +31,6 @@ import subprocess
 import sys
 import time
 
-import joblib
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATUS_FILE = os.path.join(BASE_DIR, 'pipeline_status.json')
 LOG_FILE = os.path.join(BASE_DIR, 'pipeline_output.log')
@@ -42,10 +40,12 @@ PYTHON = '/home/kyle/miniforge3/envs/jetson/bin/python'
 ENV = {
     **os.environ,
     'LD_LIBRARY_PATH': (
+        '/home/kyle/miniforge3/envs/jetson/lib:'
         '/home/kyle/miniforge3/envs/jetson/lib/python3.10/site-packages/'
         'nvidia/cusparselt/lib:'
         + os.environ.get('LD_LIBRARY_PATH', '')
     ),
+    'LD_PRELOAD': '/home/kyle/miniforge3/envs/jetson/lib/libstdc++.so.6',
     'PYTHONUNBUFFERED': '1',
 }
 
@@ -90,7 +90,6 @@ def run_phase(phase, log_fh, status):
     status['trial_current'] = 0
     status['trial_prior'] = 0
     status['best_score'] = status.get('best_score', 0.0) if 'search' not in phase_id else 0.0
-    status['best_per_class'] = {} if 'search' in phase_id else status.get('best_per_class', {})
 
     if 'search' in phase_id:
         status['trial_total'] = phase.get('trials', 250)
@@ -126,27 +125,18 @@ def run_phase(phase, log_fh, status):
         sys.stdout.flush()
 
         # Parse prior trials: "Resuming from 119 prior trials in bear_study.db"
-        # Store prior offset so we can show new-trial progress (not absolute)
         m = re.match(r'Resuming from (\d+) prior trials', line)
         if m:
             status['trial_prior'] = int(m.group(1))
             write_status(status, force=True)
 
-        # Parse prior best: "Prior best score=0.396 ..." or "Prior best sharpe=0.396 ..."
-        m = re.match(r'Prior best (?:score|sharpe)=(-?\d+\.\d+)', line)
+        # Parse prior best: "Prior best sharpe=0.396 ..."
+        m = re.match(r'Prior best sharpe=(-?\d+\.\d+)', line)
         if m:
             status['best_score'] = float(m.group(1))
-            mc = re.search(r'B:(\d+)% N:(\d+)% U:(\d+)%', line)
-            if mc:
-                status['best_per_class'] = {
-                    'bear': int(mc.group(1)) / 100,
-                    'neutral': int(mc.group(2)) / 100,
-                    'bull': int(mc.group(3)) / 100,
-                }
             write_status(status, force=True)
 
-        # Parse trial progress: "[  45] score=0.543 ..."
-        # Subtract prior trials so GUI shows new-run progress (e.g. 50/300 not 178/428)
+        # Parse trial progress: "[  45] sharpe=0.543 ..."
         force = False
         m = re.match(r'\[\s*(\d+)\]', line)
         if m:
@@ -156,23 +146,9 @@ def run_phase(phase, log_fh, status):
 
         # Parse best score on "** BEST **" lines
         if '** BEST **' in line:
-            # v1: "score=0.543" or v2: "sharpe=1.234"
-            m = re.search(r'(?:score|sharpe)=(-?\d+\.\d+)', line)
+            m = re.search(r'sharpe=(-?\d+\.\d+)', line)
             if m:
                 status['best_score'] = float(m.group(1))
-            m = re.search(r'F1=(\d+\.\d+)', line)
-            if m:
-                status['best_f1'] = float(m.group(1))
-            m = re.search(r'cat=(\d+\.\d+)', line)
-            if m:
-                status['best_catastrophic'] = float(m.group(1))
-            m = re.search(r'B:(\d+)% N:(\d+)% U:(\d+)%', line)
-            if m:
-                status['best_per_class'] = {
-                    'bear': int(m.group(1)) / 100,
-                    'neutral': int(m.group(2)) / 100,
-                    'bull': int(m.group(3)) / 100,
-                }
             force = True
 
         write_status(status, force=force)
@@ -202,23 +178,32 @@ def run_phase(phase, log_fh, status):
 # ---------------------------------------------------------------------------
 
 def _start_bot(cmd, log_path):
-    """Start a trading bot as a background process."""
+    """Start a trading bot as a background process.
+
+    Returns (proc, file_handle) so the caller can close the log FH when done.
+    """
     fh = open(log_path, 'a')
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         cmd, stdout=fh, stderr=subprocess.STDOUT,
         env=ENV, cwd=BASE_DIR,
     )
+    return proc, fh
 
 
 def _check_restart_bots(bots, log_fh):
     """Check for crashed bots and restart them."""
-    for i, (name, proc) in enumerate(bots):
+    for i, (name, proc, bot_fh) in enumerate(bots):
         if proc.poll() is not None:
+            # Close the old log file handle before opening a new one
+            try:
+                bot_fh.close()
+            except Exception:
+                pass
             log_path = CRYPTO_BOT_LOG if name == 'Crypto' else STOCK_BOT_LOG
             cmd = [PYTHON, '-u',
                    'crypto_loop.py' if name == 'Crypto' else 'stock_loop.py']
-            new_proc = _start_bot(cmd, log_path)
-            bots[i] = (name, new_proc)
+            new_proc, new_fh = _start_bot(cmd, log_path)
+            bots[i] = (name, new_proc, new_fh)
             msg = (f"{name} bot crashed (exit {proc.returncode}),"
                    f" restarted as PID {new_proc.pid}\n")
             log_fh.write(msg)
@@ -288,86 +273,28 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
     return phases
 
 
-def _read_bear_threshold(prefix=''):
-    """Read the best threshold from a completed bear model config."""
-    p = f'{prefix}_' if prefix else ''
-    path = os.path.join(BASE_DIR, f'{p}bear_config.pkl')
-    try:
-        config = joblib.load(path)
-        th = config.get('bull_threshold')
-        if th is not None:
-            print(f"  Bear threshold extracted: {th:.2f} (will share with bull search)")
-        return th
-    except Exception as e:
-        print(f"  WARNING: Could not read bear config ({e}), bull will search independently")
-        return None
-
-
-def _build_training_phases(trials, train_crypto, train_stock, use_v2=False):
+def _build_training_phases(trials, train_crypto, train_stock):
     """Build model training phases."""
-    from indicator_config import get_preset_name
-    preset = get_preset_name()
     phases = []
 
-    if use_v2:
-        # v2 regression: single model per asset type
-        if train_crypto:
-            phases.append({
-                'id': 'crypto_v2_search',
-                'label': 'Training Crypto v2 Regression Model',
-                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
-                        '--trials', str(trials), '--preset', 'stationary'],
-                'trials': trials,
-            })
-        if train_stock:
-            phases.append({
-                'id': 'stock_v2_search',
-                'label': 'Training Stock v2 Regression Model',
-                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
-                        '--trials', str(trials),
-                        '--data', 'stock_training_data.csv', '--prefix', 'stock',
-                        '--preset', 'stationary', '--max-rows', '350000'],
-                'trials': trials,
-            })
-    else:
-        # v1 classification: dual bear/bull models
-        if train_crypto:
-            phases.append({
-                'id': 'bear_search',
-                'label': 'Training Crypto Bear Model',
-                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
-                        '--target', 'bear', '--trials', str(trials),
-                        '--preset', preset],
-                'trials': trials,
-            })
-            phases.append({
-                'id': 'bull_search',
-                'label': 'Training Crypto Bull Model',
-                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
-                        '--target', 'bull', '--trials', str(trials),
-                        '--preset', preset],
-                'trials': trials,
-            })
-
-        if train_stock:
-            phases.append({
-                'id': 'stock_bear_search',
-                'label': 'Training Stock Bear Model',
-                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
-                        '--target', 'bear', '--trials', str(trials),
-                        '--data', 'stock_training_data.csv', '--prefix', 'stock',
-                        '--preset', preset, '--max-rows', '350000'],
-                'trials': trials,
-            })
-            phases.append({
-                'id': 'stock_bull_search',
-                'label': 'Training Stock Bull Model',
-                'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_dual.py'),
-                        '--target', 'bull', '--trials', str(trials),
-                        '--data', 'stock_training_data.csv', '--prefix', 'stock',
-                        '--preset', preset, '--max-rows', '350000'],
-                'trials': trials,
-            })
+    if train_crypto:
+        phases.append({
+            'id': 'crypto_search',
+            'label': 'Training Crypto Regression Model',
+            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
+                    '--trials', str(trials), '--preset', 'stationary'],
+            'trials': trials,
+        })
+    if train_stock:
+        phases.append({
+            'id': 'stock_search',
+            'label': 'Training Stock Regression Model',
+            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
+                    '--trials', str(trials),
+                    '--data', 'stock_training_data.csv', '--prefix', 'stock',
+                    '--preset', 'stationary', '--max-rows', '350000'],
+            'trials': trials,
+        })
 
     return phases
 
@@ -377,30 +304,11 @@ def _run_training(phases, log_fh, status, is_retrain):
     for phase in phases:
         rc = run_phase(phase, log_fh, status)
 
-        # After bear search succeeds, inject --fixed-threshold into the bull phase
-        if rc == 0 and phase['id'] in ('bear_search', 'stock_bear_search'):
-            prefix = '' if phase['id'] == 'bear_search' else 'stock'
-            th = _read_bear_threshold(prefix)
-            if th is not None:
-                bull_id = 'bull_search' if phase['id'] == 'bear_search' else 'stock_bull_search'
-                for p in phases:
-                    if p['id'] == bull_id and '--fixed-threshold' not in p['cmd']:
-                        p['cmd'].extend(['--fixed-threshold', str(th)])
-                        break
-
         # Save final scores
-        if phase['id'] == 'bear_search':
-            status['bear_final_score'] = status.get('best_score', 0)
-        elif phase['id'] == 'bull_search':
-            status['bull_final_score'] = status.get('best_score', 0)
-        elif phase['id'] == 'stock_bear_search':
-            status['stock_bear_final_score'] = status.get('best_score', 0)
-        elif phase['id'] == 'stock_bull_search':
-            status['stock_bull_final_score'] = status.get('best_score', 0)
-        elif phase['id'] == 'crypto_v2_search':
-            status['crypto_v2_final_score'] = status.get('best_score', 0)
-        elif phase['id'] == 'stock_v2_search':
-            status['stock_v2_final_score'] = status.get('best_score', 0)
+        if phase['id'] == 'crypto_search':
+            status['crypto_final_score'] = status.get('best_score', 0)
+        elif phase['id'] == 'stock_search':
+            status['stock_final_score'] = status.get('best_score', 0)
 
         if rc != 0:
             if is_retrain:
@@ -446,22 +354,12 @@ def main():
                         help='Hour to start retrain (0-23, default: 2)')
     parser.add_argument('--retrain-trials', type=int, default=100,
                         help='Trials per model for weekly retrain (default: 100)')
-    parser.add_argument('--v2', action='store_true', default=True,
-                        help='Use v2 regression training (default: True)')
-    parser.add_argument('--v1', action='store_true',
-                        help='Use v1 classification training (overrides --v2)')
     args = parser.parse_args()
-
-    # --v1 explicitly overrides the default v2
-    if args.v1:
-        args.v2 = False
 
     train_crypto = not args.stock_only
     train_stock = not args.crypto_only
     run_crypto = not args.stock_only
     run_stock = not args.crypto_only
-
-    use_v2 = args.v2
 
     status = {
         'started_at': datetime.datetime.now().isoformat(),
@@ -472,14 +370,10 @@ def main():
         'trial_current': 0,
         'trial_total': 0,
         'best_score': 0.0,
-        'best_per_class': {},
-        'bear_final_score': None,
-        'bull_final_score': None,
-        'stock_bear_final_score': None,
-        'stock_bull_final_score': None,
+        'crypto_final_score': None,
+        'stock_final_score': None,
         'retrain_cycle': 0,
         'bots_running': False,
-        'model_version': 2 if use_v2 else 1,
     }
 
     with open(LOG_FILE, 'a') as log_fh:
@@ -489,7 +383,7 @@ def main():
         # =============================================================
         if not args.bot_only:
             phases = (_build_harvest_phases(args.skip_harvest, train_crypto, train_stock)
-                      + _build_training_phases(args.trials, train_crypto, train_stock, use_v2=use_v2))
+                      + _build_training_phases(args.trials, train_crypto, train_stock))
             for i, p in enumerate(phases):
                 p['idx'] = i
 
@@ -512,10 +406,12 @@ def main():
 
             # Start background sentiment fetch (runs during training)
             sentiment_proc = None
+            sentiment_fh = None
             try:
+                sentiment_fh = open(os.path.join(BASE_DIR, 'sentiment_fetch.log'), 'a')
                 sentiment_proc = subprocess.Popen(
                     [PYTHON, '-u', 'sentiment_history.py', '--fetch-stocks'],
-                    stdout=open(os.path.join(BASE_DIR, 'sentiment_fetch.log'), 'a'),
+                    stdout=sentiment_fh,
                     stderr=subprocess.STDOUT,
                     env=ENV, cwd=BASE_DIR,
                 )
@@ -537,16 +433,16 @@ def main():
         bots = []
 
         if run_crypto:
-            proc = _start_bot([PYTHON, '-u', 'crypto_loop.py'], CRYPTO_BOT_LOG)
-            bots.append(('Crypto', proc))
+            proc, bot_fh = _start_bot([PYTHON, '-u', 'crypto_loop.py'], CRYPTO_BOT_LOG)
+            bots.append(('Crypto', proc, bot_fh))
             msg = f"Crypto bot started (PID {proc.pid}, log: crypto_bot_output.log)\n"
             log_fh.write(msg)
             log_fh.flush()
             print(msg, end='')
 
         if run_stock:
-            proc = _start_bot([PYTHON, '-u', 'stock_loop.py'], STOCK_BOT_LOG)
-            bots.append(('Stock', proc))
+            proc, bot_fh = _start_bot([PYTHON, '-u', 'stock_loop.py'], STOCK_BOT_LOG)
+            bots.append(('Stock', proc, bot_fh))
             msg = f"Stock bot started (PID {proc.pid}, log: stock_bot_output.log)\n"
             log_fh.write(msg)
             log_fh.flush()
@@ -562,9 +458,10 @@ def main():
         try:
             from sentiment_history import set_live_mode
             set_live_mode(True)
+            backfill_fh = open(os.path.join(BASE_DIR, 'backfill_output.log'), 'a')
             backfill_proc = subprocess.Popen(
                 [PYTHON, '-u', 'sentiment_history.py', '--backfill'],
-                stdout=open(os.path.join(BASE_DIR, 'backfill_output.log'), 'a'),
+                stdout=backfill_fh,
                 stderr=subprocess.STDOUT,
                 env=ENV, cwd=BASE_DIR,
             )
@@ -627,7 +524,7 @@ def main():
 
             retrain_phases = (
                 _build_harvest_phases(False, train_crypto, train_stock)
-                + _build_training_phases(args.retrain_trials, train_crypto, train_stock, use_v2=use_v2)
+                + _build_training_phases(args.retrain_trials, train_crypto, train_stock)
             )
             for i, p in enumerate(retrain_phases):
                 p['idx'] = i

@@ -445,7 +445,7 @@ def compute_features(df, btc_close=None):
 
     # BTC cross-asset features (crypto only)
     if btc_close is not None:
-        btc_aligned = btc_close.reindex(df.index, method='ffill')
+        btc_aligned = btc_close.reindex(df.index).ffill()
         df['BTC_Return_1h'] = btc_aligned.pct_change(1)
         btc_sma20 = btc_aligned.rolling(window=20).mean()
         df['BTC_SMA_Ratio'] = btc_aligned / btc_sma20
@@ -524,7 +524,7 @@ def compute_stock_features(df, spy_close=None):
     # Relative strength vs SPY
     if spy_close is not None:
         # Align SPY close to df's index
-        spy_aligned = spy_close.reindex(df.index, method='ffill')
+        spy_aligned = spy_close.reindex(df.index).ffill()
         df['RS_vs_SPY'] = compute_relative_strength(df['Close'], spy_aligned)
     else:
         df['RS_vs_SPY'] = 1.0  # neutral if no benchmark

@@ -37,6 +37,7 @@ from sklearn.preprocessing import MinMaxScaler
 
 from model import CryptoLSTM
 from hw_monitor import wait_for_cool_gpu, get_gpu_temp, get_ram_usage
+from gpu_lock import acquire_for_training
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -433,4 +434,5 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    with acquire_for_training("evolve"):
+        main()

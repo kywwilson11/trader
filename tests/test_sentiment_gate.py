@@ -110,10 +110,11 @@ class TestSentimentGate:
     @patch("sentiment.get_market_sentiment", return_value=None)
     @patch("sentiment.get_news_sentiment", return_value=None)
     @patch("sentiment.get_fear_greed", return_value={'value': 10, 'label': 'Extreme Fear'})
-    def test_extreme_fear_reduces(self, mock_fng, mock_news, mock_market):
+    def test_extreme_fear_no_reduction(self, mock_fng, mock_news, mock_market):
+        """FnG extreme fear does NOT reduce — model already uses Daily_Sentiment."""
         mult, reasons = sentiment_gate('BTC/USD', 'crypto')
-        assert mult < 1.0
-        assert any('extreme_fear' in r for r in reasons)
+        assert mult == pytest.approx(1.0)
+        assert any('FnG=10' in r for r in reasons)
 
     @patch("sentiment.get_market_sentiment", return_value=None)
     @patch("sentiment.get_news_sentiment", return_value={

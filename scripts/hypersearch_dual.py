@@ -25,6 +25,7 @@ import os
 import time
 import optuna
 from optuna.pruners import MedianPruner
+from gpu_lock import acquire_for_training
 
 NUM_TRIALS = 200
 MAX_EPOCHS = 60
@@ -57,6 +58,8 @@ def parse_args():
                         help='Prefix for output files (e.g. "stock" -> stock_bear_model.pth)')
     parser.add_argument('--fixed-threshold', type=float, default=None,
                         help='Use a fixed bull_threshold instead of searching (for shared threshold between bear/bull)')
+    parser.add_argument('--fixed-forward-bars', type=int, default=None,
+                        help='Use a fixed forward_bars instead of searching (for shared horizon between bear/bull)')
     parser.add_argument('--preset', type=str, default=None,
                         help='Indicator preset: minimal, standard, full')
     parser.add_argument('--max-rows', type=int, default=500_000,
@@ -240,7 +243,8 @@ class SeqCache:
 
 def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
                      tickers, ticker_boundaries, input_dim, _state_cache,
-                     fixed_threshold=None, has_multi_horizon=True):
+                     fixed_threshold=None, fixed_forward_bars=None,
+                     has_multi_horizon=True):
     # target class index: bear=0, bull=2
     target_class = 0 if target == 'bear' else 2
 
@@ -254,8 +258,10 @@ def create_objective(target, all_scaled, all_returns, all_returns_by_fb,
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Forward bars horizon (searchable if multi-horizon data available)
-        if has_multi_horizon:
+        # Forward bars horizon
+        if fixed_forward_bars is not None:
+            forward_bars = fixed_forward_bars
+        elif has_multi_horizon:
             forward_bars = trial.suggest_categorical('forward_bars', FORWARD_BARS)
         else:
             forward_bars = 4  # legacy single-horizon
@@ -717,4 +723,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    args = parse_args()
+    lock_label = f"hypersearch_dual_{args.prefix or ''}{args.target}"
+    with acquire_for_training(lock_label):
+        main()

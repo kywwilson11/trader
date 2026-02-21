@@ -41,10 +41,14 @@ def get_model_mtime(path):
 # --- INFERENCE DEVICE ---
 
 def choose_inference_device():
-    """Choose inference device: CPU if GPU is busy/unavailable, else default."""
-    if not is_gpu_available():
-        return 'cpu'
-    return None  # None = use default device
+    """Always use CPU for inference in the trading bots.
+
+    The model is ~1.3MB — CPU inference is fast enough for 30-second trading
+    cycles (a few ms per symbol). Reserving GPU exclusively for training
+    eliminates the CUDA OOM crashes that happen when inference and training
+    compete for the Jetson's 8GB unified memory.
+    """
+    return 'cpu'
 
 
 # --- COOLDOWN ---
@@ -65,51 +69,14 @@ def cooldown_ok(last_trade_time, symbol, cooldown_minutes=30):
 
 # --- PREDICTION WRAPPER ---
 
-def predict_symbol(api, symbol, bear_model, bear_config, bull_model, bull_config,
-                   scaler_X, feature_cols, inference_device,
-                   asset_type='crypto', benchmark_close=None):
-    """Run both bear and bull predictions for a single symbol.
-
-    Args:
-        api: Alpaca REST API object
-        symbol: Alpaca symbol (e.g. 'BTC/USD' or 'TSLA')
-        bear_model/bear_config: bear model and its config dict
-        bull_model/bull_config: bull model and its config dict
-        scaler_X: feature scaler
-        feature_cols: list of feature column names
-        inference_device: device string or None for default
-        asset_type: 'crypto' or 'stock'
-        benchmark_close: SPY close Series (stocks) or BTC close Series (crypto)
-
-    Returns:
-        (symbol, bear_pred, bull_pred) tuple
-    """
-    # Route the benchmark to the correct kwarg based on asset type
-    extra_kwargs = {}
-    if asset_type == 'stock':
-        extra_kwargs['spy_close'] = benchmark_close
-    else:
-        extra_kwargs['btc_close'] = benchmark_close
-
-    bear_pred = get_live_prediction(
-        symbol, bear_model, scaler_X, bear_config, feature_cols,
-        api=api, inference_device=inference_device,
-        asset_type=asset_type, **extra_kwargs,
-    )
-    bull_pred = get_live_prediction(
-        symbol, bull_model, scaler_X, bull_config, feature_cols,
-        api=api, inference_device=inference_device,
-        asset_type=asset_type, **extra_kwargs,
-    )
-    return symbol, bear_pred, bull_pred
-
-
-def predict_symbol_v2(api, symbol, model, config, scaler_X, feature_cols,
-                      inference_device, asset_type='crypto', benchmark_close=None):
-    """Run a single v2 regression prediction for a symbol.
+def predict_symbol(api, symbol, model, config, scaler_X, feature_cols,
+                   inference_device, asset_type='crypto', benchmark_close=None,
+                   return_snapshot=False):
+    """Run a regression prediction for a single symbol.
 
     Returns:
         (symbol, pred_return) tuple where pred_return is float or None
+        If return_snapshot: (symbol, pred_return, snapshot_dict)
     """
     extra_kwargs = {}
     if asset_type == 'stock':
@@ -117,9 +84,13 @@ def predict_symbol_v2(api, symbol, model, config, scaler_X, feature_cols,
     else:
         extra_kwargs['btc_close'] = benchmark_close
 
-    pred = get_live_prediction(
+    result = get_live_prediction(
         symbol, model, scaler_X, config, feature_cols,
         api=api, inference_device=inference_device,
-        asset_type=asset_type, **extra_kwargs,
+        asset_type=asset_type, return_snapshot=return_snapshot,
+        **extra_kwargs,
     )
-    return symbol, pred
+    if return_snapshot:
+        pred, snapshot = result if result else (None, None)
+        return symbol, pred, snapshot
+    return symbol, result

@@ -1,10 +1,10 @@
-"""24/7 crypto trading loop — 10 symbols, dual bear/bull models, sentiment-gated.
+"""24/7 crypto trading loop — 10 symbols, regression model, sentiment-gated.
 
 Runs continuously (crypto markets never close):
   1. Fetch predictions for all symbols in parallel (ThreadPoolExecutor)
   2. Check stop-loss / trailing stop / take-profit on open positions
-  3. Sell positions where the bear model signals weakness
-  4. Buy symbols where the bull model signals strength (sentiment-gated)
+  3. Sell positions where the model signals weakness
+  4. Buy symbols where the model signals strength (sentiment-gated)
   5. Sleep and repeat
 
 Uses ATR-adaptive stops with fixed-percentage fallbacks.
@@ -12,7 +12,7 @@ Uses ATR-adaptive stops with fixed-percentage fallbacks.
 
 import time
 import datetime
-import gc
+
 import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,11 +23,11 @@ from order_utils import (
     cancel_all_open_orders, reconstruct_positions,
     check_circuit_breaker, emergency_flatten,
 )
-from predict_now import load_dual_models, load_v2_models, get_live_prediction
-from market_data import fetch_bars_alpaca, get_live_atr
-from trading_utils import get_api, get_model_mtime, choose_inference_device, cooldown_ok, predict_symbol, predict_symbol_v2
+from predict_now import load_models, get_live_prediction
+from market_data import fetch_bars_alpaca, get_live_atr, fetch_crypto_volume
+from trading_utils import get_api, get_model_mtime, choose_inference_device, cooldown_ok, predict_symbol
 from hw_monitor import get_gpu_temp
-from sentiment import sentiment_gate, get_fear_greed
+from sentiment import sentiment_gate, get_fear_greed, get_recent_headlines
 from llm_config import load_llm_config
 from llm_analyst import analyze_trades
 from fundamentals import get_fundamentals, format_fundamentals_for_llm
@@ -37,12 +37,14 @@ from stock_config import CRYPTO_SYMBOLS
 # --- CONFIGURATION ---
 
 NOTIONAL_PER_SYMBOL = 250  # $250 per symbol per cycle
+MAX_NOTIONAL_PER_SYMBOL = 750  # max total position per symbol (3x base)
 ORDER_TIMEOUT = 30  # seconds to wait for limit fill
 LOOP_INTERVAL = 30  # seconds between checks
-COOLDOWN_MINUTES = 30  # min time between trades on same symbol
+COOLDOWN_MINUTES = 120  # min time between trades on same symbol (match fb=24 horizon)
 MAX_PREDICTION_WORKERS = 5
 TEMP_LOG_EVERY_N_CYCLES = 10
 THERMAL_THROTTLE_TEMP = 75  # increase sleep if GPU above this
+LLM_INTERVAL_SEC = 600       # LLM analyst call every 10 min (not every 30s cycle)
 
 # ATR-based stop-loss / trailing stop / take-profit settings
 ATR_STOP_MULTIPLIER = 2.0          # stop = entry - (ATR * 2.0)
@@ -61,39 +63,8 @@ CIRCUIT_BREAKER_PCT = 0.05         # 5% daily equity drawdown triggers flatten
 _PRED_CACHE_FILE = Path(__file__).resolve().parent / "crypto_predictions.json"
 
 
-def _write_prediction_cache_v1(bear_preds, bull_preds, bear_threshold, bull_threshold):
-    """Write v1 dual-model prediction scores to JSON for GUI consumption."""
-    try:
-        data = {}
-        all_syms = set(bear_preds) | set(bull_preds)
-        for sym in sorted(all_syms):
-            bear = bear_preds.get(sym)
-            bull = bull_preds.get(sym)
-            score = (bull or 0) - abs(bear or 0)
-            if bull is not None and bull >= bull_threshold:
-                if bear is not None and bear < -bear_threshold:
-                    signal = "DISAGREE"
-                else:
-                    signal = "BULL"
-            elif bear is not None and bear < -bear_threshold:
-                signal = "BEAR"
-            else:
-                signal = "NEUTRAL"
-            data[sym] = {
-                "bear": round(bear, 6) if bear is not None else None,
-                "bull": round(bull, 6) if bull is not None else None,
-                "score": round(score, 6),
-                "signal": signal,
-                "updated": datetime.datetime.now().isoformat(),
-            }
-        with open(_PRED_CACHE_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"  [CACHE] Error writing crypto prediction cache: {e}")
-
-
-def _write_prediction_cache_v2(preds, trade_threshold):
-    """Write v2 regression prediction scores to JSON for GUI consumption."""
+def _write_prediction_cache(preds, trade_threshold):
+    """Write prediction scores to JSON for GUI consumption."""
     try:
         data = {}
         for sym in sorted(preds):
@@ -105,8 +76,7 @@ def _write_prediction_cache_v2(preds, trade_threshold):
             else:
                 signal = "NEUTRAL"
             data[sym] = {
-                "bear": None,
-                "bull": round(pred, 6) if pred is not None else None,
+                "pred": round(pred, 6) if pred is not None else None,
                 "score": round(pred, 6) if pred is not None else 0,
                 "signal": signal,
                 "updated": datetime.datetime.now().isoformat(),
@@ -152,41 +122,23 @@ def place_smart_order(api, symbol, side, notional):
 def run_crypto_bot():
     api = get_api()
 
-    # ── Load prediction models (try v2 first, fall back to v1 dual) ──
+    # ── Load prediction model ──
     print("Loading prediction models...")
-    model_version = 1
-    v2_model = v2_config = None
-    bear_model = bull_model = None
-    bear_config = bull_config = {}
-    bear_threshold = bull_threshold = 0.15
-    trade_threshold = 0.15
+    model = None
+    config = {}
     scaler_X = feature_cols = None
-    is_dual = False
+    trade_threshold = 0.15
 
     try:
         inference_device = choose_inference_device()
-        v2_model, v2_config, v2_scaler, v2_features = load_v2_models(inference_device)
-        if v2_model is not None:
-            model_version = 2
-            scaler_X = v2_scaler
-            feature_cols = v2_features
-            trade_threshold = v2_config.get('trade_threshold', 0.15)
-            print(f"v2 regression model loaded (trade_threshold={trade_threshold:.2f})")
-        else:
-            bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
-                load_dual_models(inference_device)
-            bear_threshold = bear_config.get('bull_threshold', 0.15)
-            bull_threshold = bull_config.get('bull_threshold', 0.15)
-            is_dual = bear_model is not bull_model
-            print(f"v1 models loaded (dual={is_dual}, bear_th={bear_threshold:.2f}, bull_th={bull_threshold:.2f})")
+        model, config, scaler_X, feature_cols = load_models(inference_device)
+        trade_threshold = config.get('trade_threshold', 0.15)
+        print(f"Model loaded (trade_threshold={trade_threshold:.2f})")
     except FileNotFoundError:
         print("WARNING: Model files not found. Running without prediction gating.")
 
-    # Track model file mtimes for hot-reload
-    v2_mtime = get_model_mtime('model_v2.pth')
-    bear_mtime = get_model_mtime('bear_model.pth')
-    bull_mtime = get_model_mtime('bull_model.pth')
-    default_mtime = get_model_mtime('stock_predictor.pth')
+    # Track model file mtime for hot-reload
+    model_mtime = get_model_mtime('model_v2.pth')
 
     # ── Cancel stale orders from previous runs ──
     cancel_all_open_orders(api)
@@ -210,6 +162,8 @@ def run_crypto_bot():
             print(f"  {sym}: qty={info['qty']}, entry=${info['entry_price']:.4f}, hwm=${info['high_water_mark']:.4f}, {atr_str}, {tp_str}")
 
     last_trade_time = {}
+    llm_scores = {}
+    _last_llm_time = 0.0  # run LLM immediately on first cycle
 
     print("\n--- JETSON CRYPTO BOT STARTED (CONTINUOUS MODE) ---")
     print(f"Symbols: {', '.join(CRYPTO_SYMBOLS)}")
@@ -229,38 +183,17 @@ def run_crypto_bot():
             print(f"[SENTIMENT] Fear & Greed: {fng['value']} ({fng['label']})")
 
         # ── Hot-reload check ──
-        new_v2_mt = get_model_mtime('model_v2.pth')
-        new_bear_mt = get_model_mtime('bear_model.pth')
-        new_bull_mt = get_model_mtime('bull_model.pth')
-        new_default_mt = get_model_mtime('stock_predictor.pth')
-
-        reload_needed = (new_v2_mt != v2_mtime or new_bear_mt != bear_mtime
-                         or new_bull_mt != bull_mtime or new_default_mt != default_mtime)
-        if reload_needed:
+        new_mtime = get_model_mtime('model_v2.pth')
+        if new_mtime != model_mtime:
             print("[HOT-RELOAD] Model files changed, reloading...")
             try:
                 inference_device = choose_inference_device()
-                _v2m, _v2c, _v2s, _v2f = load_v2_models(inference_device)
-                if _v2m is not None:
-                    model_version = 2
-                    v2_model, v2_config = _v2m, _v2c
-                    scaler_X, feature_cols = _v2s, _v2f
-                    trade_threshold = v2_config.get('trade_threshold', 0.15)
-                    print(f"[HOT-RELOAD] v2 model (trade_threshold={trade_threshold:.2f})")
-                else:
-                    bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = \
-                        load_dual_models(inference_device)
-                    bear_threshold = bear_config.get('bull_threshold', 0.15)
-                    bull_threshold = bull_config.get('bull_threshold', 0.15)
-                    is_dual = bear_model is not bull_model
-                    model_version = 1
-                    print(f"[HOT-RELOAD] v1 (dual={is_dual}, bear_th={bear_threshold:.2f}, bull_th={bull_threshold:.2f})")
-                v2_mtime = new_v2_mt
-                bear_mtime = new_bear_mt
-                bull_mtime = new_bull_mt
-                default_mtime = new_default_mt
+                model, config, scaler_X, feature_cols = load_models(inference_device)
+                trade_threshold = config.get('trade_threshold', 0.15)
+                print(f"[HOT-RELOAD] Model reloaded (trade_threshold={trade_threshold:.2f})")
+                model_mtime = new_mtime
             except Exception as e:
-                print(f"[HOT-RELOAD] Failed: {e}, keeping current models")
+                print(f"[HOT-RELOAD] Failed: {e}, keeping current model")
 
         # ── Circuit breaker check ──
         tripped, dd = check_circuit_breaker(api, max_drawdown_pct=CIRCUIT_BREAKER_PCT)
@@ -333,12 +266,11 @@ def run_crypto_bot():
             print(f"  [BTC] Error fetching benchmark: {e}")
 
         # ── Get predictions for all symbols in parallel ──
-        bear_preds = {}
-        bull_preds = {}
-        v2_preds = {}
-        has_models = (model_version == 2 and v2_model is not None) or (model_version == 1 and bear_model is not None)
+        preds = {}
+        snapshots = {}
+        has_model = model is not None
 
-        if has_models:
+        if has_model:
             inference_device = choose_inference_device()
             if inference_device == 'cpu':
                 print("[HW] GPU unavailable, using CPU for inference")
@@ -346,88 +278,72 @@ def run_crypto_bot():
             with ThreadPoolExecutor(max_workers=MAX_PREDICTION_WORKERS) as executor:
                 futures = {}
                 for symbol in CRYPTO_SYMBOLS:
-                    if model_version == 2:
-                        f = executor.submit(
-                            predict_symbol_v2, api, symbol,
-                            v2_model, v2_config, scaler_X, feature_cols,
-                            inference_device, asset_type='crypto',
-                            benchmark_close=btc_close,
-                        )
-                    else:
-                        f = executor.submit(
-                            predict_symbol, api, symbol,
-                            bear_model, bear_config, bull_model, bull_config,
-                            scaler_X, feature_cols, inference_device,
-                            asset_type='crypto', benchmark_close=btc_close,
-                        )
+                    f = executor.submit(
+                        predict_symbol, api, symbol,
+                        model, config, scaler_X, feature_cols,
+                        inference_device, asset_type='crypto',
+                        benchmark_close=btc_close,
+                        return_snapshot=True,
+                    )
                     futures[f] = symbol
 
                 for future in as_completed(futures):
                     symbol = futures[future]
                     try:
-                        if model_version == 2:
-                            sym, pred = future.result()
-                            if pred is not None:
-                                v2_preds[sym] = pred
-                        else:
-                            sym, bear_pred, bull_pred = future.result()
-                            if bear_pred is not None:
-                                bear_preds[sym] = bear_pred
-                            if bull_pred is not None:
-                                bull_preds[sym] = bull_pred
+                        sym, pred, snapshot = future.result()
+                        if pred is not None:
+                            preds[sym] = pred
+                        if snapshot is not None:
+                            snapshots[sym] = snapshot
                     except Exception as e:
                         print(f"  {symbol}: Prediction error: {e}")
 
-            gc.collect()
-
             # Write prediction cache for GUI
-            if model_version == 2:
-                _write_prediction_cache_v2(v2_preds, trade_threshold)
-            else:
-                _write_prediction_cache_v1(bear_preds, bull_preds, bear_threshold, bull_threshold)
+            _write_prediction_cache(preds, trade_threshold)
 
-        # ── LLM pre-trade analysis ──
-        llm_scores = {}
-        llm_cfg = load_llm_config()
-        if llm_cfg.get("enabled"):
-            candidates = []
-            for symbol in CRYPTO_SYMBOLS:
-                if symbol in positions:
-                    continue
-                if model_version == 2:
-                    pred = v2_preds.get(symbol, 0)
-                    if pred < trade_threshold:
-                        continue
-                    bull_pred_val = pred
-                    bear_pred_val = None
+        # ── Fetch real crypto volume from CryptoCompare (Alpaca reports zero) ──
+        try:
+            vol_ratios = fetch_crypto_volume(CRYPTO_SYMBOLS)
+            for sym, ratio in vol_ratios.items():
+                if sym in snapshots:
+                    snapshots[sym]['Volume_Ratio'] = ratio
                 else:
-                    bull_pred_val = bull_preds.get(symbol, 0)
-                    if bull_pred_val < bull_threshold:
-                        continue
-                    bear_pred_val = bear_preds.get(symbol)
-                    if bear_pred_val is not None and bear_pred_val < -bear_threshold:
-                        continue
-                fund = get_fundamentals(symbol, 'crypto')
-                fund_text = format_fundamentals_for_llm(symbol, fund)
-                candidates.append({
-                    'symbol': symbol,
-                    'bull_pred': bull_pred_val,
-                    'bear_pred': bear_pred_val,
-                    'fundamentals_text': fund_text,
-                })
-            if candidates:
-                fng_val = fng['value'] if fng else None
-                try:
-                    acct = api.get_account()
-                    equity = float(acct.equity)
-                except Exception:
-                    equity = 0
-                llm_scores = analyze_trades(
-                    candidates, 'crypto', equity=equity,
-                    positions=list(positions.keys()), fng_value=fng_val,
-                )
-                if llm_scores:
-                    print("[LLM] Scores: " + ", ".join(f"{s}={v.get('m', 1.0):.1f}x" for s, v in llm_scores.items()))
+                    snapshots[sym] = {'Volume_Ratio': ratio}
+        except Exception as e:
+            print(f"  [VOLUME] CryptoCompare error: {e}")
+
+        # ── LLM pre-trade analysis (throttled to save cost) ──
+        now_ts = time.time()
+        if now_ts - _last_llm_time >= LLM_INTERVAL_SEC:
+            llm_cfg = load_llm_config()
+            if llm_cfg.get("enabled"):
+                candidates = []
+                for symbol in CRYPTO_SYMBOLS:
+                    fund = get_fundamentals(symbol, 'crypto')
+                    fund_text = format_fundamentals_for_llm(symbol, fund)
+                    headlines = get_recent_headlines(symbol, 'crypto')
+                    candidates.append({
+                        'symbol': symbol,
+                        'snapshot': snapshots.get(symbol),
+                        'fundamentals_text': fund_text,
+                        'news_headlines': headlines,
+                    })
+                if candidates:
+                    fng_val = fng['value'] if fng else None
+                    try:
+                        acct = api.get_account()
+                        equity = float(acct.equity)
+                    except Exception:
+                        equity = 0
+                    new_scores = analyze_trades(
+                        candidates, 'crypto', equity=equity,
+                        positions=list(positions.keys()), fng_value=fng_val,
+                        model_config=config,
+                    )
+                    if new_scores:
+                        llm_scores = new_scores
+                        _last_llm_time = now_ts
+                        print("[LLM] Scores: " + ", ".join(f"{s}={v.get('m', 1.0):.1f}x" for s, v in llm_scores.items()))
 
         # ── SELL: bearish positions with cooldown expired ──
         for symbol in list(positions):
@@ -437,28 +353,17 @@ def run_crypto_bot():
                 del positions[symbol]
                 continue
 
-            if model_version == 2:
-                pred = v2_preds.get(symbol)
-                if pred is not None and pred > -trade_threshold:
-                    print(f"  {symbol}: Pred {pred:+.4f}% > -{trade_threshold:.2f}, HOLDING")
-                    continue
-            else:
-                bear_pred = bear_preds.get(symbol)
-                if bear_pred is not None and bear_pred > -bear_threshold:
-                    print(f"  {symbol}: Bear pred {bear_pred:+.4f}% > -{bear_threshold:.2f}, HOLDING")
-                    continue
+            pred = preds.get(symbol)
+            if pred is not None and pred > -trade_threshold:
+                print(f"  {symbol}: Pred {pred:+.4f}% > -{trade_threshold:.2f}, HOLDING")
+                continue
 
             if not cooldown_ok(last_trade_time, symbol, COOLDOWN_MINUTES):
                 remaining = COOLDOWN_MINUTES * 60 - (datetime.datetime.now() - last_trade_time[symbol]).total_seconds()
                 print(f"  {symbol}: Bearish but in cooldown ({remaining/60:.1f} min left), skipping sell")
                 continue
 
-            if model_version == 2:
-                pred = v2_preds.get(symbol)
-                reason = f"pred={pred:+.4f}%" if pred is not None else "no prediction"
-            else:
-                bear_pred = bear_preds.get(symbol)
-                reason = f"bear_pred={bear_pred:+.4f}%" if bear_pred is not None else "no prediction"
+            reason = f"pred={pred:+.4f}%" if pred is not None else "no prediction"
             print(f"  {symbol}: SELLING ({reason})")
 
             quote = get_crypto_quote(api, symbol)
@@ -476,7 +381,7 @@ def run_crypto_bot():
                     )
                     result = manage_order_lifecycle(api, order.id, timeout=ORDER_TIMEOUT,
                                                    fallback_to_market=True)
-                    if result:
+                    if result and getattr(result, 'status', None) == 'filled':
                         del positions[symbol]
                         last_trade_time[symbol] = datetime.datetime.now()
                 except Exception as e:
@@ -491,73 +396,95 @@ def run_crypto_bot():
                     print(f"  {symbol}: Market sell error: {e}")
             time.sleep(1)
 
-        # ── BUY: bullish symbols we don't hold, with cooldown expired ──
-        for symbol in CRYPTO_SYMBOLS:
-            if symbol in positions:
+        # ── LLM SELL: very bearish LLM score triggers sell even if ML says hold ──
+        for symbol in list(positions):
+            llm_info = llm_scores.get(symbol, {})
+            llm_m = llm_info.get('m', 1.0)
+            if llm_m >= 0.3:
                 continue
+            # LLM says very bearish — sell regardless of ML prediction
+            pos = verify_position(api, symbol)
+            if pos is None:
+                del positions[symbol]
+                continue
+            if not cooldown_ok(last_trade_time, symbol, COOLDOWN_MINUTES):
+                print(f"  {symbol}: LLM bearish ({llm_m:.1f}x) but in cooldown, skipping")
+                continue
+            print(f"  {symbol}: LLM SELL ({llm_m:.1f}x — {llm_info.get('r', '')})")
+            info = positions[symbol]
+            quote = get_crypto_quote(api, symbol)
+            if quote is not None:
+                try:
+                    order = api.submit_order(
+                        symbol=symbol, qty=info['qty'], side='sell', type='limit',
+                        limit_price=round(quote['midpoint'] - quote['midpoint'] * 0.0005, 4),
+                        time_in_force='gtc',
+                    )
+                    result = manage_order_lifecycle(api, order.id, timeout=ORDER_TIMEOUT,
+                                                    fallback_to_market=True)
+                    if result and getattr(result, 'status', None) == 'filled':
+                        del positions[symbol]
+                        last_trade_time[symbol] = datetime.datetime.now()
+                except Exception as e:
+                    print(f"  {symbol}: LLM sell error: {e}")
+            time.sleep(1)
 
+        # ── BUY: bullish symbols (new or add to existing), with cooldown ──
+        for symbol in CRYPTO_SYMBOLS:
             if not cooldown_ok(last_trade_time, symbol, COOLDOWN_MINUTES):
                 remaining = COOLDOWN_MINUTES * 60 - (datetime.datetime.now() - last_trade_time[symbol]).total_seconds()
                 print(f"  {symbol}: In cooldown ({remaining/60:.1f} min left), skipping buy")
                 continue
 
+            # Check position cap
+            existing_value = 0.0
+            if symbol in positions:
+                info = positions[symbol]
+                existing_value = info['qty'] * info.get('entry_price', 0)
+                if existing_value >= MAX_NOTIONAL_PER_SYMBOL:
+                    print(f"  {symbol}: At max position ${existing_value:.0f} >= ${MAX_NOTIONAL_PER_SYMBOL}, skipping")
+                    continue
+
             quote = get_crypto_quote(api, symbol)
 
-            if model_version == 2:
-                pred_return = v2_preds.get(symbol)
-                if pred_return is not None and quote is not None:
-                    if not should_trade(pred_return, quote['spread_pct']):
-                        print(f"  {symbol}: Pred {pred_return:+.4f}% too weak vs spread "
-                              f"{quote['spread_pct']:.3f}%, skipping")
-                        continue
-                    if pred_return < trade_threshold:
-                        print(f"  {symbol}: Pred {pred_return:+.4f}% < {trade_threshold:.2f}, skipping")
-                        continue
-                bull_pred = pred_return  # for logging/sizing compatibility
-            else:
-                bull_pred = bull_preds.get(symbol)
-                if bull_pred is not None and quote is not None:
-                    if not should_trade(bull_pred, quote['spread_pct']):
-                        print(f"  {symbol}: Bull pred {bull_pred:+.4f}% too weak vs spread "
-                              f"{quote['spread_pct']:.3f}%, skipping")
-                        continue
-                    if bull_pred < bull_threshold:
-                        print(f"  {symbol}: Bull pred {bull_pred:+.4f}% < {bull_threshold:.2f}, skipping")
-                        continue
+            pred_return = preds.get(symbol)
+            if pred_return is not None and quote is not None:
+                if not should_trade(pred_return, quote['spread_pct']):
+                    print(f"  {symbol}: Pred {pred_return:+.4f}% too weak vs spread "
+                          f"{quote['spread_pct']:.3f}%, skipping")
+                    continue
+                if pred_return < trade_threshold:
+                    print(f"  {symbol}: Pred {pred_return:+.4f}% < {trade_threshold:.2f}, skipping")
+                    continue
 
-                    # Bear agreement check — skip if bear model disagrees
-                    bear_pred = bear_preds.get(symbol)
-                    if bear_pred is not None and bear_pred < -bear_threshold:
-                        print(f"  {symbol}: Bull {bull_pred:+.4f}% but bear {bear_pred:+.4f}% disagrees, skipping")
-                        continue
-
-            # Confidence-based sizing
-            active_threshold = trade_threshold if model_version == 2 else bull_threshold
-            if bull_pred is not None and active_threshold > 0:
-                confidence = min(2.0, max(0.5, bull_pred / active_threshold))
+            # Confidence-based sizing (capped by remaining room)
+            if pred_return is not None and trade_threshold > 0:
+                confidence = min(2.0, max(0.5, pred_return / trade_threshold))
             else:
                 confidence = 1.0
             sized_notional = int(NOTIONAL_PER_SYMBOL * confidence)
+            room = MAX_NOTIONAL_PER_SYMBOL - existing_value
+            sized_notional = min(sized_notional, int(room))
 
             # Sentiment gate
             gate, gate_reasons = sentiment_gate(symbol, 'crypto')
             if gate <= 0:
                 print(f"  {symbol}: BLOCKED by sentiment ({', '.join(gate_reasons)})")
                 log_decision({"symbol": symbol, "action": "skip", "skip_reason": "sentiment_block",
-                              "bull_pred": bull_pred, "bear_pred": bear_preds.get(symbol),
+                              "pred_return": pred_return,
                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
                               "llm_multiplier": None, "llm_reasoning": None})
                 continue
             adjusted_notional = int(sized_notional * gate)
 
-            # LLM multiplier
+            # LLM gate: < 0.5 blocks buy, 0.5-0.8 reduces size, >= 0.8 full/boosted
             llm_info = llm_scores.get(symbol, {})
             llm_mult = llm_info.get('m', 1.0)
             llm_reason = llm_info.get('r', '')
-            if llm_mult <= 0:
-                print(f"  {symbol}: BLOCKED by LLM ({llm_reason})")
+            if llm_mult < 0.5:
+                print(f"  {symbol}: BLOCKED by LLM ({llm_mult:.1f}x — {llm_reason})")
                 log_decision({"symbol": symbol, "action": "skip", "skip_reason": "llm_block",
-                              "bull_pred": bull_pred, "bear_pred": bear_preds.get(symbol),
+                              "pred_return": pred_return,
                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
                               "llm_multiplier": llm_mult, "llm_reasoning": llm_reason})
                 continue
@@ -572,14 +499,13 @@ def run_crypto_bot():
                 sizing_info += f" ({', '.join(gate_reasons)})"
             print(f"  {symbol}: Sizing ${adjusted_notional} [{sizing_info}]")
 
+            is_add = symbol in positions
+            action_label = "ADD" if is_add else "BUY"
             if place_smart_order(api, symbol, 'buy', adjusted_notional):
-                fill_price = None
-                quote = get_crypto_quote(api, symbol)
-                if quote:
-                    fill_price = quote['midpoint']
                 pos = verify_position(api, symbol)
                 if pos:
                     fill_price = float(pos.avg_entry_price)
+                    total_qty = float(pos.qty)
 
                     entry_atr = get_live_atr(api, symbol, asset_type='crypto')
                     tp_price = None
@@ -596,17 +522,22 @@ def run_crypto_bot():
                     else:
                         print(f"  [ATR-STOP] {symbol}: ATR unavailable, using fixed stops")
 
+                    # Preserve high water mark on adds, reset on new positions
+                    hwm = fill_price
+                    if is_add and symbol in positions:
+                        hwm = max(positions[symbol].get('high_water_mark', fill_price), fill_price)
+                        print(f"  [{action_label}] {symbol}: Added ${adjusted_notional}, total qty={total_qty}, avg_entry=${fill_price:.4f}")
                     positions[symbol] = {
-                        'qty': float(pos.qty),
+                        'qty': total_qty,
                         'entry_price': fill_price,
-                        'high_water_mark': fill_price,
+                        'high_water_mark': hwm,
                         'stop_order_id': None,
                         'trailing_activated': False,
                         'entry_atr': entry_atr,
                         'take_profit_price': tp_price,
                     }
                 log_decision({"symbol": symbol, "action": "buy",
-                              "bull_pred": bull_pred, "bear_pred": bear_preds.get(symbol),
+                              "pred_return": pred_return,
                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
                               "llm_multiplier": llm_mult, "llm_reasoning": llm_reason,
                               "final_notional": adjusted_notional, "confidence": confidence,

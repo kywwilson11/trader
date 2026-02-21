@@ -33,7 +33,7 @@ BENCHMARK = 'BTC-USD'
 ALPACA_START = '2021-01-01'
 
 # Multi-horizon forward returns (bars ahead)
-FORWARD_BARS = [4, 8, 12, 18, 24]
+FORWARD_BARS = [12, 18, 24, 32, 48]
 
 
 def _to_alpaca(yf_ticker):
@@ -125,8 +125,8 @@ def prepare_data(ticker, btc_close=None, api=None):
         future_close = df['Close'].shift(-fb)
         df[f'Target_Return_{fb}'] = (future_close - df['Close']) / df['Close'] * 100
 
-    # Backward compat: Target_Return = Target_Return_4
-    df['Target_Return'] = df['Target_Return_4']
+    # Backward compat: Target_Return = shortest horizon
+    df['Target_Return'] = df[f'Target_Return_{FORWARD_BARS[0]}']
 
     df = df.dropna()
     return df
@@ -149,6 +149,9 @@ def main():
             all_data.append(crypto_df)
 
     # Combine and save — sort chronologically for time-series split in training
+    if not all_data:
+        print("ERROR: No data fetched for any ticker. Check API credentials and network.")
+        return
     final_df = pd.concat(all_data)
     final_df = final_df.sort_index()
 

@@ -210,8 +210,13 @@ def _score_text(text):
             else:
                 raw_score += weight
     for pat, weight in _NEG_PHRASE_RES:
-        if pat.search(text_lower):
-            raw_score += weight  # weight is already negative
+        m = pat.search(text_lower)
+        if m:
+            prefix = text_lower[max(0, m.start() - 15):m.start()]
+            if _NEG_PREFIX.search(prefix):
+                raw_score -= weight * 0.7  # negated negative → positive
+            else:
+                raw_score += weight  # weight is already negative
 
     # Phase 2: Negation-aware single-word matching (bidirectional)
     clean = _PUNCT.sub(' ', text_lower)
@@ -436,6 +441,7 @@ def _parse_llm_json(raw_text):
         text = text[brace_start:]
     # Find matching closing brace
     depth = 0
+    found_close = False
     for i, c in enumerate(text):
         if c == '{':
             depth += 1
@@ -443,7 +449,17 @@ def _parse_llm_json(raw_text):
             depth -= 1
             if depth == 0:
                 text = text[:i + 1]
+                found_close = True
                 break
+
+    # Repair truncated JSON (model cut off mid-response)
+    if not found_close and depth > 0:
+        # Strip last incomplete entry (after last comma) and close
+        last_comma = text.rfind(',')
+        if last_comma > 0:
+            text = text[:last_comma] + '}'
+        else:
+            text = text.rstrip() + '}'
 
     # Attempt 1: standard JSON
     try:
@@ -477,11 +493,19 @@ def _parse_llm_json(raw_text):
 # --- Tiered Gemini scoring ---
 # Newest articles get the best model, older articles get cheaper models.
 # Tiers: (model, cumulative_fraction) — newest first
-_SCORING_TIERS = [
-    ("gemini-2.5-pro",        0.15),  # newest 15%
-    ("gemini-2.5-flash",      0.50),  # next 35%
-    ("gemini-2.5-flash-lite", 1.00),  # rest
-]
+def _get_scoring_tiers():
+    """Build scoring tiers from configured sentiment model."""
+    from llm_config import load_llm_config
+    cfg = load_llm_config()
+    model = cfg.get("sentiment_model", "gemini-2.5-flash")
+    if "flash-lite" in model:
+        return [("gemini-2.5-flash-lite", 1.00)]
+    # Default: Flash for newest, Flash-Lite for bulk
+    return [
+        ("gemini-2.5-flash", 0.40),
+        ("gemini-2.5-flash-lite", 1.00),
+    ]
+
 
 # Model quality ranking (higher = better)
 _MODEL_RANK = {
@@ -532,20 +556,19 @@ def _parse_scores(result, n):
         key_str = str(i)
         if key_str in data or i in data:
             raw = data.get(key_str, data.get(i))
-            scores.append(max(-1.0, min(1.0, float(raw))))
-            matched += 1
+            try:
+                scores.append(max(-1.0, min(1.0, float(raw))))
+                matched += 1
+            except (TypeError, ValueError):
+                scores.append(None)  # malformed value → KW fallback
         else:
             # Missing article — use None sentinel so caller can KW-fallback
             scores.append(None)
     if matched < n * 0.5:
         print(f"[SENTIMENT] LLM chunk only scored {matched}/{n}, failing chunk")
         return None
-    # Fill missing with KW fallback marker (0.0 placeholder — caller handles)
-    for i in range(len(scores)):
-        if scores[i] is None:
-            scores[i] = 0.0
     if matched < n:
-        print(f"[SENTIMENT] LLM scored {matched}/{n}, filled {n - matched} gaps with 0.0")
+        print(f"[SENTIMENT] LLM scored {matched}/{n}, {n - matched} gaps left for KW fallback")
     return scores
 
 
@@ -557,7 +580,7 @@ def _llm_score_chunk(chunk_articles, full_texts, model=None):
     """
     prompt, n = _build_score_prompt(chunk_articles, full_texts)
     system = "Financial sentiment scorer. Return only a JSON object mapping article number strings to float scores. No explanation."
-    max_tokens = max(256, n * 20)
+    max_tokens = max(512, n * 40)  # thinking models need more headroom
 
     if model:
         from llm_client import call_gemini
@@ -597,11 +620,20 @@ def _llm_score_batch(articles):
     Returns list[float] or None if all models fail.
     """
     try:
-        from llm_client import call_gemini, get_budget  # noqa: F401
+        from llm_client import call_gemini, get_budget, _429_cooled_down  # noqa: F401
+        from llm_config import load_llm_config
     except ImportError:
         return None
 
     if not articles:
+        return None
+
+    # Check configured sentiment model
+    _cfg = load_llm_config()
+    sentiment_model = _cfg.get("sentiment_model", "gemini-2.5-flash")
+
+    # Skip entirely if LLM is in 429 cooldown (don't waste time fetching texts)
+    if not _429_cooled_down():
         return None
 
     full_texts = _fetch_full_texts(articles)
@@ -612,40 +644,34 @@ def _llm_score_batch(articles):
     all_scores = [None] * n
     all_models = [None] * n
 
+    from llm_client import _trigger_429_cooldown
+
     prev_end = 0
-    for tier_model, cum_frac in _SCORING_TIERS:
+    for tier_model, cum_frac in _get_scoring_tiers():
         end = min(round(n * cum_frac), n)
         if prev_end >= end:
+            prev_end = end
+            continue
+
+        # Bail early if cooldown triggered by a previous tier
+        if not _429_cooled_down():
             prev_end = end
             continue
 
         chunk_articles = articles[prev_end:end]
         chunk_texts = full_texts[prev_end:end]
 
-        # Try this tier's model, fall back to cheaper on budget/failure
-        scored = False
-        models_to_try = [tier_model] + [
-            m for m, _ in reversed(_SCORING_TIERS) if m != tier_model
-        ]
-
-        for try_model in models_to_try:
-            remaining, _ = get_budget(try_model)
-            if remaining <= 0:
-                continue
-
-            scores = _llm_score_chunk(chunk_articles, chunk_texts, model=try_model)
+        # Try this tier's assigned model only — no slow fallback chain
+        remaining, _ = get_budget(tier_model)
+        if remaining > 0:
+            scores = _llm_score_chunk(chunk_articles, chunk_texts, model=tier_model)
             if scores is not None:
-                all_scores[prev_end:end] = scores
-                all_models[prev_end:end] = [try_model] * (end - prev_end)
-                scored = True
-                break
-
-            # 8s pace between model attempts (RPM limit)
-            time.sleep(8)
-
-        if not scored:
-            # This tier totally failed — try to cover with next tier's model
-            pass
+                for j, s in enumerate(scores):
+                    all_scores[prev_end + j] = s
+                    if s is not None:
+                        all_models[prev_end + j] = tier_model
+            # scores=None means parse failure or bad response, NOT a 429.
+            # Don't trigger cooldown here — actual 429s are handled inside call_gemini.
 
         prev_end = end
 
@@ -1075,43 +1101,35 @@ def sentiment_gate(symbol, asset_type='crypto'):
         1.2  = increase position (positive sentiment)
         1.5  = max increase (strong positive + calm market)
 
-    Design philosophy for profit optimization:
-    - The ML models are the primary signal (technical, leading indicator).
-      Sentiment is a position-sizing modifier, NOT a trade blocker.
-    - Never fully block (min 0.15x): the ML model may be catching a
-      bounce/reversal that news hasn't priced in yet.
-    - Reward positive confirmation aggressively: when technicals AND news
-      agree bullish, size up — momentum compounds.
-    - Wide neutral zone: most news is noise. Only act on strong signals.
-    - FnG is a real liquidity/spread signal — keep it multiplicative.
-    - Symbol news is most actionable — strong weight.
-    - Market news is diffuse — very light touch, wide neutral zone.
+    Design philosophy:
+    - The ML model is the primary signal. It already uses Daily_Sentiment
+      (FnG) as an input feature, so FnG is NOT applied as a position
+      reducer — that would double-count sentiment the model already saw.
+    - FnG extreme greed (>90) is the one exception: bubble risk is
+      asymmetric and worth reducing exposure for.
+    - Symbol-specific news is genuinely new info the model can't see.
+      Catastrophic events (hacks, fraud) warrant hard reductions.
+    - Market news is diffuse — very light touch.
     """
     multiplier = 1.0
     reasons = []
 
-    # --- Crypto: Fear & Greed Index (liquidity/spread proxy) ---
+    # --- Crypto: FnG — only reduce on extreme greed (bubble protection) ---
+    # The model already uses Daily_Sentiment (derived from FnG) as a feature,
+    # so fear-based reductions would double-count what the model already saw.
+    # Extreme greed is kept because bubble tops are asymmetric risk.
     if asset_type == 'crypto':
         fng = get_fear_greed()
         if fng is not None:
             val = fng['value']
-            if val <= 10:
-                multiplier *= 0.35
-                reasons.append(f"FnG={val}(extreme_fear)")
-            elif val <= 25:
-                multiplier *= 0.55
-                reasons.append(f"FnG={val}(fear)")
-            elif val <= 40:
-                multiplier *= 0.8
-                reasons.append(f"FnG={val}(cautious)")
-            elif val >= 90:
+            if val >= 90:
                 multiplier *= 0.7
                 reasons.append(f"FnG={val}(extreme_greed)")
-            elif val >= 75:
-                multiplier *= 0.9
+            elif val >= 80:
+                multiplier *= 0.85
                 reasons.append(f"FnG={val}(greed)")
             else:
-                reasons.append(f"FnG={val}(normal)")
+                reasons.append(f"FnG={val}")
 
     # --- Symbol-specific news sentiment (strongest signal) ---
     news = get_news_sentiment(symbol, asset_type)
@@ -1153,3 +1171,44 @@ def sentiment_gate(symbol, asset_type='crypto'):
     multiplier = max(0.15, min(1.5, multiplier))
 
     return multiplier, reasons
+
+
+def get_recent_headlines(symbol, asset_type='crypto', max_headlines=5):
+    """Get recent news headlines for a symbol (no scoring, just text).
+
+    Returns list of headline strings, or empty list.
+    Cached alongside get_news_sentiment (same Finnhub call).
+    """
+    client = _get_finnhub()
+    if client is None:
+        return []
+
+    try:
+        if asset_type == 'crypto':
+            articles = client.general_news('crypto', min_id=0)
+            base = symbol.replace('/USD', '').replace('-USD', '').lower()
+            relevant = [a for a in articles
+                        if base in a.get('headline', '').lower()
+                        or base in a.get('summary', '').lower()]
+            if len(relevant) < 2:
+                relevant = articles[:10]
+        else:
+            import datetime as dt
+            today = dt.date.today()
+            week_ago = today - dt.timedelta(days=7)
+            clean_sym = symbol.replace('/', '')
+            articles = client.company_news(
+                clean_sym,
+                _from=week_ago.strftime('%Y-%m-%d'),
+                to=today.strftime('%Y-%m-%d'),
+            )
+            relevant = articles[:15]
+
+        headlines = []
+        for a in relevant[:max_headlines]:
+            h = a.get('headline', '').strip()
+            if h:
+                headlines.append(h)
+        return headlines
+    except Exception:
+        return []

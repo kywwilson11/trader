@@ -136,15 +136,29 @@ def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2, fallback_
     If fallback_to_market is True, places a market order after cancellation.
     Returns the final order object.
     """
+    # Save order params upfront for market fallback (in case later get_order fails)
+    saved_symbol = saved_qty = saved_side = None
+    consecutive_errors = 0
     elapsed = 0
     while elapsed < timeout:
         time.sleep(poll_interval)
         elapsed += poll_interval
         try:
             order = api.get_order(order_id)
+            consecutive_errors = 0
         except Exception as e:
-            print(f"  [LIFECYCLE] Error checking order {order_id}: {e}")
-            return None
+            consecutive_errors += 1
+            print(f"  [LIFECYCLE] Error checking order {order_id} ({consecutive_errors}x): {e}")
+            if consecutive_errors >= 3:
+                print(f"  [LIFECYCLE] Giving up after {consecutive_errors} consecutive errors")
+                return None
+            continue
+
+        # Cache order params on first successful poll
+        if saved_symbol is None:
+            saved_symbol = order.symbol
+            saved_qty = order.qty
+            saved_side = order.side
 
         if order.status == 'filled':
             print(f"  [LIFECYCLE] Order {order_id} FILLED ({order.filled_qty} @ ${order.filled_avg_price})")
@@ -170,17 +184,27 @@ def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2, fallback_
     except Exception:
         pass
 
-    if fallback_to_market:
+    if fallback_to_market and saved_symbol:
         print(f"  [LIFECYCLE] Falling back to market order...")
         try:
             market_order = api.submit_order(
-                symbol=order.symbol,
-                qty=order.qty,
-                side=order.side,
+                symbol=saved_symbol,
+                qty=saved_qty,
+                side=saved_side,
                 type='market',
                 time_in_force='gtc',
             )
             print(f"  [LIFECYCLE] Market fallback submitted: {market_order.id}")
+            # Poll briefly for fill
+            for _ in range(3):
+                time.sleep(1)
+                try:
+                    mkt = api.get_order(market_order.id)
+                    if mkt.status == 'filled':
+                        print(f"  [LIFECYCLE] Market fallback FILLED ({mkt.filled_qty} @ ${mkt.filled_avg_price})")
+                        return mkt
+                except Exception:
+                    pass
             return market_order
         except Exception as e:
             print(f"  [LIFECYCLE] Market fallback error: {e}")
@@ -211,13 +235,13 @@ def verify_position(api, symbol):
 
 
 def get_all_positions(api):
-    """Returns a dict of symbol -> position object for all current positions."""
+    """Returns a dict of symbol -> position object, or None on API error."""
     try:
         positions = api.list_positions()
         return {pos.symbol: pos for pos in positions}
     except Exception as e:
         print(f"  [POSITIONS] Error listing positions: {e}")
-        return {}
+        return None
 
 
 # --- TRADE GATING ---

@@ -56,7 +56,7 @@ class TestParseResponse:
 class TestBuildPrompt:
     def test_contains_symbol(self):
         candidates = [{"symbol": "TSLA", "bull_pred": 0.5, "bear_pred": -0.2}]
-        prompt = _build_prompt(candidates, "stock", 100000, ["AAPL"], 55)
+        prompt = _build_prompt(candidates, "stock", 100000, ["AAPL"], 55, {})
         assert "TSLA" in prompt
         assert "stock" in prompt
         assert "$100,000" in prompt
@@ -64,8 +64,8 @@ class TestBuildPrompt:
         assert "55" in prompt
 
     def test_handles_empty_candidates(self):
-        prompt = _build_prompt([], "crypto", 0, None, None)
-        assert "Trade Candidates" in prompt
+        prompt = _build_prompt([], "crypto", 0, None, None, {})
+        assert "crypto" in prompt
 
     def test_includes_fundamentals(self):
         candidates = [{
@@ -73,5 +73,5 @@ class TestBuildPrompt:
             "bull_pred": 0.3,
             "fundamentals_text": "P/E=25.0, MktCap=$3.0T",
         }]
-        prompt = _build_prompt(candidates, "stock", 0, None, None)
+        prompt = _build_prompt(candidates, "stock", 0, None, None, {})
         assert "P/E=25.0" in prompt

@@ -24,6 +24,7 @@ import gc
 import json
 import os
 import time
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -36,16 +37,40 @@ import optuna
 from optuna.pruners import MedianPruner
 
 from model_v2 import RegressionLSTM
+from gpu_lock import acquire_for_training
 
-NUM_TRIALS = 200
+_STATUS_FILE = Path(__file__).resolve().parent.parent / 'pipeline_status.json'
+
+
+def _write_pipeline_status(status):
+    """Write pipeline_status.json, merging with existing data to preserve prior results."""
+    # Read existing status to preserve fields like crypto_final_score
+    existing = {}
+    try:
+        with open(_STATUS_FILE) as f:
+            existing = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    existing.update(status)
+    existing['updated_at'] = datetime.now().isoformat()
+    tmp = str(_STATUS_FILE) + '.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, str(_STATUS_FILE))
+    except OSError:
+        pass
+
+
+NUM_TRIALS = 300
 MAX_EPOCHS = 60
 EARLY_STOP_PATIENCE = 10
 PRUNE_WARMUP_EPOCHS = 12
-PRUNE_STARTUP_TRIALS = 50
+PRUNE_STARTUP_TRIALS = 60
 NUM_FOLDS = 3
 EMBARGO_MULTIPLIER = 1  # embargo = seq_len * this
 
-FORWARD_BARS = [4, 8, 12, 18, 24]
+FORWARD_BARS = [12, 18, 24, 32, 48]
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.backends.cudnn.benchmark = True
@@ -204,14 +229,22 @@ def compute_sharpe(predictions, actual_returns, threshold):
     """Simulate trades and compute annualized Sharpe ratio.
 
     Buy when pred > threshold, sell when pred < -threshold, else flat.
-    Annualized for hourly bars: sqrt(252 * 6.5) ≈ sqrt(1638).
+    Sharpe computed only on bars where a trade occurs, annualized by
+    the actual trade frequency (trades_per_bar * bars_per_year).
     """
     signals = np.where(predictions > threshold, 1,
               np.where(predictions < -threshold, -1, 0))
-    trade_returns = signals * actual_returns
-    if trade_returns.std() == 0:
+    traded = signals != 0
+    n_trades = traded.sum()
+    if n_trades < 10:
         return 0.0
-    return float((trade_returns.mean() / trade_returns.std()) * np.sqrt(1638))
+    trade_returns = signals[traded] * actual_returns[traded]
+    if trade_returns.std() < 1e-8:
+        return 0.0
+    # Annualize: trade_freq * bars/year.  1638 hourly stock bars/year.
+    trade_freq = n_trades / len(signals)
+    trades_per_year = trade_freq * 1638
+    return float((trade_returns.mean() / trade_returns.std()) * np.sqrt(trades_per_year))
 
 
 # ---------------------------------------------------------------------------
@@ -219,37 +252,41 @@ def compute_sharpe(predictions, actual_returns, threshold):
 # ---------------------------------------------------------------------------
 
 class SeqCache:
-    """Cache numpy sequence arrays by (seq_len, fold_idx, scaler_key).
+    """Cache ONE fold's numpy sequence arrays at a time.
 
-    Builds sequences once per unique configuration, reuses across trials.
+    On Jetson Orin Nano (8GB unified CPU/GPU memory), keeping multiple folds
+    cached simultaneously (~280 MB each) exhausts RAM and causes CUDA failures.
+    Only one fold is cached; rebuilds take ~0.5s which is acceptable.
     """
     def __init__(self, all_features, tickers, ticker_boundaries):
         self._all_features = all_features
         self._tickers = tickers
         self._boundaries = ticker_boundaries
-        self._cache = {}
+        self._key = None
+        self._X_train = None
+        self._X_val = None
+        self._scaler = None
 
     def get(self, seq_len, fold_idx, train_indices, val_indices):
-        """Return (X_train, X_val) numpy arrays, fitting scaler on train only."""
-        key = (seq_len, fold_idx)
-        if key in self._cache:
-            return self._cache[key]
+        """Return (X_train, X_val, scaler) numpy arrays, fitting scaler on train only."""
+        key = (seq_len, fold_idx, len(train_indices), len(val_indices))
+        if key == self._key and self._X_train is not None:
+            return self._X_train, self._X_val, self._scaler
 
-        # Free old caches if memory is tight
-        if len(self._cache) > 6:
-            self._cache.clear()
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Free previous cache before allocating new one
+        self._X_train = None
+        self._X_val = None
+        self._scaler = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
         t0 = time.time()
 
         # Fit scaler on train fold only (no leakage)
         scaler = RobustScaler()
-        # Gather raw features for train indices
-        train_features = self._all_features[train_indices]
-        scaler.fit(train_features)
+        scaler.fit(self._all_features[train_indices])
 
-        # Scale ALL features using train-only scaler
+        # Scale ALL features using train-only scaler, build sequences
         all_scaled = scaler.transform(self._all_features).astype(np.float32)
 
         offsets = np.arange(-seq_len, 0)
@@ -258,15 +295,20 @@ class SeqCache:
         X_val = np.ascontiguousarray(
             all_scaled[val_indices[:, None] + offsets[None, :]])
 
+        del all_scaled  # free ~18 MB immediately
+        gc.collect()
+
         elapsed = time.time() - t0
         print(f"  [CACHE] fold={fold_idx} seq_len={seq_len}: "
               f"{len(train_indices)} train + {len(val_indices)} val "
               f"({X_train.nbytes / 1e6:.0f}+{X_val.nbytes / 1e6:.0f} MB, "
               f"{elapsed:.1f}s)")
 
-        result = (X_train, X_val, scaler)
-        self._cache[key] = result
-        return result
+        self._key = key
+        self._X_train = X_train
+        self._X_val = X_val
+        self._scaler = scaler
+        return X_train, X_val, scaler
 
 
 # ---------------------------------------------------------------------------
@@ -292,12 +334,12 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
             forward_bars = 4
 
         seq_len = trial.suggest_categorical('seq_len', [12, 18, 24, 32])
-        hidden_dim = trial.suggest_categorical('hidden_dim', [64, 96, 128])
+        hidden_dim = trial.suggest_categorical('hidden_dim', [64, 96, 128, 192, 256])
         num_layers = trial.suggest_int('num_layers', 1, 2)
         n_heads = trial.suggest_categorical('n_heads', [2, 4])
         dropout = trial.suggest_float('dropout', 0.10, 0.40, step=0.05)
         learning_rate = trial.suggest_float('learning_rate', 5e-4, 3e-3, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [256, 512])
+        batch_size = trial.suggest_categorical('batch_size', [512, 1024, 2048])
         weight_decay = trial.suggest_float('weight_decay', 1e-5, 5e-4, log=True)
         huber_delta = trial.suggest_float('huber_delta', 0.5, 2.0, step=0.1)
         trade_threshold = trial.suggest_float('trade_threshold', 0.05, 1.0, step=0.01)
@@ -329,8 +371,10 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
             print(f"  [ERROR] Trial {trial.number}: {err_str}")
             gc.collect()
             torch.cuda.empty_cache()
-            if 'INTERNAL ASSERT FAILED' in err_str:
-                raise RuntimeError(f"CUDA allocator corrupted: {err_str}") from e
+            # CUDA errors corrupt the context — all subsequent trials will fail.
+            # Abort immediately instead of looping 200 times with score=0.
+            if 'CUDA' in err_str or 'INTERNAL ASSERT' in err_str:
+                raise SystemExit(f"CUDA error, aborting: {err_str}") from e
             return 0.0
 
     def _train_walk_forward(trial, trial_start, cfg, trial_returns, input_dim,
@@ -357,12 +401,23 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
         best_fold_sharpe = -999
 
         for fold_idx, (train_indices, val_indices) in enumerate(folds):
+            # Filter out indices where the target return is NaN
+            # (happens at the end of each ticker series for larger forward_bars)
+            train_mask = ~np.isnan(trial_returns[train_indices])
+            val_mask = ~np.isnan(trial_returns[val_indices])
+            train_indices = train_indices[train_mask]
+            val_indices = val_indices[val_mask]
+
             X_train, X_val, scaler = seq_cache.get(seq_len, fold_idx, train_indices, val_indices)
             n_train = len(train_indices)
             n_val = len(val_indices)
 
             y_train = trial_returns[train_indices]
             y_val = trial_returns[val_indices]
+
+            # On Jetson (unified memory), pre-loading to GPU causes OOM because
+            # CUDA allocator and system memory share the same 8GB pool.
+            # Per-batch transfer is fine — the 1020 MHz GPU clock is the real win.
 
             model = RegressionLSTM(input_dim, hidden_dim, num_layers,
                                    dropout, n_heads).to(device)
@@ -397,7 +452,7 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                         pred = model(xb)
                         raw_loss = criterion(pred, yb)
                         # Weight by |actual_return| + 1.0 (emphasize big moves)
-                        weights = torch.abs(yb) + 1.0
+                        weights = torch.clamp(torch.abs(yb) + 1.0, max=50.0)
                         loss = (raw_loss * weights).mean()
 
                     optimizer.zero_grad(set_to_none=True)
@@ -482,17 +537,24 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
             torch.cuda.empty_cache()
 
         avg_sharpe = np.mean(fold_sharpes) if fold_sharpes else 0.0
+        std_sharpe = np.std(fold_sharpes) if len(fold_sharpes) > 1 else 0.0
+        # Risk-adjusted score: penalize inconsistency across folds.
+        # A model with [2.8, 2.9, 2.7] (score=2.80) beats [4.0, 4.0, -1.0] (score=2.83)
+        score = avg_sharpe - 0.5 * std_sharpe
 
         trial.set_user_attr('fold_sharpes', fold_sharpes)
         trial.set_user_attr('avg_sharpe', avg_sharpe)
+        trial.set_user_attr('std_sharpe', std_sharpe)
 
-        if best_fold_state is not None and avg_sharpe > 0:
+        if best_fold_state is not None and score > 0:
+            # Only keep this trial's state; clear old entries to avoid memory leak
+            _state_cache.clear()
             _state_cache[trial.number] = {
                 'state': best_fold_state,
                 'scaler': best_fold_scaler,
             }
 
-        return avg_sharpe
+        return score
 
     return objective
 
@@ -523,6 +585,22 @@ def main():
     best_state_holder = {'state': None, 'scaler': None, 'score': 0.0, 'cfg': None}
     _state_cache = {}
 
+    asset_type = args.prefix or 'crypto'
+    phase_id = f'{asset_type}_search'
+    phase_label = f'Training {asset_type.title()} v2 Model'
+    _pipeline_status = {
+        'phase': phase_id,
+        'phase_label': phase_label,
+        'phase_idx': 0,
+        'total_phases': 1,
+        'trial_current': 0,
+        'trial_total': num_trials,
+        'best_score': 0.0,
+        'elapsed_sec': 0,
+        'model_version': 2,
+    }
+    _write_pipeline_status(_pipeline_status)
+
     results_log = []
     t0 = time.time()
     trials_since_improvement = 0
@@ -550,28 +628,37 @@ def main():
                 trials_since_improvement = 0
                 tag = " ** BEST **"
 
-        fb = cfg.get('forward_bars', 4)
+        fb = cfg.get('forward_bars', 12)
         th = cfg.get('trade_threshold', '')
+        avg_s = trial.user_attrs.get('avg_sharpe', score)
+        std_s = trial.user_attrs.get('std_sharpe', 0)
         sharpes_str = '/'.join(f'{s:.2f}' for s in fold_sharpes) if fold_sharpes else ''
-        print(f"[{n:3d}] sharpe={score:.3f} folds=[{sharpes_str}] "
+        print(f"[{n:3d}] score={score:.3f} (mean={avg_s:.2f} std={std_s:.2f}) folds=[{sharpes_str}] "
               f"| fb={fb} s={cfg.get('seq_len','')} h={cfg.get('hidden_dim','')} "
               f"l={cfg.get('num_layers','')} nh={cfg.get('n_heads','')} "
-              f"d={cfg.get('dropout', ''):.2f} "
-              f"lr={cfg.get('learning_rate', ''):.4f} "
+              f"d={cfg.get('dropout', 0):.2f} "
+              f"lr={cfg.get('learning_rate', 0):.4f} "
               f"th={th if th == '' else f'{th:.2f}'} "
               f"hd={cfg.get('huber_delta', '')}"
               f"{tag}")
 
         results_log.append({
-            'i': n, 'cfg': cfg, 'avg_sharpe': score,
+            'i': n, 'cfg': cfg, 'score': score,
+            'avg_sharpe': avg_s, 'std_sharpe': std_s,
             'fold_sharpes': fold_sharpes,
             'state': str(trial.state), 'time': elapsed,
         })
 
+        # Update pipeline status for GUI every trial
+        _pipeline_status['trial_current'] = n
+        _pipeline_status['best_score'] = best_state_holder['score']
+        _pipeline_status['elapsed_sec'] = int(elapsed)
+        _write_pipeline_status(_pipeline_status)
+
         if n % 10 == 0:
             with open(f'hypersearch_{prefix}v2_log.json', 'w') as f:
                 json.dump(results_log, f, indent=2, default=str)
-            print(f"  --- {elapsed/60:.1f}min elapsed, best sharpe={best_state_holder['score']:.3f}, "
+            print(f"  --- {elapsed/60:.1f}min elapsed, best score={best_state_holder['score']:.3f}, "
                   f"total trials in study={len(study.trials)}, "
                   f"{trials_since_improvement} since last improvement ---")
 
@@ -589,7 +676,7 @@ def main():
     prior_trials = len(study.trials)
     print(f"\n{'='*70}")
     print(f"OPTUNA V2 REGRESSION SEARCH: {num_trials} new trials (TPE + pruning)")
-    print(f"Optimizing: Sharpe ratio (walk-forward {NUM_FOLDS}-fold CV)")
+    print(f"Optimizing: risk-adjusted Sharpe (mean - 0.5*std, {NUM_FOLDS}-fold walk-forward CV)")
     if has_multi_horizon:
         print(f"Multi-horizon: forward_bars in {FORWARD_BARS}")
     print(f"Mixed precision: {'FP16' if device.type == 'cuda' else 'disabled (CPU)'}")
@@ -606,7 +693,7 @@ def main():
                 best_state_holder['score'] = t.value
                 best_state_holder['cfg'] = t.user_attrs.get('cfg', {})
         if best_state_holder['score'] > 0:
-            print(f"Prior best sharpe={best_state_holder['score']:.3f} — new trials must beat this")
+            print(f"Prior best score={best_state_holder['score']:.3f} — new trials must beat this")
 
     objective_fn = create_objective(all_features, all_returns_by_fb,
                                     tickers, ticker_boundaries, input_dim,
@@ -625,7 +712,7 @@ def main():
         best_cfg = best_state_holder['cfg']
         best_scaler = best_state_holder['scaler']
 
-        print(f"\nBest model (sharpe={best_state_holder['score']:.3f}):")
+        print(f"\nBest model (score={best_state_holder['score']:.3f}, mean-0.5*std):")
         for k, v in best_cfg.items():
             print(f"  {k}: {v}")
 
@@ -644,7 +731,7 @@ def main():
             'dropout': best_cfg['dropout'],
             'seq_len': best_cfg['seq_len'],
             'trade_threshold': best_cfg['trade_threshold'],
-            'forward_bars': best_cfg.get('forward_bars', 4),
+            'forward_bars': best_cfg.get('forward_bars', 24),
             'huber_delta': best_cfg['huber_delta'],
             'prefix': args.prefix,
             'indicator_preset': preset_name,
@@ -658,7 +745,7 @@ def main():
         print(f"Scaler saved: {prefix}scaler_v2.pkl")
         print(f"Features saved: {prefix}feature_cols_v2.pkl")
     else:
-        print(f"\nNo new best found (prior best sharpe={best_state_holder['score']:.3f})")
+        print(f"\nNo new best found (prior best score={best_state_holder['score']:.3f})")
 
     # Param importance
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
@@ -671,6 +758,15 @@ def main():
         except Exception:
             pass
 
+    # Final pipeline status
+    _pipeline_status['phase'] = 'complete'
+    _pipeline_status['trial_current'] = num_trials
+    _pipeline_status['best_score'] = best_state_holder['score']
+    _pipeline_status['elapsed_sec'] = int(total_time)
+    score_key = f'{asset_type}_final_score'
+    _pipeline_status[score_key] = round(best_state_holder['score'], 4)
+    _write_pipeline_status(_pipeline_status)
+
     # Save full log
     with open(f'hypersearch_{prefix}v2_log.json', 'w') as f:
         json.dump(results_log, f, indent=2, default=str)
@@ -681,4 +777,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    args = parse_args()
+    lock_label = f"hypersearch_v2_{args.prefix or 'crypto'}"
+    with acquire_for_training(lock_label):
+        main()

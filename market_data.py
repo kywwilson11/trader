@@ -4,6 +4,7 @@ Provides bar-fetching functions for both Alpaca (crypto + stock) and yfinance,
 plus a live ATR helper used by the trading loops for adaptive stop-losses.
 """
 
+import calendar
 import time
 
 import pandas as pd
@@ -27,6 +28,43 @@ def flatten_yfinance_columns(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
+
+
+# --- CRYPTO VOLUME (supplements Alpaca crypto which reports zero volume) ---
+
+def fetch_crypto_volume(symbols: list[str], limit: int = 24) -> dict[str, float]:
+    """Fetch volume ratios from CryptoCompare for crypto symbols.
+
+    Returns dict mapping symbol -> volume_ratio (last completed bar vol / 20-bar avg).
+    Uses CryptoCompare public API — no auth needed, no geo-block.
+    """
+    import urllib.request
+    import json as _json
+
+    result = {}
+    for symbol in symbols:
+        try:
+            fsym = symbol.split("/")[0] if "/" in symbol else symbol.replace("USD", "")
+            url = (f"https://min-api.cryptocompare.com/data/v2/histohour"
+                   f"?fsym={fsym}&tsym=USD&limit={max(limit, 21)}")
+            req = urllib.request.Request(url, headers={"User-Agent": "trader/1.0"})
+            resp = urllib.request.urlopen(req, timeout=5)
+            data = _json.loads(resp.read())
+            bars = data.get("Data", {}).get("Data", [])
+            if len(bars) < 2:
+                continue
+            # volumeto = USD-denominated volume (aggregated across exchanges)
+            volumes = [b.get("volumeto", 0) for b in bars]
+            # Last bar is in-progress; use second-to-last as "current completed"
+            current_vol = volumes[-2]
+            # 20-bar average excluding the last 2
+            avg_window = volumes[:-2][-20:] if len(volumes) > 22 else volumes[:-2]
+            avg_vol = sum(avg_window) / len(avg_window) if avg_window else 1.0
+            ratio = current_vol / avg_vol if avg_vol > 0 else 0.0
+            result[symbol] = round(ratio, 2)
+        except Exception as e:
+            print(f"  [VOLUME] {symbol}: {e}")
+    return result
 
 
 # --- ALPACA BAR FETCHING ---
@@ -198,11 +236,13 @@ def fetch_historical_bars(api, symbol, start_date, asset_type='crypto',
     chunks = []
     chunk_start = start_dt
     while chunk_start < now:
-        # Advance by chunk_months
+        # Advance by chunk_months (clamp day to last day of target month)
         m = chunk_start.month + chunk_months
         y = chunk_start.year + (m - 1) // 12
         m = (m - 1) % 12 + 1
-        chunk_end = chunk_start.replace(year=y, month=m)
+        last_day = calendar.monthrange(y, m)[1]
+        chunk_end = chunk_start.replace(year=y, month=m,
+                                        day=min(chunk_start.day, last_day))
         if chunk_end > now:
             chunk_end = now
         chunks.append((chunk_start, chunk_end))

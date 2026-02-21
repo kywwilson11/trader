@@ -1,12 +1,8 @@
-"""ML prediction engine — model loading, dual bear/bull inference, live predictions.
+"""ML prediction engine — RegressionLSTM loading, JIT tracing, live predictions.
 
-Supports two model versions:
-  v1: Dual CryptoLSTM classifiers (bear + bull) with softmax → score → predicted_return
-  v2: Single RegressionLSTM that directly outputs predicted return percentage
-
-Loads models from disk, optionally JIT-traces them for faster inference,
-and provides get_live_prediction() which fetches recent bars, computes features,
-and returns a predicted-return score.
+Loads a single RegressionLSTM model from disk, optionally JIT-traces it
+for faster inference, and provides get_live_prediction() which fetches recent
+bars, computes features, and returns a predicted return percentage.
 
 Bar-fetching and ATR logic live in market_data.py.
 """
@@ -16,7 +12,6 @@ Bar-fetching and ATR logic live in market_data.py.
 import joblib
 import os
 import torch
-from model import CryptoLSTM
 from model_v2 import RegressionLSTM
 from indicators import compute_features, compute_stock_features
 from market_data import (
@@ -24,49 +19,33 @@ from market_data import (
     fetch_stock_bars_alpaca,
 )
 
+# Lazy-load with retry: try once per cycle, stop spamming after first failure log
+_get_live_sentiment = None
+_sentiment_import_failed = False
+
 # --- CONFIGURATION ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-MODEL_PATH = 'stock_predictor.pth'
-SCALER_X_PATH = 'scaler_X.pkl'
-FEATURE_COLS_PATH = 'feature_cols.pkl'
-MODEL_CONFIG_PATH = 'model_config.pkl'
-
-# Dual model paths
-BEAR_MODEL_PATH = 'bear_model.pth'
-BEAR_CONFIG_PATH = 'bear_config.pkl'
-BULL_MODEL_PATH = 'bull_model.pth'
-BULL_CONFIG_PATH = 'bull_config.pkl'
 
 
 def _prefixed_paths(prefix):
     """Return dict of file paths for a given model prefix (e.g. 'stock')."""
     p = f'{prefix}_' if prefix else ''
     return {
-        'bear_model': f'{p}bear_model.pth',
-        'bear_config': f'{p}bear_config.pkl',
-        'bull_model': f'{p}bull_model.pth',
-        'bull_config': f'{p}bull_config.pkl',
-        'scaler_X': f'{p}scaler_X.pkl',
-        'feature_cols': f'{p}feature_cols.pkl',
-        'default_model': MODEL_PATH,
-        'default_config': MODEL_CONFIG_PATH,
-        # v2 regression model paths
-        'v2_model': f'{p}model_v2.pth',
-        'v2_config': f'{p}config_v2.pkl',
-        'v2_scaler': f'{p}scaler_v2.pkl',
-        'v2_features': f'{p}feature_cols_v2.pkl',
+        'model': f'{p}model_v2.pth',
+        'config': f'{p}config_v2.pkl',
+        'scaler': f'{p}scaler_v2.pkl',
+        'features': f'{p}feature_cols_v2.pkl',
     }
 
 
 # --- MODEL LOADING ---
 
-def load_model(model_type='default', inference_device=None, prefix=''):
-    """Load a model by type: 'default', 'bear', or 'bull'.
+def load_model(inference_device=None, prefix=''):
+    """Load a RegressionLSTM model from disk.
 
     Args:
-        model_type: Which model to load
         inference_device: Override device for inference (e.g. 'cpu' for GPU fallback)
-        prefix: File prefix (e.g. 'stock' -> stock_bear_model.pth)
+        prefix: File prefix (e.g. 'stock' -> stock_model_v2.pth)
 
     Returns:
         (model, scaler_X, config, seq_len, feature_cols)
@@ -74,88 +53,9 @@ def load_model(model_type='default', inference_device=None, prefix=''):
     dev = torch.device(inference_device) if inference_device else device
     paths = _prefixed_paths(prefix)
 
-    scaler_X = joblib.load(paths['scaler_X'])
-    feature_cols = joblib.load(paths['feature_cols'])
-
-    if model_type == 'bear':
-        config = joblib.load(paths['bear_config'])
-        model_path = paths['bear_model']
-    elif model_type == 'bull':
-        config = joblib.load(paths['bull_config'])
-        model_path = paths['bull_model']
-    else:
-        config = joblib.load(paths['default_config'])
-        model_path = paths['default_model']
-
-    num_classes = config.get('num_classes', 3)
-    model = CryptoLSTM(
-        input_dim=config['input_dim'],
-        hidden_dim=config['hidden_dim'],
-        num_layers=config['num_layers'],
-        dropout=config['dropout'],
-        num_classes=num_classes,
-    ).to(dev)
-    model.load_state_dict(torch.load(model_path, map_location=dev, weights_only=True))
-    model.eval()
-
-    # Try to JIT-trace for faster inference (LSTM compatible with trace)
-    try:
-        dummy = torch.randn(1, config['seq_len'], config['input_dim']).to(dev)
-        model = torch.jit.trace(model, dummy)
-        print(f"  [JIT] Model traced successfully ({model_type})")
-    except Exception as e:
-        print(f"  [JIT] Trace failed ({model_type}): {e}, using eager mode")
-
-    return model, scaler_X, config, config['seq_len'], feature_cols
-
-
-def load_dual_models(inference_device=None, prefix=''):
-    """Load both bear and bull models. Falls back to default model if dual models don't exist.
-
-    Args:
-        inference_device: Override device for inference
-        prefix: File prefix (e.g. 'stock' -> stock_bear_model.pth)
-
-    Returns:
-        (bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols)
-    """
-    paths = _prefixed_paths(prefix)
-    has_dual = os.path.exists(paths['bear_model']) and os.path.exists(paths['bull_model'])
-
-    pfx_label = f"{prefix} " if prefix else ""
-    if has_dual:
-        bear_model, scaler_X, bear_config, _, feature_cols = load_model('bear', inference_device, prefix)
-        bull_model, _, bull_config, _, _ = load_model('bull', inference_device, prefix)
-        bear_fb = bear_config.get('forward_bars', 4)
-        bull_fb = bull_config.get('forward_bars', 4)
-        print(f"{pfx_label}Dual models loaded: "
-              f"bear(seq={bear_config['seq_len']}, th={bear_config.get('bull_threshold', 0.15):.2f}, fb={bear_fb}) "
-              f"bull(seq={bull_config['seq_len']}, th={bull_config.get('bull_threshold', 0.15):.2f}, fb={bull_fb})")
-    else:
-        print(f"No {pfx_label}dual models found, falling back to default model for both")
-        model, scaler_X, config, _, feature_cols = load_model('default', inference_device, prefix)
-        bear_model = model
-        bear_config = config
-        bull_model = model
-        bull_config = config
-
-    return bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols
-
-
-# --- V2 REGRESSION MODEL LOADING ---
-
-def load_model_v2(inference_device=None, prefix=''):
-    """Load a v2 regression model.
-
-    Returns:
-        (model, scaler_X, config, seq_len, feature_cols)
-    """
-    dev = torch.device(inference_device) if inference_device else device
-    paths = _prefixed_paths(prefix)
-
-    config = joblib.load(paths['v2_config'])
-    scaler_X = joblib.load(paths['v2_scaler'])
-    feature_cols = joblib.load(paths['v2_features'])
+    config = joblib.load(paths['config'])
+    scaler_X = joblib.load(paths['scaler'])
+    feature_cols = joblib.load(paths['features'])
 
     model = RegressionLSTM(
         input_dim=config['input_dim'],
@@ -164,35 +64,38 @@ def load_model_v2(inference_device=None, prefix=''):
         dropout=config['dropout'],
         n_heads=config.get('n_heads', 4),
     ).to(dev)
-    model.load_state_dict(torch.load(paths['v2_model'], map_location=dev, weights_only=True))
+    model.load_state_dict(torch.load(paths['model'], map_location=dev, weights_only=True))
     model.eval()
 
     try:
         dummy = torch.randn(1, config['seq_len'], config['input_dim']).to(dev)
         model = torch.jit.trace(model, dummy, check_trace=False)
-        print(f"  [JIT] v2 model traced successfully")
+        print(f"  [JIT] Model traced successfully")
     except Exception as e:
-        print(f"  [JIT] v2 trace failed: {e}, using eager mode")
+        print(f"  [JIT] Trace failed: {e}, using eager mode")
 
     return model, scaler_X, config, config['seq_len'], feature_cols
 
 
-def load_v2_models(inference_device=None, prefix=''):
-    """Try to load v2 regression model. Returns None tuple if not found.
+def load_models(inference_device=None, prefix=''):
+    """Load a regression model, printing summary info.
+
+    Args:
+        inference_device: Override device for inference
+        prefix: File prefix (e.g. 'stock' -> stock_model_v2.pth)
 
     Returns:
-        (model, config, scaler_X, feature_cols) or (None, None, None, None)
-    """
-    paths = _prefixed_paths(prefix)
-    if not os.path.exists(paths['v2_model']):
-        return None, None, None, None
+        (model, config, scaler_X, feature_cols)
 
+    Raises:
+        FileNotFoundError: If model files don't exist
+    """
     pfx_label = f"{prefix} " if prefix else ""
-    model, scaler_X, config, seq_len, feature_cols = load_model_v2(inference_device, prefix)
+    model, scaler_X, config, seq_len, feature_cols = load_model(inference_device, prefix)
     th = config.get('trade_threshold', 0.15)
     fb = config.get('forward_bars', 4)
-    print(f"{pfx_label}v2 regression model loaded: "
-          f"seq={seq_len}, th={th:.2f}, fb={fb}, "
+    print(f"{pfx_label}Model loaded: "
+          f"seq={seq_len}, threshold={th:.2f}, fb={fb}, "
           f"heads={config.get('n_heads', 4)}")
     return model, config, scaler_X, feature_cols
 
@@ -201,28 +104,26 @@ def load_v2_models(inference_device=None, prefix=''):
 
 def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
                         api=None, inference_device=None,
-                        asset_type='crypto', spy_close=None, btc_close=None):
-    """Get prediction for a symbol. Returns a predicted-return score.
-
-    Score interpretation:
-        Positive = bullish (higher = more confident)
-        Negative = bearish (lower = more confident)
-        Near zero = neutral
+                        asset_type='crypto', spy_close=None, btc_close=None,
+                        return_snapshot=False):
+    """Get predicted return for a symbol.
 
     Args:
         symbol: Ticker symbol (Alpaca format 'BTC/USD' if api provided, else yfinance 'BTC-USD')
-        model: CryptoLSTM model (or JIT-traced variant)
+        model: RegressionLSTM model (or JIT-traced variant)
         scaler_X: Feature scaler
-        config: Model config dict (must contain 'seq_len', 'bull_threshold')
+        config: Model config dict (must contain 'seq_len', 'trade_threshold')
         feature_cols: List of feature column names
         api: Alpaca API object — if provided, uses Alpaca bars instead of yfinance
         inference_device: Override device for inference (e.g. 'cpu')
         asset_type: 'crypto' or 'stock' — determines feature computation and data source
         spy_close: SPY close Series for stock relative strength (optional)
         btc_close: BTC/USD close Series for crypto cross-asset features (optional)
+        return_snapshot: If True, return (predicted_return, indicator_snapshot_dict)
 
     Returns:
         float predicted_return, or None on error
+        If return_snapshot=True: (predicted_return, snapshot_dict) or (None, None)
     """
     dev = torch.device(inference_device) if inference_device else device
     seq_len = config['seq_len']
@@ -243,9 +144,11 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             yf_sym = symbol.replace('/', '-') if '/' in symbol else symbol
             df = fetch_bars_yfinance(yf_sym)
 
+    _none_ret = (None, None) if return_snapshot else None
+
     if df is None or df.empty:
         print("Error: No data found for symbol.")
-        return None
+        return _none_ret
 
     # --- Compute technical features ---
     if asset_type == 'stock':
@@ -256,22 +159,35 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
 
     if len(df) < seq_len:
         print(f"  Not enough data for sequence (need {seq_len}, have {len(df)})")
-        return None
+        return _none_ret
 
     # Inject live sentiment if the model was trained with it
     if 'Daily_Sentiment' in feature_cols and 'Daily_Sentiment' not in df.columns:
-        try:
-            from sentiment_history import get_live_daily_sentiment
-            df['Daily_Sentiment'] = get_live_daily_sentiment(symbol, asset_type)
-        except Exception as e:
-            print(f"  [SENTIMENT] Live sentiment unavailable: {e}")
+        global _get_live_sentiment, _sentiment_import_failed
+        # Retry import each cycle until it succeeds; only log failure once
+        if _get_live_sentiment is None:
+            try:
+                from sentiment_history import get_live_daily_sentiment
+                _get_live_sentiment = get_live_daily_sentiment
+                if _sentiment_import_failed:
+                    print("  [SENTIMENT] sentiment_history recovered")
+            except Exception as e:
+                if not _sentiment_import_failed:
+                    print(f"  [SENTIMENT] sentiment_history unavailable: {e}")
+                    _sentiment_import_failed = True
+        if _get_live_sentiment is not None:
+            try:
+                df['Daily_Sentiment'] = _get_live_sentiment(symbol, asset_type)
+            except Exception:
+                df['Daily_Sentiment'] = 0.0
+        else:
             df['Daily_Sentiment'] = 0.0
 
     try:
         current_features = df[feature_cols].values
     except KeyError as e:
         print(f"  Feature mismatch: {e}")
-        return None
+        return _none_ret
 
     # --- Scale and build input tensor ---
     current_features_scaled = scaler_X.transform(current_features)
@@ -280,45 +196,53 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
     tensor_input = torch.tensor(sequence, dtype=torch.float32).to(dev)
 
     # --- Run inference ---
-    model_version = config.get('model_version', 1)
-
     with torch.inference_mode():
         output = model(tensor_input)
 
+    predicted_return = float(output.cpu().item())
+    trade_threshold = config.get('trade_threshold', 0.15)
+
     price = df['Close'].iloc[-1]
+    print(f"Current Price:   ${price:.2f}")
+    print(f"Predicted Return: {predicted_return:+.4f}% (threshold={trade_threshold:.2f})")
 
-    if model_version >= 2:
-        # v2 regression: model outputs predicted return directly
-        predicted_return = float(output.cpu().item())
-        trade_threshold = config.get('trade_threshold', 0.15)
-
-        print(f"Current Price:   ${price:.2f}")
-        print(f"Predicted Return: {predicted_return:+.4f}% (threshold={trade_threshold:.2f})")
-
-        if predicted_return > trade_threshold:
-            print("Recommendation:  [BUY]")
-        elif predicted_return < -trade_threshold:
-            print("Recommendation:  [SELL/AVOID]")
-        else:
-            print("Recommendation:  [HOLD/WEAK]")
+    if predicted_return > trade_threshold:
+        print("Recommendation:  [BUY]")
+    elif predicted_return < -trade_threshold:
+        print("Recommendation:  [SELL/AVOID]")
     else:
-        # v1 classification: softmax → score → predicted_return
-        probs = torch.softmax(output, dim=1).cpu().numpy()[0]
-        bear_prob, neut_prob, bull_prob = probs
-        score = bull_prob - bear_prob
-        bull_threshold = config.get('bull_threshold', 0.15)
-        predicted_return = score * bull_threshold
+        print("Recommendation:  [HOLD/WEAK]")
 
-        print(f"Current Price:   ${price:.2f}")
-        print(f"Probabilities:   Bear={bear_prob:.1%}  Neut={neut_prob:.1%}  Bull={bull_prob:.1%}")
-        print(f"Score: {score:+.3f} -> Predicted Return: {predicted_return:+.4f}%")
-
-        if predicted_return > bull_threshold:
-            print("Recommendation:  [BUY]")
-        elif predicted_return < -bull_threshold:
-            print("Recommendation:  [SELL/AVOID]")
-        else:
-            print("Recommendation:  [HOLD/WEAK]")
+    if return_snapshot:
+        # Build snapshot of latest indicator values (all available, not just model features)
+        last_row = df.iloc[-1]
+        # Use previous completed bar for volume (current bar is incomplete)
+        prev_row = df.iloc[-2] if len(df) >= 2 else last_row
+        _SNAPSHOT_COLS = [
+            'Close', 'RSI', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
+            'STOCHk_14_3_3', 'STOCHd_14_3_3', 'ATR',
+            'SMA_20', 'Price_SMA20_Ratio', 'BBL_20_2.0', 'BBU_20_2.0',
+            'BBP_20_2.0', 'BBB_20_2.0',
+            'ROC', 'Return_4h', 'Return_12h', 'Volatility_12h',
+            'Daily_Sentiment',
+            # Cross-asset (may not exist for all asset types)
+            'BTC_Return_1h', 'BTC_SMA_Ratio', 'BTC_RSI',
+            'RS_vs_SPY', 'Price_VWAP_Ratio', 'ATR_Pct',
+        ]
+        snapshot = {}
+        for col in _SNAPSHOT_COLS:
+            if col in last_row.index:
+                val = last_row[col]
+                if val is not None and val == val:
+                    snapshot[col] = float(val)
+        # Volume from last completed bar — only include if real data exists
+        # (Alpaca crypto bars often report zero volume)
+        prev_vol = prev_row.get('Volume', 0) if 'Volume' in prev_row.index else 0
+        if prev_vol and prev_vol > 0 and 'Volume_Ratio' in prev_row.index:
+            val = prev_row['Volume_Ratio']
+            if val is not None and val == val:
+                snapshot['Volume_Ratio'] = float(val)
+        return predicted_return, snapshot
 
     return predicted_return
 
@@ -326,29 +250,15 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
 if __name__ == "__main__":
     print(f"Using device: {device}")
 
-    # Try dual models first, fall back to default
     try:
-        bear_model, bear_config, bull_model, bull_config, scaler_X, feature_cols = load_dual_models()
-        dual = bear_model is not bull_model
+        model, config, scaler_X, feature_cols = load_models()
     except FileNotFoundError:
-        try:
-            model, scaler_X, config, seq_len, feature_cols = load_model()
-            bear_model = bull_model = model
-            bear_config = bull_config = config
-            dual = False
-        except FileNotFoundError:
-            print("Error: Model files not found. Did you run hypersearch_dual.py?")
-            exit(1)
+        print("Error: Model files not found. Run hypersearch_v2.py first.")
+        exit(1)
 
     symbols = [
         'BTC-USD', 'ETH-USD', 'XRP-USD', 'SOL-USD', 'DOGE-USD',
         'LINK-USD',
     ]
     for sym in symbols:
-        if dual:
-            print(f"\n{'='*40} BEAR MODEL {'='*40}")
-            get_live_prediction(sym, bear_model, scaler_X, bear_config, feature_cols)
-            print(f"\n{'='*40} BULL MODEL {'='*40}")
-            get_live_prediction(sym, bull_model, scaler_X, bull_config, feature_cols)
-        else:
-            get_live_prediction(sym, bear_model, scaler_X, bear_config, feature_cols)
+        get_live_prediction(sym, model, scaler_X, config, feature_cols)
