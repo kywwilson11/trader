@@ -16,8 +16,8 @@ _DEFAULTS = {
         "claude": {"api_key": "", "model": "claude-sonnet-4-5-20250929"},
         "openai": {"api_key": "", "model": "gpt-4.1"},
     },
-    "analyst_model": "gemini-2.5-flash",      # Pro or Flash for trade analysis
-    "sentiment_model": "gemini-2.5-flash",   # Flash or Flash-Lite for news scoring
+    "analyst_model": "gemini-2.5-pro",        # Pro for trade analysis (best reasoning)
+    "sentiment_model": "gemini-2.5-flash",   # Flash for news scoring (cost-effective)
     "fmp_api_key": "",
     "max_llm_latency_sec": 15,
     "journal_enabled": True,

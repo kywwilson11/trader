@@ -33,7 +33,7 @@ GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
 _GEMINI_FALLBACK_CHAIN = [
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
-    # Pro excluded — too slow for fallback. Use call_gemini() directly for Pro.
+    "gemini-2.5-pro",  # Paid tier: Pro has generous limits, fast enough for fallback
 ]
 
 # HTTP codes that trigger immediate fallback:
@@ -61,7 +61,7 @@ _model_calls: dict[str, int] = {}
 _quota_reset_date: str = ""
 
 # --- Daily cost tracking (hard cap to prevent runaway spending) ---
-_DAILY_COST_LIMIT = 0.65  # ~$20/month
+_DAILY_COST_LIMIT = 1.00  # ~$30/month (paid tier 1)
 _daily_cost: float = 0.0
 _cost_reset_date: str = ""
 

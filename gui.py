@@ -1003,7 +1003,8 @@ class DataFetcher(QObject):
             res_config = {
                 'daily':  ('1Day',  365, 365),
                 'hourly': ('1Hour',  10, 168),   # 7 days of hourly = ~168 bars
-                '15min':  ('15Min',   2, 104),   # 2 days of 15-min = ~104 bars
+                '15min':  ('15Min',   5, 200),   # 5 days lookback covers weekends
+                '5min':   ('5Min',    3, 300),   # 3 days of 5-min bars
             }
             tf, lookback_days, limit = res_config.get(resolution, ('1Day', 365, 365))
 
@@ -1702,6 +1703,15 @@ class TradingDashboard(QMainWindow):
             f" border: 1px solid {t['bg_border'].name()}; }}"
         )
 
+        # Manual trade inputs
+        trade_input_style = (
+            f"QLineEdit {{ background-color: {t['bg_table'].name()};"
+            f" color: {t['white'].name()}; border: 1px solid {t['bg_border'].name()};"
+            f" border-radius: 4px; padding: 4px; }}"
+        )
+        for widget in [self._manual_symbol, self._manual_qty, self._manual_notional]:
+            widget.setStyleSheet(trade_input_style)
+
         # Settings tab inputs
         input_style = (
             f"QLineEdit, QSpinBox, QComboBox {{ background-color: {t['bg_table'].name()};"
@@ -1757,14 +1767,19 @@ class TradingDashboard(QMainWindow):
         pos_label.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 8px;")
         layout.addWidget(pos_label)
 
-        self._positions_table = QTableWidget(0, 8)
+        self._positions_table = QTableWidget(0, 9)
         self._positions_table.setHorizontalHeaderLabels(
             ["Symbol", "Qty", "Side", "Avg Entry", "Current Price",
-             "Mkt Value", "Unrealized P&L", "P&L %"]
+             "Mkt Value", "Unrealized P&L", "P&L %", ""]
         )
-        self._positions_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        header = self._positions_table.horizontalHeader()
+        for col in range(8):
+            header.setSectionResizeMode(col, QHeaderView.Stretch)
+        header.setSectionResizeMode(8, QHeaderView.Fixed)
+        self._positions_table.setColumnWidth(8, 60)
         self._positions_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._positions_table.setAlternatingRowColors(True)
+        self._positions_table.setSortingEnabled(True)
         layout.addWidget(self._positions_table)
 
         tax_group = QGroupBox("Tax Estimation (MinTax)")
@@ -1785,6 +1800,51 @@ class TradingDashboard(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        # --- Manual Trade controls ---
+        trade_group = QGroupBox("Manual Trade")
+        trade_layout = QHBoxLayout(trade_group)
+
+        trade_layout.addWidget(QLabel("Symbol:"))
+        self._manual_symbol = QLineEdit()
+        self._manual_symbol.setPlaceholderText("TSLA or BTC/USD")
+        self._manual_symbol.setFixedWidth(120)
+        trade_layout.addWidget(self._manual_symbol)
+
+        trade_layout.addWidget(QLabel("Qty:"))
+        self._manual_qty = QLineEdit()
+        self._manual_qty.setPlaceholderText("1")
+        self._manual_qty.setFixedWidth(80)
+        trade_layout.addWidget(self._manual_qty)
+
+        trade_layout.addWidget(QLabel("Notional $:"))
+        self._manual_notional = QLineEdit()
+        self._manual_notional.setPlaceholderText("250")
+        self._manual_notional.setFixedWidth(80)
+        trade_layout.addWidget(self._manual_notional)
+
+        self._manual_buy_btn = QPushButton("BUY")
+        self._manual_buy_btn.setFixedWidth(60)
+        self._manual_buy_btn.setStyleSheet(
+            "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; border-radius: 4px; }"
+            " QPushButton:hover { background-color: #388e3c; }")
+        self._manual_buy_btn.clicked.connect(lambda: self._manual_trade("buy"))
+        trade_layout.addWidget(self._manual_buy_btn)
+
+        self._manual_sell_btn = QPushButton("SELL")
+        self._manual_sell_btn.setFixedWidth(60)
+        self._manual_sell_btn.setStyleSheet(
+            "QPushButton { background-color: #c62828; color: white; font-weight: bold; border-radius: 4px; }"
+            " QPushButton:hover { background-color: #d32f2f; }")
+        self._manual_sell_btn.clicked.connect(lambda: self._manual_trade("sell"))
+        trade_layout.addWidget(self._manual_sell_btn)
+
+        self._manual_status = QLabel("")
+        self._manual_status.setStyleSheet("font-size: 11px;")
+        trade_layout.addWidget(self._manual_status)
+        trade_layout.addStretch()
+        layout.addWidget(trade_group)
+
+        # --- Filter + orders ---
         filter_layout = QHBoxLayout()
         filter_layout.addWidget(QLabel("Filter:"))
         self._trade_filter = QComboBox()
@@ -1821,6 +1881,76 @@ class TradingDashboard(QMainWindow):
         layout.addWidget(self._fills_table)
 
         self.tabs.addTab(tab, "Trading")
+
+    def _manual_trade(self, side):
+        """Execute a manual buy/sell order via the Alpaca API."""
+        symbol = self._manual_symbol.text().strip().upper()
+        if not symbol:
+            self._manual_status.setText("Enter a symbol")
+            self._manual_status.setStyleSheet(f"color: {T['red'].name()}; font-size: 11px;")
+            return
+
+        qty_text = self._manual_qty.text().strip()
+        notional_text = self._manual_notional.text().strip()
+
+        if not qty_text and not notional_text:
+            self._manual_status.setText("Enter qty or notional")
+            self._manual_status.setStyleSheet(f"color: {T['red'].name()}; font-size: 11px;")
+            return
+
+        self._manual_status.setText("Submitting...")
+        self._manual_status.setStyleSheet(f"color: {T['muted'].name()}; font-size: 11px;")
+        QApplication.processEvents()
+
+        try:
+            order_params = {
+                'symbol': symbol,
+                'side': side,
+                'type': 'market',
+                'time_in_force': 'gtc' if '/' in symbol else 'day',
+            }
+            if qty_text:
+                order_params['qty'] = float(qty_text)
+            else:
+                order_params['notional'] = float(notional_text)
+
+            order = self.api.submit_order(**order_params)
+            self._manual_status.setText(
+                f"{side.upper()} {symbol} submitted (ID: {str(order.id)[:8]}...)")
+            self._manual_status.setStyleSheet(
+                f"color: {T['green'].name()}; font-size: 11px;")
+            # Trigger a refresh
+            from PySide6.QtCore import QMetaObject
+            QMetaObject.invokeMethod(
+                self._fetcher, "fetch_positions", Qt.QueuedConnection)
+            QMetaObject.invokeMethod(
+                self._fetcher, "fetch_orders", Qt.QueuedConnection)
+        except Exception as e:
+            self._manual_status.setText(f"Error: {e}")
+            self._manual_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+
+    def _close_position(self, symbol):
+        """Close a position by market-selling the entire qty."""
+        self._manual_status.setText(f"Closing {symbol}...")
+        self._manual_status.setStyleSheet(f"color: {T['muted'].name()}; font-size: 11px;")
+        QApplication.processEvents()
+
+        try:
+            # Use Alpaca's close position endpoint
+            self.api.close_position(symbol)
+            self._manual_status.setText(f"Close order submitted for {symbol}")
+            self._manual_status.setStyleSheet(
+                f"color: {T['green'].name()}; font-size: 11px;")
+            from PySide6.QtCore import QMetaObject
+            QMetaObject.invokeMethod(
+                self._fetcher, "fetch_positions", Qt.QueuedConnection)
+            QMetaObject.invokeMethod(
+                self._fetcher, "fetch_orders", Qt.QueuedConnection)
+        except Exception as e:
+            self._manual_status.setText(f"Close error: {e}")
+            self._manual_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
 
     # ---- Tab 3: Performance ----------------------------------------------
     def _build_performance_tab(self):
@@ -2183,7 +2313,9 @@ class TradingDashboard(QMainWindow):
             return 'daily'
         elif z == '1W':
             return 'hourly'
-        else:  # '1D'
+        elif z == '1D':
+            return '5min'
+        else:
             return '15min'
 
     def _on_zoom_clicked(self, zoom):
@@ -2214,6 +2346,8 @@ class TradingDashboard(QMainWindow):
         if item:
             sym = item.text()
             self._stock_symbol_combo.setCurrentText(sym)
+            # Also pre-fill manual trade symbol for convenience
+            self._manual_symbol.setText(sym)
 
     def _on_heatmap_clicked(self, sym):
         self._stock_symbol_combo.setCurrentText(sym)
@@ -2529,6 +2663,33 @@ class TradingDashboard(QMainWindow):
         self._ram_label, self._ram_bar = _hw_gauge("Shared Memory", 1, 2)
 
         layout.addWidget(hw_group)
+
+        # LLM Usage group
+        llm_usage_group = QGroupBox("LLM Usage (Today)")
+        llm_usage_layout = QGridLayout(llm_usage_group)
+        self._llm_cost_label = QLabel("Cost: $0.000 / $0.65")
+        self._llm_cost_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        llm_usage_layout.addWidget(self._llm_cost_label, 0, 0)
+
+        self._llm_cost_bar = QProgressBar()
+        self._llm_cost_bar.setRange(0, 100)
+        self._llm_cost_bar.setFixedHeight(10)
+        self._llm_cost_bar.setTextVisible(False)
+        llm_usage_layout.addWidget(self._llm_cost_bar, 0, 1)
+
+        self._llm_pro_label = QLabel("Pro: \u2014")
+        self._llm_pro_label.setStyleSheet("font-size: 12px;")
+        llm_usage_layout.addWidget(self._llm_pro_label, 1, 0)
+
+        self._llm_flash_label = QLabel("Flash: \u2014")
+        self._llm_flash_label.setStyleSheet("font-size: 12px;")
+        llm_usage_layout.addWidget(self._llm_flash_label, 1, 1)
+
+        self._llm_lite_label = QLabel("Lite: \u2014")
+        self._llm_lite_label.setStyleSheet("font-size: 12px;")
+        llm_usage_layout.addWidget(self._llm_lite_label, 1, 2)
+
+        layout.addWidget(llm_usage_group)
         layout.addStretch()
         self.tabs.addTab(tab, "Models")
 
@@ -2656,9 +2817,9 @@ class TradingDashboard(QMainWindow):
         self._settings_models = {}
         model_options = {
             "gemini": [
-                ("gemini-2.5-flash-lite", "Flash Lite (free, fastest)"),
-                ("gemini-2.5-flash", "Flash (free, balanced)"),
-                ("gemini-2.5-pro", "Pro (free, smartest, low RPM)"),
+                ("gemini-2.5-flash-lite", "Flash Lite (fastest, cheapest)"),
+                ("gemini-2.5-flash", "Flash (balanced)"),
+                ("gemini-2.5-pro", "Pro (best reasoning)"),
             ],
             "claude": [
                 ("claude-haiku-4-5-20251001", "Haiku 4.5 (cheapest)"),
@@ -2772,9 +2933,10 @@ class TradingDashboard(QMainWindow):
         preset_labels = {
             "minimal": f"Minimal (~{preset_info['minimal']['count']} features)",
             "standard": f"Standard (~{preset_info['standard']['count']} features)",
+            "stationary": f"Stationary (~{preset_info['stationary']['count']} features)",
             "full": "Full (all features)",
         }
-        for name in ["minimal", "standard", "full"]:
+        for name in ["minimal", "standard", "stationary", "full"]:
             self._settings_indicator_preset.addItem(preset_labels[name], name)
         idx = self._settings_indicator_preset.findData(current_preset)
         if idx >= 0:
@@ -2951,6 +3113,7 @@ class TradingDashboard(QMainWindow):
     @Slot(list)
     def on_positions(self, positions):
         tbl = self._positions_table
+        tbl.setSortingEnabled(False)
         tbl.setUpdatesEnabled(False)
         tbl.setRowCount(len(positions))
         total_unr = 0.0
@@ -2964,22 +3127,47 @@ class TradingDashboard(QMainWindow):
                 mkt_val = float(p["qty"]) * float(p["current_price"])
             except (TypeError, ValueError):
                 mkt_val = 0.0
+            try:
+                pnl_pct = float(p["unrealized_plpc"]) * 100
+            except (TypeError, ValueError):
+                pnl_pct = 0.0
             items = [
                 p["symbol"], p["qty"], p["side"],
                 fmt_money(p["avg_entry_price"]),
                 fmt_money(p["current_price"]),
                 fmt_money(mkt_val),
                 fmt_money(p["unrealized_pl"]),
-                fmt_pct(float(p["unrealized_plpc"]) * 100),
+                fmt_pct(pnl_pct),
+            ]
+            sort_values = [
+                None, float(p["qty"]), None,
+                float(p["avg_entry_price"]), float(p["current_price"]),
+                mkt_val, unr, pnl_pct,
             ]
             color = pnl_color(p["unrealized_pl"])
             for col, val in enumerate(items):
-                item = QTableWidgetItem(str(val))
+                if sort_values[col] is not None:
+                    item = NumericTableItem(str(val))
+                    item.setData(Qt.UserRole, float(sort_values[col]))
+                else:
+                    item = QTableWidgetItem(str(val))
                 item.setTextAlignment(Qt.AlignCenter)
                 if col >= 6:
                     item.setForeground(color)
                 tbl.setItem(row, col, item)
+
+            # Close button
+            close_btn = QPushButton("Close")
+            close_btn.setFixedHeight(24)
+            close_btn.setStyleSheet(
+                "QPushButton { background-color: #c62828; color: white;"
+                " font-size: 10px; font-weight: bold; border-radius: 3px; padding: 2px 6px; }"
+                " QPushButton:hover { background-color: #e53935; }")
+            sym = p["symbol"]
+            close_btn.clicked.connect(lambda _, s=sym: self._close_position(s))
+            tbl.setCellWidget(row, 8, close_btn)
         tbl.setUpdatesEnabled(True)
+        tbl.setSortingEnabled(True)
         self._status_positions.setText(
             f"Pos: {len(positions)} | Unr: {fmt_money(total_unr)}")
 
@@ -3574,6 +3762,33 @@ class TradingDashboard(QMainWindow):
             except (ValueError, TypeError):
                 pass
         self._pipeline_retrain.setText(retrain_text)
+
+        # --- LLM Usage ---
+        try:
+            from llm_client import get_daily_cost, get_budget
+            spent, limit = get_daily_cost()
+            pct = int(spent / limit * 100) if limit > 0 else 0
+            self._llm_cost_label.setText(f"Cost: ${spent:.3f} / ${limit:.2f}")
+            if pct < 50:
+                cost_color = T['green'].name()
+            elif pct < 80:
+                cost_color = T['yellow'].name()
+            else:
+                cost_color = T['red'].name()
+            self._llm_cost_bar.setValue(min(pct, 100))
+            self._llm_cost_bar.setStyleSheet(
+                f"QProgressBar::chunk {{ background-color: {cost_color}; }}")
+
+            for model, label in [
+                ("gemini-2.5-pro", self._llm_pro_label),
+                ("gemini-2.5-flash", self._llm_flash_label),
+                ("gemini-2.5-flash-lite", self._llm_lite_label),
+            ]:
+                remaining, total = get_budget(model)
+                short_name = model.split("-")[-1].capitalize()
+                label.setText(f"{short_name}: {remaining}/{total}")
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         from PySide6.QtCore import QMetaObject
