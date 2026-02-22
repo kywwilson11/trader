@@ -105,7 +105,13 @@ def parse_args():
 
 def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_000):
     print("Loading data...")
-    df = pd.read_csv(data_path, index_col=0, parse_dates=True)
+    # Try Parquet first (faster), fall back to CSV
+    from data_utils import load_training_data
+    pq_prefix = 'stock' if 'stock' in data_path else 'crypto'
+    df = load_training_data(pq_prefix)
+    if df.empty:
+        # Direct CSV fallback if data_utils didn't find anything
+        df = pd.read_csv(data_path, index_col=0, parse_dates=True)
     print(f"Dataset: {len(df)} rows")
 
     # Detect multi-horizon columns

@@ -7,16 +7,25 @@ Supports two calling modes:
   1. call_llm() — uses config model + automatic fallback chain
   2. call_gemini() — calls a specific Gemini model (for tiered scoring)
 
+Smart model routing:
+  Selects the best model per role (analyst, sentiment, backfill) based on
+  daily cost spend. Progressively downgrades as daily cost increases.
+
+Tier auto-detection:
+  Detects free vs paid tier from rate limit headers on first API response.
+  Uses tier-appropriate budgets and rate limits.
+
 Daily quota tracking:
   Tracks calls per model since midnight Pacific. Budget limits prevent
-  burning through free-tier RPD (requests per day) limits.
+  burning through RPD (requests per day) limits.
 
 Rate limiting:
-  Client-side sliding window (10 RPM) prevents hitting per-minute limits.
+  Client-side sliding window prevents hitting per-minute limits.
 """
 
 import collections
 import json
+import math
 import re
 import time
 import urllib.request
@@ -24,10 +33,9 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
-from llm_config import load_llm_config
+from llm_config import load_llm_config, save_llm_config
 
 # Gemini models ordered by daily quota (most generous first for fallback)
-# Free tier RPD: flash-lite≈1000, flash≈250, pro≈100
 GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
 _GEMINI_FALLBACK_CHAIN = [
@@ -47,16 +55,24 @@ _429_MAX_WAIT_FALLBACK = 5   # fallback models: don't wait long
 _429_COOLDOWN_SEC = 30   # short cooldown — paid tier rarely sustains 429s
 _429_cooldown_until: float = 0.0  # timestamp when cooldown expires
 
-# --- Sliding-window rate limiter (10 RPM) ---
-_RATE_LIMIT_RPM = 30  # paid tier allows 60+ RPM for pro, 360 for flash
+# --- Tier detection ---
+_detected_tier: str | None = None  # 'free', 'paid', or None (unknown)
+
+_FREE_TIER_BUDGETS = {
+    "gemini-2.5-pro": 50,
+    "gemini-2.5-flash": 500,
+    "gemini-2.5-flash-lite": 1500,
+}
+_PAID_TIER_BUDGETS = {
+    "gemini-2.5-pro": 1000,
+    "gemini-2.5-flash": 2000,
+    "gemini-2.5-flash-lite": 5000,
+}
+
+# --- Sliding-window rate limiter ---
 _call_timestamps: collections.deque = collections.deque()
 
 # --- Daily quota tracking (resets at midnight Pacific) ---
-_DAILY_BUDGETS = {
-    "gemini-2.5-pro": 1000,       # paid tier: 1000 RPD
-    "gemini-2.5-flash": 2000,     # paid tier: generous
-    "gemini-2.5-flash-lite": 5000, # paid tier: very generous
-}
 _model_calls: dict[str, int] = {}
 _quota_reset_date: str = ""
 
@@ -71,6 +87,183 @@ _PRICING = {
     "gemini-2.5-flash":      (0.15, 0.60),
     "gemini-2.5-flash-lite": (0.075, 0.30),
 }
+
+# --- Smart model routing ---
+# Cost brackets: {max_daily_cost: {role: model}}
+_PAID_ROUTING = [
+    (0.10, {"analyst": "gemini-2.5-pro",        "sentiment": "gemini-2.5-flash",      "backfill": "gemini-2.5-flash-lite"}),
+    (0.40, {"analyst": "gemini-2.5-flash",      "sentiment": "gemini-2.5-flash-lite", "backfill": "gemini-2.5-flash-lite"}),
+    (math.inf, {"analyst": "gemini-2.5-flash-lite", "sentiment": "gemini-2.5-flash-lite", "backfill": "gemini-2.5-flash-lite"}),
+]
+
+# Free tier: always use best models (it's free!)
+_FREE_ROUTING = [
+    (math.inf, {"analyst": "gemini-2.5-pro", "sentiment": "gemini-2.5-flash", "backfill": "gemini-2.5-flash-lite"}),
+]
+
+
+def _get_rate_limit_rpm() -> int:
+    """Get rate limit RPM based on detected tier."""
+    tier = get_tier()
+    return 10 if tier == 'free' else 30
+
+
+def _get_budgets() -> dict:
+    """Get tier-appropriate daily budgets."""
+    return _FREE_TIER_BUDGETS if get_tier() == 'free' else _PAID_TIER_BUDGETS
+
+
+# --- Tier detection ---
+
+def get_tier() -> str:
+    """Get current tier. Priority: manual override > detected > cached > 'paid'."""
+    config = load_llm_config()
+
+    # 1. Manual override
+    override = config.get("tier_override")
+    if override in ('free', 'paid'):
+        return override
+
+    # 2. Runtime detection
+    global _detected_tier
+    if _detected_tier:
+        return _detected_tier
+
+    # 3. Cached detection from config
+    cached = config.get("detected_tier")
+    if cached in ('free', 'paid'):
+        _detected_tier = cached
+        return cached
+
+    # 4. Default to paid (user confirmed they're on paid tier)
+    return 'paid'
+
+
+def _capture_rate_limit_headers(resp, model: str):
+    """Check rate limit headers from API response to detect tier.
+
+    Gemini returns x-ratelimit-limit-requests header:
+      - Free tier: RPM <= 15
+      - Paid tier: RPM >= 30
+    """
+    global _detected_tier
+    if _detected_tier is not None:
+        return  # already detected
+
+    try:
+        rpm_header = resp.getheader('x-ratelimit-limit-requests')
+        if rpm_header is None:
+            return
+
+        rpm = int(rpm_header)
+        if rpm <= 15:
+            _detected_tier = 'free'
+        else:
+            _detected_tier = 'paid'
+
+        print(f"[LLM] Tier detected: {_detected_tier.upper()} (RPM limit={rpm} for {model})")
+
+        # Persist to config
+        config = load_llm_config()
+        config['detected_tier'] = _detected_tier
+        save_llm_config(config)
+
+    except (TypeError, ValueError):
+        pass
+
+
+def probe_tier() -> str:
+    """Make a cheap API call to detect tier from headers. Returns tier string."""
+    global _detected_tier
+    if _detected_tier:
+        return _detected_tier
+
+    config = load_llm_config()
+    gemini_key = config.get("models", {}).get("gemini", {}).get("api_key", "")
+    if not gemini_key:
+        return get_tier()
+
+    try:
+        # Minimal call to trigger header capture
+        _call_gemini("Hi", "", gemini_key, "gemini-2.5-flash-lite", 10, 10)
+    except Exception:
+        pass
+
+    return get_tier()
+
+
+# --- Smart model routing ---
+
+def get_recommended_model(role: str) -> str:
+    """Get the recommended model for a role based on daily cost and tier.
+
+    Args:
+        role: 'analyst', 'sentiment', or 'backfill'
+
+    Returns:
+        Model name string (e.g. 'gemini-2.5-pro')
+    """
+    config = load_llm_config()
+
+    # 1. Check manual override
+    override_key = f"{role}_model_override"
+    override = config.get(override_key)
+    if override and override in GEMINI_MODELS:
+        return override
+
+    # 2. Select routing table based on tier
+    tier = get_tier()
+    routing = _FREE_ROUTING if tier == 'free' else _PAID_ROUTING
+
+    # 3. Find bracket based on daily cost
+    _maybe_reset_quota()
+    for threshold, models in routing:
+        if _daily_cost < threshold:
+            recommended = models.get(role, "gemini-2.5-flash-lite")
+            break
+    else:
+        recommended = "gemini-2.5-flash-lite"
+
+    # 4. Verify recommended model has budget remaining; downgrade if exhausted
+    budgets = _get_budgets()
+    remaining = budgets.get(recommended, 50) - _model_calls.get(recommended, 0)
+    if remaining <= 0:
+        # Try downgrading through the model list
+        downgrade_order = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+        if recommended == "gemini-2.5-flash":
+            downgrade_order = ["gemini-2.5-flash-lite"]
+        elif recommended == "gemini-2.5-flash-lite":
+            downgrade_order = []
+
+        for fallback in downgrade_order:
+            fb_remaining = budgets.get(fallback, 50) - _model_calls.get(fallback, 0)
+            if fb_remaining > 0:
+                return fallback
+        return recommended  # all exhausted, return anyway (call will fail gracefully)
+
+    return recommended
+
+
+def get_routing_info() -> dict:
+    """Get routing info for GUI display."""
+    _maybe_reset_quota()
+    tier = get_tier()
+    budgets = _get_budgets()
+    return {
+        'tier': tier,
+        'daily_cost': round(_daily_cost, 4),
+        'daily_limit': _DAILY_COST_LIMIT,
+        'analyst_model': get_recommended_model('analyst'),
+        'sentiment_model': get_recommended_model('sentiment'),
+        'backfill_model': get_recommended_model('backfill'),
+        'budgets': {
+            model: {
+                'used': _model_calls.get(model, 0),
+                'total': budgets.get(model, 0),
+            }
+            for model in GEMINI_MODELS
+        },
+    }
 
 
 def _parse_retry_after(http_error) -> float | None:
@@ -88,12 +281,13 @@ def _parse_retry_after(http_error) -> float | None:
 
 
 def _rate_limit_ok() -> bool:
-    """Check if we're within the per-minute rate limit."""
+    """Check if we're within the per-minute rate limit (tier-aware)."""
     now = time.time()
     cutoff = now - 60.0
     while _call_timestamps and _call_timestamps[0] < cutoff:
         _call_timestamps.popleft()
-    if len(_call_timestamps) >= _RATE_LIMIT_RPM:
+    rpm = _get_rate_limit_rpm()
+    if len(_call_timestamps) >= rpm:
         return False
     _call_timestamps.append(now)
     return True
@@ -158,9 +352,10 @@ def get_daily_cost() -> tuple[float, float]:
 
 
 def get_budget(model: str) -> tuple[int, int]:
-    """Return (remaining, total) daily budget for a model."""
+    """Return (remaining, total) daily budget for a model (tier-aware)."""
     _maybe_reset_quota()
-    total = _DAILY_BUDGETS.get(model, 50)
+    budgets = _get_budgets()
+    total = budgets.get(model, 50)
     used = _model_calls.get(model, 0)
     return max(0, total - used), total
 
@@ -402,6 +597,7 @@ def _call_gemini(prompt, system, api_key, model, max_tokens, timeout,
         method="POST",
     )
     resp = urllib.request.urlopen(req, timeout=timeout)
+    _capture_rate_limit_headers(resp, model)
     data = json.loads(resp.read())
     try:
         finish = data["candidates"][0].get("finishReason", "unknown")

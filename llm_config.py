@@ -16,11 +16,19 @@ _DEFAULTS = {
         "claude": {"api_key": "", "model": "claude-sonnet-4-5-20250929"},
         "openai": {"api_key": "", "model": "gpt-4.1"},
     },
-    "analyst_model": "gemini-2.5-pro",        # Pro for trade analysis (best reasoning)
-    "sentiment_model": "gemini-2.5-flash",   # Flash for news scoring (cost-effective)
+    "analyst_model_override": None,     # None = use smart routing
+    "sentiment_model_override": None,   # None = use smart routing
+    "detected_tier": None,              # Auto-detected: 'free' or 'paid'
+    "tier_override": None,              # Manual override: 'free', 'paid', or None (auto)
     "fmp_api_key": "",
     "max_llm_latency_sec": 15,
     "journal_enabled": True,
+}
+
+# Keys migrated from old format to new
+_MIGRATE_KEYS = {
+    "analyst_model": "analyst_model_override",
+    "sentiment_model": "sentiment_model_override",
 }
 
 
@@ -33,6 +41,17 @@ def load_llm_config() -> dict:
                 config = json.load(f)
     except Exception:
         pass
+
+    # Migrate old keys to new names (e.g. analyst_model -> analyst_model_override)
+    migrated = False
+    for old_key, new_key in _MIGRATE_KEYS.items():
+        if old_key in config and new_key not in config:
+            config[new_key] = config.pop(old_key)
+            migrated = True
+        elif old_key in config and new_key in config:
+            # Both exist — remove old key
+            del config[old_key]
+            migrated = True
 
     # Merge defaults for any missing top-level keys
     for key, default in _DEFAULTS.items():
@@ -47,6 +66,9 @@ def load_llm_config() -> dict:
                     for pk, pv in pdefault.items():
                         if pk not in config["models"][provider]:
                             config["models"][provider][pk] = pv
+
+    if migrated:
+        save_llm_config(config)
 
     return config
 

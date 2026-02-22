@@ -1,10 +1,12 @@
-"""Harvest crypto training data — Alpaca historical + yfinance hourly OHLCV.
+"""Harvest crypto training data — Alpaca + yfinance + CryptoCompare hourly OHLCV.
 
-Fetches data from two sources:
+Supports incremental harvesting (only fetches new bars since last run) and
+saves as Parquet + CSV. Falls back through multiple data sources.
+
+Data sources (in priority order):
   - Alpaca: Jan 2021 – present (via get_crypto_bars auto-pagination)
   - yfinance: Most recent 730 days (max for hourly)
-Merges, deduplicates, computes technical features, and generates multi-horizon
-return targets for use by hypersearch_dual.py.
+  - CryptoCompare: Free, no key needed, up to 2000 bars/call
 """
 import sys; from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -12,13 +14,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import os
 import time
 
-import yfinance as yf
 import pandas as pd
 from dotenv import load_dotenv
 
 from indicators import compute_features
-from market_data import flatten_yfinance_columns, fetch_historical_bars
 from adaptive_config import get_forward_bars_list
+from data_sources import fetch_with_fallback
+from data_utils import (load_training_data, save_training_data,
+                         append_ticker_data, validate_training_data)
 
 load_dotenv()
 
@@ -35,11 +38,6 @@ ALPACA_START = '2021-01-01'
 
 # Multi-horizon forward returns (bars ahead) — read from adaptive state
 FORWARD_BARS = get_forward_bars_list('crypto')
-
-
-def _to_alpaca(yf_ticker):
-    """Convert yfinance ticker to Alpaca format: BTC-USD -> BTC/USD."""
-    return yf_ticker.replace('-', '/')
 
 
 def _get_alpaca_api():
@@ -60,66 +58,59 @@ def _get_alpaca_api():
         return None
 
 
-def fetch_ticker_data(ticker, api=None):
-    """Fetch hourly bars from Alpaca + yfinance, merge and deduplicate.
+def _get_incremental_start(existing_df, ticker):
+    """Find start date for incremental fetch (48h overlap for safety)."""
+    if existing_df.empty or 'Ticker' not in existing_df.columns:
+        return ALPACA_START
 
-    Returns a DataFrame with OHLCV columns and DatetimeIndex, or None.
-    """
-    frames = []
+    ticker_rows = existing_df[existing_df['Ticker'] == ticker]
+    if ticker_rows.empty:
+        return ALPACA_START
 
-    # 1. Alpaca historical data (2021+)
-    if api is not None:
-        alpaca_sym = _to_alpaca(ticker)
-        alpaca_df = fetch_historical_bars(api, alpaca_sym, ALPACA_START, asset_type='crypto')
-        if alpaca_df is not None and not alpaca_df.empty:
-            # Ensure tz-aware UTC index for dedup
-            if alpaca_df.index.tz is None:
-                alpaca_df.index = alpaca_df.index.tz_localize('UTC')
-            else:
-                alpaca_df.index = alpaca_df.index.tz_convert('UTC')
-            frames.append(alpaca_df)
-        time.sleep(2)  # pacing between tickers
-
-    # 2. yfinance recent data (up to 730 days)
-    print(f"  [YF] Fetching {ticker}...")
-    yf_df = yf.download(ticker, period="max", interval="1h", progress=False)
-    yf_df = flatten_yfinance_columns(yf_df)
-    if yf_df is not None and not yf_df.empty:
-        if yf_df.index.tz is None:
-            yf_df.index = yf_df.index.tz_localize('UTC')
-        else:
-            yf_df.index = yf_df.index.tz_convert('UTC')
-        frames.append(yf_df)
-
-    if not frames:
-        return None
-
-    # Merge: concat, drop duplicate timestamps (keep='last' = prefer yfinance for overlap)
-    combined = pd.concat(frames)
-    combined = combined[~combined.index.duplicated(keep='last')]
-    combined = combined.sort_index()
-    print(f"  [MERGED] {ticker}: {len(combined)} bars ({combined.index.min().date()} to {combined.index.max().date()})")
-    return combined
+    latest = ticker_rows.index.max()
+    # Go back 48h for overlap to catch any gaps
+    start = latest - pd.Timedelta(hours=48)
+    return str(start.date())
 
 
 def fetch_btc_close(api=None):
-    """Fetch BTC-USD hourly close from both sources for cross-asset features."""
+    """Fetch BTC-USD hourly close from all sources for cross-asset features."""
     print(f"Fetching benchmark ({BENCHMARK})...")
-    df = fetch_ticker_data(BENCHMARK, api=api)
+    df = fetch_with_fallback(BENCHMARK, ALPACA_START, api=api, asset_type='crypto')
     if df is None or df.empty:
         return None
     return df['Close']
 
 
-def prepare_data(ticker, btc_close=None, api=None):
-    """Fetch bars, compute features, and add multi-horizon return targets."""
+def prepare_data(ticker, btc_close=None, api=None, existing_ohlcv=None,
+                 start_date=None):
+    """Fetch bars, merge with existing, compute features, add targets."""
     print(f"Processing {ticker}...")
 
-    df = fetch_ticker_data(ticker, api=api)
-    if df is None or df.empty:
+    # Fetch new bars (incremental or full)
+    fetch_start = start_date or ALPACA_START
+    new_ohlcv = fetch_with_fallback(ticker, fetch_start, api=api, asset_type='crypto')
+
+    # Merge with existing OHLCV if incremental
+    if existing_ohlcv is not None and not existing_ohlcv.empty:
+        if new_ohlcv is not None and not new_ohlcv.empty:
+            ohlcv = append_ticker_data(existing_ohlcv, new_ohlcv)
+            new_bars = len(ohlcv) - len(existing_ohlcv)
+            print(f"  [INCREMENTAL] {ticker}: {new_bars} new bars "
+                  f"(total {len(ohlcv)})")
+        else:
+            ohlcv = existing_ohlcv
+            print(f"  [INCREMENTAL] {ticker}: no new bars, using existing {len(ohlcv)}")
+    elif new_ohlcv is not None:
+        ohlcv = new_ohlcv
+    else:
         return None
 
-    df = compute_features(df, btc_close=btc_close)
+    if ohlcv.empty:
+        return None
+
+    # Recompute ALL features on full history (indicators need lookback windows)
+    df = compute_features(ohlcv, btc_close=btc_close)
 
     # Multi-horizon targets: return over N bars as a percentage
     for fb in FORWARD_BARS:
@@ -136,15 +127,40 @@ def prepare_data(ticker, btc_close=None, api=None):
 def main():
     api = _get_alpaca_api()
     if api is None:
-        print("WARNING: No Alpaca API credentials — using yfinance only (limited to ~730 days)")
+        print("WARNING: No Alpaca API credentials — using yfinance + CryptoCompare only")
     else:
         print("Alpaca API connected — fetching historical data from 2021")
+
+    # Load existing data for incremental harvesting
+    existing = load_training_data('crypto')
+    is_incremental = not existing.empty
+    if is_incremental:
+        print(f"Existing data: {len(existing)} rows — incremental mode")
+        # Extract per-ticker OHLCV from existing (before features were computed)
+        # We need raw OHLCV for merge, but existing has features. Extract what we need.
+        ohlcv_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        available_ohlcv = [c for c in ohlcv_cols if c in existing.columns]
+    else:
+        print("No existing data — full harvest")
+        available_ohlcv = []
 
     btc_close = fetch_btc_close(api=api)
 
     all_data = []
     for t in CRYPTO_TICKERS:
-        crypto_df = prepare_data(t, btc_close=btc_close, api=api)
+        # For incremental: extract this ticker's existing OHLCV
+        existing_ohlcv = None
+        start = ALPACA_START
+        if is_incremental and available_ohlcv and 'Ticker' in existing.columns:
+            ticker_data = existing[existing['Ticker'] == t]
+            if not ticker_data.empty:
+                existing_ohlcv = ticker_data[available_ohlcv]
+                start = _get_incremental_start(existing, t)
+                print(f"  [INCREMENTAL] {t}: fetching from {start}")
+
+        crypto_df = prepare_data(t, btc_close=btc_close, api=api,
+                                  existing_ohlcv=existing_ohlcv,
+                                  start_date=start)
         if crypto_df is not None:
             crypto_df['Ticker'] = t
             all_data.append(crypto_df)
@@ -157,7 +173,6 @@ def main():
     final_df = final_df.sort_index()
 
     # Add historical sentiment (Fear & Greed Index for crypto)
-    # Use cached data if available (instant); fetch in background for next run
     try:
         from sentiment_history import fetch_crypto_sentiment_history
         start_date = str(final_df.index.min().date())
@@ -172,8 +187,11 @@ def main():
         print(f"WARNING: Could not fetch crypto sentiment history: {e}")
         final_df['Daily_Sentiment'] = 0.0
 
-    final_df.to_csv('training_data.csv')
-    print(f"\nDone! Saved {len(final_df)} rows of training data to training_data.csv")
+    # Save as Parquet + CSV
+    save_training_data(final_df, 'crypto')
+
+    # Summary
+    print(f"\nDone! Saved {len(final_df)} rows of training data")
     print(f"Cryptos harvested: {len(all_data)}/{len(CRYPTO_TICKERS)}")
     target_cols = [c for c in final_df.columns if c.startswith('Target_Return')]
     exclude = set(target_cols) | {'Ticker', 'Date', 'Datetime'}
@@ -181,6 +199,9 @@ def main():
     print(f"Feature columns: {feature_count}")
     print(f"Target columns: {target_cols}")
     print(f"Date range: {final_df.index.min()} to {final_df.index.max()}")
+
+    # Validation report
+    validate_training_data(final_df, 'crypto')
 
 
 if __name__ == '__main__':

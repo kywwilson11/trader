@@ -10,9 +10,9 @@ from unittest.mock import patch, MagicMock
 
 from llm_client import (
     call_llm, call_gemini, _call_gemini, _parse_retry_after,
-    _rate_limit_ok, _call_timestamps, _RATE_LIMIT_RPM,
+    _rate_limit_ok, _call_timestamps, _get_rate_limit_rpm,
     get_budget, record_call, _model_calls, _maybe_reset_quota,
-    _DAILY_BUDGETS, _quota_reset_date,
+    _get_budgets,
     GEMINI_MODELS,
 )
 
@@ -59,6 +59,7 @@ class TestCallGemini:
 
         mock_resp = MagicMock()
         mock_resp.read.return_value = fake_response
+        mock_resp.getheader.return_value = None
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
 
@@ -90,7 +91,8 @@ class TestQuotaTracking:
     def test_budget_floors_at_zero(self):
         """Budget should never go negative."""
         model = "gemini-2.5-pro"
-        total = _DAILY_BUDGETS[model]
+        budgets = _get_budgets()
+        total = budgets[model]
         for _ in range(total + 10):
             record_call(model)
         remaining, _ = get_budget(model)
@@ -149,14 +151,16 @@ class TestRateLimit:
         assert _rate_limit_ok() is True
 
     def test_blocks_after_limit(self):
-        for _ in range(_RATE_LIMIT_RPM):
+        rpm = _get_rate_limit_rpm()
+        for _ in range(rpm):
             assert _rate_limit_ok() is True
         assert _rate_limit_ok() is False
 
     def test_allows_after_window_expires(self):
         # Fill up the window with old timestamps
+        rpm = _get_rate_limit_rpm()
         old_time = time.time() - 61  # 61 seconds ago
-        for _ in range(_RATE_LIMIT_RPM):
+        for _ in range(rpm):
             _call_timestamps.append(old_time)
         # Should allow since old timestamps expired
         assert _rate_limit_ok() is True
@@ -184,6 +188,7 @@ class TestCallGeminiResponse:
         fake_response = json.dumps({"candidates": []}).encode()
         mock_resp = MagicMock()
         mock_resp.read.return_value = fake_response
+        mock_resp.getheader.return_value = None
         with patch("urllib.request.urlopen", return_value=mock_resp):
             result = _call_gemini("prompt", "", "key", "model", 100, 10)
         assert result is None
@@ -194,6 +199,7 @@ class TestCallGeminiResponse:
         }).encode()
         mock_resp = MagicMock()
         mock_resp.read.return_value = fake_response
+        mock_resp.getheader.return_value = None
         with patch("urllib.request.urlopen", return_value=mock_resp):
             result = _call_gemini("prompt", "", "key", "model", 100, 10)
         assert result is None
@@ -205,6 +211,7 @@ class TestCallGeminiResponse:
         }).encode()
         mock_resp = MagicMock()
         mock_resp.read.return_value = fake_response
+        mock_resp.getheader.return_value = None
 
         with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
             _call_gemini("hello", "be helpful", "key", "model", 100, 10)

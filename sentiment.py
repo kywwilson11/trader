@@ -494,10 +494,16 @@ def _parse_llm_json(raw_text):
 # Newest articles get the best model, older articles get cheaper models.
 # Tiers: (model, cumulative_fraction) — newest first
 def _get_scoring_tiers():
-    """Build scoring tiers from configured sentiment model."""
-    from llm_config import load_llm_config
-    cfg = load_llm_config()
-    model = cfg.get("sentiment_model", "gemini-2.5-flash")
+    """Build scoring tiers based on smart routing recommendation."""
+    from llm_client import get_recommended_model
+    model = get_recommended_model('sentiment')
+    if "pro" in model:
+        # Pro available: 3 tiers (Pro 20%, Flash 40%, Lite rest)
+        return [
+            ("gemini-2.5-pro", 0.20),
+            ("gemini-2.5-flash", 0.60),
+            ("gemini-2.5-flash-lite", 1.00),
+        ]
     if "flash-lite" in model:
         return [("gemini-2.5-flash-lite", 1.00)]
     # Default: Flash for newest, Flash-Lite for bulk
@@ -627,10 +633,6 @@ def _llm_score_batch(articles):
 
     if not articles:
         return None
-
-    # Check configured sentiment model
-    _cfg = load_llm_config()
-    sentiment_model = _cfg.get("sentiment_model", "gemini-2.5-flash")
 
     # Skip entirely if LLM is in 429 cooldown (don't waste time fetching texts)
     if not _429_cooled_down():

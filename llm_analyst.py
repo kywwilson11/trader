@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from llm_config import load_llm_config
-from llm_client import call_llm, call_gemini
+from llm_client import call_llm, call_gemini, get_recommended_model
 
 _ANALYSIS_FILE = Path(__file__).resolve().parent / "llm_analysis.json"
 
@@ -85,7 +85,7 @@ def analyze_trades(candidates: list[dict], asset_type: str,
     prompt = _build_prompt(candidates, asset_type, equity, positions,
                            fng_value, model_config)
 
-    analyst_model = config.get("analyst_model", "gemini-2.5-flash")
+    analyst_model = get_recommended_model('analyst')
     max_tok = 3072
 
     response = call_gemini(prompt, system=_SYSTEM_PROMPT,

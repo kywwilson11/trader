@@ -229,6 +229,20 @@ def _next_retrain_time(retrain_day, retrain_hour):
 # Phase list builders
 # ---------------------------------------------------------------------------
 
+def _get_data_age_hours(prefix):
+    """Get age in hours of the newest data file (Parquet or CSV)."""
+    stems = {'crypto': 'training_data', 'stock': 'stock_training_data'}
+    stem = stems.get(prefix, prefix)
+    best_mtime = 0
+    for ext in ('.parquet', '.csv'):
+        path = os.path.join(BASE_DIR, f'{stem}{ext}')
+        if os.path.exists(path):
+            best_mtime = max(best_mtime, os.path.getmtime(path))
+    if best_mtime == 0:
+        return None  # no data file exists
+    return (time.time() - best_mtime) / 3600
+
+
 def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
     """Build harvest phases, skipping if data is fresh."""
     phases = []
@@ -236,17 +250,9 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
         return phases
 
     if train_crypto:
-        csv_path = os.path.join(BASE_DIR, 'training_data.csv')
-        if os.path.exists(csv_path):
-            age_h = (time.time() - os.path.getmtime(csv_path)) / 3600
-            if age_h < 24:
-                print(f"Crypto training data is {age_h:.1f}h old, skipping harvest")
-            else:
-                phases.append({
-                    'id': 'crypto_harvest',
-                    'label': 'Harvesting Crypto Data',
-                    'cmd': [PYTHON, '-u', os.path.join('scripts', 'harvest_crypto_data.py')],
-                })
+        age_h = _get_data_age_hours('crypto')
+        if age_h is not None and age_h < 24:
+            print(f"Crypto training data is {age_h:.1f}h old, skipping harvest")
         else:
             phases.append({
                 'id': 'crypto_harvest',
@@ -255,17 +261,9 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
             })
 
     if train_stock:
-        stock_csv = os.path.join(BASE_DIR, 'stock_training_data.csv')
-        if os.path.exists(stock_csv):
-            age_h = (time.time() - os.path.getmtime(stock_csv)) / 3600
-            if age_h < 24:
-                print(f"Stock training data is {age_h:.1f}h old, skipping harvest")
-            else:
-                phases.append({
-                    'id': 'stock_harvest',
-                    'label': 'Harvesting Stock Data',
-                    'cmd': [PYTHON, '-u', os.path.join('scripts', 'harvest_stock_data.py')],
-                })
+        age_h = _get_data_age_hours('stock')
+        if age_h is not None and age_h < 24:
+            print(f"Stock training data is {age_h:.1f}h old, skipping harvest")
         else:
             phases.append({
                 'id': 'stock_harvest',
@@ -559,17 +557,23 @@ def main():
 
             # Check if harvest needed due to forward_bars expansion
             force_harvest = False
-            for at, csv_name in [('crypto', 'training_data.csv'), ('stock', 'stock_training_data.csv')]:
+            for at in ['crypto', 'stock']:
                 if (at == 'crypto' and not train_crypto) or (at == 'stock' and not train_stock):
                     continue
                 max_fb = get_max_forward_bars(at)
-                csv_path = os.path.join(BASE_DIR, csv_name)
-                if os.path.exists(csv_path):
-                    import pandas as pd
-                    cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
+                # Check columns in Parquet (fast) or CSV
+                import pandas as pd
+                from data_utils import get_data_path
+                data_path = get_data_path(at)
+                if data_path.exists():
+                    if str(data_path).endswith('.parquet'):
+                        import pyarrow.parquet as pq
+                        cols = pq.read_schema(data_path).names
+                    else:
+                        cols = pd.read_csv(data_path, nrows=0).columns.tolist()
                     if f'Target_Return_{max_fb}' not in cols:
                         force_harvest = True
-                        msg = (f"[ADAPTIVE] {at}: Target_Return_{max_fb} missing from CSV, "
+                        msg = (f"[ADAPTIVE] {at}: Target_Return_{max_fb} missing from data, "
                                f"forcing re-harvest\n")
                         log_fh.write(msg)
                         log_fh.flush()

@@ -2853,43 +2853,91 @@ class TradingDashboard(QMainWindow):
 
         llm_layout.addWidget(model_group)
 
-        # --- Trading Model Roles ---
-        role_group = QGroupBox("Trading Model Roles")
+        # --- Tier Detection ---
+        tier_group = QGroupBox("API Tier")
+        tier_layout = QHBoxLayout(tier_group)
+
+        tier_layout.addWidget(QLabel("Tier:"))
+        self._settings_tier_override = QComboBox()
+        self._settings_tier_override.setMaximumWidth(200)
+        for tid, tlabel in [
+            ("auto", "Auto-detect"),
+            ("free", "Force Free"),
+            ("paid", "Force Paid"),
+        ]:
+            self._settings_tier_override.addItem(tlabel, tid)
+        cur_tier = config.get("tier_override") or "auto"
+        idx = self._settings_tier_override.findData(cur_tier)
+        if idx >= 0:
+            self._settings_tier_override.setCurrentIndex(idx)
+        self._settings_tier_override.currentIndexChanged.connect(self._on_settings_changed)
+        tier_layout.addWidget(self._settings_tier_override)
+
+        self._settings_tier_label = QLabel("")
+        try:
+            from llm_client import get_tier
+            detected = get_tier()
+            self._settings_tier_label.setText(f"(detected: {detected})")
+        except Exception:
+            pass
+        tier_layout.addWidget(self._settings_tier_label)
+        tier_layout.addStretch()
+
+        llm_layout.addWidget(tier_group)
+
+        # --- Smart Model Routing ---
+        role_group = QGroupBox("Smart Model Routing")
         role_layout = QGridLayout(role_group)
         role_layout.setColumnStretch(1, 1)
         role_layout.setColumnMinimumWidth(0, 70)
 
-        # Analyst model: Pro or Flash (no Lite)
+        # Analyst model override
         role_layout.addWidget(QLabel("Analyst:"), 0, 0)
         self._settings_analyst_model = QComboBox()
         self._settings_analyst_model.setMaximumWidth(320)
         for mid, label in [
-            ("gemini-2.5-flash", "Flash (fast, low cost)"),
+            ("auto", "Auto (Smart Routing)"),
             ("gemini-2.5-pro", "Pro (best reasoning, higher cost)"),
+            ("gemini-2.5-flash", "Flash (fast, low cost)"),
+            ("gemini-2.5-flash-lite", "Flash Lite (cheapest)"),
         ]:
             self._settings_analyst_model.addItem(label, mid)
-        cur_analyst = config.get("analyst_model", "gemini-2.5-flash")
+        cur_analyst = config.get("analyst_model_override") or "auto"
         idx = self._settings_analyst_model.findData(cur_analyst)
         if idx >= 0:
             self._settings_analyst_model.setCurrentIndex(idx)
         self._settings_analyst_model.currentIndexChanged.connect(self._on_settings_changed)
         role_layout.addWidget(self._settings_analyst_model, 0, 1)
 
-        # Sentiment model: Flash or Flash-Lite (no Pro)
+        # Sentiment model override
         role_layout.addWidget(QLabel("Sentiment:"), 1, 0)
         self._settings_sentiment_model = QComboBox()
         self._settings_sentiment_model.setMaximumWidth(320)
         for mid, label in [
-            ("gemini-2.5-flash-lite", "Flash Lite (cheapest)"),
+            ("auto", "Auto (Smart Routing)"),
             ("gemini-2.5-flash", "Flash (better accuracy)"),
+            ("gemini-2.5-flash-lite", "Flash Lite (cheapest)"),
         ]:
             self._settings_sentiment_model.addItem(label, mid)
-        cur_sentiment = config.get("sentiment_model", "gemini-2.5-flash")
+        cur_sentiment = config.get("sentiment_model_override") or "auto"
         idx = self._settings_sentiment_model.findData(cur_sentiment)
         if idx >= 0:
             self._settings_sentiment_model.setCurrentIndex(idx)
         self._settings_sentiment_model.currentIndexChanged.connect(self._on_settings_changed)
         role_layout.addWidget(self._settings_sentiment_model, 1, 1)
+
+        # Routing status display
+        self._settings_routing_label = QLabel("")
+        try:
+            from llm_client import get_routing_info
+            info = get_routing_info()
+            self._settings_routing_label.setText(
+                f"Current: analyst={info['analyst_model'].split('-')[-1]}, "
+                f"sentiment={info['sentiment_model'].split('-')[-1]} "
+                f"(${info['daily_cost']:.3f}/${info['daily_limit']:.2f})")
+        except Exception:
+            pass
+        role_layout.addWidget(self._settings_routing_label, 2, 0, 1, 2)
 
         llm_layout.addWidget(role_group)
 
@@ -2997,13 +3045,15 @@ class TradingDashboard(QMainWindow):
             if model_id:
                 config.setdefault("models", {}).setdefault(provider, {})["model"] = model_id
 
-        # Trading model roles
+        # Tier override
+        tier = self._settings_tier_override.currentData()
+        config["tier_override"] = None if tier == "auto" else tier
+
+        # Model role overrides (None = smart routing)
         analyst = self._settings_analyst_model.currentData()
-        if analyst:
-            config["analyst_model"] = analyst
+        config["analyst_model_override"] = None if analyst == "auto" else analyst
         sentiment = self._settings_sentiment_model.currentData()
-        if sentiment:
-            config["sentiment_model"] = sentiment
+        config["sentiment_model_override"] = None if sentiment == "auto" else sentiment
 
         save_llm_config(config)
 
