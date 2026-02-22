@@ -8,19 +8,16 @@ import pytest
 MODULES = [
     "connection_test",
     "crypto_loop",
-    "evolve",
     "fundamentals",
     "harvest_crypto_data",
     "harvest_stock_data",
     "hw_monitor",
-    "hypersearch_dual",
     "indicator_config",
     "indicators",
     "llm_analyst",
     "llm_client",
     "llm_config",
     "market_data",
-    "model",
     "order_utils",
     "predict_now",
     "run_pipeline",
@@ -30,7 +27,6 @@ MODULES = [
     "stock_loop",
     "trade_journal",
     "trading_utils",
-    "watchdog",
 ]
 
 

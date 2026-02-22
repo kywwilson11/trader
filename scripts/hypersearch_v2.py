@@ -327,6 +327,8 @@ class SeqCache:
         self._X_val = None
         self._scaler = None
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
         t0 = time.time()
@@ -378,6 +380,8 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
     def objective(trial):
         trial_start = time.time()
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
         # --- Hyperparameters (from adaptive search space) ---
@@ -434,6 +438,8 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
             err_str = str(e)
             print(f"  [ERROR] Trial {trial.number}: {err_str}")
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             torch.cuda.empty_cache()
             # CUDA errors corrupt the context — all subsequent trials will fail.
             # Abort immediately instead of looping 200 times with score=0.
@@ -555,6 +561,8 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                 if epoch >= PRUNE_WARMUP_EPOCHS and trial.should_prune():
                     del model
                     gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                     raise optuna.TrialPruned()
 
@@ -598,6 +606,8 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
 
             del model
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
         avg_sharpe = np.mean(fold_sharpes) if fold_sharpes else 0.0

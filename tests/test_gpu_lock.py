@@ -26,19 +26,6 @@ def test_acquire_and_release():
     assert gpu_lock.is_gpu_free() is True
 
 
-def test_try_acquire_blocks_second():
-    """Second try_acquire should fail when first holds lock."""
-    ok = gpu_lock.try_acquire_for_training("first")
-    assert ok is True
-    assert gpu_lock.is_gpu_free() is False
-
-    ok2 = gpu_lock.try_acquire_for_training("second")
-    assert ok2 is False
-
-    gpu_lock.release_training_lock()
-    assert gpu_lock.is_gpu_free() is True
-
-
 def _child_acquire(ready_event, release_event):
     """Helper: acquire lock in child process, signal ready, wait for release."""
     with gpu_lock.acquire_for_training("child_process"):
@@ -70,8 +57,11 @@ def test_cross_process_lock():
 
 def _child_crash():
     """Helper: acquire lock then crash (OS should release flock)."""
-    gpu_lock.try_acquire_for_training("crash_test")
-    # Exit without releasing — OS should release the flock
+    # Acquire lock via context manager, then hard-exit without releasing
+    gpu_lock._LOCK_FILE.touch(exist_ok=True)
+    import fcntl
+    fd = open(gpu_lock._LOCK_FILE, 'w')
+    fcntl.flock(fd, fcntl.LOCK_EX)
     os._exit(1)
 
 

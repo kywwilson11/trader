@@ -112,40 +112,6 @@ def acquire_for_training(owner: str = "training"):
         print(f"[GPU-LOCK] Released by '{owner}'")
 
 
-def try_acquire_for_training(owner: str = "training") -> bool:
-    """Non-blocking attempt to acquire GPU lock.
-
-    Returns True if lock acquired (caller MUST call release_training_lock
-    when done). Returns False if GPU is busy.
-    """
-    global _lock_fd
-
-    _LOCK_FILE.touch(exist_ok=True)
-    fd = open(_LOCK_FILE, 'w')
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _lock_fd = fd
-        _write_info(owner)
-        print(f"[GPU-LOCK] Acquired by '{owner}' (PID {os.getpid()})")
-        return True
-    except BlockingIOError:
-        fd.close()
-        return False
-    except Exception:
-        fd.close()
-        raise
-
-
-def release_training_lock():
-    """Release a lock acquired via try_acquire_for_training()."""
-    global _lock_fd
-    if _lock_fd is not None:
-        _clear_info()
-        fcntl.flock(_lock_fd, fcntl.LOCK_UN)
-        _lock_fd.close()
-        _lock_fd = None
-
-
 def is_gpu_free() -> bool:
     """Check if GPU is available (no training process holds the lock).
 

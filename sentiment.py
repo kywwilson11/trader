@@ -627,7 +627,6 @@ def _llm_score_batch(articles):
     """
     try:
         from llm_client import call_gemini, get_budget, _429_cooled_down  # noqa: F401
-        from llm_config import load_llm_config
     except ImportError:
         return None
 

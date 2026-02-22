@@ -27,6 +27,7 @@ import datetime
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -341,6 +342,54 @@ def _run_training(phases, log_fh, status, is_retrain):
 # Main
 # ---------------------------------------------------------------------------
 
+def _cleanup_handles(handles):
+    """Close all tracked file handles safely."""
+    for fh in handles:
+        try:
+            if fh and not fh.closed:
+                fh.close()
+        except Exception:
+            pass
+
+
+def _terminate_procs(procs):
+    """Terminate all tracked subprocesses."""
+    for proc in procs:
+        try:
+            if proc and proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+
+# Global refs for signal handler cleanup
+_all_handles = []
+_all_procs = []
+_all_bots = []
+_shutdown_requested = False
+
+
+def _signal_handler(signum, frame):
+    """Graceful shutdown: stop bots, close handles, exit."""
+    global _shutdown_requested
+    if _shutdown_requested:
+        return  # Prevent re-entry
+    _shutdown_requested = True
+    sig_name = signal.Signals(signum).name
+    print(f"\n[PIPELINE] {sig_name} received, shutting down...")
+    # Stop bot processes
+    for name, proc, fh in _all_bots:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                print(f"  Stopped {name} bot (PID {proc.pid})")
+        except Exception:
+            pass
+    _terminate_procs(_all_procs)
+    _cleanup_handles(_all_handles)
+    sys.exit(0)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Trading pipeline orchestrator')
     parser.add_argument('--trials', type=int, default=200,
@@ -363,6 +412,9 @@ def main():
                         help='Trials per model for weekly retrain (default: 100)')
     args = parser.parse_args()
 
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     train_crypto = not args.stock_only
     train_stock = not args.crypto_only
     run_crypto = not args.stock_only
@@ -383,8 +435,10 @@ def main():
         'bots_running': False,
     }
 
-    with open(LOG_FILE, 'a') as log_fh:
+    log_fh = open(LOG_FILE, 'a')
+    _all_handles.append(log_fh)
 
+    try:
         # =============================================================
         # PHASE A: Initial training (cycle 0)
         # =============================================================
@@ -417,12 +471,14 @@ def main():
             sentiment_fh = None
             try:
                 sentiment_fh = open(os.path.join(BASE_DIR, 'sentiment_fetch.log'), 'a')
+                _all_handles.append(sentiment_fh)
                 sentiment_proc = subprocess.Popen(
                     [PYTHON, '-u', 'sentiment_history.py', '--fetch-stocks'],
                     stdout=sentiment_fh,
                     stderr=subprocess.STDOUT,
                     env=ENV, cwd=BASE_DIR,
                 )
+                _all_procs.append(sentiment_proc)
                 msg = f"Background sentiment fetch started (PID {sentiment_proc.pid})\n"
                 log_fh.write(msg)
                 log_fh.flush()
@@ -438,11 +494,12 @@ def main():
         # =============================================================
         # PHASE B: Start trading bots (run forever)
         # =============================================================
-        bots = []
+        bots = _all_bots
 
         if run_crypto:
             proc, bot_fh = _start_bot([PYTHON, '-u', 'crypto_loop.py'], CRYPTO_BOT_LOG)
             bots.append(('Crypto', proc, bot_fh))
+            _all_handles.append(bot_fh)
             msg = f"Crypto bot started (PID {proc.pid}, log: crypto_bot_output.log)\n"
             log_fh.write(msg)
             log_fh.flush()
@@ -451,6 +508,7 @@ def main():
         if run_stock:
             proc, bot_fh = _start_bot([PYTHON, '-u', 'stock_loop.py'], STOCK_BOT_LOG)
             bots.append(('Stock', proc, bot_fh))
+            _all_handles.append(bot_fh)
             msg = f"Stock bot started (PID {proc.pid}, log: stock_bot_output.log)\n"
             log_fh.write(msg)
             log_fh.flush()
@@ -463,16 +521,19 @@ def main():
 
         # Start sentiment backfill worker (LLM-scores historical articles)
         backfill_proc = None
+        backfill_fh = None
         try:
             from sentiment_history import set_live_mode
             set_live_mode(True)
             backfill_fh = open(os.path.join(BASE_DIR, 'backfill_output.log'), 'a')
+            _all_handles.append(backfill_fh)
             backfill_proc = subprocess.Popen(
                 [PYTHON, '-u', 'sentiment_history.py', '--backfill'],
                 stdout=backfill_fh,
                 stderr=subprocess.STDOUT,
                 env=ENV, cwd=BASE_DIR,
             )
+            _all_procs.append(backfill_proc)
             msg = f"Backfill worker started (PID {backfill_proc.pid})\n"
             log_fh.write(msg)
             log_fh.flush()
@@ -491,7 +552,7 @@ def main():
             print(msg, end='')
             if bots:
                 # Block forever, restarting crashed bots
-                while True:
+                while not _shutdown_requested:
                     time.sleep(60)
                     _check_restart_bots(bots, log_fh)
             return
@@ -500,7 +561,7 @@ def main():
         # PHASE C: Weekly retrain loop (bots keep running)
         # =============================================================
         cycle = 0
-        while True:
+        while not _shutdown_requested:
             cycle += 1
             next_retrain = _next_retrain_time(args.retrain_day, args.retrain_hour)
             status['next_retrain'] = next_retrain.isoformat()
@@ -517,10 +578,13 @@ def main():
             print(msg, end='')
 
             # Wait until retrain time, auto-restarting crashed bots
-            while datetime.datetime.now() < next_retrain:
+            while datetime.datetime.now() < next_retrain and not _shutdown_requested:
                 time.sleep(60)
                 _check_restart_bots(bots, log_fh)
                 write_status(status)
+
+            if _shutdown_requested:
+                break
 
             # --- Retrain (bots keep trading with current models) ---
             # Pause backfill during retrain to free LLM quota
@@ -618,6 +682,16 @@ def main():
             log_fh.write(msg)
             log_fh.flush()
             print(msg, end='')
+
+    finally:
+        _terminate_procs(_all_procs)
+        for name, proc, fh in _all_bots:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        _cleanup_handles(_all_handles)
 
 
 if __name__ == '__main__':
