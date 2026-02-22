@@ -56,6 +56,10 @@ _STANDARD_FEATURES = _MINIMAL_FEATURES + [
     "Volume_SMA_20",
     # Stochastic %D
     "STOCHd_14_3_3",
+    # Hurst exponent (regime awareness)
+    "Hurst",
+    # Calendar effects
+    "Month_sin", "Month_cos", "Turn_of_Month",
 ]
 
 # Stationary features only — no raw prices/volumes that trend over time.
@@ -72,6 +76,10 @@ _STATIONARY_FEATURES = [
     "MACD_12_26_9", "MACDh_12_26_9", "MACDs_12_26_9",
     # Temporal (cyclical encoding, bounded [-1, 1])
     "Hour_sin", "Hour_cos", "Day_sin", "Day_cos",
+    # Calendar effects (cyclical, bounded)
+    "Month_sin", "Month_cos", "Turn_of_Month",
+    # Hurst exponent (bounded [0, 1], regime awareness)
+    "Hurst",
     # Sentiment (bounded)
     "Daily_Sentiment",
 ]

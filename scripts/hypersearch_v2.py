@@ -225,12 +225,16 @@ def get_walk_forward_folds(tickers, ticker_boundaries, seq_len, n_folds=NUM_FOLD
 # Sharpe ratio computation
 # ---------------------------------------------------------------------------
 
-def compute_sharpe(predictions, actual_returns, threshold):
+TRANSACTION_COST_BPS = 5  # 5 basis points round-trip cost per trade
+
+
+def compute_sharpe(predictions, actual_returns, threshold, txn_cost_bps=TRANSACTION_COST_BPS):
     """Simulate trades and compute annualized Sharpe ratio.
 
     Buy when pred > threshold, sell when pred < -threshold, else flat.
     Sharpe computed only on bars where a trade occurs, annualized by
     the actual trade frequency (trades_per_bar * bars_per_year).
+    Transaction costs (5 bps round-trip) are subtracted per trade.
     """
     signals = np.where(predictions > threshold, 1,
               np.where(predictions < -threshold, -1, 0))
@@ -239,12 +243,46 @@ def compute_sharpe(predictions, actual_returns, threshold):
     if n_trades < 10:
         return 0.0
     trade_returns = signals[traded] * actual_returns[traded]
+    # Subtract transaction costs (convert bps to percentage)
+    trade_returns = trade_returns - (txn_cost_bps / 100.0)
     if trade_returns.std() < 1e-8:
         return 0.0
     # Annualize: trade_freq * bars/year.  1638 hourly stock bars/year.
     trade_freq = n_trades / len(signals)
     trades_per_year = trade_freq * 1638
     return float((trade_returns.mean() / trade_returns.std()) * np.sqrt(trades_per_year))
+
+
+def compute_regime_sharpes(predictions, actual_returns, threshold):
+    """Compute Sharpe in bull/bear/sideways regimes separately.
+
+    Labels each bar based on a rolling 50-bar return:
+      > +2% → bull, < -2% → bear, else → sideways.
+
+    Returns dict: {'bull': sharpe, 'bear': sharpe, 'sideways': sharpe, 'min': min_sharpe}
+    """
+    if len(actual_returns) < 50:
+        return {'bull': 0.0, 'bear': 0.0, 'sideways': 0.0, 'min': 0.0}
+
+    # Rolling 50-bar return for regime labeling
+    cumret = np.cumsum(actual_returns)
+    rolling_ret = np.zeros(len(actual_returns))
+    rolling_ret[50:] = cumret[50:] - cumret[:-50]
+
+    regimes = {}
+    regimes['bull'] = rolling_ret > 2.0
+    regimes['bear'] = rolling_ret < -2.0
+    regimes['sideways'] = ~regimes['bull'] & ~regimes['bear']
+
+    result = {}
+    for name, mask in regimes.items():
+        if mask.sum() < 10:
+            result[name] = 0.0
+            continue
+        result[name] = compute_sharpe(predictions[mask], actual_returns[mask], threshold)
+
+    result['min'] = min(result.values())
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +579,28 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
         # Risk-adjusted score: penalize inconsistency across folds.
         # A model with [2.8, 2.9, 2.7] (score=2.80) beats [4.0, 4.0, -1.0] (score=2.83)
         score = avg_sharpe - 0.5 * std_sharpe
+
+        # Regime-aware penalty: penalize models with negative Sharpe in any regime
+        if best_fold_state is not None and len(val_indices) > 50:
+            model_tmp = RegressionLSTM(input_dim, hidden_dim, num_layers,
+                                        dropout, n_heads).to(device)
+            model_tmp.load_state_dict(best_fold_state)
+            model_tmp.eval()
+            all_preds = []
+            with torch.inference_mode():
+                for i in range(0, n_val, batch_size):
+                    xvb = torch.from_numpy(X_val[i:i + batch_size]).to(device)
+                    with torch.amp.autocast('cuda', enabled=use_amp):
+                        vo = model_tmp(xvb)
+                    all_preds.append(vo.cpu().numpy())
+            all_preds_np = np.concatenate(all_preds)
+            regime_sharpes = compute_regime_sharpes(all_preds_np, y_val, trade_threshold)
+            trial.set_user_attr('regime_sharpes', regime_sharpes)
+            # Penalize if any regime has negative Sharpe
+            if regime_sharpes['min'] < -0.5:
+                score *= 0.7  # 30% penalty
+            del model_tmp
+            gc.collect()
 
         trial.set_user_attr('fold_sharpes', fold_sharpes)
         trial.set_user_attr('avg_sharpe', avg_sharpe)

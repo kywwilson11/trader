@@ -23,6 +23,10 @@ from market_data import (
 _get_live_sentiment = None
 _sentiment_import_failed = False
 
+# LightGBM ensemble model (loaded lazily)
+_lgb_model = None
+_lgb_load_attempted = False
+
 # --- CONFIGURATION ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -199,7 +203,29 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
     with torch.inference_mode():
         output = model(tensor_input)
 
-    predicted_return = float(output.cpu().item())
+    lstm_pred = float(output.cpu().item())
+
+    # LightGBM ensemble: combine LSTM and LGB predictions
+    global _lgb_model, _lgb_load_attempted
+    if not _lgb_load_attempted:
+        _lgb_load_attempted = True
+        try:
+            from model_lgb import load_lgb_model
+            pfx = config.get('prefix', '')
+            _lgb_model = load_lgb_model(prefix=pfx)
+        except Exception:
+            _lgb_model = None
+
+    predicted_return = lstm_pred
+    if _lgb_model is not None:
+        try:
+            from model_lgb import flatten_sequence, predict_lgb, ensemble_predict
+            flat, _ = flatten_sequence(sequence.reshape(seq_len, -1), feature_cols)
+            lgb_pred = predict_lgb(_lgb_model, flat)
+            predicted_return = ensemble_predict(lstm_pred, lgb_pred)
+        except Exception:
+            pass  # Fall back to LSTM-only
+
     trade_threshold = config.get('trade_threshold', 0.15)
 
     price = df['Close'].iloc[-1]

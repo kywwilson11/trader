@@ -58,17 +58,29 @@ def get_stock_quote(api, symbol):
 
 
 def compute_limit_price(side, quote_info, offset_bps=5):
-    """Compute a limit price near the midpoint.
+    """Compute a limit price near the midpoint with spread-aware offset.
+
     For buys: midpoint + offset (willing to pay slightly above mid).
     For sells: midpoint - offset (willing to sell slightly below mid).
     offset_bps: basis points offset from midpoint (5 bps = 0.05%).
+
+    Spread-aware: when spread is wide (> 0.1%), use a proportional offset
+    instead of the fixed offset to avoid crossing the spread unnecessarily.
     """
     mid = quote_info['midpoint']
-    offset = mid * (offset_bps / 10000.0)
-    if side == 'buy':
-        return round(mid + offset, 4)
+    spread_pct = quote_info.get('spread_pct', 0)
+
+    # Dynamic offset: tight spread → fixed bps, wide spread → proportional
+    if spread_pct > 0.1:
+        # Use 20% of half-spread as offset (more conservative for wide spreads)
+        effective_offset = mid * (spread_pct / 100.0) * 0.1
     else:
-        return round(mid - offset, 4)
+        effective_offset = mid * (offset_bps / 10000.0)
+
+    if side == 'buy':
+        return round(mid + effective_offset, 4)
+    else:
+        return round(mid - effective_offset, 4)
 
 
 # --- ORDER PLACEMENT ---
@@ -310,13 +322,17 @@ def check_circuit_breaker(api, max_drawdown_pct=0.05):
     """Check if daily equity drawdown exceeds threshold.
     Returns (tripped: bool, drawdown_pct: float).
     """
-    account = api.get_account()
-    equity = float(account.equity)
-    last_equity = float(account.last_equity)  # previous close
-    if last_equity <= 0:
+    try:
+        account = api.get_account()
+        equity = float(account.equity)
+        last_equity = float(account.last_equity)  # previous close
+        if last_equity <= 0:
+            return False, 0.0
+        drawdown = (last_equity - equity) / last_equity
+        return drawdown >= max_drawdown_pct, drawdown
+    except Exception as e:
+        print(f"  [CIRCUIT BREAKER] API error: {e}")
         return False, 0.0
-    drawdown = (last_equity - equity) / last_equity
-    return drawdown >= max_drawdown_pct, drawdown
 
 
 # --- EMERGENCY FLATTEN ---

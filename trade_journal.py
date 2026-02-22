@@ -26,8 +26,10 @@ def log_decision(entry: dict):
     filepath = JOURNAL_DIR / f"{today}.jsonl"
 
     try:
+        line = json.dumps(entry, default=str) + "\n"
         with open(filepath, "a") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
+            f.write(line)
+            f.flush()
     except Exception as e:
         print(f"[JOURNAL] Error writing: {e}")
 

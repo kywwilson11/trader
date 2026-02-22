@@ -261,6 +261,45 @@ if _HAS_NUMBA:
             out[i] = ss_xy / ss_x if ss_x != 0 else 0.0
         return out
 
+    @njit(cache=True)
+    def _hurst_rs(arr, window):
+        """Rolling Hurst exponent via Rescaled Range (R/S) analysis.
+
+        H > 0.5 → trending (persistent)
+        H < 0.5 → mean-reverting (anti-persistent)
+        H ≈ 0.5 → random walk
+        """
+        n = len(arr)
+        out = np.empty(n)
+        out[:window - 1] = np.nan
+        for i in range(window - 1, n):
+            segment = arr[i - window + 1:i + 1]
+            mean_val = 0.0
+            for j in range(window):
+                mean_val += segment[j]
+            mean_val /= window
+
+            # Cumulative deviation from mean
+            cum_dev = np.empty(window)
+            cum_dev[0] = segment[0] - mean_val
+            for j in range(1, window):
+                cum_dev[j] = cum_dev[j - 1] + (segment[j] - mean_val)
+
+            r = np.max(cum_dev) - np.min(cum_dev)  # Range
+            # Standard deviation
+            var = 0.0
+            for j in range(window):
+                d = segment[j] - mean_val
+                var += d * d
+            s = np.sqrt(var / window) if window > 0 else 0.0
+
+            if s > 1e-10 and r > 0:
+                rs = r / s
+                out[i] = np.log(rs) / np.log(window)
+            else:
+                out[i] = 0.5  # default to random walk
+        return out
+
 
 # ── Public API (unchanged signatures) ────────────────────────────────────────
 
@@ -373,6 +412,31 @@ def compute_roc(close, length=12):
     return ((close - close.shift(length)) / close.shift(length)) * 100
 
 
+def compute_hurst(series, window=100):
+    """Rolling Hurst exponent via Rescaled Range analysis.
+
+    H > 0.5 → trending, H < 0.5 → mean-reverting, H ≈ 0.5 → random walk.
+    """
+    if _HAS_NUMBA:
+        result = _hurst_rs(series.values.astype(np.float64), window)
+        return pd.Series(result, index=series.index)
+    # Pure-numpy fallback
+    n = len(series)
+    arr = series.values.astype(np.float64)
+    out = np.full(n, np.nan)
+    for i in range(window - 1, n):
+        seg = arr[i - window + 1:i + 1]
+        mean_val = seg.mean()
+        cum_dev = np.cumsum(seg - mean_val)
+        r = cum_dev.max() - cum_dev.min()
+        s = seg.std()
+        if s > 1e-10 and r > 0:
+            out[i] = np.log(r / s) / np.log(window)
+        else:
+            out[i] = 0.5
+    return pd.Series(out, index=series.index)
+
+
 def compute_features(df, btc_close=None):
     """Compute all features for crypto (and base features for stocks).
 
@@ -442,6 +506,18 @@ def compute_features(df, btc_close=None):
     obv_sign = np.sign(obv_slope)
     price_sign = np.sign(price_slope)
     df['Vol_Price_Confirm'] = obv_sign * price_sign  # +1=confirm, -1=diverge
+
+    # Hurst exponent (trending vs mean-reverting)
+    df['Hurst'] = compute_hurst(df['Close'], window=100)
+
+    # Calendar features
+    month = idx.month
+    df['Month_sin'] = np.sin(2 * np.pi * month / 12)
+    df['Month_cos'] = np.cos(2 * np.pi * month / 12)
+    # Turn-of-month flag (last 2 and first 2 trading days)
+    day_of_month = idx.day
+    days_in_month = pd.Series(idx, index=idx).dt.days_in_month
+    df['Turn_of_Month'] = ((day_of_month <= 2) | (day_of_month >= days_in_month - 1)).astype(float)
 
     # BTC cross-asset features (crypto only)
     if btc_close is not None:

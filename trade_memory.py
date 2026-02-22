@@ -25,10 +25,13 @@ def _load() -> dict:
 
 
 def _save(data: dict):
-    """Save trade memory to disk."""
+    """Save trade memory to disk atomically (write-then-rename)."""
+    import os
+    tmp = str(_MEMORY_FILE) + '.tmp'
     try:
-        with open(_MEMORY_FILE, "w") as f:
+        with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp, str(_MEMORY_FILE))
     except OSError as e:
         print(f"[TRADE-MEMORY] Error saving: {e}")
 
