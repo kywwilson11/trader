@@ -2371,10 +2371,24 @@ class TradingDashboard(QMainWindow):
             score = pred.get('score')
             signal = pred.get('signal', '')
 
-            # LLM multiplier + reasoning
+            # LLM conviction score + reasoning
+            llm_s = llm.get('s')
             llm_m = llm.get('m')
             llm_r = llm.get('r', '')
-            if llm_m is not None:
+            llm_bull = llm.get('bull', '')
+            llm_bear = llm.get('bear', '')
+            if llm_s is not None:
+                llm_text = f"{llm_s:.2f}"
+                if llm_s < 0.15:
+                    llm_color = QColor(180, 0, 0)   # dark red for VETO
+                elif llm_s < 0.40:
+                    llm_color = T['red']
+                elif llm_s <= 0.60:
+                    llm_color = T.get('yellow', T['white'])
+                else:
+                    llm_color = T['green']
+            elif llm_m is not None:
+                # Backward compat: old format with m only
                 llm_text = f"{llm_m:.1f}x"
                 llm_color = (T['green'] if llm_m >= 1.0 else
                              (T['red'] if llm_m <= 0.5 else T.get('yellow', T['white'])))
@@ -2409,7 +2423,7 @@ class TradingDashboard(QMainWindow):
                 pred_val if pred_val is not None else float('-inf'),  # 4: Pred
                 score if score is not None else float('-inf'),        # 5: Score
                 None,       # 6: Signal — text sort is fine
-                llm_m if llm_m is not None else float('-inf'),       # 7: LLM
+                (llm_s if llm_s is not None else (llm_m if llm_m is not None else float('-inf'))),  # 7: LLM
             ]
 
             for col, (val, color) in enumerate(items_data):
@@ -2420,13 +2434,19 @@ class TradingDashboard(QMainWindow):
                     item = QTableWidgetItem(str(val))
                 item.setTextAlignment(Qt.AlignCenter)
                 item.setForeground(color)
-                # LLM column (7): show reasoning as tooltip
-                if col == 7 and llm_r:
+                # LLM column (7): show bull/bear reasoning as tooltip
+                if col == 7 and (llm_r or llm_bull or llm_bear):
                     ts = llm.get('timestamp', '')
-                    tip = llm_r
+                    tip_parts = []
+                    if llm_bull:
+                        tip_parts.append(f"BULL: {llm_bull}")
+                    if llm_bear:
+                        tip_parts.append(f"BEAR: {llm_bear}")
+                    if llm_r:
+                        tip_parts.append(f"Summary: {llm_r}")
                     if ts:
-                        tip += f"\n({ts})"
-                    item.setToolTip(tip)
+                        tip_parts.append(f"({ts})")
+                    item.setToolTip("\n".join(tip_parts))
                 tbl.setItem(row, col, item)
 
         tbl.setUpdatesEnabled(True)

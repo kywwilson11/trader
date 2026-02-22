@@ -32,15 +32,16 @@ from llm_config import load_llm_config
 from llm_analyst import analyze_trades
 from fundamentals import get_fundamentals, format_fundamentals_for_llm
 from trade_journal import log_decision
+from trade_memory import record_trade
 from stock_config import CRYPTO_SYMBOLS
 
 # --- CONFIGURATION ---
 
-NOTIONAL_PER_SYMBOL = 250  # $250 per symbol per cycle
-MAX_NOTIONAL_PER_SYMBOL = 750  # max total position per symbol (3x base)
+NOTIONAL_PER_SYMBOL = 1000  # $1,000 per symbol per cycle (1% of equity)
+MAX_NOTIONAL_PER_SYMBOL = 3000  # max total position per symbol (3% of equity)
 ORDER_TIMEOUT = 30  # seconds to wait for limit fill
 LOOP_INTERVAL = 30  # seconds between checks
-COOLDOWN_MINUTES = 120  # min time between trades on same symbol (match fb=24 horizon)
+COOLDOWN_MINUTES = 60  # min time between trades on same symbol
 MAX_PREDICTION_WORKERS = 5
 TEMP_LOG_EVERY_N_CYCLES = 10
 THERMAL_THROTTLE_TEMP = 75  # increase sleep if GPU above this
@@ -50,10 +51,10 @@ LLM_INTERVAL_SEC = 600       # LLM analyst call every 10 min (not every 30s cycl
 ATR_STOP_MULTIPLIER = 2.0          # stop = entry - (ATR * 2.0)
 ATR_TRAIL_MULTIPLIER = 1.5         # trail = hwm - (ATR * 1.5)
 ATR_TRAIL_ACTIVATE_PCT = 0.01      # activate trailing at 1% profit
-ATR_STOP_FLOOR_PCT = 0.015         # min stop distance 1.5%
-ATR_STOP_CEIL_PCT = 0.08           # max stop distance 8%
-CRYPTO_TAKE_PROFIT_RR = 2.0        # 2:1 risk-reward take-profit
-CRYPTO_TAKE_PROFIT_CEIL_PCT = 0.12  # max take-profit distance 12%
+ATR_STOP_FLOOR_PCT = 0.03          # min stop distance 3%
+ATR_STOP_CEIL_PCT = 0.10           # max stop distance 10%
+CRYPTO_TAKE_PROFIT_RR = 3.0        # 3:1 risk-reward take-profit
+CRYPTO_TAKE_PROFIT_CEIL_PCT = 0.25  # max take-profit distance 25%
 
 # Fallback fixed percentages (used when ATR unavailable)
 CRYPTO_STOP_LOSS_PCT = 0.04        # 4% hard stop-loss from entry
@@ -251,6 +252,12 @@ def run_crypto_bot():
                         symbol=symbol, qty=info['qty'],
                         side='sell', type='market', time_in_force='gtc',
                     )
+                    pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                    llm_info = llm_scores.get(symbol, {})
+                    record_trade(symbol, 'sell', entry_price, current_price,
+                                 pnl_pct, llm_score=llm_info.get('s'),
+                                 reasoning=llm_info.get('r', ''),
+                                 exit_reason=stop_reason)
                     del positions[symbol]
                     last_trade_time[symbol] = datetime.datetime.now()
                 except Exception as e:
@@ -324,7 +331,7 @@ def run_crypto_bot():
                     headlines = get_recent_headlines(symbol, 'crypto')
                     candidates.append({
                         'symbol': symbol,
-                        'snapshot': snapshots.get(symbol),
+                        'pred_return': preds.get(symbol),
                         'fundamentals_text': fund_text,
                         'news_headlines': headlines,
                     })
@@ -343,7 +350,7 @@ def run_crypto_bot():
                     if new_scores:
                         llm_scores = new_scores
                         _last_llm_time = now_ts
-                        print("[LLM] Scores: " + ", ".join(f"{s}={v.get('m', 1.0):.1f}x" for s, v in llm_scores.items()))
+                        print("[LLM] Scores: " + ", ".join(f"{s}={v.get('s', 0.5):.2f}" for s, v in llm_scores.items()))
 
         # ── SELL: bearish positions with cooldown expired ──
         for symbol in list(positions):
@@ -396,21 +403,21 @@ def run_crypto_bot():
                     print(f"  {symbol}: Market sell error: {e}")
             time.sleep(1)
 
-        # ── LLM SELL: very bearish LLM score triggers sell even if ML says hold ──
+        # ── LLM VETO SELL: catastrophic LLM score (< 0.15) triggers sell ──
         for symbol in list(positions):
             llm_info = llm_scores.get(symbol, {})
-            llm_m = llm_info.get('m', 1.0)
-            if llm_m >= 0.3:
+            llm_s = llm_info.get('s', 0.5)
+            if llm_s >= 0.15:
                 continue
-            # LLM says very bearish — sell regardless of ML prediction
+            # LLM says catastrophic event — sell regardless of ML prediction
             pos = verify_position(api, symbol)
             if pos is None:
                 del positions[symbol]
                 continue
             if not cooldown_ok(last_trade_time, symbol, COOLDOWN_MINUTES):
-                print(f"  {symbol}: LLM bearish ({llm_m:.1f}x) but in cooldown, skipping")
+                print(f"  {symbol}: LLM VETO ({llm_s:.2f}) but in cooldown, skipping")
                 continue
-            print(f"  {symbol}: LLM SELL ({llm_m:.1f}x — {llm_info.get('r', '')})")
+            print(f"  {symbol}: LLM VETO SELL ({llm_s:.2f} — {llm_info.get('r', '')})")
             info = positions[symbol]
             quote = get_crypto_quote(api, symbol)
             if quote is not None:
@@ -477,24 +484,26 @@ def run_crypto_bot():
                 continue
             adjusted_notional = int(sized_notional * gate)
 
-            # LLM gate: < 0.5 blocks buy, 0.5-0.8 reduces size, >= 0.8 full/boosted
+            # LLM gate: < 0.15 = VETO (catastrophic), otherwise soft multiplier
             llm_info = llm_scores.get(symbol, {})
-            llm_mult = llm_info.get('m', 1.0)
+            llm_s = llm_info.get('s', 0.5)
             llm_reason = llm_info.get('r', '')
-            if llm_mult < 0.5:
-                print(f"  {symbol}: BLOCKED by LLM ({llm_mult:.1f}x — {llm_reason})")
-                log_decision({"symbol": symbol, "action": "skip", "skip_reason": "llm_block",
+            if llm_s < 0.15:
+                print(f"  {symbol}: VETO by LLM ({llm_s:.2f} — {llm_reason})")
+                log_decision({"symbol": symbol, "action": "skip", "skip_reason": "llm_veto",
                               "pred_return": pred_return,
                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
-                              "llm_multiplier": llm_mult, "llm_reasoning": llm_reason})
+                              "llm_multiplier": llm_s, "llm_reasoning": llm_reason})
                 continue
+            # Soft multiplier: score 0.0 → 0.5x, 0.5 → 1.0x, 1.0 → 1.5x
+            llm_mult = 0.5 + llm_s
             adjusted_notional = int(adjusted_notional * llm_mult)
 
             sizing_info = f"conf={confidence:.2f}x"
             if gate != 1.0:
                 sizing_info += f", sent={gate:.2f}x"
-            if llm_mult != 1.0:
-                sizing_info += f", llm={llm_mult:.1f}x"
+            if llm_s != 0.5:
+                sizing_info += f", llm={llm_s:.2f}→{llm_mult:.2f}x"
             if gate_reasons:
                 sizing_info += f" ({', '.join(gate_reasons)})"
             print(f"  {symbol}: Sizing ${adjusted_notional} [{sizing_info}]")
@@ -539,7 +548,8 @@ def run_crypto_bot():
                 log_decision({"symbol": symbol, "action": "buy",
                               "pred_return": pred_return,
                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
-                              "llm_multiplier": llm_mult, "llm_reasoning": llm_reason,
+                              "llm_multiplier": llm_mult, "llm_score": llm_s,
+                              "llm_reasoning": llm_reason,
                               "final_notional": adjusted_notional, "confidence": confidence,
                               "skip_reason": None})
                 last_trade_time[symbol] = datetime.datetime.now()
