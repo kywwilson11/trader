@@ -38,6 +38,8 @@ from optuna.pruners import MedianPruner
 
 from model_v2 import RegressionLSTM
 from gpu_lock import acquire_for_training
+from adaptive_config import (load_adaptive_state, get_search_space_for_trial,
+                              update_after_search, get_trial_count)
 
 _STATUS_FILE = Path(__file__).resolve().parent.parent / 'pipeline_status.json'
 
@@ -91,6 +93,9 @@ def parse_args():
                         help='Indicator preset (default: stationary)')
     parser.add_argument('--max-rows', type=int, default=500_000,
                         help='Max total rows to load (default: 500000)')
+    parser.add_argument('--mode', type=str, default='',
+                        choices=['', 'refine', 'explore', 'initial'],
+                        help='Adaptive mode (default: auto-detect from state)')
     return parser.parse_args()
 
 
@@ -354,33 +359,48 @@ class SeqCache:
 # ---------------------------------------------------------------------------
 
 def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries,
-                     input_dim, _state_cache, has_multi_horizon=True):
+                     input_dim, _state_cache, has_multi_horizon=True,
+                     adaptive_space=None):
 
     MAX_TRIAL_SECONDS = 900
 
     seq_cache = SeqCache(all_features, tickers, ticker_boundaries)
+
+    # Use adaptive search space if provided, otherwise use defaults
+    _space = adaptive_space or {}
 
     def objective(trial):
         trial_start = time.time()
         gc.collect()
         torch.cuda.empty_cache()
 
-        # --- Hyperparameters ---
+        # --- Hyperparameters (from adaptive search space) ---
         if has_multi_horizon:
-            forward_bars = trial.suggest_categorical('forward_bars', FORWARD_BARS)
+            fb_choices = _space.get('forward_bars', FORWARD_BARS)
+            forward_bars = trial.suggest_categorical('forward_bars', fb_choices)
         else:
             forward_bars = 4
 
-        seq_len = trial.suggest_categorical('seq_len', [12, 18, 24, 32])
-        hidden_dim = trial.suggest_categorical('hidden_dim', [64, 96, 128, 192, 256])
-        num_layers = trial.suggest_int('num_layers', 1, 2)
-        n_heads = trial.suggest_categorical('n_heads', [2, 4])
-        dropout = trial.suggest_float('dropout', 0.10, 0.40, step=0.05)
-        learning_rate = trial.suggest_float('learning_rate', 5e-4, 3e-3, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [512, 1024, 2048])
-        weight_decay = trial.suggest_float('weight_decay', 1e-5, 5e-4, log=True)
-        huber_delta = trial.suggest_float('huber_delta', 0.5, 2.0, step=0.1)
-        trade_threshold = trial.suggest_float('trade_threshold', 0.05, 1.0, step=0.01)
+        seq_len = trial.suggest_categorical('seq_len',
+            _space.get('seq_len', [12, 18, 24, 32]))
+        hidden_dim = trial.suggest_categorical('hidden_dim',
+            _space.get('hidden_dim', [64, 96, 128, 192, 256]))
+        nl_range = _space.get('num_layers', [1, 2])
+        num_layers = trial.suggest_int('num_layers', nl_range[0], nl_range[-1])
+        n_heads = trial.suggest_categorical('n_heads',
+            _space.get('n_heads', [2, 4]))
+        dr_range = _space.get('dropout', [0.10, 0.40])
+        dropout = trial.suggest_float('dropout', dr_range[0], dr_range[1], step=0.05)
+        lr_range = _space.get('learning_rate', [5e-4, 3e-3])
+        learning_rate = trial.suggest_float('learning_rate', lr_range[0], lr_range[1], log=True)
+        batch_size = trial.suggest_categorical('batch_size',
+            _space.get('batch_size', [512, 1024, 2048]))
+        wd_range = _space.get('weight_decay', [1e-5, 5e-4])
+        weight_decay = trial.suggest_float('weight_decay', wd_range[0], wd_range[1], log=True)
+        hd_range = _space.get('huber_delta', [0.5, 2.0])
+        huber_delta = trial.suggest_float('huber_delta', hd_range[0], hd_range[1], step=0.1)
+        tt_range = _space.get('trade_threshold', [0.05, 1.0])
+        trade_threshold = trial.suggest_float('trade_threshold', tt_range[0], tt_range[1], step=0.01)
         scheduler = trial.suggest_categorical('scheduler', ['cosine', 'plateau'])
 
         cfg = {
@@ -625,8 +645,37 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
 
 def main():
     args = parse_args()
-    num_trials = args.trials
     prefix = f'{args.prefix}_' if args.prefix else ''
+    asset_type = args.prefix or 'crypto'
+
+    # Load adaptive state
+    adaptive_state = load_adaptive_state(asset_type)
+    adaptive_space = get_search_space_for_trial(adaptive_state)
+
+    # Determine mode and trial count
+    mode = args.mode or adaptive_state.get('mode', 'refine')
+    is_initial = mode == 'initial'
+    adaptive_trials = get_trial_count(mode, is_initial=is_initial)
+    # --trials overrides adaptive count only if explicitly set (not default)
+    num_trials = args.trials if args.trials != NUM_TRIALS else adaptive_trials
+
+    # Update FORWARD_BARS global from adaptive state (used by load_data)
+    global FORWARD_BARS
+    fb_from_state = adaptive_space.get('forward_bars')
+    if fb_from_state:
+        FORWARD_BARS = sorted(fb_from_state)
+
+    print(f"[ADAPTIVE] {asset_type}: mode={mode}, trials={num_trials}, "
+          f"forward_bars={FORWARD_BARS}")
+    if adaptive_state.get('best_score', 0) > 0:
+        print(f"[ADAPTIVE] Prior best score={adaptive_state['best_score']:.3f}, "
+              f"cycles_without_improvement={adaptive_state.get('cycles_without_improvement', 0)}")
+    edges = []
+    if adaptive_state.get('best_params'):
+        from adaptive_config import detect_edges
+        edges = detect_edges(adaptive_state['best_params'], adaptive_space)
+        if edges:
+            print(f"[ADAPTIVE] Edges detected: {edges}")
 
     db_path = f'{prefix}v2_study.db'
     study_name = f'{prefix}v2_search'
@@ -645,7 +694,6 @@ def main():
     best_state_holder = {'state': None, 'scaler': None, 'score': 0.0, 'cfg': None}
     _state_cache = {}
 
-    asset_type = args.prefix or 'crypto'
     phase_id = f'{asset_type}_search'
     phase_label = f'Training {asset_type.title()} v2 Model'
     _pipeline_status = {
@@ -658,6 +706,7 @@ def main():
         'best_score': 0.0,
         'elapsed_sec': 0,
         'model_version': 2,
+        'adaptive_mode': mode,
     }
     _write_pipeline_status(_pipeline_status)
 
@@ -736,6 +785,7 @@ def main():
     prior_trials = len(study.trials)
     print(f"\n{'='*70}")
     print(f"OPTUNA V2 REGRESSION SEARCH: {num_trials} new trials (TPE + pruning)")
+    print(f"Adaptive mode: {mode}")
     print(f"Optimizing: risk-adjusted Sharpe (mean - 0.5*std, {NUM_FOLDS}-fold walk-forward CV)")
     if has_multi_horizon:
         print(f"Multi-horizon: forward_bars in {FORWARD_BARS}")
@@ -757,7 +807,8 @@ def main():
 
     objective_fn = create_objective(all_features, all_returns_by_fb,
                                     tickers, ticker_boundaries, input_dim,
-                                    _state_cache, has_multi_horizon=has_multi_horizon)
+                                    _state_cache, has_multi_horizon=has_multi_horizon,
+                                    adaptive_space=adaptive_space)
     study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback],
                    catch=(Exception,))
 
@@ -806,6 +857,25 @@ def main():
         print(f"Features saved: {prefix}feature_cols_v2.pkl")
     else:
         print(f"\nNo new best found (prior best score={best_state_holder['score']:.3f})")
+
+    # Update adaptive state with results
+    final_score = best_state_holder['score']
+    final_params = best_state_holder.get('cfg', {})
+    if final_score > 0 and final_params:
+        adaptive_state = update_after_search(adaptive_state, final_score, final_params)
+        print(f"\n[ADAPTIVE] Updated state: mode={adaptive_state['mode']}, "
+              f"cycles_without_improvement={adaptive_state['cycles_without_improvement']}")
+        if adaptive_state.get('expansion_history'):
+            latest = adaptive_state['expansion_history'][-1]
+            if latest.get('expansions'):
+                print(f"[ADAPTIVE] Expansions: {latest['expansions']}")
+    elif final_params:
+        # No improvement but still save params if this is initial run
+        if not adaptive_state.get('best_params'):
+            adaptive_state['best_params'] = final_params
+            adaptive_state['best_score'] = final_score
+            from adaptive_config import save_adaptive_state
+            save_adaptive_state(adaptive_state)
 
     # Param importance
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]

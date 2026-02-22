@@ -31,6 +31,9 @@ import subprocess
 import sys
 import time
 
+from adaptive_config import (load_adaptive_state, decide_mode, get_trial_count,
+                              get_max_forward_bars)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATUS_FILE = os.path.join(BASE_DIR, 'pipeline_status.json')
 LOG_FILE = os.path.join(BASE_DIR, 'pipeline_output.log')
@@ -273,26 +276,32 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
     return phases
 
 
-def _build_training_phases(trials, train_crypto, train_stock):
-    """Build model training phases."""
+def _build_training_phases(trials, train_crypto, train_stock, mode=''):
+    """Build model training phases with adaptive mode support."""
     phases = []
 
     if train_crypto:
+        cmd = [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
+               '--trials', str(trials), '--preset', 'stationary']
+        if mode:
+            cmd += ['--mode', mode]
         phases.append({
             'id': 'crypto_search',
             'label': 'Training Crypto Regression Model',
-            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
-                    '--trials', str(trials), '--preset', 'stationary'],
+            'cmd': cmd,
             'trials': trials,
         })
     if train_stock:
+        cmd = [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
+               '--trials', str(trials),
+               '--data', 'stock_training_data.csv', '--prefix', 'stock',
+               '--preset', 'stationary', '--max-rows', '350000']
+        if mode:
+            cmd += ['--mode', mode]
         phases.append({
             'id': 'stock_search',
             'label': 'Training Stock Regression Model',
-            'cmd': [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
-                    '--trials', str(trials),
-                    '--data', 'stock_training_data.csv', '--prefix', 'stock',
-                    '--preset', 'stationary', '--max-rows', '350000'],
+            'cmd': cmd,
             'trials': trials,
         })
 
@@ -383,7 +392,8 @@ def main():
         # =============================================================
         if not args.bot_only:
             phases = (_build_harvest_phases(args.skip_harvest, train_crypto, train_stock)
-                      + _build_training_phases(args.trials, train_crypto, train_stock))
+                      + _build_training_phases(args.trials, train_crypto, train_stock,
+                                               mode='initial'))
             for i, p in enumerate(phases):
                 p['idx'] = i
 
@@ -522,9 +532,53 @@ def main():
             except Exception:
                 pass
 
+            # --- Adaptive mode/trial decisions per asset type ---
+            # Use the worse-case (more trials) across asset types
+            adaptive_modes = {}
+            adaptive_trial_counts = {}
+            for at in (['crypto'] if train_crypto else []) + (['stock'] if train_stock else []):
+                astate = load_adaptive_state(at)
+                amode = decide_mode(astate, astate.get('best_score', 0))
+                atrial = get_trial_count(amode)
+                adaptive_modes[at] = amode
+                adaptive_trial_counts[at] = atrial
+                msg = (f"[ADAPTIVE] {at}: mode={amode}, trials={atrial}, "
+                       f"cycles_no_improve={astate.get('cycles_without_improvement', 0)}\n")
+                log_fh.write(msg)
+                log_fh.flush()
+                print(msg, end='')
+
+            # Use explicit --retrain-trials if not default, else adaptive max
+            if args.retrain_trials != 100:
+                retrain_trials = args.retrain_trials
+                retrain_mode = ''
+            else:
+                retrain_trials = max(adaptive_trial_counts.values()) if adaptive_trial_counts else 100
+                # Use explore if any asset needs it
+                retrain_mode = 'explore' if 'explore' in adaptive_modes.values() else 'refine'
+
+            # Check if harvest needed due to forward_bars expansion
+            force_harvest = False
+            for at, csv_name in [('crypto', 'training_data.csv'), ('stock', 'stock_training_data.csv')]:
+                if (at == 'crypto' and not train_crypto) or (at == 'stock' and not train_stock):
+                    continue
+                max_fb = get_max_forward_bars(at)
+                csv_path = os.path.join(BASE_DIR, csv_name)
+                if os.path.exists(csv_path):
+                    import pandas as pd
+                    cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
+                    if f'Target_Return_{max_fb}' not in cols:
+                        force_harvest = True
+                        msg = (f"[ADAPTIVE] {at}: Target_Return_{max_fb} missing from CSV, "
+                               f"forcing re-harvest\n")
+                        log_fh.write(msg)
+                        log_fh.flush()
+                        print(msg, end='')
+
             retrain_phases = (
-                _build_harvest_phases(False, train_crypto, train_stock)
-                + _build_training_phases(args.retrain_trials, train_crypto, train_stock)
+                _build_harvest_phases(not force_harvest, train_crypto, train_stock)
+                + _build_training_phases(retrain_trials, train_crypto, train_stock,
+                                         mode=retrain_mode)
             )
             for i, p in enumerate(retrain_phases):
                 p['idx'] = i
@@ -540,7 +594,7 @@ def main():
                 f"{datetime.datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}\n"
                 f"# Bots continue trading — models hot-reload on improvement\n"
                 f"# Phases: {', '.join(p['label'] for p in retrain_phases)}\n"
-                f"# Trials per model: {args.retrain_trials}\n"
+                f"# Adaptive: mode={retrain_mode}, trials={retrain_trials}\n"
                 f"{'#'*70}\n"
             )
             log_fh.write(banner)

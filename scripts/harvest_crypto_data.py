@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 from indicators import compute_features
 from market_data import flatten_yfinance_columns, fetch_historical_bars
+from adaptive_config import get_forward_bars_list
 
 load_dotenv()
 
@@ -32,8 +33,8 @@ BENCHMARK = 'BTC-USD'
 
 ALPACA_START = '2021-01-01'
 
-# Multi-horizon forward returns (bars ahead)
-FORWARD_BARS = [12, 18, 24, 32, 48]
+# Multi-horizon forward returns (bars ahead) — read from adaptive state
+FORWARD_BARS = get_forward_bars_list('crypto')
 
 
 def _to_alpaca(yf_ticker):

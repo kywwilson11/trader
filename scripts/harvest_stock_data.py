@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from indicators import compute_stock_features
 from market_data import flatten_yfinance_columns, fetch_historical_bars
 from stock_config import load_stock_universe
+from adaptive_config import get_forward_bars_list
 
 load_dotenv()
 
@@ -29,8 +30,8 @@ BENCHMARK = 'SPY'
 
 ALPACA_START = '2016-01-01'
 
-# Multi-horizon forward returns (bars ahead) — must match harvest_crypto_data.py
-FORWARD_BARS = [12, 18, 24, 32, 48]
+# Multi-horizon forward returns (bars ahead) — read from adaptive state
+FORWARD_BARS = get_forward_bars_list('stock')
 
 
 def _get_alpaca_api():
