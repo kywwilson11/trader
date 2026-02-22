@@ -77,9 +77,12 @@ def write_status(status, force=False):
         pass
     status['elapsed_sec'] = int(elapsed)
     tmp = STATUS_FILE + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(status, f, indent=2)
-    os.replace(tmp, STATUS_FILE)
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(status, f, indent=2)
+        os.replace(tmp, STATUS_FILE)
+    except OSError:
+        pass  # Non-fatal — status file is informational only
 
 
 def run_phase(phase, log_fh, status):
@@ -122,42 +125,45 @@ def run_phase(phase, log_fh, status):
         text=True,
     )
 
-    for line in proc.stdout:
-        log_fh.write(line)
-        log_fh.flush()
-        sys.stdout.write(line)
-        sys.stdout.flush()
+    try:
+        for line in proc.stdout:
+            log_fh.write(line)
+            log_fh.flush()
+            sys.stdout.write(line)
+            sys.stdout.flush()
 
-        # Parse prior trials: "Resuming from 119 prior trials in bear_study.db"
-        m = re.match(r'Resuming from (\d+) prior trials', line)
-        if m:
-            status['trial_prior'] = int(m.group(1))
-            write_status(status, force=True)
+            # Parse prior trials: "Resuming from 119 prior trials in bear_study.db"
+            m = re.match(r'Resuming from (\d+) prior trials', line)
+            if m:
+                status['trial_prior'] = int(m.group(1))
+                write_status(status, force=True)
 
-        # Parse prior best: "Prior best sharpe=0.396 ..."
-        m = re.match(r'Prior best sharpe=(-?\d+\.\d+)', line)
-        if m:
-            status['best_score'] = float(m.group(1))
-            write_status(status, force=True)
-
-        # Parse trial progress: "[  45] sharpe=0.543 ..."
-        force = False
-        m = re.match(r'\[\s*(\d+)\]', line)
-        if m:
-            absolute = int(m.group(1))
-            status['trial_current'] = absolute - status.get('trial_prior', 0)
-            force = True
-
-        # Parse best score on "** BEST **" lines
-        if '** BEST **' in line:
-            m = re.search(r'sharpe=(-?\d+\.\d+)', line)
+            # Parse prior best: "Prior best score=0.396 ..."
+            m = re.match(r'Prior best (?:sharpe|score)=(-?\d+\.\d+)', line)
             if m:
                 status['best_score'] = float(m.group(1))
-            force = True
+                write_status(status, force=True)
 
-        write_status(status, force=force)
+            # Parse trial progress: "[  45] score=0.543 ..."
+            force = False
+            m = re.match(r'\[\s*(\d+)\]', line)
+            if m:
+                absolute = int(m.group(1))
+                status['trial_current'] = absolute - status.get('trial_prior', 0)
+                force = True
 
-    proc.wait()
+            # Parse best score on "** BEST **" lines
+            if '** BEST **' in line:
+                m = re.search(r'score=(-?\d+\.\d+)', line)
+                if m:
+                    status['best_score'] = float(m.group(1))
+                force = True
+
+            write_status(status, force=force)
+    except Exception as e:
+        print(f"\n[PIPELINE] Error reading phase output: {e}")
+    finally:
+        proc.wait()
     status['phase_exit_code'] = proc.returncode
 
     elapsed = ''
@@ -207,6 +213,7 @@ def _check_restart_bots(bots, log_fh):
             cmd = [PYTHON, '-u',
                    'crypto_loop.py' if name == 'Crypto' else 'stock_loop.py']
             new_proc, new_fh = _start_bot(cmd, log_path)
+            _all_handles.append(new_fh)
             bots[i] = (name, new_proc, new_fh)
             msg = (f"{name} bot crashed (exit {proc.returncode}),"
                    f" restarted as PID {new_proc.pid}\n")

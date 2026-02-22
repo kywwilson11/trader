@@ -618,25 +618,30 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
 
         # Regime-aware penalty: penalize models with negative Sharpe in any regime
         if best_fold_state is not None and len(val_indices) > 50:
-            model_tmp = RegressionLSTM(input_dim, hidden_dim, num_layers,
-                                        dropout, n_heads).to(device)
-            model_tmp.load_state_dict(best_fold_state)
-            model_tmp.eval()
-            all_preds = []
-            with torch.inference_mode():
-                for i in range(0, n_val, batch_size):
-                    xvb = torch.from_numpy(X_val[i:i + batch_size]).to(device)
-                    with torch.amp.autocast('cuda', enabled=use_amp):
-                        vo = model_tmp(xvb)
-                    all_preds.append(vo.cpu().numpy())
-            all_preds_np = np.concatenate(all_preds)
-            regime_sharpes = compute_regime_sharpes(all_preds_np, y_val, trade_threshold)
-            trial.set_user_attr('regime_sharpes', regime_sharpes)
-            # Penalize if any regime has negative Sharpe
-            if regime_sharpes['min'] < -0.5:
-                score *= 0.7  # 30% penalty
-            del model_tmp
-            gc.collect()
+            model_tmp = None
+            try:
+                model_tmp = RegressionLSTM(input_dim, hidden_dim, num_layers,
+                                            dropout, n_heads).to(device)
+                model_tmp.load_state_dict(best_fold_state)
+                model_tmp.eval()
+                all_preds = []
+                with torch.inference_mode():
+                    for i in range(0, n_val, batch_size):
+                        xvb = torch.from_numpy(X_val[i:i + batch_size]).to(device)
+                        with torch.amp.autocast('cuda', enabled=use_amp):
+                            vo = model_tmp(xvb)
+                        all_preds.append(vo.cpu().numpy())
+                all_preds_np = np.concatenate(all_preds)
+                regime_sharpes = compute_regime_sharpes(all_preds_np, y_val, trade_threshold)
+                trial.set_user_attr('regime_sharpes', regime_sharpes)
+                # Penalize if any regime has negative Sharpe
+                if regime_sharpes['min'] < -0.5:
+                    score *= 0.7  # 30% penalty
+            except Exception as e:
+                print(f"  [REGIME] Penalty eval failed: {e}")
+            finally:
+                del model_tmp
+                gc.collect()
 
         trial.set_user_attr('fold_sharpes', fold_sharpes)
         trial.set_user_attr('avg_sharpe', avg_sharpe)

@@ -1728,10 +1728,13 @@ class TradingDashboard(QMainWindow):
             for key_edit in self._settings_api_keys.values():
                 key_edit.setStyleSheet(input_style)
             self._settings_fmp_key.setStyleSheet(input_style)
-            for combo in self._settings_models.values():
-                combo.setStyleSheet(input_style)
             self._settings_latency.setStyleSheet(input_style)
-            self._settings_provider.setStyleSheet(input_style)
+            if hasattr(self, '_settings_tier_override'):
+                self._settings_tier_override.setStyleSheet(input_style)
+            if hasattr(self, '_settings_analyst_model'):
+                self._settings_analyst_model.setStyleSheet(input_style)
+            if hasattr(self, '_settings_sentiment_model'):
+                self._settings_sentiment_model.setStyleSheet(input_style)
             for toggle in self._settings_key_toggles.values():
                 toggle.setStyleSheet(btn_style)
         if hasattr(self, '_settings_indicator_preset'):
@@ -2751,14 +2754,6 @@ class TradingDashboard(QMainWindow):
         self._settings_llm_enabled.setChecked(config.get("enabled", True))
         self._settings_llm_enabled.toggled.connect(self._on_settings_changed)
         top_row.addWidget(self._settings_llm_enabled)
-        top_row.addSpacing(16)
-        top_row.addWidget(QLabel("Provider:"))
-        self._settings_provider = QComboBox()
-        self._settings_provider.addItems(["gemini", "claude", "openai"])
-        self._settings_provider.setCurrentText(config.get("provider", "gemini"))
-        self._settings_provider.setMaximumWidth(120)
-        self._settings_provider.currentTextChanged.connect(self._on_settings_changed)
-        top_row.addWidget(self._settings_provider)
         top_row.addStretch()
         self._settings_journal = QCheckBox("Trade Journal")
         self._settings_journal.setChecked(config.get("journal_enabled", True))
@@ -2775,8 +2770,7 @@ class TradingDashboard(QMainWindow):
         self._settings_api_keys = {}
         self._settings_key_toggles = {}
         for i, (provider, label) in enumerate([
-            ("gemini", "Gemini"), ("claude", "Claude"),
-            ("openai", "OpenAI"), ("fmp", "FMP"),
+            ("gemini", "Gemini"), ("fmp", "FMP"),
         ]):
             keys_layout.addWidget(QLabel(f"{label}:"), i, 0)
             key_edit = QLineEdit()
@@ -2807,51 +2801,6 @@ class TradingDashboard(QMainWindow):
                 self._settings_key_toggles[provider] = toggle_btn
 
         llm_layout.addWidget(keys_group)
-
-        # Model Selection — non-editable dropdowns
-        model_group = QGroupBox("Model Selection")
-        model_layout = QGridLayout(model_group)
-        model_layout.setColumnStretch(1, 1)
-        model_layout.setColumnMinimumWidth(0, 55)
-
-        self._settings_models = {}
-        model_options = {
-            "gemini": [
-                ("gemini-2.5-flash-lite", "Flash Lite (fastest, cheapest)"),
-                ("gemini-2.5-flash", "Flash (balanced)"),
-                ("gemini-2.5-pro", "Pro (best reasoning)"),
-            ],
-            "claude": [
-                ("claude-haiku-4-5-20251001", "Haiku 4.5 (cheapest)"),
-                ("claude-sonnet-4-5-20250929", "Sonnet 4.5"),
-                ("claude-opus-4-6", "Opus 4.6 (most capable)"),
-            ],
-            "openai": [
-                ("gpt-4.1-nano", "GPT-4.1 Nano (cheapest)"),
-                ("gpt-4.1-mini", "GPT-4.1 Mini"),
-                ("gpt-4.1", "GPT-4.1"),
-                ("o4-mini", "o4-mini (reasoning)"),
-            ],
-        }
-        for i, (provider, label) in enumerate([
-            ("gemini", "Gemini"), ("claude", "Claude"), ("openai", "OpenAI"),
-        ]):
-            model_layout.addWidget(QLabel(f"{label}:"), i, 0)
-            combo = QComboBox()
-            combo.setMaximumWidth(320)
-            for model_id, display_name in model_options[provider]:
-                combo.addItem(display_name, model_id)
-            # Set current selection from config
-            current_model = config.get("models", {}).get(provider, {}).get("model", "")
-            if current_model:
-                idx = combo.findData(current_model)
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
-            combo.currentIndexChanged.connect(self._on_settings_changed)
-            model_layout.addWidget(combo, i, 1)
-            self._settings_models[provider] = combo
-
-        llm_layout.addWidget(model_group)
 
         # --- Tier Detection ---
         tier_group = QGroupBox("API Tier")
@@ -3033,17 +2982,12 @@ class TradingDashboard(QMainWindow):
 
         config = load_llm_config()
         config["enabled"] = self._settings_llm_enabled.isChecked()
-        config["provider"] = self._settings_provider.currentText()
         config["journal_enabled"] = self._settings_journal.isChecked()
         config["max_llm_latency_sec"] = self._settings_latency.value()
         config["fmp_api_key"] = self._settings_fmp_key.text().strip()
 
         for provider, key_edit in self._settings_api_keys.items():
             config.setdefault("models", {}).setdefault(provider, {})["api_key"] = key_edit.text().strip()
-        for provider, combo in self._settings_models.items():
-            model_id = combo.currentData()
-            if model_id:
-                config.setdefault("models", {}).setdefault(provider, {})["model"] = model_id
 
         # Tier override
         tier = self._settings_tier_override.currentData()
@@ -3074,9 +3018,8 @@ class TradingDashboard(QMainWindow):
             elapsed = (time.time() - start) * 1000
 
             if result:
-                provider = self._settings_provider.currentText()
                 self._settings_test_status.setText(
-                    f"Connected to {provider} ({elapsed:.0f}ms)")
+                    f"Connected to Gemini ({elapsed:.0f}ms)")
                 self._settings_test_status.setStyleSheet(f"color: {T['green'].name()};")
             else:
                 self._settings_test_status.setText("No response — check API key")
