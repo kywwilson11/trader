@@ -118,7 +118,7 @@ class TestExpansion:
         """[12,18,24,32,48] + high edge -> adds 64."""
         space = {'forward_bars': [12, 18, 24, 32, 48]}
         edges = [('forward_bars', 'high')]
-        new_space, logs = expand_search_space(space, edges)
+        new_space, logs, _ = expand_search_space(space, edges)
         assert 64 in new_space['forward_bars']
         assert new_space['forward_bars'] == sorted(new_space['forward_bars'])
         assert len(logs) > 0
@@ -127,7 +127,7 @@ class TestExpansion:
         """[12,18,24,32] + low edge -> adds 8."""
         space = {'seq_len': [12, 18, 24, 32]}
         edges = [('seq_len', 'low')]
-        new_space, logs = expand_search_space(space, edges)
+        new_space, logs, _ = expand_search_space(space, edges)
         assert 8 in new_space['seq_len']
         assert len(logs) > 0
 
@@ -135,7 +135,7 @@ class TestExpansion:
         """dropout [0.10, 0.40] + high edge -> [0.10, 0.50]."""
         space = {'dropout': [0.10, 0.40]}
         edges = [('dropout', 'high')]
-        new_space, logs = expand_search_space(space, edges)
+        new_space, logs, _ = expand_search_space(space, edges)
         assert new_space['dropout'][1] == 0.50
         assert new_space['dropout'][0] == 0.10  # low unchanged
 
@@ -143,7 +143,7 @@ class TestExpansion:
         """dropout [0.10, 0.40] + low edge -> [0.05, 0.40]."""
         space = {'dropout': [0.10, 0.40]}
         edges = [('dropout', 'low')]
-        new_space, logs = expand_search_space(space, edges)
+        new_space, logs, _ = expand_search_space(space, edges)
         assert new_space['dropout'][0] == 0.05
         assert new_space['dropout'][1] == 0.40  # high unchanged
 
@@ -151,14 +151,14 @@ class TestExpansion:
         """hidden_dim never exceeds 384 even after expansion."""
         space = {'hidden_dim': [64, 96, 128, 192, 256, 384]}
         edges = [('hidden_dim', 'high')]
-        new_space, logs = expand_search_space(space, edges)
+        new_space, logs, _ = expand_search_space(space, edges)
         assert max(new_space['hidden_dim']) <= 384
 
     def test_hard_limits_respected_float(self):
         """dropout never goes below 0.05."""
         space = {'dropout': [0.05, 0.40]}
         edges = [('dropout', 'low')]
-        new_space, logs = expand_search_space(space, edges)
+        new_space, logs, _ = expand_search_space(space, edges)
         # Can't expand below 0.05 (already at hard limit)
         assert new_space['dropout'][0] >= 0.05
 
@@ -166,7 +166,7 @@ class TestExpansion:
         """No edges -> space unchanged."""
         import copy
         space = copy.deepcopy(DEFAULT_SEARCH_SPACE)
-        new_space, logs = expand_search_space(space, [])
+        new_space, logs, _ = expand_search_space(space, [])
         assert new_space == space
         assert len(logs) == 0
 
@@ -174,7 +174,7 @@ class TestExpansion:
         """Expanding an already-expanded space doesn't add duplicates."""
         space = {'forward_bars': [8, 12, 18, 24, 32, 48, 64]}
         edges = [('forward_bars', 'high')]
-        new_space, logs = expand_search_space(space, edges)
+        new_space, logs, _ = expand_search_space(space, edges)
         assert len(new_space['forward_bars']) == len(set(new_space['forward_bars']))
 
     def test_expand_multiple_params(self):
@@ -184,10 +184,24 @@ class TestExpansion:
             'seq_len': [12, 18, 24, 32],
         }
         edges = [('forward_bars', 'high'), ('seq_len', 'low')]
-        new_space, logs = expand_search_space(space, edges)
+        new_space, logs, _ = expand_search_space(space, edges)
         assert 64 in new_space['forward_bars']
         assert 8 in new_space['seq_len']
         assert len(logs) >= 2  # forward_bars adds 64+96, seq_len adds 8
+
+    def test_categoricals_changed_flag(self):
+        """Categorical expansion sets categoricals_changed=True."""
+        space = {'forward_bars': [12, 18, 24, 32, 48]}
+        edges = [('forward_bars', 'high')]
+        _, _, cat_changed = expand_search_space(space, edges)
+        assert cat_changed is True
+
+    def test_categoricals_unchanged_for_float(self):
+        """Float-only expansion sets categoricals_changed=False."""
+        space = {'dropout': [0.10, 0.40]}
+        edges = [('dropout', 'high')]
+        _, _, cat_changed = expand_search_space(space, edges)
+        assert cat_changed is False
 
 
 # ---------------------------------------------------------------------------

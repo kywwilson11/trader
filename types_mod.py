@@ -75,3 +75,8 @@ class MacroRegime:
     @property
     def should_halt_stocks(self) -> bool:
         return self.vix is not None and self.vix > 35
+
+    @property
+    def should_block_risky_entries(self) -> bool:
+        """Block new entries in high-beta / speculative names when VIX > 25."""
+        return self.vix is not None and self.vix > 25

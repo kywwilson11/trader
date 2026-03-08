@@ -35,6 +35,7 @@ alpaca_emerg.txt
 gui_settings.json
 news_cache.json
 pipeline_status.json
+retrain_trigger.json
 *_predictions.json
 
 # LLM config (contains API keys)

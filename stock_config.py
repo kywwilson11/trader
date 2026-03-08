@@ -55,6 +55,17 @@ def save_stock_universe(symbols: list[str]) -> None:
         json.dump(clean, f, indent=2)
 
 
+# Leveraged ETFs: ticker -> leverage multiplier
+# Position sizes are divided by this factor to normalize risk
+LEVERAGED_ETFS = {
+    'TQQQ': 3,
+    'SOXL': 3,
+}
+
+# Safe-haven symbols allowed to trade during VIX > 25 defensive regimes
+SAFE_HAVEN_SYMBOLS = {'GLD', 'SLV', 'PALL', 'PPLT', 'OXY', 'COPX'}
+
+
 # Top cryptos by market cap (USD pairs on Alpaca)
 CRYPTO_SYMBOLS = [
     'BTC/USD',

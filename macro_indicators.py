@@ -241,6 +241,10 @@ def get_macro_regime(api=None, asset_type='crypto') -> 'MacroRegime':
 
     regime_label = '+'.join(labels) if labels else 'normal'
 
+    # In defensive or crisis regime, shorten VIX cache for faster reaction
+    if vix is not None and vix > 20:
+        _cache.pop('vix', None)  # Force refresh next call (15-min natural throttle)
+
     return MacroRegime(
         stress_level=stress,
         vix=vix,

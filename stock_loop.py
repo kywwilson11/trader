@@ -75,7 +75,7 @@ class StockLoop(BaseTradingLoop):
         self.top_symbols: list[str] = []
 
     def get_symbol_universe(self) -> list[str]:
-        return load_stock_universe()
+        return [s for s in load_stock_universe() if '/' not in s]
 
     def check_market_hours(self) -> bool:
         now = self._get_eastern_now()
@@ -316,6 +316,9 @@ class StockLoop(BaseTradingLoop):
             if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
                 continue
 
+            if self._is_hard_stop_locked(symbol):
+                continue
+
             pred = preds.get(symbol)
             if pred is None or pred < self.trade_threshold:
                 continue
@@ -349,6 +352,13 @@ class StockLoop(BaseTradingLoop):
             if self.macro_regime and self.macro_regime.should_halt_stocks:
                 logger.info("%s: Halted by VIX > 35", symbol)
                 continue
+
+            # VIX > 25: block risky entries, allow safe-havens
+            if self.macro_regime and self.macro_regime.should_block_risky_entries:
+                from stock_config import SAFE_HAVEN_SYMBOLS
+                if symbol not in SAFE_HAVEN_SYMBOLS:
+                    logger.info("%s: Blocked — VIX > 25 defensive (non-safe-haven)", symbol)
+                    continue
 
             # Compute position size
             sized_notional = self._compute_position_size(symbol, pred, quote)

@@ -44,8 +44,13 @@ from adaptive_config import (load_adaptive_state, get_search_space_for_trial,
 _STATUS_FILE = Path(__file__).resolve().parent.parent / 'pipeline_status.json'
 
 
+_SKIP_STATUS = False  # Set by --no-status flag
+
+
 def _write_pipeline_status(status):
     """Write pipeline_status.json, merging with existing data to preserve prior results."""
+    if _SKIP_STATUS:
+        return
     # Read existing status to preserve fields like crypto_final_score
     existing = {}
     try:
@@ -55,7 +60,7 @@ def _write_pipeline_status(status):
         pass
     existing.update(status)
     existing['updated_at'] = datetime.now().isoformat()
-    tmp = str(_STATUS_FILE) + '.tmp'
+    tmp = str(_STATUS_FILE) + f'.tmp.{os.getpid()}'
     try:
         with open(tmp, 'w') as f:
             json.dump(existing, f, indent=2)
@@ -96,6 +101,8 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='',
                         choices=['', 'refine', 'explore', 'initial'],
                         help='Adaptive mode (default: auto-detect from state)')
+    parser.add_argument('--no-status', action='store_true',
+                        help='Skip writing pipeline_status.json (parent handles it)')
     return parser.parse_args()
 
 
@@ -883,7 +890,8 @@ def main():
     final_score = best_state_holder['score']
     final_params = best_state_holder.get('cfg', {})
     if final_score > 0 and final_params:
-        adaptive_state = update_after_search(adaptive_state, final_score, final_params)
+        adaptive_state = update_after_search(adaptive_state, final_score, final_params,
+                                                   study_db_path=db_path)
         print(f"\n[ADAPTIVE] Updated state: mode={adaptive_state['mode']}, "
               f"cycles_without_improvement={adaptive_state['cycles_without_improvement']}")
         if adaptive_state.get('expansion_history'):
@@ -929,6 +937,8 @@ def main():
 
 if __name__ == '__main__':
     args = parse_args()
+    if args.no_status:
+        _SKIP_STATUS = True
     lock_label = f"hypersearch_v2_{args.prefix or 'crypto'}"
     with acquire_for_training(lock_label):
         main()

@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QComboBox, QCheckBox, QFrame,
     QSplitter, QGroupBox, QProgressBar, QToolBar,
     QSizePolicy, QLineEdit, QPushButton, QSpinBox,
-    QScrollArea,
+    QScrollArea, QMessageBox,
 )
 import pyqtgraph as pg
 import numpy as np
@@ -68,6 +68,29 @@ MODEL_FILES = {
     "Crypto": BASE_DIR / "model_v2.pth",
     "Stock": BASE_DIR / "stock_model_v2.pth",
 }
+
+STUDY_DBS = {
+    "Crypto": ("v2_study.db", "v2_search"),
+    "Stock": ("stock_v2_study.db", "stock_v2_search"),
+}
+
+
+def _get_best_score(name):
+    """Read best Optuna score for a model. Returns None on failure."""
+    db_file, study_name = STUDY_DBS.get(name, (None, None))
+    if not db_file:
+        return None
+    db_path = BASE_DIR / db_file
+    if not db_path.exists():
+        return None
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study = optuna.load_study(study_name=study_name,
+                                  storage=f"sqlite:///{db_path}")
+        return study.best_value
+    except Exception:
+        return None
 
 # Tax rates
 FED_SHORT_TERM = 0.37
@@ -1475,6 +1498,16 @@ def apply_theme(app):
             spacing: 8px; padding: 4px;
         }}
         QLabel#toolbar_label {{ color: {t["muted"].name()}; font-size: 11px; }}
+        QMessageBox {{ background-color: {t["bg_card"].name()}; color: {t["white"].name()}; }}
+        QMessageBox QLabel {{ color: {t["white"].name()}; }}
+        QMessageBox QPushButton {{
+            background-color: {t["bg_header"].name()}; color: {t["white"].name()};
+            border: 1px solid {t["bg_border"].name()}; border-radius: 4px;
+            padding: 6px 16px; min-width: 60px;
+        }}
+        QMessageBox QPushButton:hover {{
+            background-color: {t["accent"].name()}; color: {t["bg_dark"].name()};
+        }}
     """)
 
 
@@ -1745,6 +1778,25 @@ class TradingDashboard(QMainWindow):
                 f" border-radius: 4px; padding: 4px; }}"
             )
 
+        # Retrain buttons
+        if hasattr(self, '_retrain_crypto_btn'):
+            retrain_btn_style = (
+                f"QPushButton {{ background-color: {t['bg_header'].name()}; color: {t['white'].name()};"
+                f" border: 1px solid {t['bg_border'].name()}; border-radius: 4px;"
+                f" padding: 4px 12px; font-weight: bold; font-size: 11px; }}"
+                f" QPushButton:hover {{ background-color: {t['accent'].name()}; color: {t['bg_dark'].name()}; }}"
+                f" QPushButton:disabled {{ color: {t['muted'].name()}; background-color: {t['bg_dark'].name()}; }}"
+            )
+            for btn in [self._retrain_crypto_btn, self._retrain_stock_btn, self._retrain_both_btn]:
+                btn.setStyleSheet(retrain_btn_style)
+            cancel_btn_style = (
+                f"QPushButton {{ background-color: {t['bg_header'].name()}; color: {t['red'].name()};"
+                f" border: 1px solid {t['red'].name()}; border-radius: 4px;"
+                f" padding: 4px 12px; font-weight: bold; font-size: 11px; }}"
+                f" QPushButton:hover {{ background-color: {t['red'].name()}; color: white; }}"
+            )
+            self._retrain_cancel_btn.setStyleSheet(cancel_btn_style)
+
         # Clock
         self._clock_label_right.setStyleSheet(
             f"font-size: 12px; font-weight: bold; padding: 0 8px; color: {t['accent'].name()};"
@@ -1901,6 +1953,9 @@ class TradingDashboard(QMainWindow):
             self._manual_status.setStyleSheet(f"color: {T['red'].name()}; font-size: 11px;")
             return
 
+        # Disable buttons to prevent double-submit
+        self._manual_buy_btn.setEnabled(False)
+        self._manual_sell_btn.setEnabled(False)
         self._manual_status.setText("Submitting...")
         self._manual_status.setStyleSheet(f"color: {T['muted'].name()}; font-size: 11px;")
         QApplication.processEvents()
@@ -1932,9 +1987,20 @@ class TradingDashboard(QMainWindow):
             self._manual_status.setText(f"Error: {e}")
             self._manual_status.setStyleSheet(
                 f"color: {T['red'].name()}; font-size: 11px;")
+        finally:
+            self._manual_buy_btn.setEnabled(True)
+            self._manual_sell_btn.setEnabled(True)
 
     def _close_position(self, symbol):
         """Close a position by market-selling the entire qty."""
+        # Confirmation dialog to prevent accidental liquidation
+        reply = QMessageBox.question(
+            self, "Close Position",
+            f"Close entire {symbol} position at market price?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
         self._manual_status.setText(f"Closing {symbol}...")
         self._manual_status.setStyleSheet(f"color: {T['muted'].name()}; font-size: 11px;")
         QApplication.processEvents()
@@ -2603,9 +2669,9 @@ class TradingDashboard(QMainWindow):
         model_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         layout.addWidget(model_label)
 
-        self._model_table = QTableWidget(0, 9)
+        self._model_table = QTableWidget(0, 10)
         self._model_table.setHorizontalHeaderLabels(
-            ["Model", "Status", "Last Trained", "Age",
+            ["Model", "Status", "Score", "Last Trained", "Age",
              "Hidden Dim", "Layers", "Seq Len", "Threshold", "Preset"]
         )
         self._model_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -2637,6 +2703,33 @@ class TradingDashboard(QMainWindow):
         pipeline_layout.addWidget(self._pipeline_elapsed, 3, 0)
         pipeline_layout.addWidget(self._pipeline_scores, 3, 1)
         pipeline_layout.addWidget(self._pipeline_retrain, 4, 0, 1, 2)
+
+        # Manual retrain controls
+        retrain_row = QHBoxLayout()
+        self._retrain_crypto_btn = QPushButton("Retrain Crypto")
+        self._retrain_stock_btn = QPushButton("Retrain Stocks")
+        self._retrain_both_btn = QPushButton("Retrain Both")
+        self._retrain_cancel_btn = QPushButton("Cancel")
+        self._retrain_cancel_btn.setVisible(False)
+        self._retrain_status = QLabel("")
+        self._retrain_status.setStyleSheet("font-size: 11px;")
+        for btn in [self._retrain_crypto_btn, self._retrain_stock_btn, self._retrain_both_btn]:
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.PointingHandCursor)
+        self._retrain_cancel_btn.setFixedHeight(28)
+        self._retrain_cancel_btn.setCursor(Qt.PointingHandCursor)
+        self._retrain_crypto_btn.clicked.connect(lambda: self._trigger_retrain(crypto=True, stock=False))
+        self._retrain_stock_btn.clicked.connect(lambda: self._trigger_retrain(crypto=False, stock=True))
+        self._retrain_both_btn.clicked.connect(lambda: self._trigger_retrain(crypto=True, stock=True))
+        self._retrain_cancel_btn.clicked.connect(self._cancel_retrain)
+        retrain_row.addWidget(self._retrain_crypto_btn)
+        retrain_row.addWidget(self._retrain_stock_btn)
+        retrain_row.addWidget(self._retrain_both_btn)
+        retrain_row.addWidget(self._retrain_cancel_btn)
+        retrain_row.addWidget(self._retrain_status)
+        retrain_row.addStretch()
+        pipeline_layout.addLayout(retrain_row, 5, 0, 1, 2)
+
         layout.addWidget(pipeline_group)
 
         hw_group = QGroupBox("Hardware")
@@ -3003,6 +3096,7 @@ class TradingDashboard(QMainWindow):
 
     def _on_test_llm(self):
         """Test LLM connection with a trivial prompt."""
+        self._settings_test_btn.setEnabled(False)
         self._settings_test_status.setText("Testing...")
         self._settings_test_status.setStyleSheet("")
         QApplication.processEvents()
@@ -3027,6 +3121,8 @@ class TradingDashboard(QMainWindow):
         except Exception as e:
             self._settings_test_status.setText(f"Error: {e}")
             self._settings_test_status.setStyleSheet(f"color: {T['red'].name()};")
+        finally:
+            self._settings_test_btn.setEnabled(True)
 
     def _on_indicator_preset_changed(self, _index):
         """Save new preset and update feature display."""
@@ -3391,9 +3487,13 @@ class TradingDashboard(QMainWindow):
         articles = getattr(self, '_news_articles', [])
 
         if idx == 0:  # My Universe
-            crypto_bases = {s.split('/')[0] for s in CRYPTO_SYMBOLS}
-            stock_set = set(load_stock_universe())
-            universe = crypto_bases | stock_set
+            # Cache universe set to avoid re-reading file on every filter call
+            if not hasattr(self, '_news_universe_cache') or self._news_universe_age < _dt.datetime.now().timestamp() - 60:
+                crypto_bases = {s.split('/')[0] for s in CRYPTO_SYMBOLS}
+                stock_set = set(load_stock_universe())
+                self._news_universe_cache = crypto_bases | stock_set
+                self._news_universe_age = _dt.datetime.now().timestamp()
+            universe = self._news_universe_cache
             filtered = []
             for a in articles:
                 sym = a.get('_symbol', '')
@@ -3476,6 +3576,13 @@ class TradingDashboard(QMainWindow):
 
     @Slot(str)
     def on_error(self, msg):
+        import time as _time
+        now = _time.monotonic()
+        # Decay: reset count if >5 min since last error (transient blip, not ongoing)
+        last = getattr(self, '_last_error_time', 0)
+        if now - last > 300:
+            self._error_count = 0
+        self._last_error_time = now
         self._error_count += 1
         self._status_conn.setText(f"API: ERR({self._error_count})")
         self._status_conn.setStyleSheet(f"color: {T['red'].name()};")
@@ -3584,6 +3691,74 @@ class TradingDashboard(QMainWindow):
                 self._log_display.verticalScrollBar().setValue(
                     self._log_display.verticalScrollBar().maximum())
 
+    def _trigger_retrain(self, crypto=False, stock=False):
+        """Write a retrain trigger file for the pipeline to pick up."""
+        trigger_path = BASE_DIR / "retrain_trigger.json"
+
+        # Check if pipeline is running
+        status_path = BASE_DIR / "pipeline_status.json"
+        is_running = False
+        is_training = False
+        try:
+            age = dt.datetime.now().timestamp() - status_path.stat().st_mtime
+            is_running = age < 600
+            if is_running:
+                pinfo = _read_pipeline_status()
+                phase = pinfo.get("phase", "")
+                is_training = phase not in ("trading", "idle", "failed", "complete", "")
+        except OSError:
+            pass
+
+        if not is_running:
+            self._retrain_status.setText("Pipeline not running")
+            self._retrain_status.setStyleSheet(f"color: {T['red'].name()}; font-size: 11px;")
+            return
+
+        # Build description for confirmation
+        parts = []
+        if crypto:
+            parts.append("Crypto")
+        if stock:
+            parts.append("Stocks")
+        target = " + ".join(parts)
+
+        if is_training:
+            msg = (f"Training is already in progress.\n"
+                   f"Queue {target} retrain to start after current phase?")
+        else:
+            msg = f"Start {target} retraining now?"
+
+        reply = QMessageBox.question(
+            self, "Retrain Models", msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        # Write trigger file
+        try:
+            trigger = {"crypto": crypto, "stock": stock}
+            tmp = str(trigger_path) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(trigger, f)
+            os.replace(tmp, str(trigger_path))
+            self._retrain_status.setText(f"{target} retrain queued")
+            self._retrain_status.setStyleSheet(f"color: {T['green'].name()}; font-size: 11px;")
+        except Exception as e:
+            self._retrain_status.setText(f"Error: {e}")
+            self._retrain_status.setStyleSheet(f"color: {T['red'].name()}; font-size: 11px;")
+
+    def _cancel_retrain(self):
+        """Remove a pending retrain trigger file."""
+        trigger_path = BASE_DIR / "retrain_trigger.json"
+        try:
+            if trigger_path.exists():
+                trigger_path.unlink()
+            self._retrain_status.setText("Retrain cancelled")
+            self._retrain_status.setStyleSheet(f"color: {T['muted'].name()}; font-size: 11px;")
+        except Exception as e:
+            self._retrain_status.setText(f"Cancel error: {e}")
+            self._retrain_status.setStyleSheet(f"color: {T['red'].name()}; font-size: 11px;")
+
     def _refresh_models_tab(self):
         now_ts = dt.datetime.now().timestamp()
         configs = []
@@ -3621,21 +3796,26 @@ class TradingDashboard(QMainWindow):
                 age_str = f"{age_hours / 24:.0f}d"
                 status_color = T["red"]
 
+            best_score = _get_best_score(name)
+            score_str = f"{best_score:.3f}" if best_score is not None else "\u2014"
+
             if cfg:
-                vals = [name, status, mod_time, age_str,
+                vals = [name, status, score_str, mod_time, age_str,
                         str(cfg.get("hidden_dim", "?")),
                         str(cfg.get("num_layers", "?")),
                         str(cfg.get("seq_len", "?")),
                         str(cfg.get("trade_threshold", "?")),
                         str(cfg.get("indicator_preset", "N/A"))]
             else:
-                vals = [name, status, "Not found", age_str,
+                vals = [name, status, score_str, "Not found", age_str,
                         "\u2014", "\u2014", "\u2014", "\u2014", "\u2014"]
             for col, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setTextAlignment(Qt.AlignCenter)
                 if col == 1:
                     item.setForeground(status_color)
+                elif col == 2 and best_score is not None:
+                    item.setForeground(T["green"] if best_score > 3 else T["yellow"])
                 self._model_table.setItem(row, col, item)
         self._model_table.setUpdatesEnabled(True)
 
@@ -3651,7 +3831,7 @@ class TradingDashboard(QMainWindow):
         status_path = BASE_DIR / "pipeline_status.json"
         try:
             age = now_ts - status_path.stat().st_mtime
-            is_running = age < 60
+            is_running = age < 600  # Trials can take up to 10 minutes
         except OSError:
             pass
 
@@ -3755,6 +3935,55 @@ class TradingDashboard(QMainWindow):
             except (ValueError, TypeError):
                 pass
         self._pipeline_retrain.setText(retrain_text)
+
+        # --- Retrain button states ---
+        trigger_path = BASE_DIR / "retrain_trigger.json"
+        trigger_pending = trigger_path.exists()
+        # Auto-expire stale trigger (>5 min = pipeline didn't pick it up)
+        if trigger_pending:
+            try:
+                trigger_age = now_ts - trigger_path.stat().st_mtime
+                if trigger_age > 300:
+                    trigger_path.unlink()
+                    trigger_pending = False
+            except OSError:
+                trigger_pending = False
+        is_actively_training = (is_running and phase not in
+                                ("trading", "idle", "failed", "complete", ""))
+
+        if trigger_pending:
+            # Trigger written, waiting for pipeline to pick it up — show cancel
+            for btn in [self._retrain_crypto_btn, self._retrain_stock_btn, self._retrain_both_btn]:
+                btn.setEnabled(False)
+            self._retrain_cancel_btn.setVisible(True)
+            self._retrain_status.setText("Retrain queued — waiting for pipeline...")
+            self._retrain_status.setStyleSheet(f"color: {T['accent'].name()}; font-size: 11px;")
+        elif not is_running:
+            for btn in [self._retrain_crypto_btn, self._retrain_stock_btn, self._retrain_both_btn]:
+                btn.setEnabled(False)
+            self._retrain_cancel_btn.setVisible(False)
+            self._retrain_status.setText("Pipeline not running")
+            self._retrain_status.setStyleSheet(f"color: {T['muted'].name()}; font-size: 11px;")
+        else:
+            for btn in [self._retrain_crypto_btn, self._retrain_stock_btn, self._retrain_both_btn]:
+                btn.setEnabled(True)
+            self._retrain_cancel_btn.setVisible(False)
+            if is_actively_training:
+                # Training in progress — show which phase
+                training_what = ""
+                if "crypto" in phase:
+                    training_what = "crypto"
+                elif "stock" in phase:
+                    training_what = "stock"
+                self._retrain_status.setText(
+                    f"Training {training_what} in progress" if training_what
+                    else "Training in progress")
+                self._retrain_status.setStyleSheet(f"color: {T['accent'].name()}; font-size: 11px;")
+            else:
+                # Clear stale status messages
+                cur = self._retrain_status.text().lower()
+                if "queued" in cur or "cancelled" in cur:
+                    self._retrain_status.setText("")
 
         # --- LLM Usage ---
         try:

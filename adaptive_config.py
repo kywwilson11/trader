@@ -167,12 +167,14 @@ def detect_edges(best_params: dict, search_space: dict) -> list:
 def expand_search_space(search_space: dict, edges: list) -> tuple:
     """Expand search space for parameters at edges.
 
-    Returns (new_search_space, log_entries) where log_entries describe
-    what was expanded.
+    Returns (new_search_space, log_entries, categoricals_changed) where
+    log_entries describe what was expanded and categoricals_changed is True
+    if any categorical distribution was modified (requires Optuna study DB reset).
     """
     import copy
     new_space = copy.deepcopy(search_space)
     log_entries = []
+    categoricals_changed = False
 
     for param, direction in edges:
         if param not in EXPANSION_POOLS:
@@ -195,6 +197,7 @@ def expand_search_space(search_space: dict, edges: list) -> tuple:
                     continue
                 if val not in current:
                     current.add(val)
+                    categoricals_changed = True
                     log_entries.append(
                         f"{param}: added {val} ({direction} expansion)")
             new_space[param] = sorted(current)
@@ -215,7 +218,7 @@ def expand_search_space(search_space: dict, edges: list) -> tuple:
                     hi = new_hi
             new_space[param] = [lo, hi]
 
-    return new_space, log_entries
+    return new_space, log_entries, categoricals_changed
 
 
 def decide_mode(state: dict, new_best_score: float) -> str:
@@ -261,13 +264,15 @@ def get_search_space_for_trial(state: dict) -> dict:
 
 
 def update_after_search(state: dict, new_best_score: float,
-                        new_best_params: dict) -> dict:
+                        new_best_params: dict,
+                        study_db_path: str = None) -> dict:
     """Update adaptive state after a hypersearch completes.
 
     Handles:
       - Score tracking and improvement detection
       - Edge detection and search space expansion
       - Mode transitions
+      - Deleting stale Optuna study DB when categorical distributions change
     """
     old_score = state.get('best_score', 0.0)
 
@@ -286,7 +291,7 @@ def update_after_search(state: dict, new_best_score: float,
     # Detect edges and expand if needed
     edges = detect_edges(state['best_params'], state['search_space'])
     if edges:
-        new_space, log_entries = expand_search_space(
+        new_space, log_entries, categoricals_changed = expand_search_space(
             state['search_space'], edges)
         state['search_space'] = new_space
         if log_entries:
@@ -296,6 +301,13 @@ def update_after_search(state: dict, new_best_score: float,
                 'expansions': log_entries,
             }
             state['expansion_history'].append(entry)
+
+        # Optuna doesn't allow changing categorical distributions in an
+        # existing study.  Delete the study DB so the next run starts fresh.
+        if categoricals_changed and study_db_path and os.path.exists(study_db_path):
+            os.remove(study_db_path)
+            print(f"[ADAPTIVE] Deleted {study_db_path} "
+                  f"(categorical search space expanded — incompatible with old study)")
 
     # Decide next mode
     state['mode'] = decide_mode(state, new_best_score)

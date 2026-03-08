@@ -69,6 +69,7 @@ class BaseTradingLoop(ABC):
     TAKE_PROFIT_CEIL_PCT: float = 0.25
     STOP_LOSS_PCT: float = 0.04  # fallback fixed
     TRAIL_PCT: float = 0.03
+    HARD_STOP_LOCKOUT_HOURS: int = 24  # cooldown after hard stop
 
     def __init__(self):
         self.api = get_api()
@@ -79,6 +80,7 @@ class BaseTradingLoop(ABC):
         self.trade_threshold = 0.15
         self.positions: dict[str, Position] = {}
         self.last_trade_time: dict[str, datetime.datetime] = {}
+        self.hard_stop_lockout: dict[str, datetime.datetime] = {}
         self.llm_scores: dict = {}
         self._last_llm_time = 0.0
         self.model_mtime = 0
@@ -245,6 +247,17 @@ class BaseTradingLoop(ABC):
                      self.COOLDOWN_MINUTES)
         logger.info("Risk management: GARCH + Macro regime + Correlation + Kelly")
 
+        # Pre-load cached LLM scores from disk
+        try:
+            from llm_analyst import load_analysis
+            data = load_analysis()
+            section = data.get(self.get_asset_type(), {})
+            if section:
+                self.llm_scores = section
+                logger.info("[LLM] Loaded %d cached scores from disk", len(section))
+        except Exception:
+            pass
+
     def _circuit_breaker_check(self) -> bool:
         """Check circuit breaker. Returns True if tripped (caller should continue)."""
         try:
@@ -370,8 +383,27 @@ class BaseTradingLoop(ABC):
                                  exit_reason=stop_reason)
                     del self.positions[symbol]
                     self.last_trade_time[symbol] = datetime.datetime.now()
+                    if stop_reason == 'hard_stop':
+                        self.hard_stop_lockout[symbol] = datetime.datetime.now()
+                        logger.info("[LOCKOUT] %s: %dh lockout after hard stop",
+                                    symbol, self.HARD_STOP_LOCKOUT_HOURS)
                 except Exception as e:
+                    err_msg = str(e).lower()
                     logger.error("[STOP] %s: Sell error: %s", symbol, e)
+                    # Position no longer exists at broker — remove from tracking
+                    if ('insufficient qty' in err_msg
+                            or 'position does not exist' in err_msg
+                            or 'not found' in err_msg
+                            or 'available: 0' in err_msg):
+                        logger.warning("[DESYNC] %s: Position gone at broker, removing from tracking", symbol)
+                        pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                        llm_info = self.llm_scores.get(symbol, {})
+                        record_trade(symbol, 'sell', entry_price, current_price,
+                                     pnl_pct, llm_score=llm_info.get('s'),
+                                     reasoning='position desync — broker qty=0',
+                                     exit_reason='desync')
+                        del self.positions[symbol]
+                        self.last_trade_time[symbol] = datetime.datetime.now()
 
     def _get_predictions(self, benchmark_close) -> tuple[dict, dict]:
         """Get predictions for all symbols in parallel."""
@@ -413,6 +445,9 @@ class BaseTradingLoop(ABC):
         """Run LLM pre-trade analysis if interval elapsed."""
         now_ts = time.time()
         if now_ts - self._last_llm_time < self.LLM_INTERVAL_SEC:
+            # Even if interval hasn't elapsed, check for stale disk cache
+            # and warn if scores are being used from hours-old analysis
+            self._check_llm_staleness()
             return
 
         llm_cfg = load_llm_config()
@@ -433,6 +468,37 @@ class BaseTradingLoop(ABC):
             self._last_llm_time = now_ts
             logger.info("[LLM] Scores: %s",
                         ", ".join(f"{s}={v.get('s', 0.5):.2f}" for s, v in self.llm_scores.items()))
+
+    def _check_llm_staleness(self):
+        """Warn and force refresh if LLM scores on disk are stale (> 2 hours)."""
+        if not self.llm_scores:
+            return
+        from llm_analyst import load_analysis
+        from datetime import datetime, timezone
+        try:
+            data = load_analysis()
+            section = data.get(self.get_asset_type(), {})
+            if not section:
+                return
+            # Check oldest timestamp in section
+            oldest_ts = None
+            for sym, entry in section.items():
+                ts_str = entry.get('timestamp', '')
+                if ts_str:
+                    try:
+                        ts = datetime.fromisoformat(ts_str)
+                        if oldest_ts is None or ts < oldest_ts:
+                            oldest_ts = ts
+                    except ValueError:
+                        pass
+            if oldest_ts is not None:
+                age_hours = (datetime.now(timezone.utc) - oldest_ts).total_seconds() / 3600
+                if age_hours > 2:
+                    logger.warning("[LLM] Scores are %.1fh stale — forcing refresh next cycle",
+                                   age_hours)
+                    self._last_llm_time = 0  # Force refresh
+        except Exception:
+            pass
 
     def _build_llm_candidates(self, preds: dict) -> list[dict]:
         """Build candidate list for LLM analysis. Override for stock-specific fundamentals."""
@@ -515,7 +581,8 @@ class BaseTradingLoop(ABC):
             confidence = 1.0
         sized = base * confidence
 
-        # GARCH vol-targeted sizing
+        # Fetch bars once for both GARCH and HMM
+        returns = None
         try:
             from market_data import fetch_bars_alpaca, fetch_stock_bars_alpaca
             if self.get_asset_type() == 'crypto':
@@ -524,11 +591,17 @@ class BaseTradingLoop(ABC):
                 df = fetch_stock_bars_alpaca(self.api, symbol)
             if df is not None and len(df) > 100:
                 returns = df['Close'].pct_change().dropna().values * 100
+        except Exception:
+            pass
+
+        # GARCH vol-targeted sizing
+        if returns is not None:
+            try:
                 sigma = get_cached_sigma(symbol, returns)
                 if sigma is not None:
                     sized = compute_vol_adjusted_size(sized, sigma)
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         # Macro regime multiplier
         if self.macro_regime:
@@ -541,26 +614,39 @@ class BaseTradingLoop(ABC):
             sized *= corr_factor
 
         # HMM regime multiplier
-        try:
-            from market_data import fetch_bars_alpaca, fetch_stock_bars_alpaca
-            if self.get_asset_type() == 'crypto':
-                df = fetch_bars_alpaca(self.api, symbol)
-            else:
-                df = fetch_stock_bars_alpaca(self.api, symbol)
-            if df is not None and len(df) > 200:
-                returns = df['Close'].pct_change().dropna().values * 100
+        if returns is not None and len(returns) > 200:
+            try:
                 regime = get_cached_regime(symbol, returns)
                 sized *= regime['sizing_mult']
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+        # Leveraged ETF scaling: divide by leverage factor
+        from stock_config import LEVERAGED_ETFS
+        leverage = LEVERAGED_ETFS.get(symbol, 1)
+        if leverage > 1:
+            sized /= leverage
 
         return max(1, int(sized))
+
+    def _is_hard_stop_locked(self, symbol: str) -> bool:
+        """Check if symbol is in hard-stop lockout period."""
+        if symbol not in self.hard_stop_lockout:
+            return False
+        elapsed = (datetime.datetime.now() - self.hard_stop_lockout[symbol]).total_seconds()
+        if elapsed >= self.HARD_STOP_LOCKOUT_HOURS * 3600:
+            del self.hard_stop_lockout[symbol]
+            return False
+        return True
 
     def _execute_buys(self, preds: dict, snapshots: dict):
         """Buy bullish symbols with all risk checks."""
         symbols = self.get_symbol_universe()
         for symbol in symbols:
             if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
+                continue
+
+            if self._is_hard_stop_locked(symbol):
                 continue
 
             # Position cap check
@@ -604,6 +690,14 @@ class BaseTradingLoop(ABC):
             if self.macro_regime and self.macro_regime.should_halt_stocks and self.get_asset_type() == 'stock':
                 logger.info("%s: Halted by VIX > 35", symbol)
                 continue
+
+            # VIX > 25: block risky entries, allow safe-havens
+            if (self.macro_regime and self.macro_regime.should_block_risky_entries
+                    and self.get_asset_type() == 'stock'):
+                from stock_config import SAFE_HAVEN_SYMBOLS
+                if symbol not in SAFE_HAVEN_SYMBOLS:
+                    logger.info("%s: Blocked — VIX > 25 defensive (non-safe-haven)", symbol)
+                    continue
 
             # Compute position size with all adjustments
             sized_notional = self._compute_position_size(symbol, pred_return, quote)

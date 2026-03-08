@@ -30,6 +30,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from adaptive_config import (load_adaptive_state, decide_mode, get_trial_count,
@@ -41,6 +42,38 @@ LOG_FILE = os.path.join(BASE_DIR, 'pipeline_output.log')
 CRYPTO_BOT_LOG = os.path.join(BASE_DIR, 'crypto_bot_output.log')
 STOCK_BOT_LOG = os.path.join(BASE_DIR, 'stock_bot_output.log')
 PYTHON = '/home/kyle/miniforge3/envs/jetson/bin/python'
+RETRAIN_TRIGGER = os.path.join(BASE_DIR, 'retrain_trigger.json')
+# Skip stdout writes when redirected to same log file (avoids doubled lines)
+_STDOUT_IS_TTY = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+
+
+def _print(*args, **kwargs):
+    """Print only when stdout is a terminal (avoids doubling when redirected to log)."""
+    if _STDOUT_IS_TTY:
+        print(*args, **kwargs)
+
+
+def _check_retrain_trigger():
+    """Check for and consume a manual retrain trigger file from the GUI.
+
+    Returns dict {'crypto': bool, 'stock': bool} if trigger found, else None.
+    """
+    try:
+        if os.path.exists(RETRAIN_TRIGGER):
+            with open(RETRAIN_TRIGGER) as f:
+                trigger = json.load(f)
+            os.remove(RETRAIN_TRIGGER)
+            if trigger.get('crypto') or trigger.get('stock'):
+                return trigger
+    except (OSError, json.JSONDecodeError, KeyError):
+        # Remove malformed trigger file
+        try:
+            os.remove(RETRAIN_TRIGGER)
+        except OSError:
+            pass
+    return None
+
+
 ENV = {
     **os.environ,
     'LD_LIBRARY_PATH': (
@@ -60,9 +93,26 @@ STATUS_WRITE_INTERVAL = 2.0  # seconds
 DAYS_OF_WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday',
                 'Friday', 'Saturday', 'Sunday']
 
+# Heartbeat: re-write status every 30s so GUI knows pipeline is alive
+_heartbeat_status = None  # Reference to current status dict
+_heartbeat_stop = threading.Event()
+_heartbeat_lock = threading.Lock()
+
+
+def _heartbeat_loop():
+    """Background thread: re-write status file every 30s."""
+    while not _heartbeat_stop.wait(30):
+        with _heartbeat_lock:
+            if _heartbeat_status is not None:
+                write_status(_heartbeat_status, force=True)
+
 
 def write_status(status, force=False):
-    """Write pipeline status to JSON, throttled to every 2 seconds."""
+    """Write pipeline status to JSON, throttled to every 2 seconds.
+
+    Thread-safe: callers should hold _heartbeat_lock when mutating status
+    from background threads.
+    """
     global _last_status_write
     now = time.time()
     if not force and (now - _last_status_write) < STATUS_WRITE_INTERVAL:
@@ -76,7 +126,7 @@ def write_status(status, force=False):
     except (ValueError, TypeError):
         pass
     status['elapsed_sec'] = int(elapsed)
-    tmp = STATUS_FILE + '.tmp'
+    tmp = STATUS_FILE + f'.tmp.{os.getpid()}'
     try:
         with open(tmp, 'w') as f:
             json.dump(status, f, indent=2)
@@ -113,7 +163,7 @@ def run_phase(phase, log_fh, status):
     )
     log_fh.write(header)
     log_fh.flush()
-    print(header, end='')
+    _print(header, end='')
 
     proc = subprocess.Popen(
         phase['cmd'],
@@ -129,8 +179,9 @@ def run_phase(phase, log_fh, status):
         for line in proc.stdout:
             log_fh.write(line)
             log_fh.flush()
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            if _STDOUT_IS_TTY:
+                sys.stdout.write(line)
+                sys.stdout.flush()
 
             # Parse prior trials: "Resuming from 119 prior trials in bear_study.db"
             m = re.match(r'Resuming from (\d+) prior trials', line)
@@ -161,7 +212,7 @@ def run_phase(phase, log_fh, status):
 
             write_status(status, force=force)
     except Exception as e:
-        print(f"\n[PIPELINE] Error reading phase output: {e}")
+        _print(f"\n[PIPELINE] Error reading phase output: {e}")
     finally:
         proc.wait()
     status['phase_exit_code'] = proc.returncode
@@ -177,7 +228,7 @@ def run_phase(phase, log_fh, status):
     footer = f"\n--- Phase complete (exit {proc.returncode}){elapsed} ---\n"
     log_fh.write(footer)
     log_fh.flush()
-    print(footer, end='')
+    _print(footer, end='')
 
     write_status(status, force=True)
     return proc.returncode
@@ -219,7 +270,7 @@ def _check_restart_bots(bots, log_fh):
                    f" restarted as PID {new_proc.pid}\n")
             log_fh.write(msg)
             log_fh.flush()
-            print(msg, end='')
+            _print(msg, end='')
 
 
 def _next_retrain_time(retrain_day, retrain_hour):
@@ -260,7 +311,7 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
     if train_crypto:
         age_h = _get_data_age_hours('crypto')
         if age_h is not None and age_h < 24:
-            print(f"Crypto training data is {age_h:.1f}h old, skipping harvest")
+            _print(f"Crypto training data is {age_h:.1f}h old, skipping harvest")
         else:
             phases.append({
                 'id': 'crypto_harvest',
@@ -271,7 +322,7 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
     if train_stock:
         age_h = _get_data_age_hours('stock')
         if age_h is not None and age_h < 24:
-            print(f"Stock training data is {age_h:.1f}h old, skipping harvest")
+            _print(f"Stock training data is {age_h:.1f}h old, skipping harvest")
         else:
             phases.append({
                 'id': 'stock_harvest',
@@ -288,7 +339,7 @@ def _build_training_phases(trials, train_crypto, train_stock, mode=''):
 
     if train_crypto:
         cmd = [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
-               '--trials', str(trials), '--preset', 'stationary']
+               '--trials', str(trials), '--preset', 'stationary', '--no-status']
         if mode:
             cmd += ['--mode', mode]
         phases.append({
@@ -301,7 +352,7 @@ def _build_training_phases(trials, train_crypto, train_stock, mode=''):
         cmd = [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
                '--trials', str(trials),
                '--data', 'stock_training_data.csv', '--prefix', 'stock',
-               '--preset', 'stationary', '--max-rows', '350000']
+               '--preset', 'stationary', '--max-rows', '200000', '--no-status']
         if mode:
             cmd += ['--mode', mode]
         phases.append({
@@ -314,10 +365,32 @@ def _build_training_phases(trials, train_crypto, train_stock, mode=''):
     return phases
 
 
+MAX_PHASE_RETRIES = 3
+RETRY_WAIT_SECONDS = 30
+
+
 def _run_training(phases, log_fh, status, is_retrain):
     """Run all training phases. Returns True if all succeeded."""
     for phase in phases:
-        rc = run_phase(phase, log_fh, status)
+        for attempt in range(1, MAX_PHASE_RETRIES + 1):
+            rc = run_phase(phase, log_fh, status)
+            if rc == 0:
+                break
+            # Failed — retry with fresh CUDA context (Optuna DB preserves progress)
+            if attempt < MAX_PHASE_RETRIES:
+                msg = (f"\n[RETRY] {phase['label']} failed (exit {rc}), "
+                       f"attempt {attempt}/{MAX_PHASE_RETRIES}. "
+                       f"Waiting {RETRY_WAIT_SECONDS}s for memory to clear...\n")
+                log_fh.write(msg)
+                log_fh.flush()
+                _print(msg, end='')
+                time.sleep(RETRY_WAIT_SECONDS)
+            else:
+                msg = (f"\n[FAILED] {phase['label']} failed after "
+                       f"{MAX_PHASE_RETRIES} attempts\n")
+                log_fh.write(msg)
+                log_fh.flush()
+                _print(msg, end='')
 
         # Save final scores
         if phase['id'] == 'crypto_search':
@@ -331,13 +404,13 @@ def _run_training(phases, log_fh, status, is_retrain):
                        f" bots continue with existing models\n")
                 log_fh.write(msg)
                 log_fh.flush()
-                print(msg, end='')
+                _print(msg, end='')
                 return False
             else:
                 msg = f"\nPIPELINE STOPPED: {phase['label']} failed (exit {rc})\n"
                 log_fh.write(msg)
                 log_fh.flush()
-                print(msg, end='')
+                _print(msg, end='')
                 status['phase'] = 'failed'
                 status['phase_label'] = f"Failed: {phase['label']}"
                 write_status(status, force=True)
@@ -383,13 +456,13 @@ def _signal_handler(signum, frame):
         return  # Prevent re-entry
     _shutdown_requested = True
     sig_name = signal.Signals(signum).name
-    print(f"\n[PIPELINE] {sig_name} received, shutting down...")
+    _print(f"\n[PIPELINE] {sig_name} received, shutting down...")
     # Stop bot processes
     for name, proc, fh in _all_bots:
         try:
             if proc.poll() is None:
                 proc.terminate()
-                print(f"  Stopped {name} bot (PID {proc.pid})")
+                _print(f"  Stopped {name} bot (PID {proc.pid})")
         except Exception:
             pass
     _terminate_procs(_all_procs)
@@ -421,11 +494,20 @@ def main():
 
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGHUP, _signal_handler)
 
     train_crypto = not args.stock_only
     train_stock = not args.crypto_only
     run_crypto = not args.stock_only
     run_stock = not args.crypto_only
+
+    # Preserve final scores from previous runs (e.g. crypto score when restarting stock-only)
+    prev_status = {}
+    try:
+        with open(STATUS_FILE) as f:
+            prev_status = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
 
     status = {
         'started_at': datetime.datetime.now().isoformat(),
@@ -436,14 +518,19 @@ def main():
         'trial_current': 0,
         'trial_total': 0,
         'best_score': 0.0,
-        'crypto_final_score': None,
-        'stock_final_score': None,
+        'crypto_final_score': prev_status.get('crypto_final_score'),
+        'stock_final_score': prev_status.get('stock_final_score'),
         'retrain_cycle': 0,
         'bots_running': False,
     }
 
     log_fh = open(LOG_FILE, 'a')
     _all_handles.append(log_fh)
+
+    global _heartbeat_status
+    _heartbeat_status = status
+    hb = threading.Thread(target=_heartbeat_loop, daemon=True)
+    hb.start()
 
     try:
         # =============================================================
@@ -471,7 +558,7 @@ def main():
             )
             log_fh.write(banner)
             log_fh.flush()
-            print(banner, end='')
+            _print(banner, end='')
 
             # Start background sentiment fetch (runs during training)
             sentiment_proc = None
@@ -489,12 +576,12 @@ def main():
                 msg = f"Background sentiment fetch started (PID {sentiment_proc.pid})\n"
                 log_fh.write(msg)
                 log_fh.flush()
-                print(msg, end='')
+                _print(msg, end='')
             except Exception as e:
                 msg = f"Sentiment fetch failed to start: {e}\n"
                 log_fh.write(msg)
                 log_fh.flush()
-                print(msg, end='')
+                _print(msg, end='')
 
             _run_training(phases, log_fh, status, is_retrain=False)
 
@@ -510,7 +597,7 @@ def main():
             msg = f"Crypto bot started (PID {proc.pid}, log: crypto_bot_output.log)\n"
             log_fh.write(msg)
             log_fh.flush()
-            print(msg, end='')
+            _print(msg, end='')
 
         if run_stock:
             proc, bot_fh = _start_bot([PYTHON, '-u', 'stock_loop.py'], STOCK_BOT_LOG)
@@ -519,7 +606,7 @@ def main():
             msg = f"Stock bot started (PID {proc.pid}, log: stock_bot_output.log)\n"
             log_fh.write(msg)
             log_fh.flush()
-            print(msg, end='')
+            _print(msg, end='')
 
         status['phase'] = 'trading'
         status['phase_label'] = 'Trading'
@@ -544,24 +631,73 @@ def main():
             msg = f"Backfill worker started (PID {backfill_proc.pid})\n"
             log_fh.write(msg)
             log_fh.flush()
-            print(msg, end='')
+            _print(msg, end='')
         except Exception as e:
             msg = f"Backfill worker failed to start: {e}\n"
             log_fh.write(msg)
             log_fh.flush()
-            print(msg, end='')
+            _print(msg, end='')
 
-        # --- No retrain: wait forever ---
+        # --- No retrain: wait forever (but still accept manual triggers) ---
         if args.no_retrain:
-            msg = "Retrain disabled, bots running until manually stopped.\n"
+            msg = "Scheduled retrain disabled, bots running. Manual retrain still available.\n"
             log_fh.write(msg)
             log_fh.flush()
-            print(msg, end='')
-            if bots:
-                # Block forever, restarting crashed bots
-                while not _shutdown_requested:
-                    time.sleep(60)
-                    _check_restart_bots(bots, log_fh)
+            _print(msg, end='')
+            status['phase'] = 'trading'
+            status['phase_label'] = 'Trading (no auto-retrain)'
+            write_status(status, force=True)
+            manual_cycle = 0
+            while not _shutdown_requested:
+                time.sleep(60)
+                _check_restart_bots(bots, log_fh)
+                trigger = _check_retrain_trigger()
+                if trigger:
+                    manual_cycle += 1
+                    rt_crypto = trigger.get('crypto', False)
+                    rt_stock = trigger.get('stock', False)
+                    msg = (f"\n[MANUAL RETRAIN] Triggered from GUI: "
+                           f"crypto={rt_crypto}, stock={rt_stock}\n")
+                    log_fh.write(msg)
+                    log_fh.flush()
+                    _print(msg, end='')
+                    try:
+                        from sentiment_history import set_live_mode
+                        set_live_mode(False)
+                    except Exception:
+                        pass
+                    # Build and run retrain phases
+                    adaptive_modes = {}
+                    adaptive_trial_counts = {}
+                    for at in (['crypto'] if rt_crypto else []) + (['stock'] if rt_stock else []):
+                        astate = load_adaptive_state(at)
+                        amode = decide_mode(astate, astate.get('best_score', 0))
+                        atrial = get_trial_count(amode)
+                        adaptive_modes[at] = amode
+                        adaptive_trial_counts[at] = atrial
+                    retrain_trials = max(adaptive_trial_counts.values()) if adaptive_trial_counts else 100
+                    retrain_mode = 'explore' if 'explore' in adaptive_modes.values() else 'refine'
+                    retrain_phases = (
+                        _build_harvest_phases(False, rt_crypto, rt_stock)
+                        + _build_training_phases(retrain_trials, rt_crypto, rt_stock,
+                                                 mode=retrain_mode)
+                    )
+                    for i, p in enumerate(retrain_phases):
+                        p['idx'] = i
+                    status['started_at'] = datetime.datetime.now().isoformat()
+                    status['phases'] = [p['id'] for p in retrain_phases]
+                    status['phase_labels'] = {p['id']: p['label'] for p in retrain_phases}
+                    status['total_phases'] = len(retrain_phases)
+                    status['retrain_cycle'] = manual_cycle
+                    _run_training(retrain_phases, log_fh, status, is_retrain=True)
+                    try:
+                        from sentiment_history import set_live_mode
+                        set_live_mode(True)
+                    except Exception:
+                        pass
+                    status['phase'] = 'trading'
+                    status['phase_label'] = 'Trading (no auto-retrain)'
+                    write_status(status, force=True)
             return
 
         # =============================================================
@@ -582,18 +718,37 @@ def main():
                    f"{next_retrain.strftime('%Y-%m-%d %I:%M %p')}\n")
             log_fh.write(msg)
             log_fh.flush()
-            print(msg, end='')
+            _print(msg, end='')
 
             # Wait until retrain time, auto-restarting crashed bots
+            # Also check for manual retrain trigger from GUI
+            manual_trigger = None
             while datetime.datetime.now() < next_retrain and not _shutdown_requested:
                 time.sleep(60)
                 _check_restart_bots(bots, log_fh)
                 write_status(status)
+                manual_trigger = _check_retrain_trigger()
+                if manual_trigger:
+                    msg = (f"\n[MANUAL RETRAIN] Triggered from GUI: "
+                           f"crypto={manual_trigger.get('crypto', False)}, "
+                           f"stock={manual_trigger.get('stock', False)}\n")
+                    log_fh.write(msg)
+                    log_fh.flush()
+                    _print(msg, end='')
+                    break
 
             if _shutdown_requested:
                 break
 
             # --- Retrain (bots keep trading with current models) ---
+            # Determine what to retrain: manual trigger overrides defaults
+            if manual_trigger:
+                rt_crypto = manual_trigger.get('crypto', False)
+                rt_stock = manual_trigger.get('stock', False)
+            else:
+                rt_crypto = train_crypto
+                rt_stock = train_stock
+
             # Pause backfill during retrain to free LLM quota
             try:
                 from sentiment_history import set_live_mode
@@ -605,7 +760,7 @@ def main():
             # Use the worse-case (more trials) across asset types
             adaptive_modes = {}
             adaptive_trial_counts = {}
-            for at in (['crypto'] if train_crypto else []) + (['stock'] if train_stock else []):
+            for at in (['crypto'] if rt_crypto else []) + (['stock'] if rt_stock else []):
                 astate = load_adaptive_state(at)
                 amode = decide_mode(astate, astate.get('best_score', 0))
                 atrial = get_trial_count(amode)
@@ -615,7 +770,7 @@ def main():
                        f"cycles_no_improve={astate.get('cycles_without_improvement', 0)}\n")
                 log_fh.write(msg)
                 log_fh.flush()
-                print(msg, end='')
+                _print(msg, end='')
 
             # Use explicit --retrain-trials if not default, else adaptive max
             if args.retrain_trials != 100:
@@ -629,7 +784,7 @@ def main():
             # Check if harvest needed due to forward_bars expansion
             force_harvest = False
             for at in ['crypto', 'stock']:
-                if (at == 'crypto' and not train_crypto) or (at == 'stock' and not train_stock):
+                if (at == 'crypto' and not rt_crypto) or (at == 'stock' and not rt_stock):
                     continue
                 max_fb = get_max_forward_bars(at)
                 # Check columns in Parquet (fast) or CSV
@@ -648,11 +803,11 @@ def main():
                                f"forcing re-harvest\n")
                         log_fh.write(msg)
                         log_fh.flush()
-                        print(msg, end='')
+                        _print(msg, end='')
 
             retrain_phases = (
-                _build_harvest_phases(not force_harvest, train_crypto, train_stock)
-                + _build_training_phases(retrain_trials, train_crypto, train_stock,
+                _build_harvest_phases(not force_harvest, rt_crypto, rt_stock)
+                + _build_training_phases(retrain_trials, rt_crypto, rt_stock,
                                          mode=retrain_mode)
             )
             for i, p in enumerate(retrain_phases):
@@ -663,9 +818,10 @@ def main():
             status['phase_labels'] = {p['id']: p['label'] for p in retrain_phases}
             status['total_phases'] = len(retrain_phases)
 
+            retrain_source = "MANUAL" if manual_trigger else "WEEKLY"
             banner = (
                 f"\n{'#'*70}\n"
-                f"# WEEKLY RETRAIN (cycle {cycle}): "
+                f"# {retrain_source} RETRAIN (cycle {cycle}): "
                 f"{datetime.datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}\n"
                 f"# Bots continue trading — models hot-reload on improvement\n"
                 f"# Phases: {', '.join(p['label'] for p in retrain_phases)}\n"
@@ -674,7 +830,7 @@ def main():
             )
             log_fh.write(banner)
             log_fh.flush()
-            print(banner, end='')
+            _print(banner, end='')
 
             _run_training(retrain_phases, log_fh, status, is_retrain=True)
 
@@ -688,9 +844,10 @@ def main():
             msg = f"\nRetrain cycle {cycle} complete.\n"
             log_fh.write(msg)
             log_fh.flush()
-            print(msg, end='')
+            _print(msg, end='')
 
     finally:
+        _heartbeat_stop.set()
         _terminate_procs(_all_procs)
         for name, proc, fh in _all_bots:
             try:
