@@ -2006,8 +2006,11 @@ class TradingDashboard(QMainWindow):
         QApplication.processEvents()
 
         try:
-            # Use Alpaca's close position endpoint
-            self.api.close_position(symbol)
+            # Alpaca close_position uses DELETE /positions/{symbol}
+            # Crypto symbols contain '/' (e.g. BTC/USD) which breaks the URL path.
+            # Use the raw API with URL-encoded symbol instead.
+            from urllib.parse import quote
+            self.api.delete('/positions/{}'.format(quote(symbol, safe='')))
             self._manual_status.setText(f"Close order submitted for {symbol}")
             self._manual_status.setStyleSheet(
                 f"color: {T['green'].name()}; font-size: 11px;")
