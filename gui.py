@@ -74,6 +74,8 @@ STUDY_DBS = {
     "Stock": ("stock_v2_study.db", "stock_v2_search"),
 }
 
+PIPELINE_COMMAND = BASE_DIR / "pipeline_command.json"
+
 
 def _get_best_score(name):
     """Read best Optuna score for a model. Returns None on failure."""
@@ -647,6 +649,22 @@ def _read_pipeline_status():
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _write_pipeline_command(command, crypto=False, stock=False):
+    """Write a pipeline command file atomically for the pipeline to consume.
+
+    Returns True on success, error string on failure.
+    """
+    try:
+        payload = {"command": command, "crypto": crypto, "stock": stock}
+        tmp = str(PIPELINE_COMMAND) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, str(PIPELINE_COMMAND))
+        return True
+    except Exception as e:
+        return str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -1797,6 +1815,19 @@ class TradingDashboard(QMainWindow):
             )
             self._retrain_cancel_btn.setStyleSheet(cancel_btn_style)
 
+        # Bot control buttons
+        if hasattr(self, '_crypto_start_btn'):
+            bot_btn_style = (
+                f"QPushButton {{ background-color: {t['bg_header'].name()}; color: {t['white'].name()};"
+                f" border: 1px solid {t['bg_border'].name()}; border-radius: 4px;"
+                f" padding: 4px 12px; font-weight: bold; font-size: 11px; }}"
+                f" QPushButton:hover {{ background-color: {t['accent'].name()}; color: {t['bg_dark'].name()}; }}"
+                f" QPushButton:disabled {{ color: {t['muted'].name()}; background-color: {t['bg_dark'].name()}; }}"
+            )
+            for btn in [self._crypto_start_btn, self._crypto_stop_btn,
+                        self._stock_start_btn, self._stock_stop_btn]:
+                btn.setStyleSheet(bot_btn_style)
+
         # Clock
         self._clock_label_right.setStyleSheet(
             f"font-size: 12px; font-weight: bold; padding: 0 8px; color: {t['accent'].name()};"
@@ -2734,6 +2765,50 @@ class TradingDashboard(QMainWindow):
         pipeline_layout.addLayout(retrain_row, 5, 0, 1, 2)
 
         layout.addWidget(pipeline_group)
+
+        # Bot Control group
+        bot_group = QGroupBox("Bot Control")
+        bot_layout = QHBoxLayout(bot_group)
+
+        # Crypto bot controls
+        self._crypto_bot_label = QLabel("Crypto Bot: --")
+        self._crypto_bot_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        bot_layout.addWidget(self._crypto_bot_label)
+        self._crypto_start_btn = QPushButton("Start")
+        self._crypto_stop_btn = QPushButton("Stop")
+        for btn in [self._crypto_start_btn, self._crypto_stop_btn]:
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.PointingHandCursor)
+        self._crypto_start_btn.clicked.connect(lambda: self._start_bot_clicked("Crypto"))
+        self._crypto_stop_btn.clicked.connect(lambda: self._stop_bot_clicked("Crypto"))
+        bot_layout.addWidget(self._crypto_start_btn)
+        bot_layout.addWidget(self._crypto_stop_btn)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        bot_layout.addWidget(sep)
+
+        # Stock bot controls
+        self._stock_bot_label = QLabel("Stock Bot: --")
+        self._stock_bot_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        bot_layout.addWidget(self._stock_bot_label)
+        self._stock_start_btn = QPushButton("Start")
+        self._stock_stop_btn = QPushButton("Stop")
+        for btn in [self._stock_start_btn, self._stock_stop_btn]:
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.PointingHandCursor)
+        self._stock_start_btn.clicked.connect(lambda: self._start_bot_clicked("Stock"))
+        self._stock_stop_btn.clicked.connect(lambda: self._stop_bot_clicked("Stock"))
+        bot_layout.addWidget(self._stock_start_btn)
+        bot_layout.addWidget(self._stock_stop_btn)
+
+        self._bot_cmd_status = QLabel("")
+        self._bot_cmd_status.setStyleSheet("font-size: 11px;")
+        bot_layout.addWidget(self._bot_cmd_status)
+        bot_layout.addStretch()
+
+        layout.addWidget(bot_group)
 
         hw_group = QGroupBox("Hardware")
         hw_grid = QGridLayout(hw_group)
@@ -3762,6 +3837,78 @@ class TradingDashboard(QMainWindow):
             self._retrain_status.setText(f"Cancel error: {e}")
             self._retrain_status.setStyleSheet(f"color: {T['red'].name()}; font-size: 11px;")
 
+    def _start_bot_clicked(self, bot_name):
+        """Handle Start button click for a bot."""
+        status_path = BASE_DIR / "pipeline_status.json"
+        is_running = False
+        is_training = False
+        try:
+            age = dt.datetime.now().timestamp() - status_path.stat().st_mtime
+            is_running = age < 600
+            if is_running:
+                pinfo = _read_pipeline_status()
+                phase = pinfo.get("phase", "")
+                is_training = phase not in (
+                    "trading", "idle", "failed", "complete", "suspended", "")
+        except OSError:
+            pass
+
+        if not is_running:
+            self._bot_cmd_status.setText("Pipeline not running")
+            self._bot_cmd_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+            return
+
+        crypto = (bot_name == "Crypto")
+        stock = (bot_name == "Stock")
+
+        if is_training:
+            reply = QMessageBox.question(
+                self, "Training In Progress",
+                f"Training is in progress. Suspend training to start "
+                f"{bot_name} bot?\n\n"
+                "Completed trials are preserved and training can resume later.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            result = _write_pipeline_command(
+                "suspend_and_start_bot", crypto=crypto, stock=stock)
+            if result is True:
+                self._bot_cmd_status.setText(
+                    f"Suspending training, starting {bot_name}...")
+                self._bot_cmd_status.setStyleSheet(
+                    f"color: {T['accent'].name()}; font-size: 11px;")
+            else:
+                self._bot_cmd_status.setText(f"Error: {result}")
+                self._bot_cmd_status.setStyleSheet(
+                    f"color: {T['red'].name()}; font-size: 11px;")
+        else:
+            result = _write_pipeline_command(
+                "start_bot", crypto=crypto, stock=stock)
+            if result is True:
+                self._bot_cmd_status.setText(f"Starting {bot_name} bot...")
+                self._bot_cmd_status.setStyleSheet(
+                    f"color: {T['green'].name()}; font-size: 11px;")
+            else:
+                self._bot_cmd_status.setText(f"Error: {result}")
+                self._bot_cmd_status.setStyleSheet(
+                    f"color: {T['red'].name()}; font-size: 11px;")
+
+    def _stop_bot_clicked(self, bot_name):
+        """Handle Stop button click for a bot."""
+        crypto = (bot_name == "Crypto")
+        stock = (bot_name == "Stock")
+        result = _write_pipeline_command(
+            "stop_bot", crypto=crypto, stock=stock)
+        if result is True:
+            self._bot_cmd_status.setText(f"Stopping {bot_name} bot...")
+            self._bot_cmd_status.setStyleSheet(
+                f"color: {T['accent'].name()}; font-size: 11px;")
+        else:
+            self._bot_cmd_status.setText(f"Error: {result}")
+            self._bot_cmd_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+
     def _refresh_models_tab(self):
         now_ts = dt.datetime.now().timestamp()
         configs = []
@@ -3852,6 +3999,9 @@ class TradingDashboard(QMainWindow):
         elif phase == "trading":
             status_color = T["green"].name()
             status_text = "TRADING"
+        elif phase == "suspended":
+            status_color = T["accent"].name()
+            status_text = "SUSPENDED"
         else:
             status_color = T["green"].name()
             status_text = "TRAINING" if bots_running else "RUNNING"
@@ -3987,6 +4137,45 @@ class TradingDashboard(QMainWindow):
                 cur = self._retrain_status.text().lower()
                 if "queued" in cur or "cancelled" in cur:
                     self._retrain_status.setText("")
+
+        # --- Per-bot status ---
+        crypto_running = pinfo.get("crypto_bot_running", False)
+        stock_running = pinfo.get("stock_bot_running", False)
+
+        if is_running:
+            if crypto_running:
+                self._crypto_bot_label.setText("Crypto Bot: Running")
+                self._crypto_bot_label.setStyleSheet(
+                    f"font-size: 13px; font-weight: bold; color: {T['green'].name()};")
+                self._crypto_start_btn.setEnabled(False)
+                self._crypto_stop_btn.setEnabled(True)
+            else:
+                self._crypto_bot_label.setText("Crypto Bot: Stopped")
+                self._crypto_bot_label.setStyleSheet(
+                    f"font-size: 13px; font-weight: bold; color: {T['muted'].name()};")
+                self._crypto_start_btn.setEnabled(True)
+                self._crypto_stop_btn.setEnabled(False)
+
+            if stock_running:
+                self._stock_bot_label.setText("Stock Bot: Running")
+                self._stock_bot_label.setStyleSheet(
+                    f"font-size: 13px; font-weight: bold; color: {T['green'].name()};")
+                self._stock_start_btn.setEnabled(False)
+                self._stock_stop_btn.setEnabled(True)
+            else:
+                self._stock_bot_label.setText("Stock Bot: Stopped")
+                self._stock_bot_label.setStyleSheet(
+                    f"font-size: 13px; font-weight: bold; color: {T['muted'].name()};")
+                self._stock_start_btn.setEnabled(True)
+                self._stock_stop_btn.setEnabled(False)
+        else:
+            for lbl in [self._crypto_bot_label, self._stock_bot_label]:
+                lbl.setText(lbl.text().split(":")[0] + ": --")
+                lbl.setStyleSheet(
+                    f"font-size: 13px; font-weight: bold; color: {T['muted'].name()};")
+            for btn in [self._crypto_start_btn, self._crypto_stop_btn,
+                        self._stock_start_btn, self._stock_stop_btn]:
+                btn.setEnabled(False)
 
         # --- LLM Usage ---
         try:

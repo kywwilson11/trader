@@ -5,8 +5,8 @@ Flow:
   1. Initial training (harvest + hypersearch for all models)
   2. Start trading bots (crypto 24/7 + stock during market hours)
   3. Bots run continuously — they hot-reload models when .pth files change
-  4. Every Saturday 2 AM: re-harvest data + retrain models in background
-     (bots keep trading with current models, swap to new ones automatically)
+  4. Every Saturday 2 AM: re-harvest data + retrain models
+     (bots stop during training to free GPU memory, restart after)
 
 Writes status to pipeline_status.json for GUI monitoring.
 All output logged to pipeline_output.log.
@@ -43,6 +43,7 @@ CRYPTO_BOT_LOG = os.path.join(BASE_DIR, 'crypto_bot_output.log')
 STOCK_BOT_LOG = os.path.join(BASE_DIR, 'stock_bot_output.log')
 PYTHON = '/home/kyle/miniforge3/envs/jetson/bin/python'
 RETRAIN_TRIGGER = os.path.join(BASE_DIR, 'retrain_trigger.json')
+PIPELINE_COMMAND = os.path.join(BASE_DIR, 'pipeline_command.json')
 # Skip stdout writes when redirected to same log file (avoids doubled lines)
 _STDOUT_IS_TTY = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
 
@@ -74,6 +75,26 @@ def _check_retrain_trigger():
     return None
 
 
+def _check_pipeline_command():
+    """Check for and consume a pipeline command file from the GUI.
+
+    Returns dict with 'command', 'crypto', 'stock' keys if found, else None.
+    """
+    try:
+        if os.path.exists(PIPELINE_COMMAND):
+            with open(PIPELINE_COMMAND) as f:
+                cmd = json.load(f)
+            os.remove(PIPELINE_COMMAND)
+            if cmd.get('command'):
+                return cmd
+    except (OSError, json.JSONDecodeError, KeyError):
+        try:
+            os.remove(PIPELINE_COMMAND)
+        except OSError:
+            pass
+    return None
+
+
 ENV = {
     **os.environ,
     'LD_LIBRARY_PATH': (
@@ -85,6 +106,10 @@ ENV = {
     'LD_PRELOAD': '/home/kyle/miniforge3/envs/jetson/lib/libstdc++.so.6',
     'PYTHONUNBUFFERED': '1',
 }
+
+# Bots use CPU-only inference — hide GPU so PyTorch doesn't reserve CUDA memory.
+# This frees ~600MB for training (each CUDA context costs ~300MB on Jetson).
+BOT_ENV = {**ENV, 'CUDA_VISIBLE_DEVICES': ''}
 
 # Throttle JSON writes to avoid excessive disk I/O
 _last_status_write = 0
@@ -210,6 +235,31 @@ def run_phase(phase, log_fh, status):
                     status['best_score'] = float(m.group(1))
                 force = True
 
+            # Check for suspend request from GUI
+            global _suspend_requested
+            if not _suspend_requested:
+                scmd = _check_pipeline_command()
+                if scmd and scmd.get('command') == 'suspend_and_start_bot':
+                    _suspend_requested = True
+                    status['_pending_bot_start'] = {
+                        'crypto': scmd.get('crypto', False),
+                        'stock': scmd.get('stock', False),
+                    }
+            if _suspend_requested:
+                msg = "\n[SUSPEND] Training suspended by GUI command\n"
+                log_fh.write(msg)
+                log_fh.flush()
+                _print(msg, end='')
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                status['phase_exit_code'] = -99
+                write_status(status, force=True)
+                return -99
+
             write_status(status, force=force)
     except Exception as e:
         _print(f"\n[PIPELINE] Error reading phase output: {e}")
@@ -241,20 +291,195 @@ def run_phase(phase, log_fh, status):
 def _start_bot(cmd, log_path):
     """Start a trading bot as a background process.
 
+    Uses BOT_ENV which hides the GPU (CUDA_VISIBLE_DEVICES='') so bots
+    don't reserve ~300MB of GPU memory each via CUDA context init.
     Returns (proc, file_handle) so the caller can close the log FH when done.
     """
     fh = open(log_path, 'a')
     proc = subprocess.Popen(
         cmd, stdout=fh, stderr=subprocess.STDOUT,
-        env=ENV, cwd=BASE_DIR,
+        env=BOT_ENV, cwd=BASE_DIR,
     )
     return proc, fh
 
 
+def _stop_bots(bots, log_fh):
+    """Stop all bot processes to free memory for training.
+
+    On Jetson (8GB unified memory), each bot's PyTorch import reserves
+    ~300-500MB.  Stopping them before training frees ~1GB for CUDA.
+    """
+    for name, proc, fh in bots:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                msg = f"  Stopped {name} bot (PID {proc.pid}) for training\n"
+                log_fh.write(msg)
+                log_fh.flush()
+                _print(msg, end='')
+        except Exception as e:
+            msg = f"  Warning: failed to stop {name} bot: {e}\n"
+            log_fh.write(msg)
+            log_fh.flush()
+        try:
+            fh.close()
+        except Exception:
+            pass
+    bots.clear()
+    # Give OS a moment to reclaim memory from terminated processes
+    time.sleep(3)
+
+
+def _restart_bots(bots, log_fh, run_crypto, run_stock):
+    """Restart bot processes after training completes."""
+    if run_crypto:
+        proc, bot_fh = _start_bot([PYTHON, '-u', 'crypto_loop.py'], CRYPTO_BOT_LOG)
+        bots.append(('Crypto', proc, bot_fh))
+        _all_handles.append(bot_fh)
+        msg = f"Crypto bot restarted (PID {proc.pid})\n"
+        log_fh.write(msg)
+        log_fh.flush()
+        _print(msg, end='')
+
+    if run_stock:
+        proc, bot_fh = _start_bot([PYTHON, '-u', 'stock_loop.py'], STOCK_BOT_LOG)
+        bots.append(('Stock', proc, bot_fh))
+        _all_handles.append(bot_fh)
+        msg = f"Stock bot restarted (PID {proc.pid})\n"
+        log_fh.write(msg)
+        log_fh.flush()
+        _print(msg, end='')
+
+
+def _stop_single_bot(bots, name, log_fh):
+    """Stop a single bot by name. Returns True if found and stopped."""
+    for i, (bot_name, proc, fh) in enumerate(bots):
+        if bot_name == name:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                msg = f"  Stopped {name} bot (PID {proc.pid}) per GUI command\n"
+                log_fh.write(msg)
+                log_fh.flush()
+                _print(msg, end='')
+            except Exception as e:
+                msg = f"  Warning: failed to stop {name} bot: {e}\n"
+                log_fh.write(msg)
+                log_fh.flush()
+            try:
+                fh.close()
+            except Exception:
+                pass
+            bots.pop(i)
+            return True
+    return False
+
+
+def _start_single_bot(bots, name, log_fh):
+    """Start a single bot by name if not already running."""
+    for bot_name, proc, fh in bots:
+        if bot_name == name and proc.poll() is None:
+            return
+    if name == 'Crypto':
+        cmd = [PYTHON, '-u', 'crypto_loop.py']
+        log_path = CRYPTO_BOT_LOG
+    elif name == 'Stock':
+        cmd = [PYTHON, '-u', 'stock_loop.py']
+        log_path = STOCK_BOT_LOG
+    else:
+        return
+    proc, bot_fh = _start_bot(cmd, log_path)
+    bots.append((name, proc, bot_fh))
+    _all_handles.append(bot_fh)
+    msg = f"  {name} bot started (PID {proc.pid}) per GUI command\n"
+    log_fh.write(msg)
+    log_fh.flush()
+    _print(msg, end='')
+
+
+def _update_per_bot_status(bots, status):
+    """Update per-bot running flags in the status dict."""
+    crypto_running = any(n == 'Crypto' and p.poll() is None for n, p, _ in bots)
+    stock_running = any(n == 'Stock' and p.poll() is None for n, p, _ in bots)
+    status['crypto_bot_running'] = crypto_running
+    status['stock_bot_running'] = stock_running
+    status['bots_running'] = crypto_running or stock_running
+
+
+def _handle_command(cmd, bots, log_fh, status):
+    """Handle a pipeline command from the GUI."""
+    global _suspend_requested
+    command = cmd.get('command', '')
+    want_crypto = cmd.get('crypto', False)
+    want_stock = cmd.get('stock', False)
+
+    msg = f"\n[CMD] Received: {command} (crypto={want_crypto}, stock={want_stock})\n"
+    log_fh.write(msg)
+    log_fh.flush()
+    _print(msg, end='')
+
+    if command == 'stop_bot':
+        if want_crypto:
+            _stop_single_bot(bots, 'Crypto', log_fh)
+            _manually_stopped.add('Crypto')
+        if want_stock:
+            _stop_single_bot(bots, 'Stock', log_fh)
+            _manually_stopped.add('Stock')
+        _update_per_bot_status(bots, status)
+        write_status(status, force=True)
+
+    elif command == 'start_bot':
+        phase = status.get('phase', '')
+        if phase not in ('trading', 'idle', 'failed', 'complete', 'suspended', ''):
+            msg = "  Cannot start bot: training in progress\n"
+            log_fh.write(msg)
+            log_fh.flush()
+            return
+        if want_crypto:
+            _manually_stopped.discard('Crypto')
+            _start_single_bot(bots, 'Crypto', log_fh)
+        if want_stock:
+            _manually_stopped.discard('Stock')
+            _start_single_bot(bots, 'Stock', log_fh)
+        _update_per_bot_status(bots, status)
+        write_status(status, force=True)
+
+    elif command == 'suspend_and_start_bot':
+        _suspend_requested = True
+        status['_pending_bot_start'] = {
+            'crypto': want_crypto, 'stock': want_stock,
+        }
+        if want_crypto:
+            _manually_stopped.discard('Crypto')
+        if want_stock:
+            _manually_stopped.discard('Stock')
+        msg = "  Training suspension requested, will start bots after\n"
+        log_fh.write(msg)
+        log_fh.flush()
+        write_status(status, force=True)
+
+
 def _check_restart_bots(bots, log_fh):
-    """Check for crashed bots and restart them."""
+    """Check for crashed bots and restart them (skips manually stopped)."""
     for i, (name, proc, bot_fh) in enumerate(bots):
         if proc.poll() is not None:
+            if name in _manually_stopped:
+                try:
+                    bot_fh.close()
+                except Exception:
+                    pass
+                bots.pop(i)
+                return  # List modified; next cycle will re-check
             # Close the old log file handle before opening a new one
             try:
                 bot_fh.close()
@@ -370,10 +595,17 @@ RETRY_WAIT_SECONDS = 30
 
 
 def _run_training(phases, log_fh, status, is_retrain):
-    """Run all training phases. Returns True if all succeeded."""
+    """Run all training phases. Returns True if all succeeded, 'suspended' if suspended."""
+    global _suspend_requested
     for phase in phases:
         for attempt in range(1, MAX_PHASE_RETRIES + 1):
             rc = run_phase(phase, log_fh, status)
+            if rc == -99:
+                _suspend_requested = False
+                status['phase'] = 'suspended'
+                status['phase_label'] = 'Training suspended'
+                write_status(status, force=True)
+                return 'suspended'
             if rc == 0:
                 break
             # Failed — retry with fresh CUDA context (Optuna DB preserves progress)
@@ -447,6 +679,8 @@ _all_handles = []
 _all_procs = []
 _all_bots = []
 _shutdown_requested = False
+_manually_stopped = set()    # Bot names user explicitly stopped (skip auto-restart)
+_suspend_requested = False   # Set True when GUI requests training suspension
 
 
 def _signal_handler(signum, frame):
@@ -522,6 +756,8 @@ def main():
         'stock_final_score': prev_status.get('stock_final_score'),
         'retrain_cycle': 0,
         'bots_running': False,
+        'crypto_bot_running': False,
+        'stock_bot_running': False,
     }
 
     log_fh = open(LOG_FILE, 'a')
@@ -610,7 +846,7 @@ def main():
 
         status['phase'] = 'trading'
         status['phase_label'] = 'Trading'
-        status['bots_running'] = True
+        _update_per_bot_status(bots, status)
         write_status(status, force=True)
 
         # Start sentiment backfill worker (LLM-scores historical articles)
@@ -649,8 +885,17 @@ def main():
             write_status(status, force=True)
             manual_cycle = 0
             while not _shutdown_requested:
-                time.sleep(60)
+                # Poll every 5s for commands, check bots/triggers each 60s cycle
+                trigger = None
+                for _ in range(12):
+                    if _shutdown_requested:
+                        break
+                    time.sleep(5)
+                    cmd = _check_pipeline_command()
+                    if cmd:
+                        _handle_command(cmd, bots, log_fh, status)
                 _check_restart_bots(bots, log_fh)
+                _update_per_bot_status(bots, status)
                 trigger = _check_retrain_trigger()
                 if trigger:
                     manual_cycle += 1
@@ -689,7 +934,21 @@ def main():
                     status['phase_labels'] = {p['id']: p['label'] for p in retrain_phases}
                     status['total_phases'] = len(retrain_phases)
                     status['retrain_cycle'] = manual_cycle
-                    _run_training(retrain_phases, log_fh, status, is_retrain=True)
+                    # Stop bots to free GPU memory for training
+                    _stop_bots(bots, log_fh)
+                    status['bots_running'] = False
+                    _update_per_bot_status(bots, status)
+                    write_status(status, force=True)
+                    result = _run_training(retrain_phases, log_fh, status, is_retrain=True)
+                    if result == 'suspended':
+                        pending = status.pop('_pending_bot_start', {})
+                        if pending.get('crypto'):
+                            _start_single_bot(bots, 'Crypto', log_fh)
+                        if pending.get('stock'):
+                            _start_single_bot(bots, 'Stock', log_fh)
+                    else:
+                        # Restart all bots after normal training completion
+                        _restart_bots(bots, log_fh, run_crypto, run_stock)
                     try:
                         from sentiment_history import set_live_mode
                         set_live_mode(True)
@@ -697,6 +956,7 @@ def main():
                         pass
                     status['phase'] = 'trading'
                     status['phase_label'] = 'Trading (no auto-retrain)'
+                    _update_per_bot_status(bots, status)
                     write_status(status, force=True)
             return
 
@@ -724,8 +984,16 @@ def main():
             # Also check for manual retrain trigger from GUI
             manual_trigger = None
             while datetime.datetime.now() < next_retrain and not _shutdown_requested:
-                time.sleep(60)
+                # Poll every 5s for commands, check bots/triggers each 60s cycle
+                for _ in range(12):
+                    if _shutdown_requested:
+                        break
+                    time.sleep(5)
+                    cmd = _check_pipeline_command()
+                    if cmd:
+                        _handle_command(cmd, bots, log_fh, status)
                 _check_restart_bots(bots, log_fh)
+                _update_per_bot_status(bots, status)
                 write_status(status)
                 manual_trigger = _check_retrain_trigger()
                 if manual_trigger:
@@ -823,7 +1091,7 @@ def main():
                 f"\n{'#'*70}\n"
                 f"# {retrain_source} RETRAIN (cycle {cycle}): "
                 f"{datetime.datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}\n"
-                f"# Bots continue trading — models hot-reload on improvement\n"
+                f"# Bots stop during training, restart after\n"
                 f"# Phases: {', '.join(p['label'] for p in retrain_phases)}\n"
                 f"# Adaptive: mode={retrain_mode}, trials={retrain_trials}\n"
                 f"{'#'*70}\n"
@@ -832,7 +1100,25 @@ def main():
             log_fh.flush()
             _print(banner, end='')
 
-            _run_training(retrain_phases, log_fh, status, is_retrain=True)
+            # Stop bots to free GPU memory for training
+            _stop_bots(bots, log_fh)
+            status['bots_running'] = False
+            _update_per_bot_status(bots, status)
+            write_status(status, force=True)
+
+            result = _run_training(retrain_phases, log_fh, status, is_retrain=True)
+
+            if result == 'suspended':
+                pending = status.pop('_pending_bot_start', {})
+                if pending.get('crypto'):
+                    _start_single_bot(bots, 'Crypto', log_fh)
+                if pending.get('stock'):
+                    _start_single_bot(bots, 'Stock', log_fh)
+            else:
+                # Restart all bots after normal training completion
+                _restart_bots(bots, log_fh, run_crypto, run_stock)
+
+            _update_per_bot_status(bots, status)
 
             # Resume live mode after retrain (backfill pauses)
             try:
