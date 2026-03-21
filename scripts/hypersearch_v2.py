@@ -430,6 +430,21 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
         }
         trial.set_user_attr('cfg', cfg)
 
+        # Memory guard: estimate if this config will OOM on Jetson (8GB unified)
+        if torch.cuda.is_available():
+            free_mb, _ = torch.cuda.mem_get_info()
+            free_mb /= 1e6
+            # Estimate: seq cache (~biggest fold) + model + batch activations
+            n_biggest_fold = int(len(all_features) * 0.85)  # ~85% for largest fold
+            cache_mb = n_biggest_fold * seq_len * input_dim * 4 / 1e6
+            model_mb = 4 * (input_dim * hidden_dim + hidden_dim ** 2 + hidden_dim) * num_layers * 12 / 1e6
+            batch_mb = batch_size * seq_len * hidden_dim * num_layers * 4 / 1e6
+            needed_mb = cache_mb + model_mb + batch_mb + 200  # 200 MB headroom
+            if needed_mb > free_mb:
+                print(f"  [SKIP] Trial {trial.number}: est {needed_mb:.0f}MB > {free_mb:.0f}MB free "
+                      f"| s={seq_len} h={hidden_dim} l={num_layers} bs={batch_size}")
+                return 0.0
+
         # Select returns for this horizon
         if forward_bars in all_returns_by_fb:
             trial_returns = all_returns_by_fb[forward_bars]
