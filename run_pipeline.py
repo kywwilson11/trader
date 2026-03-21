@@ -639,14 +639,12 @@ def _run_training(phases, log_fh, status, is_retrain):
                 _print(msg, end='')
                 return False
             else:
-                msg = f"\nPIPELINE STOPPED: {phase['label']} failed (exit {rc})\n"
+                msg = (f"\nWARNING: {phase['label']} failed (exit {rc}),"
+                       f" continuing to bot phase with existing models\n")
                 log_fh.write(msg)
                 log_fh.flush()
                 _print(msg, end='')
-                status['phase'] = 'failed'
-                status['phase_label'] = f"Failed: {phase['label']}"
-                write_status(status, force=True)
-                sys.exit(1)
+                return False
     return True
 
 
