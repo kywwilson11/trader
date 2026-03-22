@@ -40,17 +40,19 @@ competitive threats, deteriorating fundamentals.
 5. SYNTHESIS: Given all of the above, what's the risk/reward skew? \
 What would you do with this stock today?
 
-SCORING — use precise, continuous values (e.g., 0.37, 0.62, 0.78):
+SCORING — use precise values across the full 0.0–1.0 range:
 - 0.00–0.15: VETO — confirmed catastrophe (fraud, insolvency, delisting)
 - 0.15–0.35: Bearish — material negative catalysts, poor risk/reward
-- 0.35–0.50: Lean negative — more headwinds than tailwinds
-- 0.50: Neutral — balanced or insufficient information
-- 0.50–0.65: Lean positive — modest tailwinds, decent setup
+- 0.35–0.48: Lean negative — more headwinds than tailwinds
+- 0.52–0.65: Lean positive — modest tailwinds, decent setup
 - 0.65–0.85: Bullish — clear catalysts, strong backdrop
 - 0.85–1.00: Strong conviction — exceptional, multi-factor opportunity
 
-Use the FULL continuous range. Scores like 0.43 or 0.71 are expected. \
-Avoid rounding to 0.05 increments — be precise about your conviction level.\
+IMPORTANT: You almost always have SOME directional view. A stock that's \
+oversold with good fundamentals is NOT 0.50 — it's 0.58 or 0.63. A stock \
+with deteriorating earnings and bad news is NOT 0.50 — it's 0.38 or 0.42. \
+Only use 0.49–0.51 if you genuinely have zero information to form a view. \
+Take a position. Use values like 0.33, 0.57, 0.71, 0.44.\
 """
 
 
