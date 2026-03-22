@@ -476,7 +476,7 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
             model_mb = (input_dim * hidden_dim + hidden_dim ** 2 * num_layers) * 4 / 1e6
             optim_mb = model_mb * 2  # Adam stores m + v
             batch_mb = batch_size * seq_len * hidden_dim * num_layers * 4 * 2 / 1e6  # fwd + bwd
-            needed_mb = cache_mb + scaled_mb + model_mb + optim_mb + batch_mb + 500
+            needed_mb = cache_mb + scaled_mb + model_mb + optim_mb + batch_mb + 800
             if needed_mb > free_mb:
                 print(f"  [SKIP] Trial {trial.number}: est {needed_mb:.0f}MB > {free_mb:.0f}MB free "
                       f"| s={seq_len} h={hidden_dim} l={num_layers} bs={batch_size}")
@@ -547,6 +547,22 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
             # On Jetson (unified memory), pre-loading to GPU causes OOM because
             # CUDA allocator and system memory share the same 8GB pool.
             # Per-batch transfer is fine — the 1020 MHz GPU clock is the real win.
+
+            # Check free memory before CUDA allocation (Jetson unified memory)
+            try:
+                with open('/proc/meminfo') as f:
+                    for line in f:
+                        if line.startswith('MemAvailable:'):
+                            avail_mb = int(line.split()[1]) / 1024
+                            break
+                    else:
+                        avail_mb = float('inf')
+            except Exception:
+                avail_mb = float('inf')
+            if avail_mb < 600:
+                raise RuntimeError(
+                    f"OOM guard: only {avail_mb:.0f}MB free before model creation"
+                    f" (need ~600MB for CUDA)")
 
             model = RegressionLSTM(input_dim, hidden_dim, num_layers,
                                    dropout, n_heads).to(device)
