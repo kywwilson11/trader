@@ -3838,9 +3838,24 @@ class TradingDashboard(QMainWindow):
             os.replace(tmp, str(trigger_path))
             self._retrain_status.setText(f"{target} retrain queued")
             self._retrain_status.setStyleSheet(f"color: {T['green'].name()}; font-size: 11px;")
+            self._schedule_models_refresh(5000)
         except Exception as e:
             self._retrain_status.setText(f"Error: {e}")
             self._retrain_status.setStyleSheet(f"color: {T['red'].name()}; font-size: 11px;")
+
+    def _schedule_models_refresh(self, delay_ms=3000):
+        """Schedule a quick Models tab refresh after a button action."""
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(delay_ms, self._refresh_models_tab)
+
+    def _is_pipeline_running(self):
+        """Check if pipeline process is running (status file < 120s old)."""
+        try:
+            age = dt.datetime.now().timestamp() - (
+                BASE_DIR / "pipeline_status.json").stat().st_mtime
+            return age < 120
+        except OSError:
+            return False
 
     def _restart_pipeline_clicked(self):
         """Kill existing pipeline (if running) and start a fresh one."""
@@ -3848,31 +3863,32 @@ class TradingDashboard(QMainWindow):
         import subprocess
 
         self._restart_pipeline_btn.setEnabled(False)
-        self._restart_pipeline_status.setText("Restarting...")
+        was_running = self._is_pipeline_running()
+        action = "Restarting" if was_running else "Starting"
+        self._restart_pipeline_status.setText(f"{action}...")
         self._restart_pipeline_status.setStyleSheet(
             f"color: {T['accent'].name()}; font-size: 11px;")
         QApplication.processEvents()
 
         # Find and kill existing pipeline process
-        killed = False
-        try:
-            result = subprocess.run(
-                ["pgrep", "-f", "run_pipeline\\.py"],
-                capture_output=True, text=True, timeout=5)
-            pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
-            for pid in pids:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                    killed = True
-                except ProcessLookupError:
-                    pass
-        except Exception:
-            pass
+        if was_running:
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", "run_pipeline\\.py"],
+                    capture_output=True, text=True, timeout=5)
+                pids = [int(p) for p in result.stdout.strip().split()
+                        if p.strip()]
+                for pid in pids:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+            except Exception:
+                pass
 
-        if killed:
             # Wait for processes to exit
             import time
-            for _ in range(30):  # up to 3 seconds
+            for _ in range(50):  # up to 5 seconds
                 time.sleep(0.1)
                 QApplication.processEvents()
                 try:
@@ -3906,8 +3922,8 @@ class TradingDashboard(QMainWindow):
                     env=env, cwd=str(BASE_DIR),
                     start_new_session=True,
                 )
-            msg = f"Pipeline started (PID {proc.pid})"
-            self._restart_pipeline_status.setText(msg)
+            self._restart_pipeline_status.setText(
+                f"Pipeline started (PID {proc.pid})")
             self._restart_pipeline_status.setStyleSheet(
                 f"color: {T['green'].name()}; font-size: 11px;")
         except Exception as e:
@@ -3916,6 +3932,9 @@ class TradingDashboard(QMainWindow):
                 f"color: {T['red'].name()}; font-size: 11px;")
 
         self._restart_pipeline_btn.setEnabled(True)
+        # Refresh UI after pipeline has time to write status
+        self._schedule_models_refresh(5000)
+        self._schedule_models_refresh(15000)
 
     def _cancel_retrain(self):
         """Remove a pending retrain trigger file."""
@@ -3931,25 +3950,16 @@ class TradingDashboard(QMainWindow):
 
     def _start_bot_clicked(self, bot_name):
         """Handle Start button click for a bot."""
-        status_path = BASE_DIR / "pipeline_status.json"
-        is_running = False
-        is_training = False
-        try:
-            age = dt.datetime.now().timestamp() - status_path.stat().st_mtime
-            is_running = age < 600
-            if is_running:
-                pinfo = _read_pipeline_status()
-                phase = pinfo.get("phase", "")
-                is_training = phase not in (
-                    "trading", "idle", "failed", "complete", "suspended", "")
-        except OSError:
-            pass
-
-        if not is_running:
+        if not self._is_pipeline_running():
             self._bot_cmd_status.setText("Pipeline not running")
             self._bot_cmd_status.setStyleSheet(
                 f"color: {T['red'].name()}; font-size: 11px;")
             return
+
+        pinfo = _read_pipeline_status()
+        phase = pinfo.get("phase", "")
+        is_training = phase not in (
+            "trading", "idle", "failed", "complete", "suspended", "")
 
         crypto = (bot_name == "Crypto")
         stock = (bot_name == "Stock")
@@ -3965,26 +3975,22 @@ class TradingDashboard(QMainWindow):
                 return
             result = _write_pipeline_command(
                 "suspend_and_start_bot", crypto=crypto, stock=stock)
-            if result is True:
-                self._bot_cmd_status.setText(
-                    f"Suspending training, starting {bot_name}...")
-                self._bot_cmd_status.setStyleSheet(
-                    f"color: {T['accent'].name()}; font-size: 11px;")
-            else:
-                self._bot_cmd_status.setText(f"Error: {result}")
-                self._bot_cmd_status.setStyleSheet(
-                    f"color: {T['red'].name()}; font-size: 11px;")
         else:
             result = _write_pipeline_command(
                 "start_bot", crypto=crypto, stock=stock)
-            if result is True:
-                self._bot_cmd_status.setText(f"Starting {bot_name} bot...")
-                self._bot_cmd_status.setStyleSheet(
-                    f"color: {T['green'].name()}; font-size: 11px;")
-            else:
-                self._bot_cmd_status.setText(f"Error: {result}")
-                self._bot_cmd_status.setStyleSheet(
-                    f"color: {T['red'].name()}; font-size: 11px;")
+
+        if result is True:
+            msg = (f"Suspending training, starting {bot_name}..."
+                   if is_training else f"Starting {bot_name} bot...")
+            self._bot_cmd_status.setText(msg)
+            self._bot_cmd_status.setStyleSheet(
+                f"color: {T['accent'].name()}; font-size: 11px;")
+            self._schedule_models_refresh(3000)
+            self._schedule_models_refresh(8000)
+        else:
+            self._bot_cmd_status.setText(f"Error: {result}")
+            self._bot_cmd_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
 
     def _stop_bot_clicked(self, bot_name):
         """Handle Stop button click for a bot."""
@@ -3996,6 +4002,8 @@ class TradingDashboard(QMainWindow):
             self._bot_cmd_status.setText(f"Stopping {bot_name} bot...")
             self._bot_cmd_status.setStyleSheet(
                 f"color: {T['accent'].name()}; font-size: 11px;")
+            self._schedule_models_refresh(3000)
+            self._schedule_models_refresh(8000)
         else:
             self._bot_cmd_status.setText(f"Error: {result}")
             self._bot_cmd_status.setStyleSheet(
@@ -4068,7 +4076,7 @@ class TradingDashboard(QMainWindow):
         phase_idx = pinfo.get("phase_idx", -1)
         total_phases = pinfo.get("total_phases", 0)
 
-        # Determine if pipeline is actively running (status file updated < 60s ago)
+        # Determine if pipeline is actively running (status file updated recently)
         is_running = False
         status_path = BASE_DIR / "pipeline_status.json"
         try:
@@ -4076,6 +4084,17 @@ class TradingDashboard(QMainWindow):
             is_running = age < 600  # Trials can take up to 10 minutes
         except OSError:
             pass
+
+        # Update restart button text and clear stale command status
+        if hasattr(self, '_restart_pipeline_btn'):
+            self._restart_pipeline_btn.setText(
+                "Restart Pipeline" if is_running else "Start Pipeline")
+        if hasattr(self, '_bot_cmd_status'):
+            # Clear stale "Starting/Stopping" messages once state is reflected
+            cur = self._bot_cmd_status.text().lower()
+            if cur and ("starting" in cur or "stopping" in cur
+                        or "suspending" in cur):
+                self._bot_cmd_status.setText("")
 
         bots_running = pinfo.get("bots_running", False)
 
