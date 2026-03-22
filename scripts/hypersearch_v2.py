@@ -538,16 +538,23 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                     del xb, yb, pred, raw_loss, weights, loss
                     break  # fits in memory
                 except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                    if 'INTERNAL ASSERT' in str(e):
-                        raise  # fatal, can't recover
-                    del model, criterion, optimizer
+                    # CUDA context recovers after NvMap/INTERNAL ASSERT errors
+                    # on Jetson — halve batch and retry instead of giving up
+                    try:
+                        del model, criterion, optimizer
+                    except NameError:
+                        pass
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
                     oom_retries += 1
                     eff_batch_size //= 2
                     if eff_batch_size < 128:
                         raise  # give up, let outer handler catch it
-                    print(f"  [OOM-RETRY] fold {fold_idx}: batch {eff_batch_size*2}→{eff_batch_size}")
+                    print(f"  [OOM-RETRY] fold {fold_idx}: batch {eff_batch_size*2}→{eff_batch_size}"
+                          f" ({str(e)[:60]})")
 
             if oom_retries > 0:
                 print(f"  [OOM-RETRY] fold {fold_idx}: training with batch_size={eff_batch_size} "
