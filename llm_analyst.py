@@ -86,15 +86,15 @@ def analyze_trades(candidates: list[dict], asset_type: str,
                            fng_value, model_config)
 
     analyst_model = get_recommended_model('analyst')
-    max_tok = 3072
+    n_syms = len(candidates)
+    max_tok = max(4096, n_syms * 400)
 
     response = call_gemini(prompt, system=_SYSTEM_PROMPT,
                            model=analyst_model, max_tokens=max_tok,
                            json_mode=True)
     if not response:
-        n_syms = len(candidates)
         response = call_llm(prompt, system=_SYSTEM_PROMPT,
-                            max_tokens=max(2048, n_syms * 150))
+                            max_tokens=max_tok)
     if not response:
         return {}
 
@@ -356,15 +356,19 @@ def refresh_all():
     from fundamentals import format_fundamentals_for_llm
 
     stock_syms = load_stock_universe()
-    crypto_syms = list(CRYPTO_SYMBOLS.keys())
+    crypto_syms = list(CRYPTO_SYMBOLS)
 
     fng = None
     try:
-        fng = get_fear_greed()
+        fng_data = get_fear_greed()
+        if isinstance(fng_data, dict):
+            fng = fng_data.get('value')
+        elif isinstance(fng_data, (int, float)):
+            fng = int(fng_data)
     except Exception:
         pass
 
-    BATCH_SIZE = 10  # symbols per LLM call
+    BATCH_SIZE = 5  # symbols per LLM call (keep small for token limits)
 
     for asset_type, syms in [('stock', stock_syms), ('crypto', crypto_syms)]:
         for i in range(0, len(syms), BATCH_SIZE):
