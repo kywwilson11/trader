@@ -1819,6 +1819,10 @@ class TradingDashboard(QMainWindow):
         if hasattr(self, '_restart_pipeline_btn'):
             self._restart_pipeline_btn.setStyleSheet(retrain_btn_style)
 
+        # LLM refresh button
+        if hasattr(self, '_llm_refresh_btn'):
+            self._llm_refresh_btn.setStyleSheet(retrain_btn_style)
+
         # Bot control buttons
         if hasattr(self, '_crypto_start_btn'):
             bot_btn_style = (
@@ -2355,10 +2359,13 @@ class TradingDashboard(QMainWindow):
         splitter.setSizes([600, 300])
         main_layout.addWidget(splitter, stretch=1)
 
-        # --- Bottom: metrics table ---
-        self._stock_table = QTableWidget(0, 8)
+        # --- Bottom: metrics table + detail panel ---
+        bottom_splitter = QSplitter(Qt.Vertical)
+
+        self._stock_table = QTableWidget(0, 9)
         self._stock_table.setHorizontalHeaderLabels(
-            ["Symbol", "Price", "Day Chg%", "Volume", "Pred", "Score", "Signal", "LLM"]
+            ["Symbol", "Price", "Day Chg%", "Volume", "Pred", "Score",
+             "Signal", "LLM", "LLM Age"]
         )
         self._stock_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._stock_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -2366,9 +2373,45 @@ class TradingDashboard(QMainWindow):
         self._stock_table.setSortingEnabled(True)
         self._stock_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._stock_table.cellDoubleClicked.connect(self._on_stock_table_dblclick)
-        main_layout.addWidget(self._stock_table, stretch=1)
+        self._stock_table.currentCellChanged.connect(self._on_stock_row_selected)
+        bottom_splitter.addWidget(self._stock_table)
+
+        # LLM detail panel — shows full reasoning for selected symbol
+        detail_frame = QFrame()
+        detail_layout = QVBoxLayout(detail_frame)
+        detail_layout.setContentsMargins(4, 4, 4, 4)
+
+        detail_header = QHBoxLayout()
+        self._llm_detail_symbol = QLabel("Select a symbol to see LLM analysis")
+        self._llm_detail_symbol.setStyleSheet(
+            "font-size: 14px; font-weight: bold;")
+        detail_header.addWidget(self._llm_detail_symbol)
+        detail_header.addStretch()
+        self._llm_refresh_btn = QPushButton("Refresh All LLM Analysis")
+        self._llm_refresh_btn.setFixedHeight(26)
+        self._llm_refresh_btn.setCursor(Qt.PointingHandCursor)
+        self._llm_refresh_btn.clicked.connect(self._refresh_all_llm_clicked)
+        detail_header.addWidget(self._llm_refresh_btn)
+        self._llm_refresh_status = QLabel("")
+        self._llm_refresh_status.setStyleSheet("font-size: 11px;")
+        detail_header.addWidget(self._llm_refresh_status)
+        detail_layout.addLayout(detail_header)
+
+        self._llm_detail_text = QLabel("")
+        self._llm_detail_text.setWordWrap(True)
+        self._llm_detail_text.setTextFormat(Qt.RichText)
+        self._llm_detail_text.setStyleSheet(
+            "font-size: 12px; padding: 6px; border: 1px solid #444;"
+            " border-radius: 4px; background: rgba(0,0,0,0.2);")
+        self._llm_detail_text.setMinimumHeight(60)
+        detail_layout.addWidget(self._llm_detail_text)
+        bottom_splitter.addWidget(detail_frame)
+
+        bottom_splitter.setSizes([400, 150])
+        main_layout.addWidget(bottom_splitter, stretch=1)
 
         self._stock_data_cache = {}  # latest data from fetch_stocks
+        self._llm_analysis_cache = {}  # latest llm analysis
         self.tabs.addTab(tab, "Markets")
 
     def _on_stock_add(self):
@@ -2455,6 +2498,121 @@ class TradingDashboard(QMainWindow):
             self._stock_symbol_combo.setCurrentText(sym)
             # Also pre-fill manual trade symbol for convenience
             self._manual_symbol.setText(sym)
+
+    def _on_stock_row_selected(self, row, _col, _prev_row, _prev_col):
+        """Show full LLM reasoning when a row is selected."""
+        if row < 0:
+            return
+        item = self._stock_table.item(row, 0)
+        if not item:
+            return
+        sym = item.text()
+        llm = self._llm_analysis_cache.get(sym, {})
+        if not llm:
+            self._llm_detail_symbol.setText(f"{sym} — No LLM analysis available")
+            self._llm_detail_text.setText(
+                "<i>No analysis found. Click 'Refresh All LLM Analysis' to generate.</i>")
+            return
+
+        score = llm.get('s', llm.get('m', '?'))
+        model = llm.get('model', '?')
+        ts = llm.get('timestamp', '')
+        age_str = ""
+        if ts:
+            try:
+                t = dt.datetime.fromisoformat(ts)
+                age_h = (dt.datetime.now(tz=t.tzinfo or None) - t).total_seconds() / 3600
+                if age_h < 1:
+                    age_str = f"{age_h * 60:.0f}m ago"
+                elif age_h < 24:
+                    age_str = f"{age_h:.1f}h ago"
+                else:
+                    age_str = f"{age_h / 24:.1f}d ago"
+            except (ValueError, TypeError):
+                age_str = ts[:16]
+
+        bull = llm.get('bull', '').strip()
+        bear = llm.get('bear', '').strip()
+        summary = llm.get('r', '').strip()
+
+        green = T['green'].name()
+        red = T['red'].name()
+        accent = T['accent'].name()
+        muted = T['muted'].name()
+
+        self._llm_detail_symbol.setText(
+            f"{sym}  |  Score: {score}  |  {model}  |  {age_str}")
+
+        html = ""
+        if bull:
+            html += f"<b style='color:{green};'>BULL:</b> {bull}<br>"
+        if bear:
+            html += f"<b style='color:{red};'>BEAR:</b> {bear}<br>"
+        if summary:
+            html += f"<b style='color:{accent};'>Summary:</b> {summary}"
+        if not html:
+            html = f"<span style='color:{muted};'>No reasoning available</span>"
+        self._llm_detail_text.setText(html)
+
+    def _refresh_all_llm_clicked(self):
+        """Trigger LLM analysis for all symbols in the universe."""
+        import subprocess
+        self._llm_refresh_btn.setEnabled(False)
+        self._llm_refresh_status.setText("Running analysis...")
+        self._llm_refresh_status.setStyleSheet(
+            f"color: {T['accent'].name()}; font-size: 11px;")
+        QApplication.processEvents()
+
+        python = "/home/kyle/miniforge3/envs/jetson/bin/python"
+        script = str(BASE_DIR / "llm_analyst.py")
+        env = {
+            **os.environ,
+            "LD_LIBRARY_PATH": (
+                "/home/kyle/miniforge3/envs/jetson/lib:"
+                + os.environ.get("LD_LIBRARY_PATH", "")
+            ),
+            "PYTHONUNBUFFERED": "1",
+        }
+        try:
+            proc = subprocess.Popen(
+                [python, "-u", script, "--refresh-all"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=env, cwd=str(BASE_DIR), text=True,
+            )
+            # Don't block GUI — check completion on timer
+            self._llm_refresh_proc = proc
+            from PySide6.QtCore import QTimer
+            self._llm_refresh_timer = QTimer()
+            self._llm_refresh_timer.timeout.connect(self._check_llm_refresh)
+            self._llm_refresh_timer.start(2000)
+        except Exception as e:
+            self._llm_refresh_status.setText(f"Error: {e}")
+            self._llm_refresh_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+            self._llm_refresh_btn.setEnabled(True)
+
+    def _check_llm_refresh(self):
+        """Poll the LLM refresh subprocess for completion."""
+        if not hasattr(self, '_llm_refresh_proc'):
+            return
+        proc = self._llm_refresh_proc
+        rc = proc.poll()
+        if rc is None:
+            # Still running — count symbols done from output
+            return
+        # Done
+        self._llm_refresh_timer.stop()
+        self._llm_refresh_btn.setEnabled(True)
+        if rc == 0:
+            self._llm_refresh_status.setText("Analysis complete")
+            self._llm_refresh_status.setStyleSheet(
+                f"color: {T['green'].name()}; font-size: 11px;")
+        else:
+            output = proc.stdout.read() if proc.stdout else ""
+            self._llm_refresh_status.setText(f"Failed (exit {rc})")
+            self._llm_refresh_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+        del self._llm_refresh_proc
 
     def _on_heatmap_clicked(self, sym):
         self._stock_symbol_combo.setCurrentText(sym)
@@ -2548,6 +2706,7 @@ class TradingDashboard(QMainWindow):
         snapshots = data.get('snapshots', {})
         predictions = data.get('predictions', {})
         llm_analysis = data.get('llm_analysis', {})
+        self._llm_analysis_cache = llm_analysis
 
         # --- Heatmap ---
         cols = 7  # grid columns
@@ -2639,6 +2798,28 @@ class TradingDashboard(QMainWindow):
 
             chg_color = T['green'] if chg > 0 else (T['red'] if chg < 0 else T['white'])
 
+            # LLM age computation
+            llm_ts = llm.get('timestamp', '')
+            llm_age_hours = float('inf')
+            llm_age_text = "\u2014"
+            llm_age_color = T['muted']
+            if llm_ts:
+                try:
+                    t = dt.datetime.fromisoformat(llm_ts)
+                    now = dt.datetime.now(tz=t.tzinfo or None)
+                    llm_age_hours = (now - t).total_seconds() / 3600
+                    if llm_age_hours < 1:
+                        llm_age_text = f"{llm_age_hours * 60:.0f}m"
+                    elif llm_age_hours < 24:
+                        llm_age_text = f"{llm_age_hours:.0f}h"
+                    else:
+                        llm_age_text = f"{llm_age_hours / 24:.0f}d"
+                    llm_age_color = (T['green'] if llm_age_hours < 12 else
+                                     (T.get('yellow', T['white'])
+                                      if llm_age_hours < 48 else T['red']))
+                except (ValueError, TypeError):
+                    pass
+
             items_data = [
                 (sym, T['white']),
                 (f"${price:.2f}" if price else "\u2014", T['white']),
@@ -2653,6 +2834,7 @@ class TradingDashboard(QMainWindow):
                 (signal, T['green'] if signal == 'BULL' else
                  (T['red'] if signal == 'BEAR' else T['muted'])),
                 (llm_text, llm_color),
+                (llm_age_text, llm_age_color),
             ]
 
             # Numeric sort values for columns that need numeric sorting
@@ -2665,6 +2847,7 @@ class TradingDashboard(QMainWindow):
                 score if score is not None else float('-inf'),        # 5: Score
                 None,       # 6: Signal — text sort is fine
                 (llm_s if llm_s is not None else (llm_m if llm_m is not None else float('-inf'))),  # 7: LLM
+                llm_age_hours,  # 8: LLM Age
             ]
 
             for col, (val, color) in enumerate(items_data):

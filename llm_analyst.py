@@ -343,3 +343,67 @@ def _parse_response(response: str, symbols: list[str]) -> dict[str, dict]:
             }
 
     return result
+
+
+def refresh_all():
+    """Analyze ALL symbols in the universe (stocks + crypto).
+
+    Called from GUI 'Refresh All LLM Analysis' button or CLI.
+    Batches symbols to avoid exceeding LLM token limits.
+    """
+    from stock_config import load_stock_universe, CRYPTO_SYMBOLS
+    from sentiment import get_recent_headlines, get_fear_greed
+    from fundamentals import format_fundamentals_for_llm
+
+    stock_syms = load_stock_universe()
+    crypto_syms = list(CRYPTO_SYMBOLS.keys())
+
+    fng = None
+    try:
+        fng = get_fear_greed()
+    except Exception:
+        pass
+
+    BATCH_SIZE = 10  # symbols per LLM call
+
+    for asset_type, syms in [('stock', stock_syms), ('crypto', crypto_syms)]:
+        for i in range(0, len(syms), BATCH_SIZE):
+            batch = syms[i:i + BATCH_SIZE]
+            candidates = []
+            for sym in batch:
+                c = {"symbol": sym, "pred_return": None}
+                try:
+                    headlines = get_recent_headlines(sym)
+                    if headlines:
+                        c["news_headlines"] = headlines[:5]
+                except Exception:
+                    pass
+                try:
+                    ft = format_fundamentals_for_llm(sym)
+                    if ft:
+                        c["fundamentals_text"] = ft
+                except Exception:
+                    pass
+                candidates.append(c)
+
+            print(f"[LLM-ANALYST] Analyzing {asset_type} batch "
+                  f"{i // BATCH_SIZE + 1}: {', '.join(batch)}")
+            try:
+                result = analyze_trades(candidates, asset_type, fng_value=fng)
+                n = len(result) if result else 0
+                print(f"[LLM-ANALYST] Got {n}/{len(batch)} results")
+            except Exception as e:
+                print(f"[LLM-ANALYST] Batch failed: {e}")
+
+            # Rate limit between batches
+            time.sleep(2)
+
+    print("[LLM-ANALYST] Refresh complete")
+
+
+if __name__ == "__main__":
+    import sys
+    if "--refresh-all" in sys.argv:
+        refresh_all()
+    else:
+        print("Usage: python llm_analyst.py --refresh-all")
