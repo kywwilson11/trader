@@ -2622,19 +2622,10 @@ class TradingDashboard(QMainWindow):
         self._llm_refresh_one_btn.setEnabled(True)
         sym = getattr(self, '_llm_refresh_one_sym', '?')
         if rc == 0:
-            # Reload analysis from disk so the display updates immediately
-            try:
-                analysis_file = BASE_DIR / "llm_analysis.json"
-                if analysis_file.exists():
-                    with open(analysis_file) as f:
-                        raw = json.load(f)
-                    for section in raw.values():
-                        if isinstance(section, dict):
-                            self._llm_analysis_cache.update(section)
-                    # Re-display the selected symbol's analysis
-                    self._on_stock_row_selected(self._stock_table.currentRow(), 0, -1, 0)
-            except (OSError, json.JSONDecodeError):
-                pass
+            # Reload analysis from disk and update table + detail panel
+            self._reload_llm_from_disk()
+            self._update_llm_table_cells(sym)
+            self._on_stock_row_selected(self._stock_table.currentRow(), 0, -1, 0)
             self._llm_refresh_status.setText(f"{sym} updated")
             self._llm_refresh_status.setStyleSheet(
                 f"color: {T['green'].name()}; font-size: 11px;")
@@ -2694,29 +2685,97 @@ class TradingDashboard(QMainWindow):
         self._llm_refresh_timer.stop()
         self._llm_refresh_btn.setEnabled(True)
         if rc == 0:
-            # Reload analysis from disk so the display updates immediately
-            try:
-                analysis_file = BASE_DIR / "llm_analysis.json"
-                if analysis_file.exists():
-                    with open(analysis_file) as f:
-                        raw = json.load(f)
-                    llm_analysis = {}
-                    for section in raw.values():
-                        if isinstance(section, dict):
-                            llm_analysis.update(section)
-                    self._llm_analysis_cache = llm_analysis
-                    self._on_stock_row_selected(self._stock_table.currentRow())
-            except (OSError, json.JSONDecodeError):
-                pass
+            self._reload_llm_from_disk()
+            self._update_llm_table_cells()  # all symbols
+            self._on_stock_row_selected(self._stock_table.currentRow(), 0, -1, 0)
             self._llm_refresh_status.setText("Analysis complete")
             self._llm_refresh_status.setStyleSheet(
                 f"color: {T['green'].name()}; font-size: 11px;")
         else:
-            output = proc.stdout.read() if proc.stdout else ""
             self._llm_refresh_status.setText(f"Failed (exit {rc})")
             self._llm_refresh_status.setStyleSheet(
                 f"color: {T['red'].name()}; font-size: 11px;")
         del self._llm_refresh_proc
+
+    def _reload_llm_from_disk(self):
+        """Reload llm_analysis.json into the cache."""
+        try:
+            analysis_file = BASE_DIR / "llm_analysis.json"
+            if analysis_file.exists():
+                with open(analysis_file) as f:
+                    raw = json.load(f)
+                for section in raw.values():
+                    if isinstance(section, dict):
+                        self._llm_analysis_cache.update(section)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def _update_llm_table_cells(self, only_sym=None):
+        """Update LLM score + age columns in the table from cache.
+
+        If only_sym is set, only update that row. Otherwise update all rows.
+        """
+        tbl = self._stock_table
+        now_ts = dt.datetime.now().timestamp()
+        for row in range(tbl.rowCount()):
+            item = tbl.item(row, 0)
+            if not item:
+                continue
+            sym = item.text()
+            if only_sym and sym != only_sym:
+                continue
+            llm = self._llm_analysis_cache.get(sym, {})
+            if not llm:
+                continue
+
+            # LLM score (column 7)
+            llm_s = llm.get('s')
+            llm_m = llm.get('m')
+            if llm_s is not None:
+                llm_text = f"{llm_s:.2f}"
+                if llm_s < 0.15:
+                    llm_color = QColor(180, 0, 0)
+                elif llm_s < 0.40:
+                    llm_color = T['red']
+                elif llm_s <= 0.60:
+                    llm_color = T.get('yellow', T['white'])
+                else:
+                    llm_color = T['green']
+            elif llm_m is not None:
+                llm_text = f"{llm_m:.1f}x"
+                llm_color = (T['green'] if llm_m >= 1.0 else
+                             (T['red'] if llm_m <= 0.5 else
+                              T.get('yellow', T['white'])))
+            else:
+                continue
+
+            score_item = tbl.item(row, 7)
+            if score_item:
+                score_item.setText(llm_text)
+                score_item.setForeground(llm_color)
+
+            # LLM age (column 8)
+            llm_ts = llm.get('timestamp', '')
+            if llm_ts:
+                try:
+                    t = dt.datetime.fromisoformat(llm_ts)
+                    now = dt.datetime.now(tz=t.tzinfo or None)
+                    age_h = (now - t).total_seconds() / 3600
+                    if age_h < 1:
+                        age_text = f"{age_h * 60:.0f}m"
+                    elif age_h < 24:
+                        age_text = f"{age_h:.0f}h"
+                    else:
+                        age_text = f"{age_h / 24:.0f}d"
+                    age_color = (T['green'] if age_h < 12 else
+                                 (T.get('yellow', T['white'])
+                                  if age_h < 48 else T['red']))
+                    age_item = tbl.item(row, 8)
+                    if age_item:
+                        age_item.setText(age_text)
+                        age_item.setForeground(age_color)
+                except (ValueError, TypeError):
+                    pass
 
     def _on_heatmap_clicked(self, sym):
         self._stock_symbol_combo.setCurrentText(sym)
