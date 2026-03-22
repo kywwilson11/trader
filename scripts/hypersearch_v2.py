@@ -885,11 +885,15 @@ def main():
     print(f"DONE: {num_trials} new trials in {total_time/60:.1f}min ({total_trials} total in study)")
     print(f"{'='*70}")
 
-    if best_state_holder['state'] is not None:
+    # Check if new best exceeds the existing model's score (protect against regression)
+    existing_score = adaptive_state.get('best_score', 0.0)
+    new_score = best_state_holder['score']
+
+    if best_state_holder['state'] is not None and new_score > existing_score:
         best_cfg = best_state_holder['cfg']
         best_scaler = best_state_holder['scaler']
 
-        print(f"\nBest model (score={best_state_holder['score']:.3f}, mean-0.5*std):")
+        print(f"\nNew best model (score={new_score:.3f} > existing {existing_score:.3f}):")
         for k, v in best_cfg.items():
             print(f"  {k}: {v}")
 
@@ -921,6 +925,9 @@ def main():
         print(f"Config saved: {prefix}config_v2.pkl")
         print(f"Scaler saved: {prefix}scaler_v2.pkl")
         print(f"Features saved: {prefix}feature_cols_v2.pkl")
+    elif best_state_holder['state'] is not None:
+        print(f"\nModel NOT saved: new best {new_score:.3f} <= existing {existing_score:.3f}")
+        print("Existing model preserved (higher score).")
     else:
         print(f"\nNo new best found (prior best score={best_state_holder['score']:.3f})")
 
