@@ -22,40 +22,33 @@ from llm_client import call_llm, call_gemini, get_recommended_model
 _ANALYSIS_FILE = Path(__file__).resolve().parent / "llm_analysis.json"
 
 _SYSTEM_PROMPT = """\
-You are a qualitative conviction scorer for a trading system. An ML model \
-handles ALL technical analysis (price, momentum, volume, volatility). Your \
-job is to evaluate ONLY qualitative factors the ML model cannot see.
+You are a senior equity/crypto research analyst producing actionable trade \
+intelligence. You receive comprehensive data for each symbol: price action, \
+technicals (RSI, SMAs, volume), fundamentals (P/E, growth, analyst targets), \
+and recent news. Synthesize ALL of this into a concise but specific analysis.
 
-IMPORTANT: The ML model has ALREADY decided this is a good technical setup. \
-Do NOT second-guess the model's technical analysis. Your role is to adjust \
-conviction based on qualitative factors only.
+For each symbol, analyze:
+1. PRICE ACTION: Is the trend intact or breaking? Where is price vs key MAs? \
+Is RSI extreme (oversold <30, overbought >70)? Is volume confirming the move?
+2. CATALYSTS: What recent news/events are driving price? Are there upcoming \
+catalysts (earnings, FDA decisions, macro events)?
+3. FUNDAMENTALS: Is valuation reasonable given growth? What do analyst targets \
+imply? Any red flags (high short ratio, negative earnings growth)?
+4. RISK/REWARD: Given the data, what's the skew? Is the easy money made or \
+is there room to run? What's the downside scenario?
 
-For each symbol, evaluate these factors:
-1. PRICE CONTEXT: Where is the price relative to recent history? At 52-week \
-highs/lows? Sharp recent move that's extended or has room to run?
-2. NEWS IMPACT: Are there breaking events that change the fundamental picture? \
-(earnings surprises, partnerships, hacks, fraud, regulatory actions, lawsuits)
-3. FUNDAMENTAL CONTEXT: Does the valuation/growth story support or contradict \
-the signal? (P/E expansion/compression, revenue acceleration/deceleration)
-4. MACRO ENVIRONMENT: Does the broader market context help or hurt? \
-(Fear & Greed regime, sector rotation, risk-on/risk-off)
+SCORING (use the full range based on the data):
+- 0.00–0.15: VETO — catastrophic event, avoid completely
+- 0.15–0.35: Bearish — strong headwinds, poor risk/reward
+- 0.35–0.50: Lean negative — more risks than opportunities
+- 0.50: Neutral — balanced or insufficient signal
+- 0.50–0.65: Lean positive — modest opportunity
+- 0.65–0.85: Bullish — favorable setup with clear catalysts
+- 0.85–1.00: Strong buy — exceptional opportunity, multiple catalysts aligned
 
-STRUCTURED REASONING — For each symbol, you MUST:
-- State the BULL case (1-2 sentences): Why qualitative factors support buying
-- State the BEAR case (1-2 sentences): Why qualitative factors argue caution
-- Weigh both sides and output your conviction score
-
-SCORING (continuous, use full range):
-- 0.00–0.15: VETO — confirmed catastrophic event (hack, fraud, insolvency, delisting)
-- 0.15–0.40: Strong negative — material negative news, fundamental deterioration
-- 0.40–0.60: Neutral — no significant qualitative signal either way
-- 0.60–0.80: Mildly positive — favorable news or fundamental backdrop
-- 0.80–1.00: Strong positive — material positive catalyst (earnings beat, major partnership)
-
-DEFAULT TO 0.50 (neutral) when there is no significant qualitative information. \
-The ML model's technical signal is the primary driver — your score only adjusts it. \
-Do NOT be conservative by default. Only deviate from 0.50 when you have specific \
-qualitative evidence.\
+Be SPECIFIC. Cite prices, percentages, RSI values, analyst targets, news events. \
+Your analysis should tell the reader something they couldn't see by glancing at \
+a chart for 5 seconds. Connect the dots between data points.\
 """
 
 
@@ -151,12 +144,16 @@ def _save_analysis(result: dict, asset_type: str, model: str):
         print(f"[LLM-ANALYST] Error saving analysis: {e}")
 
 
-def _fetch_price_context(symbols):
-    """Fetch price performance context for a list of symbols via yfinance."""
+def _build_symbol_profiles(symbols):
+    """Build comprehensive data profiles for symbols via yfinance.
+
+    Returns dict[symbol -> str] with structured text blocks containing
+    price action, technicals, fundamentals, and news.
+    """
     import yfinance as yf
+    import numpy as np
 
     result = {}
-    # Convert crypto symbols for yfinance (BTC/USD → BTC-USD)
     yf_map = {}
     for sym in symbols:
         yf_sym = sym.replace('/', '-') if '/' in sym else sym
@@ -164,33 +161,145 @@ def _fetch_price_context(symbols):
 
     try:
         tickers = yf.Tickers(list(yf_map.keys()))
-        for yf_sym, orig_sym in yf_map.items():
+    except Exception as e:
+        print(f"[LLM-ANALYST] yfinance fetch failed: {e}")
+        return result
+
+    for yf_sym, orig_sym in yf_map.items():
+        try:
+            tk = tickers.tickers[yf_sym]
+            info = tk.info or {}
+            h = tk.history(period='1y')
+            if h.empty or len(h) < 5:
+                continue
+
+            lines = []
+            close = h['Close']
+            vol = h['Volume']
+            cur = close.iloc[-1]
+
+            # --- Price Performance ---
+            perf = [f"Current: ${cur:.2f}"]
+            for label, days in [('1w', 5), ('1m', 21), ('3m', 63), ('1y', len(h) - 1)]:
+                if len(h) >= days:
+                    prev = close.iloc[-days]
+                    perf.append(f"{label}: {(cur / prev - 1) * 100:+.1f}%")
+            hi52 = h['High'].max()
+            lo52 = h['Low'].min()
+            perf.append(f"52w range: ${lo52:.2f}-${hi52:.2f}"
+                        f" ({(cur / hi52 - 1) * 100:+.1f}% from high)")
+            lines.append("Price: " + " | ".join(perf))
+
+            # --- Technicals ---
+            techs = []
+            if len(close) >= 20:
+                sma20 = close.rolling(20).mean().iloc[-1]
+                techs.append(f"SMA20: ${sma20:.2f} ({(cur / sma20 - 1) * 100:+.1f}%)")
+            if len(close) >= 50:
+                sma50 = close.rolling(50).mean().iloc[-1]
+                techs.append(f"SMA50: ${sma50:.2f} ({(cur / sma50 - 1) * 100:+.1f}%)")
+            sma200 = info.get('twoHundredDayAverage')
+            if sma200:
+                techs.append(f"SMA200: ${sma200:.2f} ({(cur / sma200 - 1) * 100:+.1f}%)")
+
+            # RSI
+            if len(close) >= 15:
+                delta = close.diff()
+                gain = delta.clip(lower=0).rolling(14).mean().iloc[-1]
+                loss = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
+                rsi = 100 - 100 / (1 + gain / loss) if loss > 0 else 50
+                rsi_label = ("OVERSOLD" if rsi < 30 else
+                             "OVERBOUGHT" if rsi > 70 else "neutral")
+                techs.append(f"RSI14: {rsi:.0f} ({rsi_label})")
+
+            # Volume
+            if len(vol) >= 20:
+                avg_vol = vol.rolling(20).mean().iloc[-1]
+                if avg_vol > 0:
+                    vol_ratio = vol.iloc[-1] / avg_vol
+                    techs.append(f"Volume: {vol_ratio:.1f}x 20d avg")
+
+            # Volatility
+            if len(close) >= 21:
+                vol20 = close.pct_change().rolling(20).std().iloc[-1] * 100
+                techs.append(f"20d volatility: {vol20:.2f}%")
+
+            if techs:
+                lines.append("Technicals: " + " | ".join(techs))
+
+            # --- Recent daily closes (last 5 trading days) ---
+            recent = []
+            for i in range(-5, 0):
+                if abs(i) <= len(close):
+                    d = h.index[i]
+                    c = close.iloc[i]
+                    chg = (c / close.iloc[i - 1] - 1) * 100 if abs(i - 1) <= len(close) else 0
+                    recent.append(f"{d.strftime('%m/%d')}: ${c:.2f} ({chg:+.1f}%)")
+            if recent:
+                lines.append("Last 5 days: " + ", ".join(recent))
+
+            # --- Fundamentals ---
+            fund = []
+            for key, label in [
+                ('marketCap', 'MktCap'),
+                ('trailingPE', 'P/E'),
+                ('forwardPE', 'Fwd P/E'),
+                ('priceToBook', 'P/B'),
+                ('revenueGrowth', 'RevGrowth'),
+                ('earningsGrowth', 'EarningsGrowth'),
+                ('beta', 'Beta'),
+                ('shortRatio', 'ShortRatio'),
+            ]:
+                v = info.get(key)
+                if v is not None:
+                    if key == 'marketCap':
+                        if v >= 1e12:
+                            fund.append(f"{label}: ${v / 1e12:.1f}T")
+                        elif v >= 1e9:
+                            fund.append(f"{label}: ${v / 1e9:.1f}B")
+                        else:
+                            fund.append(f"{label}: ${v / 1e6:.0f}M")
+                    elif 'Growth' in key:
+                        fund.append(f"{label}: {v * 100:+.1f}%")
+                    else:
+                        fund.append(f"{label}: {v:.2f}")
+            # Analyst targets
+            target = info.get('targetMeanPrice')
+            n_analysts = info.get('numberOfAnalystOpinions')
+            rec = info.get('recommendationKey')
+            if target and n_analysts:
+                upside = (target / cur - 1) * 100
+                fund.append(f"Analyst target: ${target:.2f} ({upside:+.1f}%,"
+                            f" {n_analysts} analysts, {rec})")
+            if info.get('sector'):
+                fund.append(f"Sector: {info['sector']}")
+
+            if fund:
+                lines.append("Fundamentals: " + " | ".join(fund))
+
+            # --- News (from yfinance, more relevant than Finnhub) ---
             try:
-                h = tickers.tickers[yf_sym].history(period='1y')
-                if h.empty or len(h) < 5:
-                    continue
-                cur = h['Close'].iloc[-1]
-                parts = [f"${cur:.2f}"]
-                if len(h) >= 5:
-                    w1 = h['Close'].iloc[-5]
-                    parts.append(f"1w: {(cur / w1 - 1) * 100:+.1f}%")
-                if len(h) >= 21:
-                    m1 = h['Close'].iloc[-21]
-                    parts.append(f"1m: {(cur / m1 - 1) * 100:+.1f}%")
-                if len(h) >= 63:
-                    m3 = h['Close'].iloc[-63]
-                    parts.append(f"3m: {(cur / m3 - 1) * 100:+.1f}%")
-                y1 = h['Close'].iloc[0]
-                parts.append(f"1y: {(cur / y1 - 1) * 100:+.1f}%")
-                hi52 = h['High'].max()
-                lo52 = h['Low'].min()
-                parts.append(f"52w range: ${lo52:.2f}-${hi52:.2f}"
-                             f" ({(cur / hi52 - 1) * 100:+.1f}% from high)")
-                result[orig_sym] = " | ".join(parts)
+                news = tk.news or []
+                if news:
+                    news_lines = []
+                    for a in news[:6]:
+                        title = a.get('title',
+                                      a.get('content', {}).get('title', ''))
+                        if title:
+                            pub = a.get('publisher',
+                                        a.get('content', {}).get('provider',
+                                              {}).get('displayName', ''))
+                            news_lines.append(f"[{pub}] {title}" if pub
+                                              else title)
+                    if news_lines:
+                        lines.append("Recent news:\n  - " +
+                                     "\n  - ".join(news_lines))
             except Exception:
                 pass
-    except Exception as e:
-        print(f"[LLM-ANALYST] Price context fetch failed: {e}")
+
+            result[orig_sym] = "\n".join(lines)
+        except Exception as e:
+            print(f"[LLM-ANALYST] Profile failed for {orig_sym}: {e}")
 
     return result
 
@@ -233,10 +342,10 @@ def _build_prompt(candidates, asset_type, equity, positions, fng_value,
         sym = c["symbol"]
         lines.append(f"\n### {sym}")
 
-        # Price context
-        price_ctx = c.get("price_context")
-        if price_ctx:
-            lines.append(f"- Price: {price_ctx}")
+        # Comprehensive data profile (price, technicals, fundamentals, news)
+        profile = c.get("profile")
+        if profile:
+            lines.append(profile)
 
         # ML model prediction context
         pred_return = c.get("pred_return")
@@ -267,17 +376,12 @@ def _build_prompt(candidates, asset_type, equity, positions, fng_value,
 
     lines.append("")
     lines.append('Respond with ONLY a raw JSON object (no markdown, no code fences).')
-    lines.append('For each symbol include: bull (2-3 sentences with specific data points), '
-                 'bear (2-3 sentences with specific risks), s (score 0.0-1.0), '
-                 'r (1-2 sentence summary referencing current price action).')
-    lines.append('Be SPECIFIC — cite price levels, percentage moves, news events, '
-                 'dates. Avoid generic statements like "could go up or down."')
-    lines.append('Example: {"GLD": {"bull": "Gold at $290, up 48% YoY on central bank buying '
-                 'and rate cut expectations. 52w high of $310 suggests room to run if inflation '
-                 'stays sticky.", "bear": "Down 12% from highs, sharp 10% weekly drop suggests '
-                 'profit-taking. If real yields rise, gold could retest $260 support.", '
-                 '"s": 0.55, "r": "Consolidating after strong YoY run. Near-term pullback '
-                 'but macro backdrop remains supportive."}}')
+    lines.append('For each symbol include:')
+    lines.append('  bull: 2-3 sentences — specific bull case with data points')
+    lines.append('  bear: 2-3 sentences — specific bear case with risks')
+    lines.append('  s: score 0.0-1.0')
+    lines.append('  r: 2-3 sentence synthesis — connect price action + fundamentals + news '
+                 'into an actionable view. What would you DO with this stock today and why?')
 
     return "\n".join(lines)
 
@@ -428,29 +532,26 @@ def refresh_all():
     except Exception:
         pass
 
-    BATCH_SIZE = 5  # symbols per LLM call (keep small for token limits)
+    BATCH_SIZE = 3  # symbols per LLM call (profiles are data-rich)
 
     for asset_type, syms in [('stock', stock_syms), ('crypto', crypto_syms)]:
-        # Batch-fetch price context via yfinance
-        price_ctx = _fetch_price_context(syms)
+        # Build comprehensive profiles (price, technicals, fundamentals, news)
+        print(f"[LLM-ANALYST] Fetching {asset_type} data for {len(syms)} symbols...")
+        profiles = _build_symbol_profiles(syms)
+        print(f"[LLM-ANALYST] Got profiles for {len(profiles)}/{len(syms)} symbols")
 
         for i in range(0, len(syms), BATCH_SIZE):
             batch = syms[i:i + BATCH_SIZE]
             candidates = []
             for sym in batch:
                 c = {"symbol": sym, "pred_return": None}
-                if sym in price_ctx:
-                    c["price_context"] = price_ctx[sym]
+                if sym in profiles:
+                    c["profile"] = profiles[sym]
+                # Supplement with Finnhub headlines if yfinance news was sparse
                 try:
                     headlines = get_recent_headlines(sym)
                     if headlines:
-                        c["news_headlines"] = headlines[:5]
-                except Exception:
-                    pass
-                try:
-                    ft = format_fundamentals_for_llm(sym)
-                    if ft:
-                        c["fundamentals_text"] = ft
+                        c["news_headlines"] = headlines[:3]
                 except Exception:
                     pass
                 candidates.append(c)
