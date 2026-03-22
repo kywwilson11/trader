@@ -468,6 +468,14 @@ def _parse_response(response: str, symbols: list[str]) -> dict[str, dict]:
     if parsed is None:
         parsed = _repair_truncated_json(text)
 
+    # Handle array format: [{"symbol": "META", ...}] → {"META": {...}}
+    if isinstance(parsed, list):
+        converted = {}
+        for item in parsed:
+            if isinstance(item, dict) and 'symbol' in item:
+                converted[item['symbol']] = item
+        parsed = converted if converted else None
+
     if not parsed or not isinstance(parsed, dict):
         print(f"[LLM-ANALYST] Could not parse JSON from response ({len(response)} chars): {response[:200]}")
         return {}
