@@ -26,6 +26,7 @@ Rate limiting:
 import collections
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -81,6 +82,7 @@ _quota_reset_date: str = ""
 _DAILY_COST_LIMIT = 1.00  # ~$30/month (paid tier 1)
 _daily_cost: float = 0.0
 _cost_reset_date: str = ""
+_COST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_cost.json")
 
 # Thread safety for quota/cost tracking
 _quota_lock = threading.Lock()
@@ -313,6 +315,33 @@ def _trigger_429_cooldown():
     print(f"[LLM] All models rate-limited, cooling down {_429_COOLDOWN_SEC}s")
 
 
+def _load_shared_cost():
+    """Load daily cost from shared file (cross-process visibility)."""
+    global _daily_cost, _cost_reset_date
+    try:
+        with open(_COST_FILE) as f:
+            data = json.load(f)
+        today = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+        if data.get("date") == today:
+            _daily_cost = data.get("cost", 0.0)
+            _cost_reset_date = today
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+
+def _save_shared_cost():
+    """Persist daily cost to shared file (cross-process visibility)."""
+    today = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+    data = {"date": today, "cost": round(_daily_cost, 6)}
+    try:
+        tmp = _COST_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _COST_FILE)
+    except OSError:
+        pass
+
+
 def _maybe_reset_quota():
     """Reset daily quota and cost counters at midnight Pacific."""
     global _quota_reset_date, _cost_reset_date, _daily_cost
@@ -322,10 +351,15 @@ def _maybe_reset_quota():
             _model_calls.clear()
             _quota_reset_date = today
         if _cost_reset_date != today:
-            if _daily_cost > 0:
-                print(f"[LLM] Daily cost reset (yesterday: ${_daily_cost:.4f})")
-            _daily_cost = 0.0
-            _cost_reset_date = today
+            # Load shared cost file first — another process may have spent today
+            _load_shared_cost()
+            if _cost_reset_date != today:
+                # Still not today's date — fresh day
+                if _daily_cost > 0:
+                    print(f"[LLM] Daily cost reset (yesterday: ${_daily_cost:.4f})")
+                _daily_cost = 0.0
+                _cost_reset_date = today
+                _save_shared_cost()
 
 
 def _estimate_cost(model: str, prompt_chars: int, response_chars: int) -> float:
@@ -337,11 +371,14 @@ def _estimate_cost(model: str, prompt_chars: int, response_chars: int) -> float:
 
 
 def _record_cost(model: str, prompt_chars: int, response_chars: int):
-    """Record estimated cost for this call."""
+    """Record estimated cost and persist to shared file."""
     global _daily_cost
     cost = _estimate_cost(model, prompt_chars, response_chars)
     with _quota_lock:
+        # Re-read shared file to pick up costs from other processes
+        _load_shared_cost()
         _daily_cost += cost
+        _save_shared_cost()
 
 
 def _cost_ok() -> bool:
@@ -353,8 +390,13 @@ def _cost_ok() -> bool:
 
 
 def get_daily_cost() -> tuple[float, float]:
-    """Return (spent_today, daily_limit) for monitoring."""
+    """Return (spent_today, daily_limit) for monitoring.
+
+    Reads shared cost file so GUI sees costs from all processes.
+    """
     _maybe_reset_quota()
+    with _quota_lock:
+        _load_shared_cost()
     return _daily_cost, _DAILY_COST_LIMIT
 
 
