@@ -22,33 +22,35 @@ from llm_client import call_llm, call_gemini, get_recommended_model
 _ANALYSIS_FILE = Path(__file__).resolve().parent / "llm_analysis.json"
 
 _SYSTEM_PROMPT = """\
-You are a senior equity/crypto research analyst producing actionable trade \
-intelligence. You receive comprehensive data for each symbol: price action, \
-technicals (RSI, SMAs, volume), fundamentals (P/E, growth, analyst targets), \
-and recent news. Synthesize ALL of this into a concise but specific analysis.
+You are a research analyst producing trade intelligence that complements an \
+ML trading model. The ML model handles pattern recognition on technical \
+indicators, but it cannot read news, understand narratives, evaluate \
+management quality, or anticipate catalysts. You can see everything — \
+use all the data provided to form a complete, informed view.
 
-For each symbol, analyze:
-1. PRICE ACTION: Is the trend intact or breaking? Where is price vs key MAs? \
-Is RSI extreme (oversold <30, overbought >70)? Is volume confirming the move?
-2. CATALYSTS: What recent news/events are driving price? Are there upcoming \
-catalysts (earnings, FDA decisions, macro events)?
-3. FUNDAMENTALS: Is valuation reasonable given growth? What do analyst targets \
-imply? Any red flags (high short ratio, negative earnings growth)?
-4. RISK/REWARD: Given the data, what's the skew? Is the easy money made or \
-is there room to run? What's the downside scenario?
+For each symbol, synthesize:
+1. WHY is it moving? What news, events, or macro forces explain the recent \
+price action? Be specific — cite events, dates, and magnitudes.
+2. FUNDAMENTALS: Is the valuation compelling or stretched given growth? \
+What do analyst targets and earnings trajectory imply?
+3. CATALYSTS: What upcoming events could move the stock? Earnings dates, \
+FDA decisions, product launches, macro events, sector rotation.
+4. RISKS: What could go wrong? Crowded positioning, regulatory headwinds, \
+competitive threats, deteriorating fundamentals.
+5. SYNTHESIS: Given all of the above, what's the risk/reward skew? \
+What would you do with this stock today?
 
-SCORING (use the full range based on the data):
-- 0.00–0.15: VETO — catastrophic event, avoid completely
-- 0.15–0.35: Bearish — strong headwinds, poor risk/reward
-- 0.35–0.50: Lean negative — more risks than opportunities
-- 0.50: Neutral — balanced or insufficient signal
-- 0.50–0.65: Lean positive — modest opportunity
-- 0.65–0.85: Bullish — favorable setup with clear catalysts
-- 0.85–1.00: Strong buy — exceptional opportunity, multiple catalysts aligned
+SCORING — use precise, continuous values (e.g., 0.37, 0.62, 0.78):
+- 0.00–0.15: VETO — confirmed catastrophe (fraud, insolvency, delisting)
+- 0.15–0.35: Bearish — material negative catalysts, poor risk/reward
+- 0.35–0.50: Lean negative — more headwinds than tailwinds
+- 0.50: Neutral — balanced or insufficient information
+- 0.50–0.65: Lean positive — modest tailwinds, decent setup
+- 0.65–0.85: Bullish — clear catalysts, strong backdrop
+- 0.85–1.00: Strong conviction — exceptional, multi-factor opportunity
 
-Be SPECIFIC. Cite prices, percentages, RSI values, analyst targets, news events. \
-Your analysis should tell the reader something they couldn't see by glancing at \
-a chart for 5 seconds. Connect the dots between data points.\
+Use the FULL continuous range. Scores like 0.43 or 0.71 are expected. \
+Avoid rounding to 0.05 increments — be precise about your conviction level.\
 """
 
 
@@ -376,12 +378,10 @@ def _build_prompt(candidates, asset_type, equity, positions, fng_value,
 
     lines.append("")
     lines.append('Respond with ONLY a raw JSON object (no markdown, no code fences).')
-    lines.append('For each symbol include:')
-    lines.append('  bull: 2-3 sentences — specific bull case with data points')
-    lines.append('  bear: 2-3 sentences — specific bear case with risks')
-    lines.append('  s: score 0.0-1.0')
-    lines.append('  r: 2-3 sentence synthesis — connect price action + fundamentals + news '
-                 'into an actionable view. What would you DO with this stock today and why?')
+    lines.append('For each symbol: bull (2-3 sentences with specifics), '
+                 'bear (2-3 sentences with risks), '
+                 's (precise continuous score like 0.37 or 0.72, NOT rounded to 0.05), '
+                 'r (2-3 sentence actionable synthesis).')
 
     return "\n".join(lines)
 
