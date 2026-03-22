@@ -511,6 +511,34 @@ def _parse_response(response: str, symbols: list[str]) -> dict[str, dict]:
     return result
 
 
+def refresh_one(symbol: str, asset_type: str = 'stock'):
+    """Analyze a single symbol with full profile data."""
+    from sentiment import get_recent_headlines, get_fear_greed
+
+    profiles = _build_symbol_profiles([symbol])
+    fng = None
+    try:
+        fd = get_fear_greed()
+        fng = fd.get('value') if isinstance(fd, dict) else fd
+    except Exception:
+        pass
+
+    c = {"symbol": symbol, "pred_return": None}
+    if symbol in profiles:
+        c["profile"] = profiles[symbol]
+    try:
+        headlines = get_recent_headlines(symbol)
+        if headlines:
+            c["news_headlines"] = headlines[:5]
+    except Exception:
+        pass
+
+    print(f"[LLM-ANALYST] Analyzing {symbol}...")
+    result = analyze_trades([c], asset_type, fng_value=fng)
+    n = len(result) if result else 0
+    print(f"[LLM-ANALYST] Got {n} result(s)")
+
+
 def refresh_all():
     """Analyze ALL symbols in the universe (stocks + crypto).
 

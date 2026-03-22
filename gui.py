@@ -960,7 +960,7 @@ class DataFetcher(QObject):
             # Cap at 10 newest to avoid blocking the fetcher thread for minutes
             upgradeable = [a for a in articles
                            if a.get('_sent_method', '') != 'LLM'
-                           or a.get('_scored_by_model', '') != 'gemini-2.5-pro']
+                           or a.get('_scored_by_model', '') != 'gemini-3.1-pro-preview']
             if upgradeable:
                 upgradeable = upgradeable[:10]
                 upgrade_scores = try_llm_upgrade(upgradeable)
@@ -1819,9 +1819,11 @@ class TradingDashboard(QMainWindow):
         if hasattr(self, '_restart_pipeline_btn'):
             self._restart_pipeline_btn.setStyleSheet(retrain_btn_style)
 
-        # LLM refresh button
+        # LLM refresh buttons
         if hasattr(self, '_llm_refresh_btn'):
             self._llm_refresh_btn.setStyleSheet(retrain_btn_style)
+        if hasattr(self, '_llm_refresh_one_btn'):
+            self._llm_refresh_one_btn.setStyleSheet(retrain_btn_style)
 
         # Bot control buttons
         if hasattr(self, '_crypto_start_btn'):
@@ -2387,7 +2389,12 @@ class TradingDashboard(QMainWindow):
             "font-size: 14px; font-weight: bold;")
         detail_header.addWidget(self._llm_detail_symbol)
         detail_header.addStretch()
-        self._llm_refresh_btn = QPushButton("Refresh All LLM Analysis")
+        self._llm_refresh_one_btn = QPushButton("Refresh Selected")
+        self._llm_refresh_one_btn.setFixedHeight(26)
+        self._llm_refresh_one_btn.setCursor(Qt.PointingHandCursor)
+        self._llm_refresh_one_btn.clicked.connect(self._refresh_one_llm_clicked)
+        detail_header.addWidget(self._llm_refresh_one_btn)
+        self._llm_refresh_btn = QPushButton("Refresh All")
         self._llm_refresh_btn.setFixedHeight(26)
         self._llm_refresh_btn.setCursor(Qt.PointingHandCursor)
         self._llm_refresh_btn.clicked.connect(self._refresh_all_llm_clicked)
@@ -2553,6 +2560,76 @@ class TradingDashboard(QMainWindow):
         if not html:
             html = f"<span style='color:{muted};'>No reasoning available</span>"
         self._llm_detail_text.setText(html)
+
+    def _refresh_one_llm_clicked(self):
+        """Refresh LLM analysis for the currently selected symbol."""
+        row = self._stock_table.currentRow()
+        if row < 0:
+            self._llm_refresh_status.setText("No symbol selected")
+            self._llm_refresh_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+            return
+        item = self._stock_table.item(row, 0)
+        if not item:
+            return
+        sym = item.text()
+        asset_type = 'crypto' if '/' in sym else 'stock'
+
+        self._llm_refresh_one_btn.setEnabled(False)
+        self._llm_refresh_status.setText(f"Analyzing {sym}...")
+        self._llm_refresh_status.setStyleSheet(
+            f"color: {T['accent'].name()}; font-size: 11px;")
+        QApplication.processEvents()
+
+        import subprocess
+        python = "/home/kyle/miniforge3/envs/jetson/bin/python"
+        env = {
+            **os.environ,
+            "LD_LIBRARY_PATH": (
+                "/home/kyle/miniforge3/envs/jetson/lib:"
+                + os.environ.get("LD_LIBRARY_PATH", "")
+            ),
+            "PYTHONUNBUFFERED": "1",
+        }
+        try:
+            proc = subprocess.Popen(
+                [python, "-u", "-c",
+                 f"from llm_analyst import refresh_one; refresh_one('{sym}', '{asset_type}')"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=env, cwd=str(BASE_DIR), text=True,
+            )
+            self._llm_refresh_one_proc = proc
+            self._llm_refresh_one_sym = sym
+            from PySide6.QtCore import QTimer
+            self._llm_refresh_one_timer = QTimer()
+            self._llm_refresh_one_timer.timeout.connect(self._check_one_llm_refresh)
+            self._llm_refresh_one_timer.start(1000)
+        except Exception as e:
+            self._llm_refresh_status.setText(f"Error: {e}")
+            self._llm_refresh_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+            self._llm_refresh_one_btn.setEnabled(True)
+
+    def _check_one_llm_refresh(self):
+        """Poll single-symbol LLM refresh for completion."""
+        if not hasattr(self, '_llm_refresh_one_proc'):
+            return
+        proc = self._llm_refresh_one_proc
+        rc = proc.poll()
+        if rc is None:
+            return
+        self._llm_refresh_one_timer.stop()
+        self._llm_refresh_one_btn.setEnabled(True)
+        sym = getattr(self, '_llm_refresh_one_sym', '?')
+        if rc == 0:
+            self._llm_refresh_status.setText(f"{sym} updated")
+            self._llm_refresh_status.setStyleSheet(
+                f"color: {T['green'].name()}; font-size: 11px;")
+        else:
+            self._llm_refresh_status.setText(f"{sym} failed (exit {rc})")
+            self._llm_refresh_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+        del self._llm_refresh_one_proc
 
     def _refresh_all_llm_clicked(self):
         """Trigger LLM analysis for all symbols in the universe."""
@@ -3217,9 +3294,12 @@ class TradingDashboard(QMainWindow):
         self._settings_analyst_model.setMaximumWidth(320)
         for mid, label in [
             ("auto", "Auto (Smart Routing)"),
-            ("gemini-2.5-pro", "Pro (best reasoning, higher cost)"),
-            ("gemini-2.5-flash", "Flash (fast, low cost)"),
-            ("gemini-2.5-flash-lite", "Flash Lite (cheapest)"),
+            ("gemini-3.1-pro-preview", "3.1 Pro (best reasoning)"),
+            ("gemini-3-flash-preview", "3.0 Flash (fast, capable)"),
+            ("gemini-3.1-flash-lite-preview", "3.1 Flash Lite (budget)"),
+            ("gemini-2.5-pro", "2.5 Pro (legacy fallback)"),
+            ("gemini-2.5-flash", "2.5 Flash (legacy fallback)"),
+            ("gemini-2.5-flash-lite", "2.5 Flash Lite (cheapest)"),
         ]:
             self._settings_analyst_model.addItem(label, mid)
         cur_analyst = config.get("analyst_model_override") or "auto"
@@ -3235,8 +3315,10 @@ class TradingDashboard(QMainWindow):
         self._settings_sentiment_model.setMaximumWidth(320)
         for mid, label in [
             ("auto", "Auto (Smart Routing)"),
-            ("gemini-2.5-flash", "Flash (better accuracy)"),
-            ("gemini-2.5-flash-lite", "Flash Lite (cheapest)"),
+            ("gemini-3-flash-preview", "3.0 Flash (better accuracy)"),
+            ("gemini-3.1-flash-lite-preview", "3.1 Flash Lite (budget)"),
+            ("gemini-2.5-flash", "2.5 Flash (legacy fallback)"),
+            ("gemini-2.5-flash-lite", "2.5 Flash Lite (cheapest)"),
         ]:
             self._settings_sentiment_model.addItem(label, mid)
         cur_sentiment = config.get("sentiment_model_override") or "auto"
@@ -4488,12 +4570,18 @@ class TradingDashboard(QMainWindow):
                 f"QProgressBar::chunk {{ background-color: {cost_color}; }}")
 
             for model, label in [
-                ("gemini-2.5-pro", self._llm_pro_label),
-                ("gemini-2.5-flash", self._llm_flash_label),
-                ("gemini-2.5-flash-lite", self._llm_lite_label),
+                ("gemini-3.1-pro-preview", self._llm_pro_label),
+                ("gemini-3-flash-preview", self._llm_flash_label),
+                ("gemini-3.1-flash-lite-preview", self._llm_lite_label),
             ]:
                 remaining, total = get_budget(model)
-                short_name = model.split("-")[-1].capitalize()
+                # Extract readable short name from model ID
+                if "pro" in model:
+                    short_name = "Pro"
+                elif "flash-lite" in model or "flash_lite" in model:
+                    short_name = "Lite"
+                else:
+                    short_name = "Flash"
                 label.setText(f"{short_name}: {remaining}/{total}")
         except Exception:
             pass
