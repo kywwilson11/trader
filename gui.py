@@ -1815,6 +1815,10 @@ class TradingDashboard(QMainWindow):
             )
             self._retrain_cancel_btn.setStyleSheet(cancel_btn_style)
 
+        # Restart pipeline button
+        if hasattr(self, '_restart_pipeline_btn'):
+            self._restart_pipeline_btn.setStyleSheet(retrain_btn_style)
+
         # Bot control buttons
         if hasattr(self, '_crypto_start_btn'):
             bot_btn_style = (
@@ -2738,6 +2742,19 @@ class TradingDashboard(QMainWindow):
         pipeline_layout.addWidget(self._pipeline_scores, 3, 1)
         pipeline_layout.addWidget(self._pipeline_retrain, 4, 0, 1, 2)
 
+        # Pipeline restart control
+        restart_row = QHBoxLayout()
+        self._restart_pipeline_btn = QPushButton("Restart Pipeline")
+        self._restart_pipeline_btn.setFixedHeight(28)
+        self._restart_pipeline_btn.setCursor(Qt.PointingHandCursor)
+        self._restart_pipeline_btn.clicked.connect(self._restart_pipeline_clicked)
+        self._restart_pipeline_status = QLabel("")
+        self._restart_pipeline_status.setStyleSheet("font-size: 11px;")
+        restart_row.addWidget(self._restart_pipeline_btn)
+        restart_row.addWidget(self._restart_pipeline_status)
+        restart_row.addStretch()
+        pipeline_layout.addLayout(restart_row, 5, 0, 1, 2)
+
         # Manual retrain controls
         retrain_row = QHBoxLayout()
         self._retrain_crypto_btn = QPushButton("Retrain Crypto")
@@ -2762,7 +2779,7 @@ class TradingDashboard(QMainWindow):
         retrain_row.addWidget(self._retrain_cancel_btn)
         retrain_row.addWidget(self._retrain_status)
         retrain_row.addStretch()
-        pipeline_layout.addLayout(retrain_row, 5, 0, 1, 2)
+        pipeline_layout.addLayout(retrain_row, 6, 0, 1, 2)
 
         layout.addWidget(pipeline_group)
 
@@ -3824,6 +3841,81 @@ class TradingDashboard(QMainWindow):
         except Exception as e:
             self._retrain_status.setText(f"Error: {e}")
             self._retrain_status.setStyleSheet(f"color: {T['red'].name()}; font-size: 11px;")
+
+    def _restart_pipeline_clicked(self):
+        """Kill existing pipeline (if running) and start a fresh one."""
+        import signal
+        import subprocess
+
+        self._restart_pipeline_btn.setEnabled(False)
+        self._restart_pipeline_status.setText("Restarting...")
+        self._restart_pipeline_status.setStyleSheet(
+            f"color: {T['accent'].name()}; font-size: 11px;")
+        QApplication.processEvents()
+
+        # Find and kill existing pipeline process
+        killed = False
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "run_pipeline\\.py"],
+                capture_output=True, text=True, timeout=5)
+            pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    killed = True
+                except ProcessLookupError:
+                    pass
+        except Exception:
+            pass
+
+        if killed:
+            # Wait for processes to exit
+            import time
+            for _ in range(30):  # up to 3 seconds
+                time.sleep(0.1)
+                QApplication.processEvents()
+                try:
+                    result = subprocess.run(
+                        ["pgrep", "-f", "run_pipeline\\.py"],
+                        capture_output=True, text=True, timeout=2)
+                    if not result.stdout.strip():
+                        break
+                except Exception:
+                    break
+
+        # Start new pipeline
+        pipeline_py = str(BASE_DIR / "run_pipeline.py")
+        python = "/home/kyle/miniforge3/envs/jetson/bin/python"
+        log_file = str(BASE_DIR / "pipeline_output.log")
+        env = {
+            **os.environ,
+            "LD_LIBRARY_PATH": (
+                "/home/kyle/miniforge3/envs/jetson/lib:"
+                "/home/kyle/miniforge3/envs/jetson/lib/python3.10/"
+                "site-packages/nvidia/cusparselt/lib:"
+                + os.environ.get("LD_LIBRARY_PATH", "")
+            ),
+            "PYTHONUNBUFFERED": "1",
+        }
+        try:
+            with open(log_file, "a") as lf:
+                proc = subprocess.Popen(
+                    [python, "-u", pipeline_py, "--skip-harvest", "--bot-only"],
+                    stdout=lf, stderr=subprocess.STDOUT,
+                    env=env, cwd=str(BASE_DIR),
+                    start_new_session=True,
+                )
+            msg = f"Pipeline started (PID {proc.pid})"
+            self._restart_pipeline_status.setText(msg)
+            self._restart_pipeline_status.setStyleSheet(
+                f"color: {T['green'].name()}; font-size: 11px;")
+        except Exception as e:
+            self._restart_pipeline_status.setText(f"Start failed: {e}")
+            self._restart_pipeline_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+
+        self._restart_pipeline_btn.setEnabled(True)
 
     def _cancel_retrain(self):
         """Remove a pending retrain trigger file."""
