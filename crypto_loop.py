@@ -41,16 +41,16 @@ class CryptoLoop(BaseTradingLoop):
     LLM_INTERVAL_SEC = 600
     CIRCUIT_BREAKER_PCT = 0.05
 
-    # ATR stops (crypto-specific)
-    ATR_STOP_MULTIPLIER = 2.0
-    ATR_TRAIL_MULTIPLIER = 1.5
-    ATR_TRAIL_ACTIVATE_PCT = 0.01
-    ATR_STOP_FLOOR_PCT = 0.03
-    ATR_STOP_CEIL_PCT = 0.10
+    # ATR stops (crypto-specific: wider than stocks due to higher volatility)
+    ATR_STOP_MULTIPLIER = 2.5
+    ATR_TRAIL_MULTIPLIER = 2.0
+    ATR_TRAIL_ACTIVATE_PCT = 0.015
+    ATR_STOP_FLOOR_PCT = 0.06
+    ATR_STOP_CEIL_PCT = 0.15
     TAKE_PROFIT_RR = 3.0
-    TAKE_PROFIT_CEIL_PCT = 0.25
-    STOP_LOSS_PCT = 0.04
-    TRAIL_PCT = 0.03
+    TAKE_PROFIT_CEIL_PCT = 0.30
+    STOP_LOSS_PCT = 0.06
+    TRAIL_PCT = 0.05
 
     def get_symbol_universe(self) -> list[str]:
         return CRYPTO_SYMBOLS

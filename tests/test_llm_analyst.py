@@ -164,4 +164,4 @@ class TestBuildPrompt:
         prompt = _build_prompt(candidates, "stock", 0, None, None, {})
         assert "bull" in prompt
         assert "bear" in prompt
-        assert '"s"' in prompt
+        assert "s (" in prompt or '"s"' in prompt

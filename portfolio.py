@@ -41,7 +41,15 @@ def compute_correlation_matrix(returns_dict: dict[str, np.ndarray],
             if min_len < 10:
                 corr[(s1, s2)] = 0.0
                 continue
-            c = np.corrcoef(r1[-min_len:], r2[-min_len:])[0, 1]
+            try:
+                from sklearn.covariance import LedoitWolf
+                X = np.column_stack([r1[-min_len:], r2[-min_len:]])
+                lw = LedoitWolf().fit(X)
+                cov = lw.covariance_
+                std = np.sqrt(np.diag(cov))
+                c = cov[0, 1] / (std[0] * std[1]) if std[0] > 0 and std[1] > 0 else 0.0
+            except Exception:
+                c = np.corrcoef(r1[-min_len:], r2[-min_len:])[0, 1]
             if np.isnan(c):
                 c = 0.0
             corr[(s1, s2)] = c

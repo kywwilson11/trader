@@ -15,6 +15,10 @@ logger = get_logger(__name__)
 _hmm_cache: dict[str, tuple[object, dict, float]] = {}
 _REFIT_INTERVAL = 86400  # 1 day
 
+# Transition smoothing: require N consecutive bars in new regime before switching
+_REGIME_PERSISTENCE = 3
+_last_regime: dict[str, tuple[str, int]] = {}  # {symbol: (label, consecutive_count)}
+
 
 def fit_hmm(returns: np.ndarray, n_states: int = 3):
     """Fit a Gaussian HMM to a return series.
@@ -155,15 +159,37 @@ def get_cached_regime(symbol: str, returns: np.ndarray) -> dict:
         model, labels, ts = _hmm_cache[symbol]
         if now - ts < _REFIT_INTERVAL:
             regime = get_current_regime(model, labels, returns[-50:])
-            return regime
+            return _smooth_regime(symbol, regime)
 
     # Fit new model
     model, labels = fit_hmm(returns)
     if model is not None:
         _hmm_cache[symbol] = (model, labels, now)
         regime = get_current_regime(model, labels, returns[-50:])
+        regime = _smooth_regime(symbol, regime)
         logger.info("[REGIME] %s: %s (probs=%s)", symbol, regime['label'],
                     regime['probabilities'])
         return regime
 
     return _default_regime()
+
+
+def _smooth_regime(symbol: str, regime: dict) -> dict:
+    """Require N consecutive bars in new regime before switching (reduces whipsaw)."""
+    label = regime['label']
+    if symbol in _last_regime:
+        prev_label, count = _last_regime[symbol]
+        if label == prev_label:
+            _last_regime[symbol] = (label, count + 1)
+        else:
+            _last_regime[symbol] = (label, 1)
+            if count >= _REGIME_PERSISTENCE:
+                # Was in previous regime long enough; allow switch
+                pass
+            else:
+                # Not enough persistence — keep previous regime's adjustments
+                return _default_regime()
+    else:
+        _last_regime[symbol] = (label, 1)
+        return _default_regime()  # First observation, use neutral
+    return regime

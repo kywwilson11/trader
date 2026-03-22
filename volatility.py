@@ -39,6 +39,15 @@ def fit_garch(returns: np.ndarray, p: int = 1, q: int = 1):
         if np.abs(returns).mean() < 0.01:
             returns = returns * 100
 
+        # Try EGARCH first (captures asymmetry: crashes increase vol more than rallies)
+        try:
+            am = arch_model(returns, vol='EGARCH', p=p, q=q, mean='Zero',
+                            rescale=False)
+            result = am.fit(disp='off', show_warning=False)
+            return result
+        except Exception:
+            pass
+        # Fallback to standard GARCH
         am = arch_model(returns, vol='Garch', p=p, q=q, mean='Zero',
                         rescale=False)
         result = am.fit(disp='off', show_warning=False)

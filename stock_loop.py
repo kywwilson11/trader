@@ -57,16 +57,16 @@ class StockLoop(BaseTradingLoop):
     CIRCUIT_BREAKER_PCT = 0.05
     MODEL_PREFIX = 'stock'
 
-    # ATR stops (stock-specific)
+    # ATR stops (stock-specific: tighter than crypto)
     ATR_STOP_MULTIPLIER = 2.0
-    ATR_TRAIL_MULTIPLIER = 1.5
-    ATR_TRAIL_ACTIVATE_PCT = 0.015
-    ATR_STOP_FLOOR_PCT = 0.02
+    ATR_TRAIL_MULTIPLIER = 2.0
+    ATR_TRAIL_ACTIVATE_PCT = 0.01
+    ATR_STOP_FLOOR_PCT = 0.05
     ATR_STOP_CEIL_PCT = 0.10
     TAKE_PROFIT_RR = 3.0
-    TAKE_PROFIT_CEIL_PCT = 0.20
-    STOP_LOSS_PCT = 0.03
-    TRAIL_PCT = 0.02
+    TAKE_PROFIT_CEIL_PCT = 0.25
+    STOP_LOSS_PCT = 0.05
+    TRAIL_PCT = 0.04
 
     def __init__(self):
         super().__init__()

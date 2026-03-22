@@ -63,14 +63,14 @@ class BaseTradingLoop(ABC):
 
     # ATR stops
     ATR_STOP_MULTIPLIER: float = 2.0
-    ATR_TRAIL_MULTIPLIER: float = 1.5
+    ATR_TRAIL_MULTIPLIER: float = 2.0
     ATR_TRAIL_ACTIVATE_PCT: float = 0.01
-    ATR_STOP_FLOOR_PCT: float = 0.03
+    ATR_STOP_FLOOR_PCT: float = 0.05
     ATR_STOP_CEIL_PCT: float = 0.10
     TAKE_PROFIT_RR: float = 3.0
     TAKE_PROFIT_CEIL_PCT: float = 0.25
-    STOP_LOSS_PCT: float = 0.04  # fallback fixed
-    TRAIL_PCT: float = 0.03
+    STOP_LOSS_PCT: float = 0.05  # fallback fixed
+    TRAIL_PCT: float = 0.04
     HARD_STOP_LOCKOUT_HOURS: int = 24  # cooldown after hard stop
 
     def __init__(self):
@@ -93,6 +93,7 @@ class BaseTradingLoop(ABC):
         self.macro_regime: MacroRegime | None = None
         self.corr_matrix: dict = {}
         self._equity: float = 100_000
+        self._peak_equity: float = 100_000
         from stock_config import LEVERAGED_ETFS
         self._leveraged_etfs = LEVERAGED_ETFS
 
@@ -324,6 +325,8 @@ class BaseTradingLoop(ABC):
         try:
             acct = self.api.get_account()
             self._equity = float(acct.equity)
+            if self._equity > self._peak_equity:
+                self._peak_equity = self._equity
         except Exception:
             pass
 
@@ -584,8 +587,32 @@ class BaseTradingLoop(ABC):
         Applies: confidence scaling, Kelly criterion, GARCH vol targeting,
         macro regime, correlation, sentiment gate, LLM multiplier.
         """
-        # Base: Kelly or fixed
+        # Base: Kelly or fixed, scaled by VIX regime
+        # Research (arXiv 2508.16598): Kelly fraction should shrink in high-vol
+        vix = self.macro_regime.vix if self.macro_regime else None
+        if vix is not None:
+            if vix > 35:
+                kelly_scale = 0.3
+            elif vix > 25:
+                kelly_scale = 0.5
+            elif vix > 15:
+                kelly_scale = 0.7
+            else:
+                kelly_scale = 1.0
+        else:
+            kelly_scale = 1.0
         base = kelly_position_size(self.NOTIONAL_PER_SYMBOL, self._equity)
+        base = int(base * kelly_scale)
+
+        # Drawdown-based scaling: reduce size during drawdowns from peak equity
+        if self._peak_equity > 0:
+            dd = (self._peak_equity - self._equity) / self._peak_equity
+            if dd >= 0.20:
+                base = int(base * 0.25)  # 75% reduction at 20%+ drawdown
+            elif dd >= 0.15:
+                base = int(base * 0.50)  # 50% reduction at 15%+ drawdown
+            elif dd >= 0.10:
+                base = int(base * 0.75)  # 25% reduction at 10%+ drawdown
 
         # Confidence scaling
         if pred_return is not None and self.trade_threshold > 0.001:
@@ -705,11 +732,19 @@ class BaseTradingLoop(ABC):
             pred_return = preds.get(symbol)
             quote = self.get_quote(symbol)
 
-            # Prediction gate
+            # Prediction gate (higher bar if recently hard-stopped or mean-reverting)
+            effective_threshold = self.trade_threshold
+            if symbol in self.hard_stop_lockout:
+                effective_threshold = self.trade_threshold * 1.5
+            # Hurst < 0.45 = mean-reverting; momentum signals less reliable
+            hurst = snapshots.get(symbol, {}).get('Hurst')
+            if hurst is not None and hurst < 0.45:
+                effective_threshold = max(effective_threshold,
+                                          self.trade_threshold * 1.3)
             if pred_return is not None and quote is not None:
                 if not should_trade(pred_return, quote['spread_pct']):
                     continue
-                if pred_return < self.trade_threshold:
+                if pred_return < effective_threshold:
                     continue
 
             if quote is None:
