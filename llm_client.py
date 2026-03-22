@@ -656,6 +656,9 @@ def _call_gemini(prompt, system, api_key, model, max_tokens, timeout,
         # Earlier parts may be thinking/reasoning
         for part in reversed(parts):
             if "text" in part and part["text"].strip():
+                if finish == "MAX_TOKENS":
+                    print(f"[LLM] Gemini: truncated ({len(part['text'])} chars), discarding")
+                    return None  # discard — caller will retry via fallback
                 if finish != "STOP":
                     print(f"[LLM] Gemini: finish={finish} ({len(part['text'])} chars)")
                 return part["text"]
