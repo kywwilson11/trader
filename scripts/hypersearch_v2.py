@@ -347,6 +347,27 @@ class SeqCache:
         # Scale ALL features using train-only scaler, build sequences
         all_scaled = scaler.transform(self._all_features).astype(np.float32)
 
+        # Check system free memory before large allocation (Jetson unified memory)
+        train_mb = len(train_indices) * seq_len * all_scaled.shape[1] * 4 / 1e6
+        val_mb = len(val_indices) * seq_len * all_scaled.shape[1] * 4 / 1e6
+        try:
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        avail_mb = int(line.split()[1]) / 1024
+                        break
+                else:
+                    avail_mb = float('inf')
+        except Exception:
+            avail_mb = float('inf')
+        # Need 2x for numpy fancy indexing + ascontiguousarray temporary copy
+        peak_mb = (train_mb + val_mb) * 2 + 300
+        if peak_mb > avail_mb:
+            del all_scaled
+            gc.collect()
+            raise RuntimeError(
+                f"OOM guard: cache needs ~{peak_mb:.0f}MB but only {avail_mb:.0f}MB free")
+
         offsets = np.arange(-seq_len, 0)
         X_train = np.ascontiguousarray(
             all_scaled[train_indices[:, None] + offsets[None, :]])
