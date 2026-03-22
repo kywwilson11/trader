@@ -653,13 +653,35 @@ class BaseTradingLoop(ABC):
                 symbol, list(self.positions.keys()), self.corr_matrix)
             sized *= corr_factor
 
-        # HMM regime multiplier
+        # HMM regime multiplier + ensemble regime disagreement penalty
+        hmm_label = 'unknown'
         if returns is not None and len(returns) > 200:
             try:
                 regime = get_cached_regime(symbol, returns)
                 sized *= regime['sizing_mult']
+                hmm_label = regime.get('label', 'unknown')
             except Exception:
                 pass
+
+        # Ensemble regime voting: penalize when signals disagree
+        # Map each signal to directional view: -1 (bearish), 0 (neutral), +1 (bullish)
+        votes = []
+        if self.macro_regime:
+            if self.macro_regime.sizing_mult < 0.6:
+                votes.append(-1)
+            elif self.macro_regime.sizing_mult > 0.9:
+                votes.append(1)
+            else:
+                votes.append(0)
+        if hmm_label in ('bull',):
+            votes.append(1)
+        elif hmm_label in ('bear',):
+            votes.append(-1)
+        elif hmm_label != 'unknown':
+            votes.append(0)
+        if len(votes) >= 2 and len(set(votes)) > 1:
+            # Signals disagree — reduce sizing by 20% for uncertainty
+            sized *= 0.8
 
         # Leveraged ETF scaling: divide by leverage factor
         leverage = self._leveraged_etfs.get(symbol, 1)

@@ -969,6 +969,29 @@ def main():
         except Exception:
             pass
 
+    # Monte Carlo robustness test on completed trials
+    if len(completed) >= 20 and best_state_holder['score'] > 0:
+        try:
+            scores = [t.value for t in completed if t.value and t.value > 0]
+            if len(scores) >= 10:
+                n_sims = 5000
+                mc_scores = []
+                for _ in range(n_sims):
+                    sample = np.random.choice(scores, size=len(scores), replace=True)
+                    mc_scores.append(np.mean(sample) - 0.5 * np.std(sample))
+                mc_scores.sort()
+                p5 = mc_scores[int(n_sims * 0.05)]
+                p50 = mc_scores[int(n_sims * 0.50)]
+                p95 = mc_scores[int(n_sims * 0.95)]
+                print(f"\nMonte Carlo robustness ({n_sims} simulations):")
+                print(f"  5th percentile: {p5:.3f}")
+                print(f"  Median: {p50:.3f}")
+                print(f"  95th percentile: {p95:.3f}")
+                if p5 <= 0:
+                    print("  WARNING: 5th percentile <= 0 — model may be overfit")
+        except Exception as e:
+            print(f"  Monte Carlo failed: {e}")
+
     # Final pipeline status
     _pipeline_status['phase'] = 'complete'
     _pipeline_status['trial_current'] = num_trials
