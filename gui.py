@@ -2622,6 +2622,19 @@ class TradingDashboard(QMainWindow):
         self._llm_refresh_one_btn.setEnabled(True)
         sym = getattr(self, '_llm_refresh_one_sym', '?')
         if rc == 0:
+            # Reload analysis from disk so the display updates immediately
+            try:
+                analysis_file = BASE_DIR / "llm_analysis.json"
+                if analysis_file.exists():
+                    with open(analysis_file) as f:
+                        raw = json.load(f)
+                    for section in raw.values():
+                        if isinstance(section, dict):
+                            self._llm_analysis_cache.update(section)
+                    # Re-display the selected symbol's analysis
+                    self._on_stock_row_selected(self._stock_table.currentRow(), 0, -1, 0)
+            except (OSError, json.JSONDecodeError):
+                pass
             self._llm_refresh_status.setText(f"{sym} updated")
             self._llm_refresh_status.setStyleSheet(
                 f"color: {T['green'].name()}; font-size: 11px;")
@@ -2681,6 +2694,20 @@ class TradingDashboard(QMainWindow):
         self._llm_refresh_timer.stop()
         self._llm_refresh_btn.setEnabled(True)
         if rc == 0:
+            # Reload analysis from disk so the display updates immediately
+            try:
+                analysis_file = BASE_DIR / "llm_analysis.json"
+                if analysis_file.exists():
+                    with open(analysis_file) as f:
+                        raw = json.load(f)
+                    llm_analysis = {}
+                    for section in raw.values():
+                        if isinstance(section, dict):
+                            llm_analysis.update(section)
+                    self._llm_analysis_cache = llm_analysis
+                    self._on_stock_row_selected(self._stock_table.currentRow())
+            except (OSError, json.JSONDecodeError):
+                pass
             self._llm_refresh_status.setText("Analysis complete")
             self._llm_refresh_status.setStyleSheet(
                 f"color: {T['green'].name()}; font-size: 11px;")
