@@ -564,11 +564,16 @@ def refresh_all():
 
     BATCH_SIZE = 3  # symbols per LLM call (profiles are data-rich)
 
+    total_ok = 0
+    total_fail = 0
+
     for asset_type, syms in [('stock', stock_syms), ('crypto', crypto_syms)]:
         # Build comprehensive profiles (price, technicals, fundamentals, news)
         print(f"[LLM-ANALYST] Fetching {asset_type} data for {len(syms)} symbols...")
         profiles = _build_symbol_profiles(syms)
         print(f"[LLM-ANALYST] Got profiles for {len(profiles)}/{len(syms)} symbols")
+
+        failed_syms = []
 
         for i in range(0, len(syms), BATCH_SIZE):
             batch = syms[i:i + BATCH_SIZE]
@@ -577,7 +582,6 @@ def refresh_all():
                 c = {"symbol": sym, "pred_return": None}
                 if sym in profiles:
                     c["profile"] = profiles[sym]
-                # Supplement with Finnhub headlines if yfinance news was sparse
                 try:
                     headlines = get_recent_headlines(sym)
                     if headlines:
@@ -590,15 +594,40 @@ def refresh_all():
                   f"{i // BATCH_SIZE + 1}: {', '.join(batch)}")
             try:
                 result = analyze_trades(candidates, asset_type, fng_value=fng)
-                n = len(result) if result else 0
-                print(f"[LLM-ANALYST] Got {n}/{len(batch)} results")
+                got = set(result.keys()) if result else set()
+                for sym in batch:
+                    if sym in got:
+                        total_ok += 1
+                    else:
+                        failed_syms.append(sym)
+                print(f"[LLM-ANALYST] Got {len(got)}/{len(batch)} results")
             except Exception as e:
                 print(f"[LLM-ANALYST] Batch failed: {e}")
+                failed_syms.extend(batch)
 
-            # Rate limit between batches
             time.sleep(2)
 
-    print("[LLM-ANALYST] Refresh complete")
+        # Retry failed symbols individually (one at a time = smaller response)
+        if failed_syms:
+            print(f"[LLM-ANALYST] Retrying {len(failed_syms)} failed {asset_type} symbols individually...")
+            for sym in failed_syms:
+                c = {"symbol": sym, "pred_return": None}
+                if sym in profiles:
+                    c["profile"] = profiles[sym]
+                try:
+                    result = analyze_trades([c], asset_type, fng_value=fng)
+                    if result and sym in result:
+                        total_ok += 1
+                        print(f"  [OK] {sym}")
+                    else:
+                        total_fail += 1
+                        print(f"  [FAIL] {sym}")
+                except Exception:
+                    total_fail += 1
+                    print(f"  [FAIL] {sym}")
+                time.sleep(1)
+
+    print(f"[LLM-ANALYST] Refresh complete: {total_ok} updated, {total_fail} failed")
 
 
 if __name__ == "__main__":
