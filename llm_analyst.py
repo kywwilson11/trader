@@ -30,12 +30,14 @@ IMPORTANT: The ML model has ALREADY decided this is a good technical setup. \
 Do NOT second-guess the model's technical analysis. Your role is to adjust \
 conviction based on qualitative factors only.
 
-For each symbol, evaluate these qualitative factors:
-1. NEWS IMPACT: Are there breaking events that change the fundamental picture? \
+For each symbol, evaluate these factors:
+1. PRICE CONTEXT: Where is the price relative to recent history? At 52-week \
+highs/lows? Sharp recent move that's extended or has room to run?
+2. NEWS IMPACT: Are there breaking events that change the fundamental picture? \
 (earnings surprises, partnerships, hacks, fraud, regulatory actions, lawsuits)
-2. FUNDAMENTAL CONTEXT: Does the valuation/growth story support or contradict \
-the technical signal? (P/E expansion/compression, revenue acceleration/deceleration)
-3. MACRO ENVIRONMENT: Does the broader market context help or hurt? \
+3. FUNDAMENTAL CONTEXT: Does the valuation/growth story support or contradict \
+the signal? (P/E expansion/compression, revenue acceleration/deceleration)
+4. MACRO ENVIRONMENT: Does the broader market context help or hurt? \
 (Fear & Greed regime, sector rotation, risk-on/risk-off)
 
 STRUCTURED REASONING — For each symbol, you MUST:
@@ -149,9 +151,53 @@ def _save_analysis(result: dict, asset_type: str, model: str):
         print(f"[LLM-ANALYST] Error saving analysis: {e}")
 
 
+def _fetch_price_context(symbols):
+    """Fetch price performance context for a list of symbols via yfinance."""
+    import yfinance as yf
+
+    result = {}
+    # Convert crypto symbols for yfinance (BTC/USD → BTC-USD)
+    yf_map = {}
+    for sym in symbols:
+        yf_sym = sym.replace('/', '-') if '/' in sym else sym
+        yf_map[yf_sym] = sym
+
+    try:
+        tickers = yf.Tickers(list(yf_map.keys()))
+        for yf_sym, orig_sym in yf_map.items():
+            try:
+                h = tickers.tickers[yf_sym].history(period='1y')
+                if h.empty or len(h) < 5:
+                    continue
+                cur = h['Close'].iloc[-1]
+                parts = [f"${cur:.2f}"]
+                if len(h) >= 5:
+                    w1 = h['Close'].iloc[-5]
+                    parts.append(f"1w: {(cur / w1 - 1) * 100:+.1f}%")
+                if len(h) >= 21:
+                    m1 = h['Close'].iloc[-21]
+                    parts.append(f"1m: {(cur / m1 - 1) * 100:+.1f}%")
+                if len(h) >= 63:
+                    m3 = h['Close'].iloc[-63]
+                    parts.append(f"3m: {(cur / m3 - 1) * 100:+.1f}%")
+                y1 = h['Close'].iloc[0]
+                parts.append(f"1y: {(cur / y1 - 1) * 100:+.1f}%")
+                hi52 = h['High'].max()
+                lo52 = h['Low'].min()
+                parts.append(f"52w range: ${lo52:.2f}-${hi52:.2f}"
+                             f" ({(cur / hi52 - 1) * 100:+.1f}% from high)")
+                result[orig_sym] = " | ".join(parts)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[LLM-ANALYST] Price context fetch failed: {e}")
+
+    return result
+
+
 def _build_prompt(candidates, asset_type, equity, positions, fng_value,
                   model_config):
-    """Build the user prompt with qualitative data only (no technicals)."""
+    """Build the user prompt with qualitative and price context."""
     lines = []
 
     # Market context
@@ -187,6 +233,11 @@ def _build_prompt(candidates, asset_type, equity, positions, fng_value,
         sym = c["symbol"]
         lines.append(f"\n### {sym}")
 
+        # Price context
+        price_ctx = c.get("price_context")
+        if price_ctx:
+            lines.append(f"- Price: {price_ctx}")
+
         # ML model prediction context
         pred_return = c.get("pred_return")
         if pred_return is not None:
@@ -216,8 +267,17 @@ def _build_prompt(candidates, asset_type, equity, positions, fng_value,
 
     lines.append("")
     lines.append('Respond with ONLY a raw JSON object (no markdown, no code fences).')
-    lines.append('For each symbol include: bull (1-2 sentences), bear (1-2 sentences), s (score 0.0-1.0), r (summary under 2 sentences).')
-    lines.append('Example: {"BTC/USD": {"bull": "ETF inflows accelerating, institutional adoption growing.", "bear": "No material negative events.", "s": 0.65, "r": "Mild positive from ETF flows."}}')
+    lines.append('For each symbol include: bull (2-3 sentences with specific data points), '
+                 'bear (2-3 sentences with specific risks), s (score 0.0-1.0), '
+                 'r (1-2 sentence summary referencing current price action).')
+    lines.append('Be SPECIFIC — cite price levels, percentage moves, news events, '
+                 'dates. Avoid generic statements like "could go up or down."')
+    lines.append('Example: {"GLD": {"bull": "Gold at $290, up 48% YoY on central bank buying '
+                 'and rate cut expectations. 52w high of $310 suggests room to run if inflation '
+                 'stays sticky.", "bear": "Down 12% from highs, sharp 10% weekly drop suggests '
+                 'profit-taking. If real yields rise, gold could retest $260 support.", '
+                 '"s": 0.55, "r": "Consolidating after strong YoY run. Near-term pullback '
+                 'but macro backdrop remains supportive."}}')
 
     return "\n".join(lines)
 
@@ -371,11 +431,16 @@ def refresh_all():
     BATCH_SIZE = 5  # symbols per LLM call (keep small for token limits)
 
     for asset_type, syms in [('stock', stock_syms), ('crypto', crypto_syms)]:
+        # Batch-fetch price context via yfinance
+        price_ctx = _fetch_price_context(syms)
+
         for i in range(0, len(syms), BATCH_SIZE):
             batch = syms[i:i + BATCH_SIZE]
             candidates = []
             for sym in batch:
                 c = {"symbol": sym, "pred_return": None}
+                if sym in price_ctx:
+                    c["price_context"] = price_ctx[sym]
                 try:
                     headlines = get_recent_headlines(sym)
                     if headlines:
