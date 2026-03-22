@@ -17,8 +17,8 @@ BASE_DIR = Path(__file__).resolve().parent
 # Default search spaces (matching hypersearch_v2.py defaults)
 DEFAULT_SEARCH_SPACE = {
     'forward_bars': [12, 18, 24, 32, 48],
-    'seq_len': [12, 18, 24, 32],
-    'hidden_dim': [64, 96, 128, 192, 256],
+    'seq_len': [8, 40],           # suggest_int range, step=2
+    'hidden_dim': [64, 384],      # suggest_int range, step=32
     'batch_size': [512, 1024, 2048],
     'num_layers': [1, 2],
     'n_heads': [2, 4],
@@ -30,23 +30,23 @@ DEFAULT_SEARCH_SPACE = {
 }
 
 # Parameters where values are discrete choices (categorical/int list)
-CATEGORICAL_PARAMS = {'forward_bars', 'seq_len', 'hidden_dim', 'batch_size',
-                      'num_layers', 'n_heads'}
+CATEGORICAL_PARAMS = {'forward_bars', 'batch_size', 'n_heads'}
 
-# Parameters where values are continuous ranges [min, max]
-FLOAT_PARAMS = {'dropout', 'learning_rate', 'weight_decay', 'huber_delta',
+# Parameters where values are ranges [min, max] (int or float)
+RANGE_PARAMS = {'seq_len', 'hidden_dim', 'num_layers',
+                'dropout', 'learning_rate', 'weight_decay', 'huber_delta',
                 'trade_threshold'}
 
-# Expansion pools: values that can be added when edges are detected
-# For categorical params: additional values to add at low/high end
+# Expansion pools: new boundary values when edges are detected
+# For categorical params: additional discrete values to add
+# For range params: new boundary value to extend to
 EXPANSION_POOLS = {
     'forward_bars': {'low': [8], 'high': [64, 96]},
-    'seq_len': {'low': [8], 'high': [48]},
-    'hidden_dim': {'low': [48], 'high': [384]},
+    'seq_len': {'low': [4], 'high': [48]},
+    'hidden_dim': {'low': [32], 'high': [512]},
     'batch_size': {'low': [256], 'high': [4096]},
     'num_layers': {'low': [], 'high': [3]},
     'n_heads': {'low': [1], 'high': [8]},
-    # For float params: new [min, max] boundaries per expansion step
     'dropout': {'low': [0.05], 'high': [0.50]},
     'learning_rate': {'low': [2e-4], 'high': [5e-3]},
     'weight_decay': {'low': [5e-6], 'high': [1e-3]},
@@ -57,10 +57,10 @@ EXPANSION_POOLS = {
 # Hard limits: absolute boundaries that must never be exceeded
 HARD_LIMITS = {
     'forward_bars': {'min': 8, 'max': 96},
-    'seq_len': {'min': 8, 'max': 48},
-    'hidden_dim': {'min': 48, 'max': 384},
+    'seq_len': {'min': 4, 'max': 64},
+    'hidden_dim': {'min': 32, 'max': 512},
     'batch_size': {'min': 256, 'max': 4096},
-    'num_layers': {'min': 1, 'max': 3},
+    'num_layers': {'min': 1, 'max': 4},
     'n_heads': {'min': 1, 'max': 8},
     'dropout': {'min': 0.05, 'max': 0.60},
     'learning_rate': {'min': 1e-4, 'max': 1e-2},
@@ -104,6 +104,16 @@ def _default_state(asset_type: str) -> dict:
     }
 
 
+def _migrate_search_space(space: dict) -> dict:
+    """Migrate old categorical lists to ranges for seq_len/hidden_dim."""
+    for param in ('seq_len', 'hidden_dim'):
+        if param in space and len(space[param]) > 2:
+            # Old format: [8, 12, 18, 24, 32] → new format: [8, 32]
+            vals = sorted(space[param])
+            space[param] = [vals[0], vals[-1]]
+    return space
+
+
 def load_adaptive_state(asset_type: str) -> dict:
     """Load adaptive state from disk, or create defaults if not found."""
     path = _state_path(asset_type)
@@ -115,6 +125,9 @@ def load_adaptive_state(asset_type: str) -> dict:
         for key in defaults:
             if key not in state:
                 state[key] = defaults[key]
+        # Migrate old categorical lists to ranges
+        if 'search_space' in state:
+            state['search_space'] = _migrate_search_space(state['search_space'])
         return state
     return _default_state(asset_type)
 
@@ -150,9 +163,9 @@ def detect_edges(best_params: dict, search_space: dict) -> list:
                 edges.append((param, 'low'))
             elif value == sorted_vals[-1]:
                 edges.append((param, 'high'))
-        elif param in FLOAT_PARAMS:
-            # Float range: check if value is within 10% of min or max
-            lo, hi = space[0], space[1]
+        elif param in RANGE_PARAMS:
+            # Range [min, max]: check if value is within 10% of boundary
+            lo, hi = space[0], space[-1]
             range_size = hi - lo
             if range_size <= 0:
                 continue
@@ -201,8 +214,8 @@ def expand_search_space(search_space: dict, edges: list) -> tuple:
                     log_entries.append(
                         f"{param}: added {val} ({direction} expansion)")
             new_space[param] = sorted(current)
-        elif param in FLOAT_PARAMS:
-            lo, hi = new_space[param]
+        elif param in RANGE_PARAMS:
+            lo, hi = new_space[param][0], new_space[param][-1]
             new_val = expansion_values[0]
             if direction == 'low':
                 new_lo = max(new_val, limits.get('min', new_val))

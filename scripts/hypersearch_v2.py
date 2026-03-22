@@ -406,10 +406,10 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
         else:
             forward_bars = 4
 
-        seq_len = trial.suggest_categorical('seq_len',
-            _space.get('seq_len', [12, 18, 24, 32]))
-        hidden_dim = trial.suggest_categorical('hidden_dim',
-            _space.get('hidden_dim', [64, 96, 128, 192, 256]))
+        sl_range = _space.get('seq_len', [8, 40])
+        seq_len = trial.suggest_int('seq_len', sl_range[0], sl_range[-1], step=2)
+        hd_range_vals = _space.get('hidden_dim', [64, 384])
+        hidden_dim = trial.suggest_int('hidden_dim', hd_range_vals[0], hd_range_vals[-1], step=32)
         nl_range = _space.get('num_layers', [1, 2])
         num_layers = trial.suggest_int('num_layers', nl_range[0], nl_range[-1])
         n_heads = trial.suggest_categorical('n_heads',
