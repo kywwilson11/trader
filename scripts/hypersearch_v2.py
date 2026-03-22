@@ -81,6 +81,14 @@ FORWARD_BARS = [12, 18, 24, 32, 48]
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.backends.cudnn.benchmark = True
+
+# Cap CUDA allocator to prevent fatal kernel-level OOM on Jetson (unified memory).
+# Without this, OOM triggers NvMapMemAllocInternalTagged errors that corrupt CUDA
+# context and kill the process. With the cap, PyTorch raises catchable OutOfMemoryError.
+if device.type == 'cuda':
+    torch.cuda.set_per_process_memory_fraction(0.40)  # ~3GB of 7.6GB for CUDA
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 print(f"Using device: {device}")
 
 
@@ -347,27 +355,6 @@ class SeqCache:
         # Scale ALL features using train-only scaler, build sequences
         all_scaled = scaler.transform(self._all_features).astype(np.float32)
 
-        # Check system free memory before large allocation (Jetson unified memory)
-        train_mb = len(train_indices) * seq_len * all_scaled.shape[1] * 4 / 1e6
-        val_mb = len(val_indices) * seq_len * all_scaled.shape[1] * 4 / 1e6
-        try:
-            with open('/proc/meminfo') as f:
-                for line in f:
-                    if line.startswith('MemAvailable:'):
-                        avail_mb = int(line.split()[1]) / 1024
-                        break
-                else:
-                    avail_mb = float('inf')
-        except Exception:
-            avail_mb = float('inf')
-        # Need 2x for numpy fancy indexing + ascontiguousarray temporary copy
-        peak_mb = (train_mb + val_mb) * 2 + 300
-        if peak_mb > avail_mb:
-            del all_scaled
-            gc.collect()
-            raise RuntimeError(
-                f"OOM guard: cache needs ~{peak_mb:.0f}MB but only {avail_mb:.0f}MB free")
-
         offsets = np.arange(-seq_len, 0)
         X_train = np.ascontiguousarray(
             all_scaled[train_indices[:, None] + offsets[None, :]])
@@ -451,37 +438,6 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
         }
         trial.set_user_attr('cfg', cfg)
 
-        # Memory guard: estimate if this config will OOM on Jetson (8GB unified)
-        # Jetson shares CPU+GPU memory, so check both CUDA and system free
-        if torch.cuda.is_available():
-            cuda_free_mb, _ = torch.cuda.mem_get_info()
-            cuda_free_mb /= 1e6
-            # Also check system free memory (Jetson unified = shared pool)
-            try:
-                with open('/proc/meminfo') as f:
-                    for line in f:
-                        if line.startswith('MemAvailable:'):
-                            sys_free_mb = int(line.split()[1]) / 1024
-                            break
-                    else:
-                        sys_free_mb = cuda_free_mb
-            except Exception:
-                sys_free_mb = cuda_free_mb
-            free_mb = min(cuda_free_mb, sys_free_mb)
-            # Estimate: seq cache (train+val) + temp scaled array + model + optimizer + batch
-            n_biggest_fold = int(len(all_features) * 0.85)
-            n_val = int(len(all_features) * 0.15)
-            cache_mb = (n_biggest_fold + n_val) * seq_len * input_dim * 4 / 1e6
-            scaled_mb = len(all_features) * input_dim * 4 / 1e6  # temporary during cache build
-            model_mb = (input_dim * hidden_dim + hidden_dim ** 2 * num_layers) * 4 / 1e6
-            optim_mb = model_mb * 2  # Adam stores m + v
-            batch_mb = batch_size * seq_len * hidden_dim * num_layers * 4 * 2 / 1e6  # fwd + bwd
-            needed_mb = cache_mb + scaled_mb + model_mb + optim_mb + batch_mb + 800
-            if needed_mb > free_mb:
-                print(f"  [SKIP] Trial {trial.number}: est {needed_mb:.0f}MB > {free_mb:.0f}MB free "
-                      f"| s={seq_len} h={hidden_dim} l={num_layers} bs={batch_size}")
-                return 0.0
-
         # Select returns for this horizon
         if forward_bars in all_returns_by_fb:
             trial_returns = all_returns_by_fb[forward_bars]
@@ -493,17 +449,17 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                 trial, trial_start, cfg, trial_returns, input_dim, seq_cache,
                 _state_cache,
             )
-        except RuntimeError as e:
-            err_str = str(e)
-            print(f"  [ERROR] Trial {trial.number}: {err_str}")
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            # CUDA context recovers after NvMap/NVML errors — don't kill the
+            # process. Clean up, return 0 (bad score), Optuna moves on.
+            print(f"  [OOM] Trial {trial.number}: {e}")
             gc.collect()
             if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
             torch.cuda.empty_cache()
-            # CUDA errors corrupt the context — all subsequent trials will fail.
-            # Abort immediately instead of looping 200 times with score=0.
-            if 'CUDA' in err_str or 'INTERNAL ASSERT' in err_str:
-                raise SystemExit(f"CUDA error, aborting: {err_str}") from e
             return 0.0
 
     def _train_walk_forward(trial, trial_start, cfg, trial_returns, input_dim,
@@ -544,42 +500,59 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
             y_train = trial_returns[train_indices]
             y_val = trial_returns[val_indices]
 
-            # On Jetson (unified memory), pre-loading to GPU causes OOM because
-            # CUDA allocator and system memory share the same 8GB pool.
-            # Per-batch transfer is fine — the 1020 MHz GPU clock is the real win.
+            # OOM retry: if batch doesn't fit, halve until it does (min 128)
+            eff_batch_size = batch_size
+            oom_retries = 0
+            while True:
+                try:
+                    model = RegressionLSTM(input_dim, hidden_dim, num_layers,
+                                           dropout, n_heads).to(device)
+                    criterion = nn.HuberLoss(delta=huber_delta, reduction='none')
+                    optimizer = optim.Adam(model.parameters(), lr=learning_rate,
+                                           weight_decay=weight_decay)
 
-            # Check free memory before CUDA allocation (Jetson unified memory)
-            try:
-                with open('/proc/meminfo') as f:
-                    for line in f:
-                        if line.startswith('MemAvailable:'):
-                            avail_mb = int(line.split()[1]) / 1024
-                            break
+                    if scheduler_type == 'cosine':
+                        sched = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
+                    elif scheduler_type == 'plateau':
+                        sched = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=6, factor=0.5)
                     else:
-                        avail_mb = float('inf')
-            except Exception:
-                avail_mb = float('inf')
-            if avail_mb < 600:
-                raise RuntimeError(
-                    f"OOM guard: only {avail_mb:.0f}MB free before model creation"
-                    f" (need ~600MB for CUDA)")
+                        sched = None
 
-            model = RegressionLSTM(input_dim, hidden_dim, num_layers,
-                                   dropout, n_heads).to(device)
-            criterion = nn.HuberLoss(delta=huber_delta, reduction='none')
-            optimizer = optim.Adam(model.parameters(), lr=learning_rate,
-                                   weight_decay=weight_decay)
+                    # FP16 mixed precision
+                    use_amp = device.type == 'cuda'
+                    grad_scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-            if scheduler_type == 'cosine':
-                sched = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
-            elif scheduler_type == 'plateau':
-                sched = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=6, factor=0.5)
-            else:
-                sched = None
+                    # Run one batch to test if this config fits in memory
+                    model.train()
+                    test_bi = np.arange(min(eff_batch_size, n_train))
+                    xb = torch.from_numpy(X_train[test_bi]).to(device)
+                    yb = torch.from_numpy(y_train[test_bi]).to(device)
+                    with torch.amp.autocast('cuda', enabled=use_amp):
+                        pred = model(xb)
+                        raw_loss = criterion(pred, yb)
+                        weights = torch.clamp(torch.abs(yb) + 1.0, max=50.0)
+                        loss = (raw_loss * weights).mean()
+                    optimizer.zero_grad(set_to_none=True)
+                    grad_scaler.scale(loss).backward()
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
+                    del xb, yb, pred, raw_loss, weights, loss
+                    break  # fits in memory
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    if 'INTERNAL ASSERT' in str(e):
+                        raise  # fatal, can't recover
+                    del model, criterion, optimizer
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    oom_retries += 1
+                    eff_batch_size //= 2
+                    if eff_batch_size < 128:
+                        raise  # give up, let outer handler catch it
+                    print(f"  [OOM-RETRY] fold {fold_idx}: batch {eff_batch_size*2}→{eff_batch_size}")
 
-            # FP16 mixed precision
-            use_amp = device.type == 'cuda'
-            grad_scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+            if oom_retries > 0:
+                print(f"  [OOM-RETRY] fold {fold_idx}: training with batch_size={eff_batch_size} "
+                      f"(was {batch_size})")
 
             best_val_loss = float('inf')
             best_state = None
@@ -588,8 +561,8 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
             for epoch in range(MAX_EPOCHS):
                 model.train()
                 perm = np.random.permutation(n_train)
-                for i in range(0, n_train, batch_size):
-                    bi = perm[i:i + batch_size]
+                for i in range(0, n_train, eff_batch_size):
+                    bi = perm[i:i + eff_batch_size]
                     xb = torch.from_numpy(X_train[bi]).to(device)
                     yb = torch.from_numpy(y_train[bi]).to(device)
 
@@ -615,9 +588,9 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                 val_loss_sum = 0.0
                 val_preds = []
                 with torch.inference_mode():
-                    for i in range(0, n_val, batch_size):
-                        xvb = torch.from_numpy(X_val[i:i + batch_size]).to(device)
-                        yvb = torch.from_numpy(y_val[i:i + batch_size]).to(device)
+                    for i in range(0, n_val, eff_batch_size):
+                        xvb = torch.from_numpy(X_val[i:i + eff_batch_size]).to(device)
+                        yvb = torch.from_numpy(y_val[i:i + eff_batch_size]).to(device)
                         with torch.amp.autocast('cuda', enabled=use_amp):
                             vo = model(xvb)
                         val_loss_sum += nn.functional.huber_loss(vo, yvb).item() * xvb.size(0)
@@ -661,8 +634,8 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                 model.eval()
                 final_preds = []
                 with torch.inference_mode():
-                    for i in range(0, n_val, batch_size):
-                        xvb = torch.from_numpy(X_val[i:i + batch_size]).to(device)
+                    for i in range(0, n_val, eff_batch_size):
+                        xvb = torch.from_numpy(X_val[i:i + eff_batch_size]).to(device)
                         with torch.amp.autocast('cuda', enabled=use_amp):
                             vo = model(xvb)
                         final_preds.append(vo.cpu().numpy())
@@ -701,8 +674,8 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                 model_tmp.eval()
                 all_preds = []
                 with torch.inference_mode():
-                    for i in range(0, n_val, batch_size):
-                        xvb = torch.from_numpy(X_val[i:i + batch_size]).to(device)
+                    for i in range(0, n_val, eff_batch_size):
+                        xvb = torch.from_numpy(X_val[i:i + eff_batch_size]).to(device)
                         with torch.amp.autocast('cuda', enabled=use_amp):
                             vo = model_tmp(xvb)
                         all_preds.append(vo.cpu().numpy())
