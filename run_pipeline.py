@@ -58,18 +58,21 @@ def _check_retrain_trigger():
     """Check for and consume a manual retrain trigger file from the GUI.
 
     Returns dict {'crypto': bool, 'stock': bool} if trigger found, else None.
+    Uses atomic rename-before-read to avoid TOCTOU race conditions.
     """
+    if not os.path.exists(RETRAIN_TRIGGER):
+        return None
+    tmp = str(RETRAIN_TRIGGER) + '.reading'
     try:
-        if os.path.exists(RETRAIN_TRIGGER):
-            with open(RETRAIN_TRIGGER) as f:
-                trigger = json.load(f)
-            os.remove(RETRAIN_TRIGGER)
-            if trigger.get('crypto') or trigger.get('stock'):
-                return trigger
-    except (OSError, json.JSONDecodeError, KeyError):
-        # Remove malformed trigger file
+        os.rename(str(RETRAIN_TRIGGER), tmp)
+        with open(tmp) as f:
+            trigger = json.load(f)
+        os.remove(tmp)
+        if trigger.get('crypto') or trigger.get('stock'):
+            return trigger
+    except (OSError, json.JSONDecodeError):
         try:
-            os.remove(RETRAIN_TRIGGER)
+            os.remove(tmp)
         except OSError:
             pass
     return None
@@ -79,17 +82,21 @@ def _check_pipeline_command():
     """Check for and consume a pipeline command file from the GUI.
 
     Returns dict with 'command', 'crypto', 'stock' keys if found, else None.
+    Uses atomic rename-before-read to avoid TOCTOU race conditions.
     """
+    if not os.path.exists(PIPELINE_COMMAND):
+        return None
+    tmp = str(PIPELINE_COMMAND) + '.reading'
     try:
-        if os.path.exists(PIPELINE_COMMAND):
-            with open(PIPELINE_COMMAND) as f:
-                cmd = json.load(f)
-            os.remove(PIPELINE_COMMAND)
-            if cmd.get('command'):
-                return cmd
-    except (OSError, json.JSONDecodeError, KeyError):
+        os.rename(str(PIPELINE_COMMAND), tmp)
+        with open(tmp) as f:
+            cmd = json.load(f)
+        os.remove(tmp)
+        if cmd.get('command'):
+            return cmd
+    except (OSError, json.JSONDecodeError):
         try:
-            os.remove(PIPELINE_COMMAND)
+            os.remove(tmp)
         except OSError:
             pass
     return None
@@ -663,11 +670,17 @@ def _cleanup_handles(handles):
 
 
 def _terminate_procs(procs):
-    """Terminate all tracked subprocesses."""
+    """Terminate all tracked subprocesses and wait to avoid zombies."""
     for proc in procs:
         try:
             if proc and proc.poll() is None:
                 proc.terminate()
+        except Exception:
+            pass
+    for proc in procs:
+        try:
+            if proc and proc.poll() is None:
+                proc.wait(timeout=5)
         except Exception:
             pass
 
@@ -695,6 +708,12 @@ def _signal_handler(signum, frame):
             if proc.poll() is None:
                 proc.terminate()
                 _print(f"  Stopped {name} bot (PID {proc.pid})")
+        except Exception:
+            pass
+    for name, proc, fh in _all_bots:
+        try:
+            if proc.poll() is None:
+                proc.wait(timeout=3)
         except Exception:
             pass
     _terminate_procs(_all_procs)

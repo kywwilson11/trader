@@ -453,6 +453,13 @@ class StockLoop(BaseTradingLoop):
                                   "skip_reason": None})
                     self.last_trade_time[symbol] = datetime.datetime.now()
                     current_exposure += qty * fill_price
+
+                    # After fill confirmation
+                    current_exposure = self._get_current_exposure()
+                    if current_exposure > self.MAX_EXPOSURE:
+                        logger.warning("[EXPOSURE] Exceeded cap after fill: $%.0f > $%.0f",
+                                       current_exposure, self.MAX_EXPOSURE)
+                        break  # Stop placing more orders this cycle
             time.sleep(0.5)
 
     def _manage_stops(self):

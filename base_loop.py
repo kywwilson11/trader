@@ -8,6 +8,8 @@ This eliminates ~400 lines of duplicated code and ensures both loops
 stay in sync as new features are added.
 """
 
+import json
+import os
 import time
 import datetime
 import gc
@@ -81,6 +83,9 @@ class BaseTradingLoop(ABC):
         self.positions: dict[str, Position] = {}
         self.last_trade_time: dict[str, datetime.datetime] = {}
         self.hard_stop_lockout: dict[str, datetime.datetime] = {}
+        self._lockout_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          'hard_stop_lockout.json')
+        self._load_hard_stop_lockout()
         self.llm_scores: dict = {}
         self._last_llm_time = 0.0
         self.model_mtime = 0
@@ -88,6 +93,8 @@ class BaseTradingLoop(ABC):
         self.macro_regime: MacroRegime | None = None
         self.corr_matrix: dict = {}
         self._equity: float = 100_000
+        from stock_config import LEVERAGED_ETFS
+        self._leveraged_etfs = LEVERAGED_ETFS
 
     # --- Abstract methods (subclasses must implement) ---
 
@@ -180,6 +187,8 @@ class BaseTradingLoop(ABC):
 
             # Predictions
             benchmark = self.get_benchmark_close()
+            if benchmark is None:
+                logger.warning("[BENCHMARK] Benchmark data unavailable — predictions will lack relative strength")
             preds, snapshots = self._get_predictions(benchmark)
 
             # LLM analysis (throttled)
@@ -385,6 +394,7 @@ class BaseTradingLoop(ABC):
                     self.last_trade_time[symbol] = datetime.datetime.now()
                     if stop_reason == 'hard_stop':
                         self.hard_stop_lockout[symbol] = datetime.datetime.now()
+                        self._save_hard_stop_lockout()
                         logger.info("[LOCKOUT] %s: %dh lockout after hard stop",
                                     symbol, self.HARD_STOP_LOCKOUT_HOURS)
                 except Exception as e:
@@ -402,7 +412,8 @@ class BaseTradingLoop(ABC):
                                      pnl_pct, llm_score=llm_info.get('s'),
                                      reasoning='position desync — broker qty=0',
                                      exit_reason='desync')
-                        del self.positions[symbol]
+                        if symbol in self.positions:
+                            del self.positions[symbol]
                         self.last_trade_time[symbol] = datetime.datetime.now()
 
     def _get_predictions(self, benchmark_close) -> tuple[dict, dict]:
@@ -438,7 +449,6 @@ class BaseTradingLoop(ABC):
                 except Exception as e:
                     logger.error("%s: Prediction error: %s", symbol, e)
 
-        gc.collect()
         return preds, snapshots
 
     def _run_llm_analysis(self, preds: dict):
@@ -529,6 +539,9 @@ class BaseTradingLoop(ABC):
             logger.info("%s: SELLING (%s)", symbol, reason)
 
             quote = self.get_quote(symbol)
+            if quote is None:
+                logger.warning("%s: Skipping sell — quote unavailable", symbol)
+                continue
             pos = self.positions[symbol]
             if self.place_sell_order(symbol, pos.qty, quote):
                 del self.positions[symbol]
@@ -575,7 +588,7 @@ class BaseTradingLoop(ABC):
         base = kelly_position_size(self.NOTIONAL_PER_SYMBOL, self._equity)
 
         # Confidence scaling
-        if pred_return is not None and self.trade_threshold > 0:
+        if pred_return is not None and self.trade_threshold > 0.001:
             confidence = min(2.0, max(0.5, pred_return / self.trade_threshold))
         else:
             confidence = 1.0
@@ -622,12 +635,45 @@ class BaseTradingLoop(ABC):
                 pass
 
         # Leveraged ETF scaling: divide by leverage factor
-        from stock_config import LEVERAGED_ETFS
-        leverage = LEVERAGED_ETFS.get(symbol, 1)
+        leverage = self._leveraged_etfs.get(symbol, 1)
         if leverage > 1:
             sized /= leverage
 
         return max(1, int(sized))
+
+    def _load_hard_stop_lockout(self):
+        """Load hard-stop lockout state from disk (survive restarts)."""
+        try:
+            with open(self._lockout_file, 'r') as f:
+                data = json.load(f)
+            now = datetime.datetime.now().timestamp()
+            for symbol, expiry_ts in data.items():
+                if expiry_ts > now:
+                    self.hard_stop_lockout[symbol] = datetime.datetime.fromtimestamp(
+                        expiry_ts - self.HARD_STOP_LOCKOUT_HOURS * 3600)
+            if self.hard_stop_lockout:
+                logger.info("[LOCKOUT] Loaded %d lockout(s) from disk: %s",
+                            len(self.hard_stop_lockout),
+                            ', '.join(self.hard_stop_lockout.keys()))
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        except Exception as e:
+            logger.warning("[LOCKOUT] Failed to load lockout file: %s", e)
+
+    def _save_hard_stop_lockout(self):
+        """Persist hard-stop lockout state to disk (atomic write)."""
+        try:
+            data = {}
+            for symbol, lockout_time in self.hard_stop_lockout.items():
+                expiry_ts = (lockout_time + datetime.timedelta(
+                    hours=self.HARD_STOP_LOCKOUT_HOURS)).timestamp()
+                data[symbol] = expiry_ts
+            tmp = self._lockout_file + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(data, f)
+            os.replace(tmp, self._lockout_file)
+        except Exception as e:
+            logger.warning("[LOCKOUT] Failed to save lockout file: %s", e)
 
     def _is_hard_stop_locked(self, symbol: str) -> bool:
         """Check if symbol is in hard-stop lockout period."""
@@ -636,6 +682,7 @@ class BaseTradingLoop(ABC):
         elapsed = (datetime.datetime.now() - self.hard_stop_lockout[symbol]).total_seconds()
         if elapsed >= self.HARD_STOP_LOCKOUT_HOURS * 3600:
             del self.hard_stop_lockout[symbol]
+            self._save_hard_stop_lockout()
             return False
         return True
 

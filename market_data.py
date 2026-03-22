@@ -121,7 +121,7 @@ def fetch_bars_yfinance(symbol):
     return flatten_yfinance_columns(df)
 
 
-def fetch_stock_bars_alpaca(api, symbol, limit=120):
+def fetch_stock_bars_alpaca(api, symbol, limit=200):
     """Fetch hourly bars from Alpaca's stock data API.
 
     Args:
@@ -134,7 +134,8 @@ def fetch_stock_bars_alpaca(api, symbol, limit=120):
     """
     from datetime import datetime, timedelta, timezone
     try:
-        start = datetime.now(timezone.utc) - timedelta(days=6)
+        # 30 days gives ~150 market-hours bars — enough for SMA_100, Hurst, etc.
+        start = datetime.now(timezone.utc) - timedelta(days=30)
         bars = api.get_bars(symbol, '1Hour', start=start.isoformat(), limit=limit)
         rows = []
         timestamps = []
@@ -158,7 +159,7 @@ def fetch_stock_bars_alpaca(api, symbol, limit=120):
         return None
 
 
-def fetch_spy_bars_alpaca(api, limit=120):
+def fetch_spy_bars_alpaca(api, limit=200):
     """Fetch SPY hourly bars for relative strength calculation."""
     return fetch_stock_bars_alpaca(api, 'SPY', limit)
 

@@ -27,6 +27,7 @@ import collections
 import json
 import math
 import re
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -80,6 +81,9 @@ _quota_reset_date: str = ""
 _DAILY_COST_LIMIT = 1.00  # ~$30/month (paid tier 1)
 _daily_cost: float = 0.0
 _cost_reset_date: str = ""
+
+# Thread safety for quota/cost tracking
+_quota_lock = threading.Lock()
 
 # Per-million-token pricing (input, output) — conservative estimates
 _PRICING = {
@@ -277,7 +281,8 @@ def _parse_retry_after(http_error) -> float | None:
             return float(match.group(1))
     except Exception:
         pass
-    return None
+    # If regex doesn't match, default to exponential backoff
+    return 30.0  # Default 30s backoff instead of None
 
 
 def _rate_limit_ok() -> bool:
@@ -311,15 +316,16 @@ def _trigger_429_cooldown():
 def _maybe_reset_quota():
     """Reset daily quota and cost counters at midnight Pacific."""
     global _quota_reset_date, _cost_reset_date, _daily_cost
-    today = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
-    if _quota_reset_date != today:
-        _model_calls.clear()
-        _quota_reset_date = today
-    if _cost_reset_date != today:
-        if _daily_cost > 0:
-            print(f"[LLM] Daily cost reset (yesterday: ${_daily_cost:.4f})")
-        _daily_cost = 0.0
-        _cost_reset_date = today
+    with _quota_lock:
+        today = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+        if _quota_reset_date != today:
+            _model_calls.clear()
+            _quota_reset_date = today
+        if _cost_reset_date != today:
+            if _daily_cost > 0:
+                print(f"[LLM] Daily cost reset (yesterday: ${_daily_cost:.4f})")
+            _daily_cost = 0.0
+            _cost_reset_date = today
 
 
 def _estimate_cost(model: str, prompt_chars: int, response_chars: int) -> float:
@@ -334,7 +340,8 @@ def _record_cost(model: str, prompt_chars: int, response_chars: int):
     """Record estimated cost for this call."""
     global _daily_cost
     cost = _estimate_cost(model, prompt_chars, response_chars)
-    _daily_cost += cost
+    with _quota_lock:
+        _daily_cost += cost
 
 
 def _cost_ok() -> bool:
@@ -363,7 +370,8 @@ def get_budget(model: str) -> tuple[int, int]:
 def record_call(model: str):
     """Record that we made an API call to this model."""
     _maybe_reset_quota()
-    _model_calls[model] = _model_calls.get(model, 0) + 1
+    with _quota_lock:
+        _model_calls[model] = _model_calls.get(model, 0) + 1
 
 
 # --- Public API ---

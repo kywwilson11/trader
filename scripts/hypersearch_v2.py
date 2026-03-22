@@ -161,9 +161,10 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
     if len(df) > max_rows and n_tickers > 0:
         rows_per_ticker = max_rows // n_tickers
         print(f"Capping to {max_rows} rows ({rows_per_ticker}/ticker)...")
+        df = df.sort_index()
         capped = []
         for ticker in tickers:
-            tdf = df[df['Ticker'] == ticker].sort_index()
+            tdf = df[df['Ticker'] == ticker]
             capped.append(tdf.tail(rows_per_ticker))
         df = pd.concat(capped).sort_index()
         print(f"After capping: {len(df)} rows")
@@ -343,8 +344,7 @@ class SeqCache:
         self._scaler = None
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
         t0 = time.time()
 
@@ -396,8 +396,7 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
         trial_start = time.time()
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
         # --- Hyperparameters (from adaptive search space) ---
         if has_multi_horizon:
@@ -610,8 +609,7 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                     del model
                     gc.collect()
                     if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
+                        torch.cuda.empty_cache()
                     raise optuna.TrialPruned()
 
                 # Timeout
@@ -621,7 +619,7 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    best_state = {k: v.cpu() for k, v in model.state_dict().items()}
                     counter = 0
                 else:
                     counter += 1
@@ -655,8 +653,7 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
             del model
             gc.collect()
             if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
 
         avg_sharpe = np.mean(fold_sharpes) if fold_sharpes else 0.0
         std_sharpe = np.std(fold_sharpes) if len(fold_sharpes) > 1 else 0.0

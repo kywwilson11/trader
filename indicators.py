@@ -1,6 +1,13 @@
 import pandas as pd
 import numpy as np
 
+# Priority: C extension > Numba > pure numpy
+try:
+    import indicators_c as _ic
+    _HAS_C = True
+except ImportError:
+    _HAS_C = False
+
 try:
     from numba import njit
     _HAS_NUMBA = True
@@ -304,6 +311,9 @@ if _HAS_NUMBA:
 # ── Public API (unchanged signatures) ────────────────────────────────────────
 
 def compute_rsi(series, length=14):
+    if _HAS_C:
+        result = _ic.rsi(series.values.astype(np.float64), length)
+        return pd.Series(result, index=series.index)
     if _HAS_NUMBA:
         result = _rsi_core(series.values.astype(np.float64), length)
         return pd.Series(result, index=series.index)
@@ -317,6 +327,10 @@ def compute_rsi(series, length=14):
 
 
 def compute_macd(series, fast=12, slow=26, signal=9):
+    if _HAS_C:
+        ml, hist, sl = _ic.macd(series.values.astype(np.float64), fast, slow, signal)
+        idx = series.index
+        return pd.Series(ml, index=idx), pd.Series(hist, index=idx), pd.Series(sl, index=idx)
     if _HAS_NUMBA:
         ml, hist, sl = _macd_core(series.values.astype(np.float64), fast, slow, signal)
         idx = series.index
@@ -330,6 +344,11 @@ def compute_macd(series, fast=12, slow=26, signal=9):
 
 
 def compute_atr(high, low, close, length=14):
+    if _HAS_C:
+        result = _ic.atr(high.values.astype(np.float64),
+                         low.values.astype(np.float64),
+                         close.values.astype(np.float64), length)
+        return pd.Series(result, index=close.index)
     if _HAS_NUMBA:
         result = _atr_core(high.values.astype(np.float64),
                            low.values.astype(np.float64),
@@ -344,6 +363,12 @@ def compute_atr(high, low, close, length=14):
 
 
 def compute_bbands(close, length=20, std=2):
+    if _HAS_C:
+        lo, mid, up, bw, pb = _ic.bbands(close.values.astype(np.float64), length, float(std))
+        idx = close.index
+        return (pd.Series(lo, index=idx), pd.Series(mid, index=idx),
+                pd.Series(up, index=idx), pd.Series(bw, index=idx),
+                pd.Series(pb, index=idx))
     if _HAS_NUMBA:
         lo, mid, up, bw, pb = _bbands_core(close.values.astype(np.float64), length, std)
         idx = close.index
@@ -360,6 +385,12 @@ def compute_bbands(close, length=20, std=2):
 
 
 def compute_stoch(high, low, close, k=14, d=3, smooth_k=3):
+    if _HAS_C:
+        sk, sd = _ic.stoch(high.values.astype(np.float64),
+                           low.values.astype(np.float64),
+                           close.values.astype(np.float64), k, d, smooth_k)
+        idx = close.index
+        return pd.Series(sk, index=idx), pd.Series(sd, index=idx)
     if _HAS_NUMBA:
         sk, sd = _stoch_core(high.values.astype(np.float64),
                              low.values.astype(np.float64),
@@ -375,6 +406,10 @@ def compute_stoch(high, low, close, k=14, d=3, smooth_k=3):
 
 
 def compute_obv(close, volume):
+    if _HAS_C:
+        result = _ic.obv(close.values.astype(np.float64),
+                         volume.values.astype(np.float64))
+        return pd.Series(result, index=close.index)
     if _HAS_NUMBA:
         result = _obv_core(close.values.astype(np.float64),
                            volume.values.astype(np.float64))
@@ -385,6 +420,9 @@ def compute_obv(close, volume):
 
 
 def compute_rolling_percentile(series, window=100):
+    if _HAS_C:
+        result = _ic.rolling_percentile(series.values.astype(np.float64), window)
+        return pd.Series(result, index=series.index)
     if _HAS_NUMBA:
         result = _rolling_percentile(series.values.astype(np.float64), window)
         return pd.Series(result, index=series.index)
@@ -395,6 +433,9 @@ def compute_rolling_percentile(series, window=100):
 
 
 def compute_linear_slope(series, window=5):
+    if _HAS_C:
+        result = _ic.linear_slope(series.values.astype(np.float64), window)
+        return pd.Series(result, index=series.index)
     if _HAS_NUMBA:
         result = _linear_slope(series.values.astype(np.float64), window)
         return pd.Series(result, index=series.index)
@@ -417,6 +458,9 @@ def compute_hurst(series, window=100):
 
     H > 0.5 → trending, H < 0.5 → mean-reverting, H ≈ 0.5 → random walk.
     """
+    if _HAS_C:
+        result = _ic.hurst(series.values.astype(np.float64), window)
+        return pd.Series(result, index=series.index)
     if _HAS_NUMBA:
         result = _hurst_rs(series.values.astype(np.float64), window)
         return pd.Series(result, index=series.index)

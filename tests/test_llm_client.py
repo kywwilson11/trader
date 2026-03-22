@@ -128,14 +128,14 @@ class TestParseRetryAfter:
         err = self._make_http_error("limit: 0 remaining requests")
         assert _parse_retry_after(err) is None
 
-    def test_no_retry_info_returns_none(self):
+    def test_no_retry_info_returns_default(self):
         err = self._make_http_error("rate limited, try later")
-        assert _parse_retry_after(err) is None
+        assert _parse_retry_after(err) == 30.0
 
-    def test_read_error_returns_none(self):
+    def test_read_error_returns_default(self):
         mock_err = MagicMock()
         mock_err.read.side_effect = Exception("read failed")
-        assert _parse_retry_after(mock_err) is None
+        assert _parse_retry_after(mock_err) == 30.0
 
 
 class TestRateLimit:

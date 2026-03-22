@@ -175,9 +175,16 @@ def fetch_with_fallback(ticker: str, start_date: str, api=None,
         print(f"  [DATA] {ticker}: all sources failed")
         return None
 
-    # Merge: concat, keep first occurrence (priority: Alpaca > yfinance > CC)
+    # Normalize all frames to UTC before merging
+    for i, frame in enumerate(frames):
+        if frame.index.tz is None:
+            frames[i].index = frame.index.tz_localize('UTC')
+        else:
+            frames[i].index = frame.index.tz_convert('UTC')
+
+    # Merge: concat, keep last occurrence (newest data wins, matches data_utils.py)
     combined = pd.concat(frames)
-    combined = combined[~combined.index.duplicated(keep='first')]
+    combined = combined[~combined.index.duplicated(keep='last')]
     combined = combined.sort_index()
 
     sources = ' + '.join(source_names)
