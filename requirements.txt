@@ -1,6 +1,13 @@
 # Core dependencies (works on any Python 3.10+ system)
 # For Jetson Orin Nano GPU setup, see requirements-jetson.txt
 
+# Alpaca SDKs: alpaca-py is the maintained SDK (used via alpaca_compat.py;
+# set TRADER_USE_ALPACA_PY=1 to opt in early — it also takes over
+# automatically if alpaca-trade-api stops importing). alpaca-trade-api is
+# unmaintained since 2022; its websockets<11 pin conflicts with
+# `websockets>=12`, which this file therefore no longer requests — pip will
+# resolve to the SDK's pinned range until the legacy SDK is dropped.
+alpaca-py>=0.43.0
 alpaca-trade-api>=3.0.0
 python-dotenv>=1.0.0
 numpy>=1.26,<2
@@ -13,8 +20,8 @@ numba>=0.60
 finnhub-python>=2.4
 beautifulsoup4>=4.12
 requests>=2.31
-websockets>=12.0
 PyYAML>=6.0
+lightgbm>=4.0
 
 # GUI (optional — only needed for gui.py)
 PySide6>=6.6

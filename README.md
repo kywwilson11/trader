@@ -21,44 +21,50 @@
 ## Architecture
 
 ```
-run_pipeline.py                   Orchestrator (train -> trade -> weekly retrain)
-|-- harvest_crypto_data.py        Crypto training data (10 symbols, 1yr hourly)
-|-- harvest_stock_data.py         Stock training data (~47 symbols, 1yr hourly)
-|-- hypersearch_dual.py           Optuna hyperparameter search (bear + bull models)
-|-- sentiment_history.py          Historical sentiment cache (FnG + Finnhub, background)
-|-- crypto_loop.py                24/7 crypto trading (10 symbols)
-+-- stock_loop.py                 Market-hours stock trading (top 10 of ~47)
+run_pipeline.py                   Orchestrator (harvest -> train -> gate -> trade -> weekly retrain)
+|-- scripts/harvest_crypto_data.py   Crypto training data (Alpaca primary, hourly, multi-year)
+|-- scripts/harvest_stock_data.py    Stock training data (adjusted bars, lagged sentiment)
+|-- scripts/hypersearch_v2.py        Optuna search: regression LSTM, purged time-split walk-forward,
+|                                    cost-aware Sharpe objective, holdout + DSR gate, LightGBM leg
+|-- backtest.py                      Policy backtest gate (real entries/exits/fees; rolls back bad promotions)
+|-- sentiment_history.py             Historical sentiment cache (FnG + Finnhub) + Gemini Batch backfill
+|-- crypto_loop.py                   24/7 crypto trading (10 symbols)
+|-- stock_loop.py                    Market-hours stock trading (top 10, entry windows, overnight sleeve)
++-- run_bots.py                      Optional combined runner (both loops, one process; --combined-bots)
 
 gui.py                            PySide6 dashboard (positions, P&L, news, markets, models, logs)
+strategy_config.py                Single source of truth for policy params (loops AND backtester)
+fees.py                           Transaction-cost model (Alpaca crypto 25bps taker/side + spread)
+validation.py                     Deflated Sharpe Ratio + PBO promotion gates
 stock_config.py                   Market universe config (stocks + crypto -> stock_universe.json)
 indicator_config.py               Feature preset management (minimal / standard / full)
-llm_client.py                     Unified LLM client (Gemini, Claude, OpenAI + fallback chain)
-llm_analyst.py                    Pre-trade LLM analysis (position multiplier + reasoning)
+llm_client.py                     Gemini client: schema-enforced JSON, tiered routing, cost ledger
+llm_analyst.py                    Pre-trade LLM risk overlay (consequence-aware prompt, veto/sizing)
+llm_eval.py                       Measures whether the LLM gate predicts returns (s-decile report)
 llm_config.py                     LLM provider/key configuration
-fundamentals.py                   Fundamental data (yfinance + FMP + SEC EDGAR)
+fundamentals.py                   Fundamental data (yfinance + FMP + real EDGAR filing text)
+alpaca_compat.py                  alpaca-py adapter behind the legacy REST interface
+order_stream.py                   Optional trade_updates websocket cache (TRADER_ORDER_STREAM=1)
 trade_journal.py                  JSONL decision logging (per-day journals)
-sentiment_history.py              SQLite-backed sentiment cache with LLM backfill worker
 ```
 
 ## Features
 
-- **Dual bear/bull LSTM models** -- separate models optimized per direction, hot-reloadable without downtime
-- **ATR-based adaptive risk** -- stop-loss, trailing stops, and take-profit scaled to current volatility
-- **Sentiment gating** -- Fear & Greed Index + Finnhub news scores modulate position sizing (0x-1.5x)
-- **LLM pre-trade analysis** -- optional Gemini/Claude/OpenAI analysis gates trades with position multipliers and reasoning
-- **Fundamental data** -- PE, PB, EPS, market cap, insider activity, SEC filings (yfinance + FMP + EDGAR)
-- **Historical sentiment as training feature** -- Crypto Fear & Greed + Finnhub stock news scores in LSTM training data
-- **Background sentiment fetch** -- Finnhub articles fetched in parallel with training, ready for next cycle
-- **Confidence-based sizing** -- trade notional scaled by prediction strength
-- **MinTax lot selection** -- tax-optimized lot matching: losses first, then long-term gains, then short-term gains
-- **Numba JIT indicators** -- RSI, MACD, ATR, Bollinger Bands, Stochastic, OBV (~1.8x speedup)
-- **Configurable feature presets** -- minimal (20), standard (35), or full indicator sets
+- **Regression LSTM + LightGBM ensemble** -- multi-horizon (12-48h) return forecasts, hot-reloadable via atomic save manifests
+- **Honest validation** -- purged time-split walk-forward (embargo >= max horizon), untouched final holdout, Deflated Sharpe Ratio gate, coarse PBO report
+- **Policy backtest gate** -- every retrain replays the REAL entry/exit stack with real fees; promotions that lose money are rolled back automatically
+- **Cost-aware trading** -- entries must clear 2x the true round trip (crypto: 25bps taker/side + spread; stocks: regulatory + slippage)
+- **Risk-based sizing** -- equity-at-risk-to-the-stop base, fractional Kelly (<=0.25) from confirmed fills, GARCH vol targeting calibrated to annualized targets, bounded advisory tilt
+- **ATR-based adaptive risk** -- stops/trailing/take-profit scaled to volatility (floors only guard degenerate cases; ATR does the work)
+- **Stock book structured around the evidence** -- entries in the open/close windows (Gao et al. 2018), capped overnight sleeve with GTC stops (Lou-Polk-Skouras 2019), SPY 200d trend filter (Faber)
+- **LLM risk overlay** -- schema-enforced Gemini scoring with veto + bounded sizing tilt, consequence-aware prompts, actual-responder journaling, and `llm_eval.py` to prove (or disprove) its value
+- **Sentiment** -- FnG + Finnhub keyword scores, point-in-time correct (UTC bucketing, 1-day lag for stocks), Gemini **Batch API** backfill at 50% price on a separate quota
+- **Fail-closed execution** -- missing predictions/quotes never buy or force-sell; circuit breaker halts entries until the daily baseline resets; account-state errors suspend buys
+- **Crash-safe state** -- scoped startup cleanup, protective stops re-placed after restart, persisted high-water marks and cooldowns, per-cycle exception guard
+- **Numba JIT indicators** -- RSI, MACD, ATR, Bollinger Bands, Stochastic, OBV (~1.8x speedup, cache=True)
 - **Cross-asset features** -- BTC prices for crypto correlations, SPY for stock relative strength
-- **Circuit breaker** -- auto-flattens all positions on 5% daily drawdown
-- **Persistent Optuna studies** -- Bayesian hyperparameter search with SQLite memory across cycles
-- **Weekly auto-retrain** -- Saturday 2 AM: harvest fresh data, retrain models, bots hot-reload improvements
-- **Position reconstruction** -- survives crashes by syncing state from Alpaca API on restart
-- **Trade journal** -- JSONL decision log with buy/sell/skip/llm_block stats per day
+- **Weekly auto-retrain** -- Saturday 2 AM: re-harvest fresh data, retrain, holdout + policy gates, bots hot-reload
+- **Trade journal + measurement** -- every decision and every scored LLM candidate journaled; Kelly excludes unconfirmed fills
 - **PySide6 dashboard** -- live positions, P&L, orders, news, markets heatmap/chart, model status, hardware gauges, 9 themes
 
 ---
@@ -123,38 +129,48 @@ python run_pipeline.py
 python gui.py
 ```
 
-**Jetson Orin Nano** -- set `LD_LIBRARY_PATH` for the pipeline:
+**Jetson Orin Nano** -- run the one-time system setup (headless, NVMe swap,
+cuDSS/cuSPARSELt installed system-wide via ldconfig so `LD_LIBRARY_PATH`
+exports are no longer needed — shell exports never survived systemd/cron):
 ```bash
-LD_LIBRARY_PATH="/path/to/envs/jetson/lib/python3.10/site-packages/nvidia/cusparselt/lib:${LD_LIBRARY_PATH:-}" \
-    python run_pipeline.py
+sudo bash scripts/setup_jetson_system.sh   # see --skip-headless / --skip-swap
+sudo reboot
+python run_pipeline.py --combined-bots
 ```
 
 ### 5. Pipeline Flags
 ```
---trials N          Trials per model, initial training (default: 500)
+--trials N          Trials per model, initial training (default: 200)
 --retrain-trials N  Trials per model, weekly retrain (default: 100)
 --retrain-day N     Day of week 0=Mon..6=Sun (default: 5=Saturday)
 --retrain-hour N    Hour 0-23 (default: 2)
 --bot-only          Skip training, start bots immediately
---skip-harvest      Use existing CSVs
+--skip-harvest      Use existing data files
 --crypto-only       Crypto models + bot only
 --stock-only        Stock models + bot only
 --no-retrain        Train once, run bots forever
+--combined-bots     Run both loops as threads in ONE process
+                    (saves ~0.5-0.8GB RAM on the Jetson)
 ```
 
 ### 6. Manual Steps (if not using pipeline)
 ```bash
 # Harvest training data
-python harvest_crypto_data.py    # -> training_data.csv
-python harvest_stock_data.py     # -> stock_training_data.csv
+python scripts/harvest_crypto_data.py    # -> training_data.parquet/csv
+python scripts/harvest_stock_data.py     # -> stock_training_data.parquet/csv
 
-# Train models
-python hypersearch_dual.py --target bear --data training_data.csv
-python hypersearch_dual.py --target bull --data training_data.csv
-python hypersearch_dual.py --target bear --data stock_training_data.csv --prefix stock
-python hypersearch_dual.py --target bull --data stock_training_data.csv --prefix stock
+# Train models (regression LSTM + LightGBM leg; holdout + DSR gated)
+python scripts/hypersearch_v2.py --trials 200 --preset stationary
+python scripts/hypersearch_v2.py --trials 200 --prefix stock --data stock_training_data.csv
 
-# Run bots individually
+# Backtest the ACTUAL policy with real fees (also runs as a retrain gate)
+python backtest.py --days 60
+python backtest.py --prefix stock --days 60
+
+# Measure whether the LLM gate predicts returns
+python llm_eval.py --days 14
+
+# Run bots individually (or combined: python run_bots.py)
 python crypto_loop.py
 python stock_loop.py
 ```

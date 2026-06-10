@@ -2,60 +2,55 @@
 
 Run standalone to check:
   - API key / secret are valid
-  - Account equity and PDT status
-  - Whether the account is in unlimited (>$25k) or conservative mode
+  - Account equity, buying power, and trading_blocked status
+  - Whether intraday margin applies (>= $2,000 equity; PDT retired June 2026)
 """
 import sys; from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import alpaca_trade_api as tradeapi
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- CONFIGURATION ---
-API_KEY = os.getenv('ALPACA_API_KEY')
-API_SECRET = os.getenv('ALPACA_API_SECRET')
-BASE_URL = os.getenv('ALPACA_BASE_URL')
 
 def get_trading_status():
-    # Connect to the API
-    api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+    # Connect via the shared constructor (legacy SDK or alpaca-py adapter)
+    from trading_utils import get_api
+    api = get_api()
 
     try:
         # 1. Get Account Info
         account = api.get_account()
-        
-        # 2. Check Financials
-        equity = float(account.equity)
-        day_trade_count = int(account.daytrade_count)
-        is_pdt_flagged = account.pattern_day_trader
-        
-        print(f"\n--- ACCOUNT STATUS ---")
-        print(f"Equity:       ${equity:,.2f}")
-        print(f"Day Trades:   {day_trade_count} / 3 (Rolling 5-day window)")
-        print(f"PDT Flagged:  {is_pdt_flagged}")
-        print(f"Status:       {account.status}")
 
-        # 3. The Logic Gate
-        if equity >= 25000:
-            print("\n[DECISION]: UNLIMITED MODE")
-            print("Account is over $25k. We can execute the Hourly Strategy.")
-            return "UNLIMITED"
-            
+        # 2. Check Financials.
+        # NOTE: The PDT rule was RETIRED June 4, 2026 (FINRA intraday-margin
+        # framework). Alpaca deletes pattern_day_trader / daytrade_count from
+        # the account API on July 6, 2026 — do not read them. A margin
+        # account with >= $2,000 equity gets intraday buying power; cash
+        # accounts remain bound by T+1 settled funds.
+        equity = float(account.equity)
+        buying_power = float(getattr(account, 'buying_power', 0) or 0)
+
+        print(f"\n--- ACCOUNT STATUS ---")
+        print(f"Equity:        ${equity:,.2f}")
+        print(f"Buying Power:  ${buying_power:,.2f}")
+        print(f"Status:        {account.status}")
+        if getattr(account, 'trading_blocked', False):
+            print("WARNING: trading_blocked is set on this account!")
+            return "HALT"
+
+        # 3. The Logic Gate (post-PDT world)
+        if equity >= 2000:
+            print("\n[DECISION]: OK TO TRADE")
+            print("Margin account >= $2,000: intraday margin framework applies "
+                  "(no day-trade count limits).")
+            return "SAFE_TO_TRADE"
         else:
-            print("\n[DECISION]: CONSERVATIVE MODE")
-            print("Account is under $25k.")
-            
-            # Logic: If we have burned 3 trades, we stop to prevent the 4th (Ban).
-            if day_trade_count >= 3:
-                print("CRITICAL: You are at the limit (3 trades). HALTING TRADING.")
-                return "HALT"
-            else:
-                remaining = 3 - day_trade_count
-                print(f"Safe to trade. You have {remaining} day trades remaining this week.")
-                return "SAFE_TO_TRADE"
+            print("\n[DECISION]: UNDERFUNDED")
+            print("Equity under $2,000 — intraday margin unavailable; "
+                  "a cash account is limited to settled funds (T+1).")
+            return "CONSERVATIVE"
 
     except Exception as e:
         print(f"Error connecting to Alpaca: {e}")

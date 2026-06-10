@@ -57,3 +57,17 @@ journals/
 
 # Old/backup logos
 logos/old/
+
+# Runtime state
+.gpu.lock
+llm_cost.json
+position_state.json
+*_position_state.json
+hard_stop_lockout.json
+llm_eval_report.json
+backtest_*report.json
+*.prev
+execution_report.json
+funding_history.json
+earnings_calendar.json
+*_heartbeat

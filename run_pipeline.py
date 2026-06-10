@@ -116,7 +116,9 @@ ENV = {
 
 # Bots use CPU-only inference — hide GPU so PyTorch doesn't reserve CUDA memory.
 # This frees ~600MB for training (each CUDA context costs ~300MB on Jetson).
-BOT_ENV = {**ENV, 'CUDA_VISIBLE_DEVICES': ''}
+# OMP/torch thread caps stop tiny-LSTM inference stealing cores from training.
+BOT_ENV = {**ENV, 'CUDA_VISIBLE_DEVICES': '',
+           'OMP_NUM_THREADS': '2', 'TORCH_NUM_THREADS': '2'}
 
 # Throttle JSON writes to avoid excessive disk I/O
 _last_status_write = 0
@@ -342,13 +344,37 @@ def _stop_bots(bots, log_fh):
     time.sleep(3)
 
 
-def _restart_bots(bots, log_fh, run_crypto, run_stock):
-    """Restart bot processes after training completes."""
+_COMBINED_BOTS = False  # set from --combined-bots in main()
+
+
+def _launch_bots(bots, log_fh, run_crypto, run_stock, verb='started'):
+    """Launch trading bots — combined single process or one per bot.
+
+    Combined mode (--combined-bots) saves a duplicate torch+pandas import
+    stack (~0.5-0.8GB on the Jetson) by running both loops as threads in
+    run_bots.py. Per-bot GUI restart commands target the whole 'Bots'
+    process in that mode.
+    """
+    if _COMBINED_BOTS and (run_crypto or run_stock):
+        cmd = [PYTHON, '-u', 'run_bots.py']
+        if run_crypto and not run_stock:
+            cmd.append('--crypto-only')
+        elif run_stock and not run_crypto:
+            cmd.append('--stock-only')
+        proc, bot_fh = _start_bot(cmd, CRYPTO_BOT_LOG)
+        bots.append(('Bots', proc, bot_fh))
+        _all_handles.append(bot_fh)
+        msg = f"Combined bot process {verb} (PID {proc.pid}, log: crypto_bot_output.log)\n"
+        log_fh.write(msg)
+        log_fh.flush()
+        _print(msg, end='')
+        return
+
     if run_crypto:
         proc, bot_fh = _start_bot([PYTHON, '-u', 'crypto_loop.py'], CRYPTO_BOT_LOG)
         bots.append(('Crypto', proc, bot_fh))
         _all_handles.append(bot_fh)
-        msg = f"Crypto bot restarted (PID {proc.pid})\n"
+        msg = f"Crypto bot {verb} (PID {proc.pid}, log: crypto_bot_output.log)\n"
         log_fh.write(msg)
         log_fh.flush()
         _print(msg, end='')
@@ -357,10 +383,15 @@ def _restart_bots(bots, log_fh, run_crypto, run_stock):
         proc, bot_fh = _start_bot([PYTHON, '-u', 'stock_loop.py'], STOCK_BOT_LOG)
         bots.append(('Stock', proc, bot_fh))
         _all_handles.append(bot_fh)
-        msg = f"Stock bot restarted (PID {proc.pid})\n"
+        msg = f"Stock bot {verb} (PID {proc.pid}, log: stock_bot_output.log)\n"
         log_fh.write(msg)
         log_fh.flush()
         _print(msg, end='')
+
+
+def _restart_bots(bots, log_fh, run_crypto, run_stock):
+    """Restart bot processes after training completes."""
+    _launch_bots(bots, log_fh, run_crypto, run_stock, verb='restarted')
 
 
 def _stop_single_bot(bots, name, log_fh):
@@ -492,9 +523,13 @@ def _check_restart_bots(bots, log_fh):
                 bot_fh.close()
             except Exception:
                 pass
-            log_path = CRYPTO_BOT_LOG if name == 'Crypto' else STOCK_BOT_LOG
-            cmd = [PYTHON, '-u',
-                   'crypto_loop.py' if name == 'Crypto' else 'stock_loop.py']
+            if name == 'Bots':  # combined-mode process
+                log_path = CRYPTO_BOT_LOG
+                cmd = [PYTHON, '-u', 'run_bots.py']
+            else:
+                log_path = CRYPTO_BOT_LOG if name == 'Crypto' else STOCK_BOT_LOG
+                cmd = [PYTHON, '-u',
+                       'crypto_loop.py' if name == 'Crypto' else 'stock_loop.py']
             new_proc, new_fh = _start_bot(cmd, log_path)
             _all_handles.append(new_fh)
             bots[i] = (name, new_proc, new_fh)
@@ -503,6 +538,13 @@ def _check_restart_bots(bots, log_fh):
             log_fh.write(msg)
             log_fh.flush()
             _print(msg, end='')
+            try:
+                from notify import notify
+                notify(f"{name} bot crashed (exit {proc.returncode}) — "
+                       f"auto-restarted as PID {new_proc.pid}",
+                       level='warning', dedupe_key=f'bot-crash-{name}')
+            except Exception:
+                pass
 
 
 def _next_retrain_time(retrain_day, retrain_hour):
@@ -534,14 +576,19 @@ def _get_data_age_hours(prefix):
     return (time.time() - best_mtime) / 3600
 
 
-def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
-    """Build harvest phases, skipping if data is fresh."""
+def _build_harvest_phases(skip_harvest, train_crypto, train_stock, force=False):
+    """Build harvest phases, skipping if data is fresh.
+
+    Args:
+        force: harvest even if the data file is <24h old (used when the
+            forward_bars expansion needs columns the current file lacks).
+    """
     phases = []
     if skip_harvest:
         return phases
 
     if train_crypto:
-        age_h = _get_data_age_hours('crypto')
+        age_h = None if force else _get_data_age_hours('crypto')
         if age_h is not None and age_h < 24:
             _print(f"Crypto training data is {age_h:.1f}h old, skipping harvest")
         else:
@@ -552,7 +599,7 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
             })
 
     if train_stock:
-        age_h = _get_data_age_hours('stock')
+        age_h = None if force else _get_data_age_hours('stock')
         if age_h is not None and age_h < 24:
             _print(f"Stock training data is {age_h:.1f}h old, skipping harvest")
         else:
@@ -566,7 +613,14 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock):
 
 
 def _build_training_phases(trials, train_crypto, train_stock, mode=''):
-    """Build model training phases with adaptive mode support."""
+    """Build model training phases with adaptive mode support.
+
+    Each training phase is followed by a policy-backtest GATE phase:
+    backtest.py replays the real entry/exit stack with real fees over the
+    recent window and restores the previous model artifacts if the freshly
+    promoted model loses money at the policy level (fit metrics alone are
+    not sufficient evidence — see validation.py).
+    """
     phases = []
 
     if train_crypto:
@@ -580,6 +634,12 @@ def _build_training_phases(trials, train_crypto, train_stock, mode=''):
             'cmd': cmd,
             'trials': trials,
         })
+        phases.append({
+            'id': 'crypto_backtest_gate',
+            'label': 'Crypto Policy Backtest Gate',
+            'cmd': [PYTHON, '-u', 'backtest.py', '--days', '60',
+                    '--trials', str(max(trials, 10)), '--gate'],
+        })
     if train_stock:
         cmd = [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
                '--trials', str(trials),
@@ -592,6 +652,12 @@ def _build_training_phases(trials, train_crypto, train_stock, mode=''):
             'label': 'Training Stock Regression Model',
             'cmd': cmd,
             'trials': trials,
+        })
+        phases.append({
+            'id': 'stock_backtest_gate',
+            'label': 'Stock Policy Backtest Gate',
+            'cmd': [PYTHON, '-u', 'backtest.py', '--prefix', 'stock',
+                    '--days', '60', '--trials', str(max(trials, 10)), '--gate'],
         })
 
     return phases
@@ -741,7 +807,14 @@ def main():
                         help='Hour to start retrain (0-23, default: 2)')
     parser.add_argument('--retrain-trials', type=int, default=100,
                         help='Trials per model for weekly retrain (default: 100)')
+    parser.add_argument('--combined-bots', action='store_true',
+                        help='Run both trading loops as threads in ONE process '
+                             '(saves ~0.5-0.8GB RAM on the Jetson; per-bot GUI '
+                             'restart commands then restart the whole process)')
     args = parser.parse_args()
+
+    global _COMBINED_BOTS
+    _COMBINED_BOTS = args.combined_bots
 
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
@@ -842,24 +915,7 @@ def main():
         # PHASE B: Start trading bots (run forever)
         # =============================================================
         bots = _all_bots
-
-        if run_crypto:
-            proc, bot_fh = _start_bot([PYTHON, '-u', 'crypto_loop.py'], CRYPTO_BOT_LOG)
-            bots.append(('Crypto', proc, bot_fh))
-            _all_handles.append(bot_fh)
-            msg = f"Crypto bot started (PID {proc.pid}, log: crypto_bot_output.log)\n"
-            log_fh.write(msg)
-            log_fh.flush()
-            _print(msg, end='')
-
-        if run_stock:
-            proc, bot_fh = _start_bot([PYTHON, '-u', 'stock_loop.py'], STOCK_BOT_LOG)
-            bots.append(('Stock', proc, bot_fh))
-            _all_handles.append(bot_fh)
-            msg = f"Stock bot started (PID {proc.pid}, log: stock_bot_output.log)\n"
-            log_fh.write(msg)
-            log_fh.flush()
-            _print(msg, end='')
+        _launch_bots(bots, log_fh, run_crypto, run_stock, verb='started')
 
         status['phase'] = 'trading'
         status['phase_label'] = 'Trading'
@@ -1090,8 +1146,15 @@ def main():
                         log_fh.flush()
                         _print(msg, end='')
 
+            # Weekly retrains MUST re-harvest: the docstring always promised
+            # "re-harvest + retrain", but skip_harvest=not force_harvest
+            # meant every weekly cycle re-ran Optuna on the same frozen CSV,
+            # so models drifted months behind the live market. The <24h
+            # freshness check inside _build_harvest_phases still prevents
+            # back-to-back redundant harvests.
             retrain_phases = (
-                _build_harvest_phases(not force_harvest, rt_crypto, rt_stock)
+                _build_harvest_phases(False, rt_crypto, rt_stock,
+                                      force=force_harvest)
                 + _build_training_phases(retrain_trials, rt_crypto, rt_stock,
                                          mode=retrain_mode)
             )

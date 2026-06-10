@@ -5,7 +5,10 @@
 #     --index-url https://pypi.jetson-ai-lab.io/jp6/cu126
 #
 # WARNING: PyTorch 2.9.1 is BROKEN on Jetson (missing libcudss.so.0)
+# Run scripts/setup_jetson_system.sh once to install cuDSS/cuSPARSELt
+# system-wide (replaces LD_LIBRARY_PATH exports) and configure swap/headless.
 
+alpaca-py>=0.43.0
 alpaca-trade-api>=3.0.0
 python-dotenv>=1.0.0
 numpy>=1.26,<2
@@ -18,5 +21,5 @@ numba>=0.63
 finnhub-python>=2.4
 beautifulsoup4>=4.12
 requests>=2.31
-websockets>=12.0
 PyYAML>=6.0
+lightgbm>=4.0
