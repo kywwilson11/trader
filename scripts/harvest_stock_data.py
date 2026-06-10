@@ -123,7 +123,39 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     df['Target_Return'] = df[f'Target_Return_{FORWARD_BARS[0]}']
 
     df = df.dropna()
+    df = _asof_tradability_mask(df, ticker)
     return df
+
+
+# As-of tradability floors. Several CURRENT universe names traded as
+# illiquid sub-$2 stocks in 2021-23 (POET, QBTS, RDW...). Training on
+# those rows injects look-ahead — "this name later became liquid enough
+# to make today's list" — and teaches microstructure (cent-wide books,
+# halts, 20% gaps) the bot will never trade at today's notionals.
+# NOTE: this removes the LISTING/LIQUIDITY part of survivorship bias
+# only; the winners-only panel itself (faded names absent from today's
+# universe) needs the rule-based candidate-pool harvest on the roadmap.
+MIN_DOLLAR_VOLUME = 5_000_000   # 30d median daily $ volume
+MIN_PRICE = 3.0                  # institutional-floor convention
+
+
+def _asof_tradability_mask(df, ticker):
+    """Drop rows from periods when the name wasn't realistically tradable."""
+    try:
+        daily_dv = (df['Close'] * df['Volume']).resample('1D').sum()
+        daily_dv = daily_dv[daily_dv > 0]
+        med_dv = daily_dv.rolling('30D').median()
+        dv_ok = med_dv.reindex(df.index, method='ffill') >= MIN_DOLLAR_VOLUME
+        px_ok = df['Close'] >= MIN_PRICE
+        mask = (dv_ok & px_ok).values
+        dropped = int((~mask).sum())
+        if dropped:
+            print(f"  [AS-OF] {ticker}: dropped {dropped}/{len(df)} rows "
+                  f"below tradability floors (illiquid/penny phase)")
+        return df[mask]
+    except Exception as e:
+        print(f"  [AS-OF] {ticker}: mask skipped ({e})")
+        return df
 
 
 def main():
