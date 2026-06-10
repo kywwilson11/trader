@@ -13,15 +13,18 @@ _DEFAULTS = {
     "enabled": True,
     "models": {
         "gemini": {"api_key": "", "model": "gemini-2.5-flash-lite"},
-        "claude": {"api_key": "", "model": "claude-sonnet-4-5-20250929"},
-        "openai": {"api_key": "", "model": "gpt-4.1"},
+        # Current model IDs (the old defaults were legacy/dated snapshots)
+        "claude": {"api_key": "", "model": "claude-haiku-4-5"},
+        "openai": {"api_key": "", "model": "gpt-5.4-nano"},
     },
     "analyst_model_override": None,     # None = use smart routing
     "sentiment_model_override": None,   # None = use smart routing
     "detected_tier": None,              # Auto-detected: 'free' or 'paid'
     "tier_override": None,              # Manual override: 'free', 'paid', or None (auto)
     "fmp_api_key": "",
-    "max_llm_latency_sec": 15,
+    # 15s doomed every thinking-model call mid-response; the analyst gate
+    # runs every 600s, so a 30-45s budget costs nothing
+    "max_llm_latency_sec": 30,
     "journal_enabled": True,
 }
 

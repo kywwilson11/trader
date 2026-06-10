@@ -195,10 +195,13 @@ def get_sec_filings(symbol: str) -> list[dict]:
         hits = data.get("hits", {}).get("hits", [])
         for hit in hits[:5]:
             src = hit.get("_source", {})
+            ciks = src.get("cik") or src.get("ciks") or []
             result.append({
                 "form_type": src.get("form_type", ""),
                 "filed_date": src.get("file_date", ""),
                 "title": src.get("display_names", [""])[0] if src.get("display_names") else "",
+                "doc_id": hit.get("_id", ""),       # "accession:filename"
+                "cik": ciks[0] if isinstance(ciks, list) and ciks else ciks,
             })
     except Exception as e:
         print(f"[FUNDAMENTALS] SEC EDGAR error for {symbol}: {e}")
@@ -207,8 +210,55 @@ def get_sec_filings(symbol: str) -> list[dict]:
     return result
 
 
+def _fetch_filing_text(doc_id: str, cik, max_chars: int = 7000) -> str | None:
+    """Fetch the actual filing document text from EDGAR.
+
+    doc_id is the EFTS hit id ("0000320193-24-000123:aapl-20240928.htm").
+    Prefers the Risk Factors / MD&A region when locatable. EDGAR allows
+    10 req/s with a declared User-Agent; we make one request per symbol
+    per week (7-day cache), which is far inside the limit.
+    """
+    try:
+        accession, _, filename = doc_id.partition(':')
+        if not accession or not filename or cik in (None, ''):
+            return None
+        acc_nodash = accession.replace('-', '')
+        url = (f"https://www.sec.gov/Archives/edgar/data/"
+               f"{int(cik)}/{acc_nodash}/{filename}")
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "trader-bot/1.0 (kywwilson@gmail.com)"})
+        resp = urllib.request.urlopen(req, timeout=15)
+        html = resp.read().decode('utf-8', errors='replace')
+
+        from bs4 import BeautifulSoup
+        text = BeautifulSoup(html, 'html.parser').get_text(' ')
+        text = ' '.join(text.split())
+        if len(text) < 500:
+            return None
+
+        # Aim at Risk Factors / MD&A; otherwise take the body after the
+        # boilerplate cover pages
+        lower = text.lower()
+        anchor = max(lower.find('risk factors'),
+                     lower.find("management's discussion"))
+        start = anchor if anchor > 0 else min(3000, len(text) // 10)
+        return text[start:start + max_chars]
+    except Exception as e:
+        print(f"[FUNDAMENTALS] EDGAR document fetch failed: {e}")
+        return None
+
+
 def get_filing_summary(symbol: str) -> str:
-    """Get LLM summary of most recent 10-K/10-Q filing. Cached 7 days."""
+    """LLM summary of the most recent 10-K/10-Q — from the REAL filing text.
+
+    The old version asked the LLM to summarize the filing "based on your
+    knowledge" WITHOUT fetching it. Current filings post-date every model's
+    training cutoff, so the 'guidance changes' it produced were fabricated
+    — and then fed into trade gating as fact for a week per cache entry.
+    Now: fetch the document, summarize what it actually says; if the fetch
+    fails, state only the verifiable fact (form + date), never invented
+    specifics. Cached 7 days.
+    """
     cache_key = f"filing_sum_{symbol}"
     cached = _cache_get(cache_key, SEC_TTL)
     if cached is not None:
@@ -230,16 +280,27 @@ def get_filing_summary(symbol: str) -> str:
         _cache_set(cache_key, "")
         return ""
 
-    # Build a prompt from the filing metadata (we don't fetch full text to avoid
-    # EDGAR rate limits — just ask LLM to summarize what it knows)
-    from llm_client import call_llm
+    filing_text = _fetch_filing_text(target.get("doc_id", ""), target.get("cik"))
+    if not filing_text:
+        # Verifiable fact only — no from-memory speculation
+        summary = (f"A {target['form_type']} was filed on {target['filed_date']} "
+                   f"(contents not retrieved — do not speculate on specifics).")
+        _cache_set(cache_key, summary)
+        return summary
 
+    from llm_client import call_llm
     prompt = (
-        f"For {symbol}, the most recent {target['form_type']} was filed on {target['filed_date']}. "
-        f"Based on your knowledge of {symbol}'s recent financials and SEC filings, "
-        f"summarize the key risks, guidance changes, and notable items in 2-3 sentences."
+        f"Below is an excerpt from {symbol}'s {target['form_type']} filed "
+        f"{target['filed_date']}. Summarize the key risks, guidance changes, "
+        f"and notable items in 2-3 sentences. Use ONLY this text — if it "
+        f"doesn't cover something, do not fill the gap from memory.\n\n"
+        f"---\n{filing_text}\n---"
     )
-    summary = call_llm(prompt, system="You are a financial analyst summarizing SEC filings.") or ""
+    summary = call_llm(prompt, temperature=0.2,
+                       system="You are a financial analyst summarizing SEC "
+                              "filings strictly from provided text.") or ""
+    if summary:
+        summary = f"[{target['form_type']} {target['filed_date']}] {summary}"
 
     _cache_set(cache_key, summary)
     return summary

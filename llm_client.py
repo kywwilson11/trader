@@ -60,16 +60,26 @@ _429_cooldown_until: float = 0.0  # timestamp when cooldown expires
 # --- Tier detection ---
 _detected_tier: str | None = None  # 'free', 'paid', or None (unknown)
 
+# Mid-2026 free-tier reality: 2.5 Pro was REMOVED from the free tier
+# (May 2026); flash-lite is ~15 RPM / ~1,000 RPD; flash ~10 RPM / ~250 RPD.
 _FREE_TIER_BUDGETS = {
-    "gemini-2.5-pro": 50,
-    "gemini-2.5-flash": 500,
-    "gemini-2.5-flash-lite": 1500,
+    "gemini-2.5-pro": 0,
+    "gemini-2.5-flash": 250,
+    "gemini-2.5-flash-lite": 1000,
 }
 _PAID_TIER_BUDGETS = {
     "gemini-2.5-pro": 1000,
     "gemini-2.5-flash": 2000,
     "gemini-2.5-flash-lite": 5000,
 }
+
+# Actual responder of the most recent successful call (for journaling —
+# the analysis file used to claim 'pro' produced scores that flash wrote)
+_last_model_used: str | None = None
+
+
+def get_last_model_used() -> str | None:
+    return _last_model_used
 
 # --- Sliding-window rate limiter ---
 _call_timestamps: collections.deque = collections.deque()
@@ -87,24 +97,29 @@ _COST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_cost.
 # Thread safety for quota/cost tracking
 _quota_lock = threading.Lock()
 
-# Per-million-token pricing (input, output) — conservative estimates
+# Per-million-token pricing (input, output) — current Gemini list prices.
+# The old table (flash 0.15/0.60, lite 0.075/0.30) understated real spend
+# 2-4x, so the $1/day cap tripped far later than intended.
 _PRICING = {
     "gemini-2.5-pro":        (1.25, 10.0),
-    "gemini-2.5-flash":      (0.15, 0.60),
-    "gemini-2.5-flash-lite": (0.075, 0.30),
+    "gemini-2.5-flash":      (0.30, 2.50),
+    "gemini-2.5-flash-lite": (0.10, 0.40),
 }
 
 # --- Smart model routing ---
 # Cost brackets: {max_daily_cost: {role: model}}
+# The analyst gate is a SIZING input, not research: flash-lite with an
+# enforced response schema is fast, ~$7/month at this call volume, and —
+# unlike the old pro routing — doesn't blow the latency budget on thinking
+# tokens and then silently demote to an unschema'd fallback.
 _PAID_ROUTING = [
-    (0.10, {"analyst": "gemini-2.5-pro",        "sentiment": "gemini-2.5-flash",      "backfill": "gemini-2.5-flash-lite"}),
-    (0.40, {"analyst": "gemini-2.5-flash",      "sentiment": "gemini-2.5-flash-lite", "backfill": "gemini-2.5-flash-lite"}),
+    (0.40, {"analyst": "gemini-2.5-flash-lite", "sentiment": "gemini-2.5-flash-lite", "backfill": "gemini-2.5-flash-lite"}),
     (math.inf, {"analyst": "gemini-2.5-flash-lite", "sentiment": "gemini-2.5-flash-lite", "backfill": "gemini-2.5-flash-lite"}),
 ]
 
-# Free tier: always use best models (it's free!)
+# Free tier: Pro is no longer available; flash-lite has the only generous RPD
 _FREE_ROUTING = [
-    (math.inf, {"analyst": "gemini-2.5-pro", "sentiment": "gemini-2.5-flash", "backfill": "gemini-2.5-flash-lite"}),
+    (math.inf, {"analyst": "gemini-2.5-flash-lite", "sentiment": "gemini-2.5-flash-lite", "backfill": "gemini-2.5-flash-lite"}),
 ]
 
 
@@ -191,7 +206,7 @@ def probe_tier() -> str:
 
     try:
         # Minimal call to trigger header capture
-        _call_gemini("Hi", "", gemini_key, "gemini-2.5-flash-lite", 10, 10)
+        _call_gemini("Hi", "", gemini_key, "gemini-2.5-flash-lite", 10, 10)[0]
     except Exception:
         pass
 
@@ -363,17 +378,31 @@ def _maybe_reset_quota():
 
 
 def _estimate_cost(model: str, prompt_chars: int, response_chars: int) -> float:
-    """Estimate API cost from character counts (~4 chars per token)."""
+    """Estimate API cost from character counts (~4 chars per token).
+
+    Fallback only — usage-based costing (_record_cost with usage metadata)
+    is exact and includes thinking tokens, which chars/4 cannot see.
+    """
     input_tokens = prompt_chars / 4
     output_tokens = response_chars / 4
     price_in, price_out = _PRICING.get(model, (1.25, 10.0))
     return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
 
 
-def _record_cost(model: str, prompt_chars: int, response_chars: int):
-    """Record estimated cost and persist to shared file."""
+def _record_cost(model: str, prompt_chars: int, response_chars: int,
+                 usage: dict | None = None):
+    """Record cost (from API usageMetadata when available) to the shared file."""
     global _daily_cost
-    cost = _estimate_cost(model, prompt_chars, response_chars)
+    if usage and usage.get('promptTokenCount') is not None:
+        price_in, price_out = _PRICING.get(model, (1.25, 10.0))
+        in_tok = usage.get('promptTokenCount', 0)
+        # candidatesTokenCount excludes thinking tokens; thoughtsTokenCount
+        # is billed as output too
+        out_tok = (usage.get('candidatesTokenCount', 0)
+                   + usage.get('thoughtsTokenCount', 0))
+        cost = (in_tok * price_in + out_tok * price_out) / 1_000_000
+    else:
+        cost = _estimate_cost(model, prompt_chars, response_chars)
     with _quota_lock:
         # Re-read shared file to pick up costs from other processes
         _load_shared_cost()
@@ -419,12 +448,16 @@ def record_call(model: str):
 # --- Public API ---
 
 def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
-                max_tokens: int = 2048, json_mode: bool = False) -> str | None:
+                max_tokens: int = 2048, json_mode: bool = False,
+                json_schema: dict | None = None,
+                temperature: float | None = None,
+                timeout: float | None = None) -> str | None:
     """Call a specific Gemini model. Returns text or None.
 
     Used by tiered scoring to target a specific model. Handles 429 with
     retry-after parsing. Does NOT fall back to other models (caller decides).
     """
+    global _last_model_used
     if not _429_cooled_down():
         return None
 
@@ -450,16 +483,20 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
         return None
 
     prompt_chars = len(prompt) + len(system)
-    timeout = config.get("max_llm_latency_sec", 30)
+    if timeout is None:
+        timeout = config.get("max_llm_latency_sec", 30)
     start = time.time()
 
     try:
-        result = _call_gemini(prompt, system, gemini_key, model, max_tokens, timeout,
-                              json_mode=json_mode)
+        result, usage = _call_gemini(prompt, system, gemini_key, model, max_tokens,
+                                     timeout, json_mode=json_mode,
+                                     json_schema=json_schema,
+                                     temperature=temperature)
         elapsed = (time.time() - start) * 1000
         if result:
             record_call(model)
-            _record_cost(model, prompt_chars, len(result))
+            _record_cost(model, prompt_chars, len(result), usage)
+            _last_model_used = model
             print(f"[LLM] {model}: {elapsed:.0f}ms, {len(result)} chars (${_daily_cost:.3f} today)")
         return result
 
@@ -472,11 +509,16 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
                 time.sleep(wait)
                 try:
                     start2 = time.time()
-                    result = _call_gemini(prompt, system, gemini_key, model, max_tokens,
-                                          timeout, json_mode=json_mode)
+                    result, usage = _call_gemini(prompt, system, gemini_key, model,
+                                                 max_tokens, timeout,
+                                                 json_mode=json_mode,
+                                                 json_schema=json_schema,
+                                                 temperature=temperature)
                     elapsed2 = (time.time() - start2) * 1000
                     if result:
                         record_call(model)
+                        _record_cost(model, prompt_chars, len(result), usage)
+                        _last_model_used = model
                         print(f"[LLM] {model}: {elapsed2:.0f}ms, {len(result)} chars (after wait)")
                     return result
                 except Exception:
@@ -492,13 +534,17 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
         return None
 
 
-def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | None:
+def call_llm(prompt: str, system: str = "", max_tokens: int = 2048,
+             json_schema: dict | None = None,
+             temperature: float | None = None) -> str | None:
     """Send prompt to any available Gemini model. Returns text or None.
 
     Tries the configured model first, then falls back through all models.
-    Used by non-sentiment callers (fundamentals, llm_analyst) that don't
-    need tiered scoring.
+    The chain now ALSO fires on the dominant real-world failures the old
+    code returned None for — socket timeouts, MAX_TOKENS truncation, and
+    safety blocks — not just on specific HTTP codes.
     """
+    global _last_model_used
     if not _429_cooled_down():
         return None
 
@@ -525,13 +571,17 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | Non
     # Try configured model first
     start = time.time()
     try:
-        result = _call_gemini(prompt, system, gemini_key, model, max_tokens, timeout)
+        result, usage = _call_gemini(prompt, system, gemini_key, model, max_tokens,
+                                     timeout, json_schema=json_schema,
+                                     temperature=temperature)
         elapsed = (time.time() - start) * 1000
         if result:
             record_call(model)
-            _record_cost(model, prompt_chars, len(result))
+            _record_cost(model, prompt_chars, len(result), usage)
+            _last_model_used = model
             print(f"[LLM] {model}: {elapsed:.0f}ms, {len(result)} chars (${_daily_cost:.3f} today)")
-        return result
+            return result
+        # None result = truncation / safety block / empty parts — retryable
     except urllib.error.HTTPError as e:
         elapsed = (time.time() - start) * 1000
         if e.code == 429:
@@ -541,13 +591,17 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | Non
                 time.sleep(wait)
                 try:
                     start2 = time.time()
-                    result = _call_gemini(prompt, system, gemini_key, model, max_tokens, timeout)
+                    result, usage = _call_gemini(prompt, system, gemini_key, model,
+                                                 max_tokens, timeout,
+                                                 json_schema=json_schema,
+                                                 temperature=temperature)
                     elapsed2 = (time.time() - start2) * 1000
                     if result:
                         record_call(model)
-                        _record_cost(model, prompt_chars, len(result))
+                        _record_cost(model, prompt_chars, len(result), usage)
+                        _last_model_used = model
                         print(f"[LLM] {model}: {elapsed2:.0f}ms, {len(result)} chars (after wait, ${_daily_cost:.3f} today)")
-                    return result
+                        return result
                 except Exception:
                     pass
             # Fall through to chain
@@ -555,30 +609,49 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048) -> str | Non
             print(f"[LLM] {model}: HTTP {e.code} ({elapsed:.0f}ms)")
             return None
     except Exception as e:
+        # Timeouts/URLErrors are the most common failure — they MUST reach
+        # the chain (the old code returned None here and the advertised
+        # fallback rarely executed)
         elapsed = (time.time() - start) * 1000
         print(f"[LLM] {model}: {e} ({elapsed:.0f}ms)")
-        return None
 
     # Fallback chain
     print(f"[LLM] {model}: failed, trying fallback chain")
     return _try_gemini_chain(gemini_key, prompt, system, max_tokens, timeout,
-                              skip_model=model)
+                             skip_model=model, json_schema=json_schema,
+                             temperature=temperature)
 
 
-def _try_gemini_chain(api_key, prompt, system, max_tokens, timeout, skip_model=None):
-    """Try each Gemini model in fallback order."""
+def _try_gemini_chain(api_key, prompt, system, max_tokens, timeout,
+                      skip_model=None, json_schema=None, temperature=None):
+    """Try each Gemini model in fallback order.
+
+    Continues past None results (truncation/safety/empty) instead of
+    aborting the chain — `return result` on a None used to end the chain
+    at its first member.
+    """
+    global _last_model_used
     for model in _GEMINI_FALLBACK_CHAIN:
         if model == skip_model:
+            continue
+        remaining, _total = get_budget(model)
+        if remaining <= 0:
             continue
 
         start = time.time()
         try:
-            result = _call_gemini(prompt, system, api_key, model, max_tokens, timeout)
+            result, usage = _call_gemini(prompt, system, api_key, model, max_tokens,
+                                         timeout, json_schema=json_schema,
+                                         temperature=temperature)
             elapsed = (time.time() - start) * 1000
             if result:
                 record_call(model)
+                _record_cost(model, len(prompt) + len(system), len(result), usage)
+                _last_model_used = model
                 print(f"[LLM] gemini/{model}: {elapsed:.0f}ms, {len(result)} chars")
-            return result
+                return result
+            print(f"[LLM] gemini/{model}: empty/truncated, trying next")
+            continue
 
         except urllib.error.HTTPError as e:
             elapsed = (time.time() - start) * 1000
@@ -589,12 +662,17 @@ def _try_gemini_chain(api_key, prompt, system, max_tokens, timeout, skip_model=N
                     time.sleep(wait)
                     try:
                         start2 = time.time()
-                        result = _call_gemini(prompt, system, api_key, model, max_tokens, timeout)
+                        result, usage = _call_gemini(prompt, system, api_key, model,
+                                                     max_tokens, timeout,
+                                                     json_schema=json_schema,
+                                                     temperature=temperature)
                         elapsed2 = (time.time() - start2) * 1000
                         if result:
                             record_call(model)
+                            _record_cost(model, len(prompt) + len(system), len(result), usage)
+                            _last_model_used = model
                             print(f"[LLM] gemini/{model}: {elapsed2:.0f}ms, {len(result)} chars (after wait)")
-                        return result
+                            return result
                     except Exception:
                         pass
                 print(f"[LLM] gemini/{model}: 429, trying next")
@@ -615,27 +693,41 @@ def _try_gemini_chain(api_key, prompt, system, max_tokens, timeout, skip_model=N
 # --- Gemini API call ---
 
 def _call_gemini(prompt, system, api_key, model, max_tokens, timeout,
-                 json_mode=False):
-    """Call Google Gemini API. Returns text or raises on error."""
+                 json_mode=False, json_schema=None, temperature=None):
+    """Call Google Gemini API. Returns (text|None, usage_dict|None);
+    raises urllib errors for the caller's retry/fallback logic.
+
+    json_schema: a JSON-schema dict — sets responseMimeType + responseSchema
+    so the API GUARANTEES parseable output. This works on ALL current
+    Gemini models including 2.5 Pro; the old `"pro" not in model` guard was
+    based on a false premise and left the JSON-critical analyst call
+    unenforced, which is where the repo's whole repair-parser saga came from.
+    """
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     )
 
-    contents = []
-    if system:
-        contents.append({"role": "user", "parts": [{"text": system}]})
-        contents.append({"role": "model", "parts": [{"text": "Understood."}]})
-    contents.append({"role": "user", "parts": [{"text": prompt}]})
+    contents = [{"role": "user", "parts": [{"text": prompt}]}]
 
     gen_config = {"maxOutputTokens": max_tokens}
-    if json_mode and "pro" not in model:
-        # Force structured JSON output (not supported by thinking models)
+    if temperature is not None:
+        # Gemini defaults to 1.0 — far too hot for a sizing gate that
+        # should give the same answer to the same inputs
+        gen_config["temperature"] = temperature
+    if json_schema is not None:
+        gen_config["responseMimeType"] = "application/json"
+        gen_config["responseSchema"] = json_schema
+    elif json_mode:
         gen_config["responseMimeType"] = "application/json"
 
     body = {
         "contents": contents,
         "generationConfig": gen_config,
     }
+    if system:
+        # Proper system prompt field (the old fake user/'Understood.' turns
+        # weaken instruction adherence and break implicit caching)
+        body["systemInstruction"] = {"parts": [{"text": system}]}
 
     req = urllib.request.Request(
         url,
@@ -649,6 +741,7 @@ def _call_gemini(prompt, system, api_key, model, max_tokens, timeout,
     resp = urllib.request.urlopen(req, timeout=timeout)
     _capture_rate_limit_headers(resp, model)
     data = json.loads(resp.read())
+    usage = data.get("usageMetadata")
     try:
         finish = data["candidates"][0].get("finishReason", "unknown")
         parts = data["candidates"][0]["content"]["parts"]
@@ -658,14 +751,14 @@ def _call_gemini(prompt, system, api_key, model, max_tokens, timeout,
             if "text" in part and part["text"].strip():
                 if finish == "MAX_TOKENS":
                     print(f"[LLM] Gemini: truncated ({len(part['text'])} chars), discarding")
-                    return None  # discard — caller will retry via fallback
+                    return None, usage  # caller treats as retryable
                 if finish != "STOP":
                     print(f"[LLM] Gemini: finish={finish} ({len(part['text'])} chars)")
-                return part["text"]
+                return part["text"], usage
         # No text found in any part
         finish = data["candidates"][0].get("finishReason", "unknown")
         print(f"[LLM] Gemini: no text in {len(parts)} parts (finish={finish})")
-        return None
+        return None, usage
     except (KeyError, IndexError):
         # Debug: log what we got so we can fix parsing
         finish = data.get("candidates", [{}])[0].get("finishReason", "unknown") if data.get("candidates") else "no_candidates"
@@ -674,4 +767,4 @@ def _call_gemini(prompt, system, api_key, model, max_tokens, timeout,
         if blocked:
             detail += f", blocked={blocked}"
         print(f"[LLM] Gemini: unexpected response ({detail})")
-        return None
+        return None, usage
