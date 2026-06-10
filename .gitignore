@@ -90,3 +90,5 @@ challenger_*
 stock_challenger_*
 *shadow_preds.jsonl
 meta_retrain.log
+oi_archive.parquet
+oi_history.json

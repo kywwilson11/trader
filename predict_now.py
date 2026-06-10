@@ -209,6 +209,20 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         for col in ('Funding_Rate_Ann', 'Funding_Z', 'Funding_Chg_24h'):
             df[col] = (ff or {}).get(col, 0.0)
 
+    # Inject live open-interest features (crypto only; OKX vs local
+    # rolling history — 0.0 until ~1d/7d of history accumulates)
+    if asset_type == 'crypto' and 'OI_Chg_24h' in feature_cols \
+            and 'OI_Chg_24h' not in df.columns:
+        of = None
+        try:
+            from oi_archive import live_oi_features
+            alp_sym = symbol.replace('-', '/') if '-' in symbol else symbol
+            of = live_oi_features(alp_sym)
+        except Exception:
+            pass
+        for col in ('OI_Chg_24h', 'OI_Z'):
+            df[col] = (of or {}).get(col, 0.0)
+
     try:
         current_features = df[feature_cols].values
     except KeyError as e:

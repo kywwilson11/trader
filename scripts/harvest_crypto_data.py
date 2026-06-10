@@ -124,6 +124,17 @@ def prepare_data(ticker, btc_close=None, api=None, existing_ohlcv=None,
     except Exception as e:
         print(f"  [FUNDING] {ticker}: feature merge skipped ({e})")
 
+    # Open-interest dynamics (Binance metrics archive, hourly point-in-time)
+    try:
+        from oi_archive import oi_features_for_index
+        alpaca_sym = ticker.replace('-', '/')
+        ofeats = oi_features_for_index(alpaca_sym, df.index)
+        if ofeats is not None:
+            for col, vals in ofeats.items():
+                df[col] = vals
+    except Exception as e:
+        print(f"  [OI] {ticker}: feature merge skipped ({e})")
+
     # Multi-horizon targets: return over N bars as a percentage
     for fb in FORWARD_BARS:
         future_close = df['Close'].shift(-fb)
@@ -159,6 +170,15 @@ def main():
     except Exception as e:
         print(f"WARNING: funding archive sync failed ({e}) — "
               f"funding features will be omitted this harvest")
+
+    # Sync the Binance OI metrics archive (daily files; newest-first,
+    # capped per run — older history back-fills across harvests)
+    try:
+        from oi_archive import sync as sync_oi
+        sync_oi()
+    except Exception as e:
+        print(f"WARNING: OI archive sync failed ({e}) — "
+              f"OI features will be omitted this harvest")
 
     # Load existing data for incremental harvesting
     existing = load_training_data('crypto')
