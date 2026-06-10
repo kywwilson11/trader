@@ -69,7 +69,22 @@ def _load_lgb(prefix: str):
         return None
 
 
-def _predict_ticker(model, scaler, config, feature_cols, tdf, lgb_model=None):
+def _load_q10(prefix: str):
+    """(booster, veto_floor) for the q10 tail model, or None."""
+    try:
+        import json as _json
+        import lightgbm as _lgb
+        p = f'{prefix}_' if prefix else ''
+        booster = _lgb.Booster(model_file=f'{p}lgb_q10.txt')
+        with open(f'{p}lgb_q10_meta.json') as f:
+            floor = float(_json.load(f)['floor'])
+        return booster, floor
+    except Exception:
+        return None
+
+
+def _predict_ticker(model, scaler, config, feature_cols, tdf, lgb_model=None,
+                    q10_model=None):
     """Predictions for every bar of one ticker (CPU, batched).
 
     Mirrors the LIVE inference path: LSTM prediction, ensembled 0.6/0.4
@@ -82,8 +97,9 @@ def _predict_ticker(model, scaler, config, feature_cols, tdf, lgb_model=None):
     scaled = scaler.transform(feats).astype(np.float32)
     n = len(scaled)
     preds = np.full(n, np.nan, dtype=np.float64)
+    q10 = np.full(n, np.nan, dtype=np.float64) if q10_model is not None else None
     if n <= seq_len:
-        return preds
+        return preds, q10
     idx = np.arange(seq_len, n)
     offsets = np.arange(-seq_len, 0)
     with torch.inference_mode():
@@ -91,13 +107,17 @@ def _predict_ticker(model, scaler, config, feature_cols, tdf, lgb_model=None):
             chunk = idx[i:i + 1024]
             windows = scaled[chunk[:, None] + offsets[None, :]]
             out = model(torch.from_numpy(windows)).numpy().astype(np.float64)
-            if lgb_model is not None:
+            if lgb_model is not None or q10_model is not None:
                 # flatten_sequence ordering == windows.reshape(rows, -1)
                 flat = windows.reshape(len(chunk), -1)
-                lgb_out = lgb_model.predict(flat)
-                out = 0.6 * out + 0.4 * np.asarray(lgb_out, dtype=np.float64)
+                if lgb_model is not None:
+                    lgb_out = lgb_model.predict(flat)
+                    out = 0.6 * out + 0.4 * np.asarray(lgb_out, dtype=np.float64)
+                if q10_model is not None:
+                    q10[chunk] = np.asarray(q10_model.predict(flat),
+                                            dtype=np.float64)
             preds[chunk] = out
-    return preds
+    return preds, q10
 
 
 # ---------------------------------------------------------------------------
@@ -127,16 +147,17 @@ def _entry_window_mask(times) -> np.ndarray:
     return mask
 
 def simulate_ticker(tdf, preds, asset_type: str, threshold: float,
-                    policy: dict, meta_probs=None) -> list[dict]:
+                    policy: dict, meta_probs=None, q10_preds=None,
+                    q10_floor=None) -> list[dict]:
     """Replay the live exit stack on one ticker. Returns trade dicts.
 
     The exit walk itself runs in policy_exits.exit_walk — the SAME kernel
     that generates triple-barrier training labels and the meta-labeling
     dataset, so the backtest cannot drift from label semantics. This
     function keeps only the ENTRY policy: threshold + cost-floor gates,
-    stock entry windows, cooldowns/lockouts, and the meta-probability veto
-    (applied when a trained meta model produced `meta_probs`, mirroring
-    the live loop).
+    stock entry windows, cooldowns/lockouts, the meta-probability veto,
+    and the q10 tail veto (each applied when its trained model produced
+    inputs, mirroring the live loop).
 
     Bar-level approximations of the 30s loop: entries at the signal bar's
     close; gap-aware stops (filled at min(stop, open)); stop checked
@@ -180,7 +201,10 @@ def simulate_ticker(tdf, preds, asset_type: str, threshold: float,
                 or not entry_ok[i]
                 or (meta_probs is not None
                     and not np.isnan(meta_probs[i])
-                    and meta_probs[i] < META_VETO_PROB)):
+                    and meta_probs[i] < META_VETO_PROB)
+                or (q10_preds is not None and q10_floor is not None
+                    and not np.isnan(q10_preds[i])
+                    and q10_preds[i] < q10_floor)):
             i += 1
             continue
 
@@ -250,7 +274,7 @@ def aggregate_metrics(all_trades: list[dict], asset_type: str,
 ARTIFACT_SUFFIXES = ['model_v2.pth', 'config_v2.pkl', 'scaler_v2.pkl',
                      'feature_cols_v2.pkl', 'model_v2.manifest.json',
                      'lgb_model.txt', 'meta_model.txt', 'meta_calib.pkl',
-                     'meta_meta.json']
+                     'meta_meta.json', 'lgb_q10.txt', 'lgb_q10_meta.json']
 
 
 def restore_previous_model(prefix: str) -> bool:
@@ -279,6 +303,8 @@ def run_backtest(prefix: str = '', days: int = 60,
     asset_type = prefix or 'crypto'
     model, scaler, config, feature_cols = _load_artifacts(prefix)
     lgb_model = _load_lgb(prefix)
+    q10_pack = _load_q10(prefix)
+    q10_model, q10_floor = q10_pack if q10_pack else (None, None)
     threshold = config.get('trade_threshold', 0.15)
     policy = policy_for(asset_type)
 
@@ -298,8 +324,10 @@ def run_backtest(prefix: str = '', days: int = 60,
         if missing:
             print(f"  [SKIP] {ticker}: missing features {missing[:3]}...")
             continue
-        preds = _predict_ticker(model, scaler, config, feature_cols, tdf,
-                                lgb_model=lgb_model)
+        preds, q10_preds = _predict_ticker(model, scaler, config,
+                                           feature_cols, tdf,
+                                           lgb_model=lgb_model,
+                                           q10_model=q10_model)
         # Meta-labeling parity: the live loops veto entries with low
         # calibrated meta probability, so the gate must too
         meta_probs = None
@@ -309,7 +337,8 @@ def run_backtest(prefix: str = '', days: int = 60,
         except Exception:
             pass
         trades = simulate_ticker(tdf, preds, asset_type, threshold, policy,
-                                 meta_probs=meta_probs)
+                                 meta_probs=meta_probs, q10_preds=q10_preds,
+                                 q10_floor=q10_floor)
         all_trades.extend(trades)
         print(f"  {ticker}: {len(trades)} trades")
 
