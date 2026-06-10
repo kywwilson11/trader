@@ -194,6 +194,101 @@ def check_drift(prefix: str) -> dict | None:
     return {'psi': round(psi, 4), 'n': int(live.size), 'level': level}
 
 
+# --- CUSUM on live hit-rate (outcome-side complement to input-side PSI) ---
+
+CUSUM_K = 0.05      # detect ~10pp hit-rate degradation (k = drift/2)
+CUSUM_H = 4.0       # decision interval (ARL trade-off, standard h=4-5)
+HIT_RATE_DEFLATION = 0.90   # live underperforms holdout (McLean-Pontiff)
+MIN_BASELINE = 0.30
+
+
+def load_holdout_hit_rate(prefix: str) -> float | None:
+    path = BASE_DIR / f'{_p(prefix)}model_v2.manifest.json'
+    try:
+        with open(path) as f:
+            hr = (json.load(f).get('holdout') or {}).get('hit_rate')
+        return float(hr) if hr is not None else None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _live_outcomes(asset: str, since_iso: str | None) -> list[tuple[str, int]]:
+    """(ts, win) for confirmed live exits after since_iso, oldest first."""
+    try:
+        from trade_memory import _load as load_trades
+        data = load_trades()
+    except Exception:
+        return []
+    out = []
+    for symbol, trades in data.items():
+        is_crypto = '/' in symbol
+        if (asset == 'crypto') != is_crypto:
+            continue
+        for t in trades:
+            if t.get('action') != 'sell' and t.get('exit') is None:
+                continue
+            if t.get('estimated'):
+                continue  # pre-slippage estimates flatter the hit rate
+            ts = t.get('ts')
+            if not ts or (since_iso and ts <= since_iso):
+                continue
+            out.append((ts, 1 if float(t.get('pnl_pct', 0)) > 0 else 0))
+    out.sort()
+    return out
+
+
+def run_cusum(prefix: str, label: str) -> dict | None:
+    """Update the one-sided (downward) CUSUM over new live outcomes.
+
+    S <- max(0, S + (mu0 - k) - x) per trade; alarm at S > h means the
+    live hit rate has run ~2k below the deflated holdout baseline for
+    long enough to be signal, not noise. Alarm notifies and resets.
+    """
+    baseline = load_holdout_hit_rate(prefix)
+    if baseline is None:
+        return None
+    mu0 = max(MIN_BASELINE, baseline * HIT_RATE_DEFLATION)
+    asset = 'stock' if prefix == 'stock' else 'crypto'
+
+    state = _load_state()
+    st = state.get(label, {})
+    s = float(st.get('cusum', 0.0))
+    n_new = 0
+    last_ts = st.get('cusum_last_ts')
+    alarmed = False
+    for ts, win in _live_outcomes(asset, last_ts):
+        s = max(0.0, s + (mu0 - CUSUM_K) - win)
+        last_ts = ts
+        n_new += 1
+        if s > CUSUM_H:
+            alarmed = True
+            s = 0.0  # restart surveillance after the alarm
+
+    st['cusum'] = round(s, 4)
+    if last_ts:
+        st['cusum_last_ts'] = last_ts
+    state[label] = st
+    _save_state(state)
+
+    if n_new:
+        print(f"[CUSUM] {label}: {n_new} new outcomes, S={st['cusum']:.2f} "
+              f"(h={CUSUM_H}, baseline mu0={mu0:.2f})")
+    if alarmed:
+        print(f"[CUSUM] {label}: ALARM — live hit rate persistently below "
+              f"{mu0:.0%}")
+        try:
+            from notify import notify
+            notify(f"CUSUM {label}: live hit rate persistently below the "
+                   f"deflated holdout baseline ({mu0:.0%}) — review trades "
+                   f"and consider retraining/halting",
+                   level='warning',
+                   dedupe_key=f'cusum-{label}-{dt.date.today().isoformat()}')
+        except Exception:
+            pass
+    return {'cusum': st['cusum'], 'alarmed': alarmed, 'n_new': n_new,
+            'baseline': round(mu0, 4)}
+
+
 def run_check(prefix: str, label: str) -> dict | None:
     """Daily entry: check, update consecutive-day state, fire trigger."""
     result = check_drift(prefix)
@@ -247,6 +342,11 @@ def run_check(prefix: str, label: str) -> dict | None:
                    level='warning', dedupe_key=f'drift-{label}-{today}')
         except Exception:
             pass
+
+    try:
+        run_cusum(prefix, label)
+    except Exception as e:
+        print(f"[CUSUM] {label}: check failed ({e})")
 
     prune_history(prefix)
     return result

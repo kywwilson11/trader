@@ -529,6 +529,23 @@ class StockLoop(BaseTradingLoop):
                 self.last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(0.5)
 
+    def _bucket_room_ok(self, symbol: str) -> bool:
+        """Sector-bucket notional cap. Conservative: blocks when one more
+        full-size entry would breach the bucket's share of MAX_EXPOSURE."""
+        from stock_config import SECTOR_BUCKETS, BUCKET_CAP_FRACTION
+        bucket = SECTOR_BUCKETS.get(symbol)
+        if bucket is None:
+            return True
+        cap = self.MAX_EXPOSURE * BUCKET_CAP_FRACTION.get(
+            bucket, BUCKET_CAP_FRACTION['default'])
+        held = sum(p.qty * p.entry_price for s, p in self.positions.items()
+                   if SECTOR_BUCKETS.get(s) == bucket)
+        if held + self.NOTIONAL_PER_SYMBOL > cap:
+            logger.info("[BUCKET] %s: %s bucket at $%.0f/$%.0f — entry blocked",
+                        symbol, bucket, held, cap)
+            return False
+        return True
+
     def _execute_buys(self, preds: dict, snapshots: dict):
         """Stock-specific: bracket orders with server-side stops, exposure tracking."""
         from trading_utils import cooldown_ok
@@ -538,6 +555,10 @@ class StockLoop(BaseTradingLoop):
         from portfolio import check_portfolio_correlation, get_correlation_sizing_factor
 
         if self.flattened_today:
+            return
+
+        # Macro-event stand-down (FOMC/CPI windows)
+        if not self._entries_allowed():
             return
 
         # Entry windows: predictability lives in the open/close half-hours
@@ -561,6 +582,11 @@ class StockLoop(BaseTradingLoop):
             if current_exposure >= self.MAX_EXPOSURE:
                 logger.info("Max exposure $%d reached, no more buys", self.MAX_EXPOSURE)
                 break
+
+            # Sector-bucket cap: ranked entries cluster in one theme on
+            # exactly the days that theme is running hot (factor crowding)
+            if not self._bucket_room_ok(symbol):
+                continue
 
             if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
                 continue
@@ -648,6 +674,18 @@ class StockLoop(BaseTradingLoop):
             # Meta-labeling gate (veto + bounded sizing multiplier)
             meta_ok, meta_mult = self._meta_gate(symbol, pred, snapshots)
             if not meta_ok:
+                continue
+
+            # q10 tail veto (fat left tail despite bullish mean)
+            _snap = snapshots.get(symbol, {}) or {}
+            q10 = _snap.get('Q10')
+            q10_floor = _snap.get('Q10_Floor')
+            if q10 is not None and q10_floor is not None and q10 < q10_floor:
+                log_decision({"symbol": symbol, "action": "skip",
+                              "skip_reason": "q10_tail_veto",
+                              "pred_return": pred,
+                              "q10": round(q10, 4),
+                              "q10_floor": round(q10_floor, 4)})
                 continue
 
             # Single risk-based sizing call (all bounds enforced inside)

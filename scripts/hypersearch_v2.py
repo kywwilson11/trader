@@ -917,6 +917,26 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
               f"flattened features (fb={fb})")
         booster = train_lgb(X_train, y_train, X_val, y_val)
         save_lgb_model(booster, prefix=prefix.rstrip('_'))
+
+        # Left-tail (q10) quantile model for the entry tail veto: a
+        # bullish MEAN prediction can coexist with a fat left tail; the
+        # 10th-percentile regression flags those states. The veto floor
+        # is self-calibrating — the 15th percentile of q10 over the
+        # validation slice (worst ~15% of tail states get vetoed).
+        try:
+            q10 = train_lgb(X_train, y_train, X_val, y_val,
+                            params={'objective': 'quantile', 'alpha': 0.10,
+                                    'metric': 'quantile'})
+            q10_val = q10.predict(X_val)
+            floor = float(np.percentile(q10_val, 15))
+            q10.save_model(f'{prefix}lgb_q10.txt')
+            with open(f'{prefix}lgb_q10_meta.json', 'w') as f:
+                json.dump({'alpha': 0.10, 'floor': round(floor, 6),
+                           'val_rows': int(len(q10_val))}, f)
+            print(f"[LGB-Q10] tail model saved (veto floor {floor:+.4f}%)")
+        except Exception as e:
+            print(f"[LGB-Q10] quantile training failed (non-fatal): {e}")
+
         del X_train, X_val, all_scaled
         gc.collect()
         return booster
@@ -990,6 +1010,9 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                 'dsr_min': DSR_MIN,
                 'n_trades': int(dsr['n']),
                 'n_rows': int(len(holdout_idx)),
+                # Net-of-cost hit rate — the CUSUM live monitor's baseline
+                'hit_rate': (round(float(np.mean(trade_returns > 0)), 4)
+                             if len(trade_returns) else None),
                 # Reference distribution for the live PSI drift monitor:
                 # deciles of the holdout predictions (monitor_drift.py)
                 'pred_deciles': [round(float(x), 6) for x in
@@ -1024,7 +1047,9 @@ def save_model_atomically(prefix, state, best_cfg, input_dim, config, scaler,
     # P&L even though it cleared the fit-level holdout.
     import shutil
     for path in list(artifacts) + [f'{prefix}model_v2.manifest.json',
-                                   f'{prefix}lgb_model.txt']:
+                                   f'{prefix}lgb_model.txt',
+                                   f'{prefix}lgb_q10.txt',
+                                   f'{prefix}lgb_q10_meta.json']:
         if os.path.exists(path):
             try:
                 shutil.copy2(path, f'{path}.prev')

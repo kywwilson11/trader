@@ -65,6 +65,36 @@ LEVERAGED_ETFS = {
 # Safe-haven symbols allowed to trade during VIX > 25 defensive regimes
 SAFE_HAVEN_SYMBOLS = {'GLD', 'SLV', 'PALL', 'PPLT', 'OXY', 'COPX'}
 
+# --- Sector buckets (factor-crowding caps) ---
+# The ranked top-N clusters into one theme on exactly the days that theme
+# runs hot; per-name correlation sizing helps but a hard bucket notional
+# cap is the backstop. Unmapped symbols are uncapped. crypto_proxy is the
+# tightest cap because the CRYPTO BOOK already carries spot beta to the
+# same factor (MSTR is a leveraged BTC bet wearing an equity ticker).
+SECTOR_BUCKETS = {
+    # Crypto-beta equities
+    'COIN': 'crypto_proxy', 'MSTR': 'crypto_proxy', 'MARA': 'crypto_proxy',
+    'HOOD': 'crypto_proxy',
+    # Semis / AI hardware (SOXL is 3x the same factor)
+    'NVDA': 'semis', 'AMD': 'semis', 'ARM': 'semis', 'AVGO': 'semis',
+    'MRVL': 'semis', 'SMCI': 'semis', 'SOXL': 'semis', 'POET': 'semis',
+    # Speculative growth / pre-profit moonshots
+    'IONQ': 'spec_growth', 'QBTS': 'spec_growth', 'RKLB': 'spec_growth',
+    'ASTS': 'spec_growth', 'RDW': 'spec_growth', 'SERV': 'spec_growth',
+    'QS': 'spec_growth', 'CRSP': 'spec_growth', 'PRME': 'spec_growth',
+    'MRNA': 'spec_growth', 'ENPH': 'spec_growth', 'FSLR': 'spec_growth',
+    'AFRM': 'spec_growth', 'SOFI': 'spec_growth', 'ARKK': 'spec_growth',
+    # Metals / hard assets
+    'GLD': 'metals', 'SLV': 'metals', 'PALL': 'metals', 'PPLT': 'metals',
+    'COPX': 'metals',
+}
+
+# Bucket notional caps as a fraction of MAX_EXPOSURE
+BUCKET_CAP_FRACTION = {
+    'crypto_proxy': 0.20,
+    'default': 0.35,
+}
+
 
 # Top cryptos by market cap (USD pairs on Alpaca)
 CRYPTO_SYMBOLS = [

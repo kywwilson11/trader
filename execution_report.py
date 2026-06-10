@@ -88,6 +88,20 @@ def run_report(days: int = 14) -> dict:
     overall = round(float(all_bps.mean()), 2)
     report['overall_mean_bps'] = overall
     print(f"\nOverall mean shortfall: {overall:+.1f} bps per fill")
+
+    # Maker share of crypto entries (the maker ladder journals
+    # entry_tactic per buy). Realized fee/RT = 30bps + 25*maker_share
+    # off the 50bps taker-taker baseline — feeds the fees.py review.
+    tactics = [e.get('entry_tactic') for e in rows
+               if e.get('action') == 'buy' and crypto(e.get('symbol', ''))
+               and e.get('entry_tactic')]
+    if tactics:
+        maker_n = sum(1 for t in tactics if t.startswith('maker'))
+        share = maker_n / len(tactics)
+        report['crypto_maker_share'] = round(share, 3)
+        # Entry-leg fee: 15 bps maker vs 25 bps taker
+        print(f"Crypto maker share (entries): {share:.0%} of {len(tactics)} "
+              f"— entry fee ≈ {25 - 10 * share:.1f} bps vs 25 taker")
     print("Compare against the backtest's assumptions (fees.py spread "
           "haircuts: crypto 10 bps, stock 5 bps round trip). If realized "
           "shortfall is persistently higher, the backtest is optimistic — "

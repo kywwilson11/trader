@@ -1323,8 +1323,31 @@ class BaseTradingLoop(ABC):
             return False
         return True
 
+    def _entries_allowed(self) -> bool:
+        """Book-level entry gate shared by both loops (exits never gated).
+
+        Currently: scheduled macro-event stand-down (FOMC/CPI windows) —
+        an hourly-bar model has no edge against an 8:30 CPI print, in
+        stocks OR crypto.
+        """
+        try:
+            from macro_calendar import macro_standdown, calendar_exhausted
+            blocked, reason = macro_standdown()
+            if blocked:
+                if self.cycle % 10 == 1:
+                    logger.info("[MACRO] entries paused: %s", reason)
+                return False
+            if calendar_exhausted() and self.cycle % 2000 == 1:
+                logger.warning("[MACRO] static FOMC/CPI table has no future "
+                               "events — refresh macro_calendar.py")
+        except Exception:
+            pass
+        return True
+
     def _execute_buys(self, preds: dict, snapshots: dict):
         """Buy bullish symbols with all risk checks."""
+        if not self._entries_allowed():
+            return
         symbols = self.get_symbol_universe()
         for symbol in symbols:
             if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
@@ -1421,6 +1444,19 @@ class BaseTradingLoop(ABC):
             # Meta-labeling gate (veto + bounded sizing multiplier)
             meta_ok, meta_mult = self._meta_gate(symbol, pred_return, snapshots)
             if not meta_ok:
+                continue
+
+            # q10 tail veto: a bullish mean prediction with a fat left
+            # tail (10th-pct regression below the calibrated floor) is a
+            # bad bet at 2:1 reward:risk even when the mean clears the bar
+            q10 = snapshot.get('Q10')
+            q10_floor = snapshot.get('Q10_Floor')
+            if q10 is not None and q10_floor is not None and q10 < q10_floor:
+                log_decision({"symbol": symbol, "action": "skip",
+                              "skip_reason": "q10_tail_veto",
+                              "pred_return": pred_return,
+                              "q10": round(q10, 4),
+                              "q10_floor": round(q10_floor, 4)})
                 continue
 
             # Single risk-based sizing call (all bounds enforced inside)

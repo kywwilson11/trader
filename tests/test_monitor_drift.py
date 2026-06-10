@@ -170,3 +170,66 @@ def test_run_check_gap_day_restarts_streak(sandbox):
 def test_run_check_unckeckable_without_manifest(sandbox):
     _fill_history('', [0.1] * 100)
     assert run_check('', 'crypto') is None
+
+
+# --- CUSUM ---
+
+def _write_manifest_hr(tmp_path, prefix, hit_rate):
+    p = f'{prefix}_' if prefix else ''
+    with open(tmp_path / f'{p}model_v2.manifest.json', 'w') as f:
+        json.dump({'holdout': {'hit_rate': hit_rate}}, f)
+
+
+def _mock_trades(monkeypatch, records):
+    import trade_memory
+    monkeypatch.setattr(trade_memory, '_load', lambda: records)
+
+
+def test_cusum_healthy_stream_no_alarm(sandbox, monkeypatch):
+    _write_manifest_hr(sandbox, '', 0.55)
+    trades = [{'ts': f'2026-06-01T00:{i:02d}:00+00:00', 'action': 'sell',
+               'exit': 1, 'pnl_pct': 1.0 if i % 2 else -0.5,
+               'estimated': False} for i in range(40)]
+    _mock_trades(monkeypatch, {'BTC/USD': trades})
+    r = monitor_drift.run_cusum('', 'crypto')
+    assert r is not None and not r['alarmed']
+    assert r['n_new'] == 40
+
+
+def test_cusum_degraded_stream_alarms(sandbox, monkeypatch):
+    _write_manifest_hr(sandbox, '', 0.55)  # mu0 = 0.495
+    # 25 consecutive losers: S grows by ~0.445/trade -> alarm by ~trade 9
+    trades = [{'ts': f'2026-06-01T00:{i:02d}:00+00:00', 'action': 'sell',
+               'exit': 1, 'pnl_pct': -1.0, 'estimated': False}
+              for i in range(25)]
+    _mock_trades(monkeypatch, {'ETH/USD': trades})
+    r = monitor_drift.run_cusum('', 'crypto')
+    assert r is not None and r['alarmed']
+
+
+def test_cusum_incremental_and_asset_scoped(sandbox, monkeypatch):
+    _write_manifest_hr(sandbox, '', 0.55)
+    crypto = [{'ts': '2026-06-01T00:00:00+00:00', 'action': 'sell', 'exit': 1,
+               'pnl_pct': -1.0, 'estimated': False}]
+    stocks = [{'ts': f'2026-06-01T00:{i:02d}:00+00:00', 'action': 'sell',
+               'exit': 1, 'pnl_pct': -1.0, 'estimated': False}
+              for i in range(20)]
+    _mock_trades(monkeypatch, {'BTC/USD': crypto, 'NVDA': stocks})
+    r1 = monitor_drift.run_cusum('', 'crypto')
+    assert r1['n_new'] == 1  # NVDA losers must NOT count against crypto
+    r2 = monitor_drift.run_cusum('', 'crypto')
+    assert r2['n_new'] == 0  # same trades not reprocessed
+
+
+def test_cusum_skips_estimated_fills(sandbox, monkeypatch):
+    _write_manifest_hr(sandbox, '', 0.55)
+    trades = [{'ts': '2026-06-01T00:00:00+00:00', 'action': 'sell', 'exit': 1,
+               'pnl_pct': -9.0, 'estimated': True}]
+    _mock_trades(monkeypatch, {'BTC/USD': trades})
+    r = monitor_drift.run_cusum('', 'crypto')
+    assert r['n_new'] == 0
+
+
+def test_cusum_none_without_baseline(sandbox, monkeypatch):
+    _mock_trades(monkeypatch, {})
+    assert monitor_drift.run_cusum('', 'crypto') is None

@@ -33,6 +33,11 @@ _sentiment_import_failed = False
 _lgb_model = None
 _lgb_load_attempted = False
 
+# LightGBM q10 tail model (loaded lazily; powers the entry tail veto)
+_q10_model = None
+_q10_floor = None
+_q10_load_attempted = False
+
 # --- CONFIGURATION ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -237,6 +242,7 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             _lgb_model = None
 
     predicted_return = lstm_pred
+    flat = None
     if _lgb_model is not None:
         try:
             from model_lgb import flatten_sequence, predict_lgb, ensemble_predict
@@ -245,6 +251,32 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             predicted_return = ensemble_predict(lstm_pred, lgb_pred)
         except Exception:
             pass  # Fall back to LSTM-only
+
+    # q10 tail prediction (left-tail risk of THIS state; entry veto input)
+    global _q10_model, _q10_floor, _q10_load_attempted
+    if not _q10_load_attempted:
+        _q10_load_attempted = True
+        try:
+            import json as _json
+            import lightgbm as _lgb
+            pfx = config.get('prefix', '')
+            p = f'{pfx}_' if pfx else ''
+            _q10_model = _lgb.Booster(model_file=f'{p}lgb_q10.txt')
+            with open(f'{p}lgb_q10_meta.json') as f:
+                _q10_floor = float(_json.load(f)['floor'])
+        except Exception:
+            _q10_model = None
+            _q10_floor = None
+    q10_pred = None
+    if _q10_model is not None:
+        try:
+            if flat is None:
+                from model_lgb import flatten_sequence
+                flat, _ = flatten_sequence(sequence.reshape(seq_len, -1),
+                                           feature_cols)
+            q10_pred = float(_q10_model.predict(flat.reshape(1, -1))[0])
+        except Exception:
+            q10_pred = None
 
     trade_threshold = config.get('trade_threshold', 0.15)
 
@@ -283,6 +315,10 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
                 val = last_row[col]
                 if val is not None and val == val:
                     snapshot[col] = float(val)
+        # Tail-risk model outputs for the loop's q10 entry veto
+        if q10_pred is not None and _q10_floor is not None:
+            snapshot['Q10'] = q10_pred
+            snapshot['Q10_Floor'] = _q10_floor
         # Volume from last completed bar — only include if real data exists
         # (Alpaca crypto bars often report zero volume)
         prev_vol = prev_row.get('Volume', 0) if 'Volume' in prev_row.index else 0
