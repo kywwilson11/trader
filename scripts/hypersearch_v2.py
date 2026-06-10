@@ -109,6 +109,10 @@ def parse_args():
                         help='Path to training CSV (default: training_data.csv)')
     parser.add_argument('--prefix', type=str, default='',
                         help='Prefix for output files (e.g. "stock" -> stock_model_v2.pth)')
+    parser.add_argument('--shadow', action='store_true',
+                        help='Save a gated new model as CHALLENGER when a '
+                             'champion exists (shadow mode; promotion via '
+                             'live DM test in shadow.py)')
     parser.add_argument('--preset', type=str, default='stationary',
                         help='Indicator preset (default: stationary)')
     parser.add_argument('--max-rows', type=int, default=500_000,
@@ -1353,13 +1357,31 @@ def main():
                 'indicator_preset': preset_name,
                 'holdout': holdout_report,
             }
-            save_model_atomically(prefix, best_state_holder['state'], best_cfg,
+            # Shadow mode: with a champion already deployed, the gated
+            # new model enters the CHALLENGER slot. It earns promotion
+            # only by beating the champion on LIVE predictions (DM-HLN
+            # test, shadow.py) — static gates can't prove that.
+            save_prefix = prefix
+            if args.shadow:
+                try:
+                    from shadow import challenger_prefix, champion_exists
+                    if champion_exists(args.prefix):
+                        cfg_pfx = challenger_prefix(args.prefix)
+                        save_prefix = f'{cfg_pfx}_'
+                        config['prefix'] = cfg_pfx
+                        print(f"[SHADOW] champion present — saving as "
+                              f"challenger ('{cfg_pfx}'); promotion via "
+                              f"live DM test")
+                except Exception as e:
+                    print(f"[SHADOW] slot check failed ({e}) — saving as champion")
+
+            save_model_atomically(save_prefix, best_state_holder['state'], best_cfg,
                                   input_dim, config, best_scaler, feature_cols,
                                   score=new_score)
             model_saved = True
 
             # Train the LightGBM ensemble leg on the winning config
-            train_lgb_ensemble(prefix, best_scaler, best_cfg,
+            train_lgb_ensemble(save_prefix, best_scaler, best_cfg,
                                all_features, all_returns_by_fb,
                                all_times, all_label_times,
                                tickers, ticker_boundaries)

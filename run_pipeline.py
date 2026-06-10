@@ -138,6 +138,22 @@ def _maybe_run_drift_check(log_fh):
             log_fh.flush()
         except Exception:
             pass
+    # Challenger shadow evaluation (DM-HLN promote/discard decisions)
+    try:
+        from shadow import evaluate_and_maybe_promote
+        for prefix, label in (('', 'crypto'), ('stock', 'stock')):
+            r = evaluate_and_maybe_promote(prefix, label)
+            if r is not None:
+                log_fh.write(f"[SHADOW] {label}: n={r['n']} "
+                             f"age={r['age_days']:.1f}d p={r['p']} "
+                             f"-> {r['decision']}\n")
+        log_fh.flush()
+    except Exception as e:
+        try:
+            log_fh.write(f"[SHADOW] daily eval failed: {e}\n")
+            log_fh.flush()
+        except Exception:
+            pass
 
 
 def _check_drift_trigger():
@@ -719,7 +735,8 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock, force=False):
     return phases
 
 
-def _build_training_phases(trials, train_crypto, train_stock, mode=''):
+def _build_training_phases(trials, train_crypto, train_stock, mode='',
+                           shadow=False):
     """Build model training phases with adaptive mode support.
 
     Each training phase is followed by a policy-backtest GATE phase:
@@ -729,12 +746,18 @@ def _build_training_phases(trials, train_crypto, train_stock, mode=''):
     not sufficient evidence — see validation.py).
     """
     phases = []
+    # Weekly retrains save into the CHALLENGER slot (shadow.py) so a new
+    # model must beat the champion on LIVE data before deployment.
+    # TRADER_SHADOW_MODE=0 restores immediate promotion.
+    shadow = shadow and os.getenv('TRADER_SHADOW_MODE', '1') != '0'
 
     if train_crypto:
         cmd = [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
                '--trials', str(trials), '--preset', 'stationary', '--no-status']
         if mode:
             cmd += ['--mode', mode]
+        if shadow:
+            cmd += ['--shadow']
         phases.append({
             'id': 'crypto_search',
             'label': 'Training Crypto Regression Model',
@@ -759,6 +782,8 @@ def _build_training_phases(trials, train_crypto, train_stock, mode=''):
                '--preset', 'stationary', '--max-rows', '200000', '--no-status']
         if mode:
             cmd += ['--mode', mode]
+        if shadow:
+            cmd += ['--shadow']
         phases.append({
             'id': 'stock_search',
             'label': 'Training Stock Regression Model',
@@ -1116,7 +1141,7 @@ def main():
                     retrain_phases = (
                         _build_harvest_phases(False, rt_crypto, rt_stock)
                         + _build_training_phases(retrain_trials, rt_crypto, rt_stock,
-                                                 mode=retrain_mode)
+                                                 mode=retrain_mode, shadow=True)
                     )
                     for i, p in enumerate(retrain_phases):
                         p['idx'] = i
@@ -1285,7 +1310,7 @@ def main():
                 _build_harvest_phases(False, rt_crypto, rt_stock,
                                       force=force_harvest)
                 + _build_training_phases(retrain_trials, rt_crypto, rt_stock,
-                                         mode=retrain_mode)
+                                         mode=retrain_mode, shadow=True)
             )
             for i, p in enumerate(retrain_phases):
                 p['idx'] = i

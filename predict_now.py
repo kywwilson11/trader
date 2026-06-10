@@ -29,14 +29,11 @@ from market_data import (
 _get_live_sentiment = None
 _sentiment_import_failed = False
 
-# LightGBM ensemble model (loaded lazily)
-_lgb_model = None
-_lgb_load_attempted = False
-
-# LightGBM q10 tail model (loaded lazily; powers the entry tail veto)
-_q10_model = None
-_q10_floor = None
-_q10_load_attempted = False
+# LightGBM ensemble + q10 tail models, loaded lazily PER PREFIX — the
+# challenger shadow stack must never pair its LSTM with the champion's
+# boosters (single-slot globals did exactly that)
+_lgb_models: dict[str, object | None] = {}
+_q10_models: dict[str, tuple[object, float] | None] = {}
 
 # --- CONFIGURATION ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -231,50 +228,48 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
     lstm_pred = float(output.cpu().item())
 
     # LightGBM ensemble: combine LSTM and LGB predictions
-    global _lgb_model, _lgb_load_attempted
-    if not _lgb_load_attempted:
-        _lgb_load_attempted = True
+    pfx = config.get('prefix', '')
+    if pfx not in _lgb_models:
         try:
             from model_lgb import load_lgb_model
-            pfx = config.get('prefix', '')
-            _lgb_model = load_lgb_model(prefix=pfx)
+            _lgb_models[pfx] = load_lgb_model(prefix=pfx)
         except Exception:
-            _lgb_model = None
+            _lgb_models[pfx] = None
+    lgb_model = _lgb_models[pfx]
 
     predicted_return = lstm_pred
     flat = None
-    if _lgb_model is not None:
+    if lgb_model is not None:
         try:
             from model_lgb import flatten_sequence, predict_lgb, ensemble_predict
             flat, _ = flatten_sequence(sequence.reshape(seq_len, -1), feature_cols)
-            lgb_pred = predict_lgb(_lgb_model, flat)
+            lgb_pred = predict_lgb(lgb_model, flat)
             predicted_return = ensemble_predict(lstm_pred, lgb_pred)
         except Exception:
             pass  # Fall back to LSTM-only
 
     # q10 tail prediction (left-tail risk of THIS state; entry veto input)
-    global _q10_model, _q10_floor, _q10_load_attempted
-    if not _q10_load_attempted:
-        _q10_load_attempted = True
+    if pfx not in _q10_models:
         try:
             import json as _json
             import lightgbm as _lgb
-            pfx = config.get('prefix', '')
             p = f'{pfx}_' if pfx else ''
-            _q10_model = _lgb.Booster(model_file=f'{p}lgb_q10.txt')
+            booster = _lgb.Booster(model_file=f'{p}lgb_q10.txt')
             with open(f'{p}lgb_q10_meta.json') as f:
-                _q10_floor = float(_json.load(f)['floor'])
+                floor = float(_json.load(f)['floor'])
+            _q10_models[pfx] = (booster, floor)
         except Exception:
-            _q10_model = None
-            _q10_floor = None
+            _q10_models[pfx] = None
     q10_pred = None
-    if _q10_model is not None:
+    _q10_floor = None
+    if _q10_models[pfx] is not None:
         try:
+            q10_booster, _q10_floor = _q10_models[pfx]
             if flat is None:
                 from model_lgb import flatten_sequence
                 flat, _ = flatten_sequence(sequence.reshape(seq_len, -1),
                                            feature_cols)
-            q10_pred = float(_q10_model.predict(flat.reshape(1, -1))[0])
+            q10_pred = float(q10_booster.predict(flat.reshape(1, -1))[0])
         except Exception:
             q10_pred = None
 

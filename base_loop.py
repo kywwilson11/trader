@@ -243,6 +243,14 @@ class BaseTradingLoop(ABC):
             logger.warning("[BENCHMARK] Benchmark data unavailable — predictions will lack relative strength")
         preds, snapshots = self._get_predictions(benchmark)
 
+        # Challenger shadow predictions (hourly side-by-side log; no
+        # trading impact — promotion is decided by the daily DM test)
+        try:
+            from shadow import maybe_log_shadow
+            maybe_log_shadow(self, preds, benchmark)
+        except Exception:
+            pass
+
         # LLM analysis (throttled)
         self._run_llm_analysis(preds)
 
@@ -485,6 +493,14 @@ class BaseTradingLoop(ABC):
                     load_models(inference_device, prefix=self.MODEL_PREFIX)
                 self.trade_threshold = self.config.get('trade_threshold', 0.15)
                 self.model_mtime = new_mtime
+                # New champion artifacts -> the per-prefix LGB/q10 booster
+                # caches pair with the OLD weights; drop them for reload
+                try:
+                    import predict_now
+                    predict_now._lgb_models.pop(self.MODEL_PREFIX, None)
+                    predict_now._q10_models.pop(self.MODEL_PREFIX, None)
+                except Exception:
+                    pass
                 logger.info("[HOT-RELOAD] Reloaded (threshold=%.2f)", self.trade_threshold)
             except Exception as e:
                 logger.error("[HOT-RELOAD] Failed: %s", e)

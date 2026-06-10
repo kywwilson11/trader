@@ -86,3 +86,7 @@ trading_halt.flag
 flatten_request.flag
 telegram_offset.json
 novelty_store.json
+challenger_*
+stock_challenger_*
+*shadow_preds.jsonl
+meta_retrain.log
