@@ -26,6 +26,11 @@ import os
 import time
 from datetime import datetime
 
+# Must be set BEFORE any torch.cuda call lazily initializes the allocator —
+# the old placement (after set_per_process_memory_fraction) meant
+# expandable_segments never actually applied.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import numpy as np
 import pandas as pd
 import torch
@@ -80,14 +85,15 @@ EMBARGO_MULTIPLIER = 1  # embargo = seq_len * this
 FORWARD_BARS = [12, 18, 24, 32, 48]
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-torch.backends.cudnn.benchmark = True
+# NOTE: cudnn.benchmark deliberately NOT enabled — this model has no
+# convolutions (it gains nothing) and benchmark mode is a documented source
+# of transient cuDNN workspace OOM spikes during Optuna trials.
 
 # Cap CUDA allocator to prevent fatal kernel-level OOM on Jetson (unified memory).
 # Without this, OOM triggers NvMapMemAllocInternalTagged errors that corrupt CUDA
 # context and kill the process. With the cap, PyTorch raises catchable OutOfMemoryError.
 if device.type == 'cuda':
     torch.cuda.set_per_process_memory_fraction(0.40)  # ~3GB of 7.6GB for CUDA
-    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 print(f"Using device: {device}")
 
@@ -172,13 +178,26 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
     # Per-ticker data arrays (scaler fit deferred to per-fold)
     all_features_list = []
     all_returns_dict = {fb: [] for fb in FORWARD_BARS}
+    all_times_list = []
+    all_label_times_list = []
     ticker_boundaries = {}
 
+    max_fb = max(FORWARD_BARS)
     offset = 0
     for ticker in tickers:
         tdf = df[df['Ticker'] == ticker].sort_index()
         features = tdf[feature_cols].values.astype(np.float32)
         all_features_list.append(features)
+
+        # Row timestamps + the timestamp of each row's LABEL bar (the bar
+        # max_fb steps ahead). Label times let folds purge any train row
+        # whose forward-return window crosses the fold boundary — the core
+        # of purged walk-forward CV.
+        times = tdf.index.view('int64') // 10**9  # epoch seconds
+        n = len(times)
+        label_idx = np.minimum(np.arange(n) + max_fb, n - 1)
+        all_times_list.append(times.astype(np.int64))
+        all_label_times_list.append(times[label_idx].astype(np.int64))
 
         for fb in FORWARD_BARS:
             col = f'Target_Return_{fb}'
@@ -191,18 +210,21 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
         offset += len(features)
 
     all_features = np.vstack(all_features_list)
+    all_times = np.concatenate(all_times_list)
+    all_label_times = np.concatenate(all_label_times_list)
     all_returns_by_fb = {}
     for fb in FORWARD_BARS:
         if all_returns_dict[fb]:
             all_returns_by_fb[fb] = np.concatenate(all_returns_dict[fb])
 
-    del all_features_list, all_returns_dict, df
+    del all_features_list, all_returns_dict, all_times_list, all_label_times_list, df
     gc.collect()
 
     print(f"Contiguous arrays: {all_features.shape}, {all_features.nbytes / 1e6:.1f} MB")
     input_dim = all_features.shape[1]
 
-    return (all_features, all_returns_by_fb, tickers, ticker_boundaries,
+    return (all_features, all_returns_by_fb, all_times, all_label_times,
+            tickers, ticker_boundaries,
             feature_cols, input_dim, preset_name, has_multi_horizon)
 
 
@@ -210,39 +232,81 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
 # Walk-forward cross-validation
 # ---------------------------------------------------------------------------
 
-def get_walk_forward_folds(tickers, ticker_boundaries, seq_len, n_folds=NUM_FOLDS):
-    """Generate expanding-window walk-forward folds.
+HOLDOUT_FRACTION = 0.12  # final slice of CALENDAR TIME never shown to Optuna
 
-    Returns list of (train_indices, val_indices) tuples.
-    Each fold: train on first X%, validate on next chunk, with embargo gap.
-    """
-    embargo = seq_len * EMBARGO_MULTIPLIER
-    folds = []
 
-    # Compute total valid indices per ticker (need seq_len history)
+def _valid_indices(tickers, ticker_boundaries, seq_len):
+    """Row indices with at least seq_len bars of same-ticker history."""
     all_valid = []
     for ticker in tickers:
         start, end = ticker_boundaries[ticker]
-        valid = list(range(start + seq_len, end))
-        all_valid.extend(valid)
+        if end - start > seq_len:
+            all_valid.append(np.arange(start + seq_len, end))
+    return np.concatenate(all_valid) if all_valid else np.array([], dtype=np.int64)
 
-    total = len(all_valid)
-    all_valid = np.array(all_valid)
 
-    # Expanding window: train on first 60%, 73%, 86%; val on next ~14% each
+def get_holdout_boundary(all_times) -> int:
+    """Timestamp separating the search region from the untouched holdout."""
+    return int(np.quantile(all_times, 1.0 - HOLDOUT_FRACTION))
+
+
+def get_holdout_indices(all_times, tickers, ticker_boundaries, seq_len):
+    """Rows in the final holdout slice (scored ONCE, for the winner only)."""
+    valid = _valid_indices(tickers, ticker_boundaries, seq_len)
+    boundary = get_holdout_boundary(all_times)
+    return valid[all_times[valid] > boundary]
+
+
+def get_walk_forward_folds(all_times, all_label_times, tickers,
+                           ticker_boundaries, seq_len, n_folds=NUM_FOLDS):
+    """Expanding-window walk-forward folds split by CALENDAR TIME.
+
+    The old implementation sliced the index array POSITIONALLY — but rows
+    are stored as contiguous per-ticker blocks, so "train on the first 60%"
+    meant "train on the first tickers' ENTIRE 2021-2026 history and
+    validate on other tickers over the same calendar window". With 6
+    cryptos correlated 0.7-0.9 to BTC that is near-direct leakage, and
+    train even contained bars dated AFTER val.
+
+    Now:
+      - fold boundaries are timestamp quantiles over the search region
+        (the final HOLDOUT_FRACTION of time is excluded entirely);
+      - PURGE: a train row is kept only if its label window (the bar
+        max(FORWARD_BARS) steps ahead) completes before the boundary;
+      - EMBARGO: validation starts EMBARGO_MULTIPLIER * seq_len hours
+        after the boundary.
+
+    Returns list of (train_indices, val_indices).
+    """
+    valid = _valid_indices(tickers, ticker_boundaries, seq_len)
+    if len(valid) == 0:
+        return []
+
+    t = all_times[valid]
+    search_mask = t <= get_holdout_boundary(all_times)
+    search_times = t[search_mask]
+    if len(search_times) < 1000:
+        return []
+
+    embargo_seconds = seq_len * EMBARGO_MULTIPLIER * 3600
+    folds = []
     for fold_idx in range(n_folds):
-        train_end_pct = 0.60 + fold_idx * (0.40 / n_folds)
-        val_end_pct = train_end_pct + (0.40 / n_folds)
+        train_end_pct = 0.55 + fold_idx * (0.45 / n_folds)
+        val_end_pct = train_end_pct + (0.45 / n_folds)
 
-        train_end = int(total * train_end_pct)
-        val_start = min(train_end + embargo, total)
-        val_end = min(int(total * val_end_pct), total)
+        t_train_end = int(np.quantile(search_times, min(train_end_pct, 1.0)))
+        t_val_end = int(np.quantile(search_times, min(val_end_pct, 1.0)))
 
-        if val_start >= val_end:
+        # Purge: the LABEL must complete before the boundary, not just the bar
+        train_mask = search_mask & (all_label_times[valid] <= t_train_end)
+        val_mask = (search_mask
+                    & (t >= t_train_end + embargo_seconds)
+                    & (t < t_val_end))
+
+        train_indices = valid[train_mask]
+        val_indices = valid[val_mask]
+        if len(train_indices) < 500 or len(val_indices) < 200:
             continue
-
-        train_indices = all_valid[:train_end]
-        val_indices = all_valid[val_start:val_end]
         folds.append((train_indices, val_indices))
 
     return folds
@@ -252,53 +316,88 @@ def get_walk_forward_folds(tickers, ticker_boundaries, seq_len, n_folds=NUM_FOLD
 # Sharpe ratio computation
 # ---------------------------------------------------------------------------
 
-TRANSACTION_COST_BPS = 5  # 5 basis points round-trip cost per trade
+# Real Alpaca round-trip costs (fees + typical spread), percent of notional.
+# The old constant (5 bps) was ~10x below crypto reality (25 bps taker per
+# side + spread), which selected models whose edge cannot survive live fees.
+TXN_COST_PCT = {'crypto': 0.60, 'stock': 0.11}
+BARS_PER_YEAR = {'crypto': 8760, 'stock': 1638}
 
 
-def compute_sharpe(predictions, actual_returns, threshold, txn_cost_bps=TRANSACTION_COST_BPS):
-    """Simulate trades and compute annualized Sharpe ratio.
+def simulate_trades(predictions, actual_returns, threshold, forward_bars,
+                    txn_cost_pct):
+    """Non-overlapping hold simulation. Returns per-trade net returns.
 
-    Buy when pred > threshold, sell when pred < -threshold, else flat.
-    Sharpe computed only on bars where a trade occurs, annualized by
-    the actual trade frequency (trades_per_bar * bars_per_year).
-    Transaction costs (5 bps round-trip) are subtracted per trade.
+    The model predicts the fb-bar forward return, so once a position is
+    entered it is HELD for fb bars and intervening signals are skipped.
+    The old simulator counted every signal bar as an independent trade
+    earning the full overlapping fb-bar return — inflating scores by
+    ~sqrt(fb) and mechanically favoring the longest horizon.
     """
-    signals = np.where(predictions > threshold, 1,
-              np.where(predictions < -threshold, -1, 0))
-    traded = signals != 0
-    n_trades = traded.sum()
-    if n_trades < 10:
-        return 0.0
-    trade_returns = signals[traded] * actual_returns[traded]
-    # Subtract transaction costs (convert bps to percentage)
-    trade_returns = trade_returns - (txn_cost_bps / 100.0)
-    if trade_returns.std() < 1e-8:
-        return 0.0
-    # Annualize: trade_freq * bars/year.  1638 hourly stock bars/year.
-    trade_freq = n_trades / len(signals)
-    trades_per_year = trade_freq * 1638
-    return float((trade_returns.mean() / trade_returns.std()) * np.sqrt(trades_per_year))
+    n = len(predictions)
+    trade_returns = []
+    i = 0
+    while i < n:
+        p = predictions[i]
+        r = actual_returns[i]
+        if p > threshold and np.isfinite(r):
+            trade_returns.append(r - txn_cost_pct)
+            i += forward_bars
+        elif p < -threshold and np.isfinite(r):
+            # Short side: realize the negated move (long-only live, but the
+            # signal's bear accuracy still matters for exits)
+            trade_returns.append(-r - txn_cost_pct)
+            i += forward_bars
+        else:
+            i += 1
+    return np.asarray(trade_returns, dtype=np.float64)
 
 
-def compute_regime_sharpes(predictions, actual_returns, threshold):
+def compute_sharpe(predictions, actual_returns, threshold, forward_bars=24,
+                   asset_type='crypto'):
+    """Annualized Sharpe of the non-overlapping hold policy, net of costs.
+
+    Annualization uses the asset class's actual bar count (8760 hourly
+    crypto bars/yr vs 1638 stock RTH bars/yr — the old code applied the
+    stock constant to 24/7 crypto).
+    """
+    trade_returns = simulate_trades(predictions, actual_returns, threshold,
+                                    forward_bars, TXN_COST_PCT.get(asset_type, 0.6))
+    if len(trade_returns) < 10:
+        return 0.0
+    std = trade_returns.std()
+    if std < 1e-8:
+        return 0.0
+    bars_per_year = BARS_PER_YEAR.get(asset_type, 8760)
+    # Each trade occupies forward_bars bars; cap at full investment
+    slots_per_year = bars_per_year / forward_bars
+    occupancy = min(len(trade_returns) * forward_bars / max(len(predictions), 1), 1.0)
+    trades_per_year = occupancy * slots_per_year
+    return float((trade_returns.mean() / std) * np.sqrt(max(trades_per_year, 1.0)))
+
+
+def compute_regime_sharpes(predictions, actual_returns, threshold,
+                           forward_bars=24, asset_type='crypto'):
     """Compute Sharpe in bull/bear/sideways regimes separately.
 
-    Labels each bar based on a rolling 50-bar return:
-      > +2% → bull, < -2% → bear, else → sideways.
+    Regime labels approximate the trailing 50-bar cumulative return from
+    the (overlapping) fb-bar forward returns by scaling the trailing mean:
+    mean(fb-bar returns over 50 bars) * (50 / fb).
 
-    Returns dict: {'bull': sharpe, 'bear': sharpe, 'sideways': sharpe, 'min': min_sharpe}
+    Returns dict: {'bull': sharpe, 'bear': sharpe, 'sideways': sharpe, 'min': min}
     """
-    if len(actual_returns) < 50:
+    if len(actual_returns) < 60:
         return {'bull': 0.0, 'bear': 0.0, 'sideways': 0.0, 'min': 0.0}
 
-    # Rolling 50-bar return for regime labeling
-    cumret = np.cumsum(actual_returns)
-    rolling_ret = np.zeros(len(actual_returns))
-    rolling_ret[50:] = cumret[50:] - cumret[:-50]
+    finite = np.where(np.isfinite(actual_returns), actual_returns, 0.0)
+    window = 50
+    kernel = np.ones(window) / window
+    trailing_mean = np.convolve(finite, kernel, mode='full')[:len(finite)]
+    rolling_ret = trailing_mean * (window / max(forward_bars, 1))
 
-    regimes = {}
-    regimes['bull'] = rolling_ret > 2.0
-    regimes['bear'] = rolling_ret < -2.0
+    regimes = {
+        'bull': rolling_ret > 2.0,
+        'bear': rolling_ret < -2.0,
+    }
     regimes['sideways'] = ~regimes['bull'] & ~regimes['bear']
 
     result = {}
@@ -306,7 +405,8 @@ def compute_regime_sharpes(predictions, actual_returns, threshold):
         if mask.sum() < 10:
             result[name] = 0.0
             continue
-        result[name] = compute_sharpe(predictions[mask], actual_returns[mask], threshold)
+        result[name] = compute_sharpe(predictions[mask], actual_returns[mask],
+                                      threshold, forward_bars, asset_type)
 
     result['min'] = min(result.values())
     return result
@@ -316,78 +416,69 @@ def compute_regime_sharpes(predictions, actual_returns, threshold):
 # Sequence cache (reused from hypersearch_dual pattern)
 # ---------------------------------------------------------------------------
 
-class SeqCache:
-    """Cache ONE fold's numpy sequence arrays at a time.
+class ScaledCache:
+    """Cache ONE fold's scaled 2-D feature matrix + scaler at a time.
 
-    On Jetson Orin Nano (8GB unified CPU/GPU memory), keeping multiple folds
-    cached simultaneously (~280 MB each) exhausts RAM and causes CUDA failures.
-    Only one fold is cached; rebuilds take ~0.5s which is acceptable.
+    The old SeqCache materialized full (N, seq_len, F) sequence arrays —
+    ~1.0GB of host numpy for the crypto fold-3 train split, UNPROTECTED by
+    the 40% CUDA allocator cap. During Saturday retrains that risked the
+    kernel OOM-killer SIGKILLing training (uncatchable). We now keep only
+    the scaled matrix (~25-45MB) and gather each batch's windows on the
+    fly (~8MB per batch) — same per-batch copy cost as before.
     """
-    def __init__(self, all_features, tickers, ticker_boundaries):
+    def __init__(self, all_features):
         self._all_features = all_features
-        self._tickers = tickers
-        self._boundaries = ticker_boundaries
         self._key = None
-        self._X_train = None
-        self._X_val = None
+        self._all_scaled = None
         self._scaler = None
 
-    def get(self, seq_len, fold_idx, train_indices, val_indices):
-        """Return (X_train, X_val, scaler) numpy arrays, fitting scaler on train only."""
-        key = (seq_len, fold_idx, len(train_indices), len(val_indices))
-        if key == self._key and self._X_train is not None:
-            return self._X_train, self._X_val, self._scaler
+    def get(self, fold_idx, train_indices):
+        """Return (all_scaled, scaler), fitting the scaler on train rows only."""
+        n = len(train_indices)
+        key = (fold_idx, n,
+               int(train_indices[0]) if n else -1,
+               int(train_indices[-1]) if n else -1)
+        if key == self._key and self._all_scaled is not None:
+            return self._all_scaled, self._scaler
 
-        # Free previous cache before allocating new one
-        self._X_train = None
-        self._X_val = None
+        self._all_scaled = None
         self._scaler = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         t0 = time.time()
-
-        # Fit scaler on train fold only (no leakage)
         scaler = RobustScaler()
         scaler.fit(self._all_features[train_indices])
-
-        # Scale ALL features using train-only scaler, build sequences
         all_scaled = scaler.transform(self._all_features).astype(np.float32)
 
-        offsets = np.arange(-seq_len, 0)
-        X_train = np.ascontiguousarray(
-            all_scaled[train_indices[:, None] + offsets[None, :]])
-        X_val = np.ascontiguousarray(
-            all_scaled[val_indices[:, None] + offsets[None, :]])
-
-        del all_scaled  # free ~18 MB immediately
-        gc.collect()
-
-        elapsed = time.time() - t0
-        print(f"  [CACHE] fold={fold_idx} seq_len={seq_len}: "
-              f"{len(train_indices)} train + {len(val_indices)} val "
-              f"({X_train.nbytes / 1e6:.0f}+{X_val.nbytes / 1e6:.0f} MB, "
-              f"{elapsed:.1f}s)")
+        print(f"  [CACHE] fold={fold_idx}: scaler fit on {n} train rows "
+              f"({all_scaled.nbytes / 1e6:.0f} MB scaled matrix, "
+              f"{time.time() - t0:.1f}s)")
 
         self._key = key
-        self._X_train = X_train
-        self._X_val = X_val
+        self._all_scaled = all_scaled
         self._scaler = scaler
-        return X_train, X_val, scaler
+        return all_scaled, scaler
+
+
+def gather_windows(all_scaled, indices, offsets):
+    """Build (len(indices), seq_len, F) windows for one batch on the fly."""
+    return all_scaled[indices[:, None] + offsets[None, :]]
 
 
 # ---------------------------------------------------------------------------
 # Objective function
 # ---------------------------------------------------------------------------
 
-def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries,
-                     input_dim, _state_cache, has_multi_horizon=True,
-                     adaptive_space=None):
+def create_objective(all_features, all_returns_by_fb, all_times, all_label_times,
+                     tickers, ticker_boundaries,
+                     input_dim, _state_cache, asset_type='crypto',
+                     has_multi_horizon=True, adaptive_space=None):
 
     MAX_TRIAL_SECONDS = 900
 
-    seq_cache = SeqCache(all_features, tickers, ticker_boundaries)
+    seq_cache = ScaledCache(all_features)
 
     # Use adaptive search space if provided, otherwise use defaults
     _space = adaptive_space or {}
@@ -475,24 +566,27 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
         trade_threshold = cfg['trade_threshold']
         scheduler_type = cfg['scheduler']
 
-        folds = get_walk_forward_folds(tickers, ticker_boundaries, seq_len)
+        folds = get_walk_forward_folds(all_times, all_label_times, tickers,
+                                       ticker_boundaries, seq_len)
         if not folds:
             return 0.0
 
+        offsets = np.arange(-seq_len, 0)
         fold_sharpes = []
         best_fold_state = None
         best_fold_scaler = None
+        best_fold_val = None  # (val_indices, scaler) of the winning fold
         best_fold_sharpe = -999
 
         for fold_idx, (train_indices, val_indices) in enumerate(folds):
             # Filter out indices where the target return is NaN
             # (happens at the end of each ticker series for larger forward_bars)
-            train_mask = ~np.isnan(trial_returns[train_indices])
-            val_mask = ~np.isnan(trial_returns[val_indices])
-            train_indices = train_indices[train_mask]
-            val_indices = val_indices[val_mask]
+            train_indices = train_indices[~np.isnan(trial_returns[train_indices])]
+            val_indices = val_indices[~np.isnan(trial_returns[val_indices])]
+            if len(train_indices) < 500 or len(val_indices) < 100:
+                continue
 
-            X_train, X_val, scaler = seq_cache.get(seq_len, fold_idx, train_indices, val_indices)
+            all_scaled, scaler = seq_cache.get(fold_idx, train_indices)
             n_train = len(train_indices)
             n_val = len(val_indices)
 
@@ -523,9 +617,9 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
 
                     # Run one batch to test if this config fits in memory
                     model.train()
-                    test_bi = np.arange(min(eff_batch_size, n_train))
-                    xb = torch.from_numpy(X_train[test_bi]).to(device)
-                    yb = torch.from_numpy(y_train[test_bi]).to(device)
+                    test_idx = train_indices[:min(eff_batch_size, n_train)]
+                    xb = torch.from_numpy(gather_windows(all_scaled, test_idx, offsets)).to(device)
+                    yb = torch.from_numpy(y_train[:len(test_idx)]).to(device)
                     with torch.amp.autocast('cuda', enabled=use_amp):
                         pred = model(xb)
                         raw_loss = criterion(pred, yb)
@@ -569,7 +663,10 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                 perm = np.random.permutation(n_train)
                 for i in range(0, n_train, eff_batch_size):
                     bi = perm[i:i + eff_batch_size]
-                    xb = torch.from_numpy(X_train[bi]).to(device)
+                    # Gather this batch's windows on the fly (~8MB) instead
+                    # of holding the whole fold as sequences (~1GB)
+                    xb = torch.from_numpy(
+                        gather_windows(all_scaled, train_indices[bi], offsets)).to(device)
                     yb = torch.from_numpy(y_train[bi]).to(device)
 
                     with torch.amp.autocast('cuda', enabled=use_amp):
@@ -595,7 +692,9 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                 val_preds = []
                 with torch.inference_mode():
                     for i in range(0, n_val, eff_batch_size):
-                        xvb = torch.from_numpy(X_val[i:i + eff_batch_size]).to(device)
+                        vidx = val_indices[i:i + eff_batch_size]
+                        xvb = torch.from_numpy(
+                            gather_windows(all_scaled, vidx, offsets)).to(device)
                         yvb = torch.from_numpy(y_val[i:i + eff_batch_size]).to(device)
                         with torch.amp.autocast('cuda', enabled=use_amp):
                             vo = model(xvb)
@@ -608,9 +707,14 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                 if scheduler_type == 'plateau' and sched:
                     sched.step(val_loss)
 
-                # Compute Sharpe for pruning feedback
-                epoch_sharpe = compute_sharpe(val_preds_np, y_val, trade_threshold)
-                trial.report(epoch_sharpe, epoch * NUM_FOLDS + fold_idx)
+                # Compute Sharpe for pruning feedback. Step must be
+                # MONOTONIC within a trial (fold-major), otherwise Optuna's
+                # last_step freezes at fold-0 values and pruning goes inert
+                # for later folds.
+                epoch_sharpe = compute_sharpe(val_preds_np, y_val, trade_threshold,
+                                              forward_bars=cfg['forward_bars'],
+                                              asset_type=asset_type)
+                trial.report(epoch_sharpe, fold_idx * MAX_EPOCHS + epoch)
 
                 if epoch >= PRUNE_WARMUP_EPOCHS and trial.should_prune():
                     del model
@@ -640,12 +744,16 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                 final_preds = []
                 with torch.inference_mode():
                     for i in range(0, n_val, eff_batch_size):
-                        xvb = torch.from_numpy(X_val[i:i + eff_batch_size]).to(device)
+                        vidx = val_indices[i:i + eff_batch_size]
+                        xvb = torch.from_numpy(
+                            gather_windows(all_scaled, vidx, offsets)).to(device)
                         with torch.amp.autocast('cuda', enabled=use_amp):
                             vo = model(xvb)
                         final_preds.append(vo.cpu().numpy())
                 final_preds_np = np.concatenate(final_preds)
-                fold_sharpe = compute_sharpe(final_preds_np, y_val, trade_threshold)
+                fold_sharpe = compute_sharpe(final_preds_np, y_val, trade_threshold,
+                                             forward_bars=cfg['forward_bars'],
+                                             asset_type=asset_type)
             else:
                 fold_sharpe = 0.0
 
@@ -656,6 +764,7 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
                 best_fold_sharpe = fold_sharpe
                 best_fold_state = best_state
                 best_fold_scaler = scaler
+                best_fold_val = (val_indices, y_val)
 
             del model
             gc.collect()
@@ -668,27 +777,39 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
         # A model with [2.8, 2.9, 2.7] (score=2.80) beats [4.0, 4.0, -1.0] (score=2.83)
         score = avg_sharpe - 0.5 * std_sharpe
 
-        # Regime-aware penalty: penalize models with negative Sharpe in any regime
-        if best_fold_state is not None and len(val_indices) > 50:
+        # Regime-aware penalty: penalize models with negative Sharpe in any
+        # regime — evaluated on the WINNING fold's own validation slice
+        # with that fold's scaler (the old code reused loop-leaked state
+        # from whatever fold happened to run last).
+        if best_fold_state is not None and best_fold_val is not None \
+                and len(best_fold_val[0]) > 60:
             model_tmp = None
             try:
+                rg_val_indices, rg_y_val = best_fold_val
+                rg_scaled = best_fold_scaler.transform(all_features).astype(np.float32)
                 model_tmp = RegressionLSTM(input_dim, hidden_dim, num_layers,
                                             dropout, n_heads).to(device)
                 model_tmp.load_state_dict(best_fold_state)
                 model_tmp.eval()
                 all_preds = []
+                use_amp = device.type == 'cuda'
                 with torch.inference_mode():
-                    for i in range(0, n_val, eff_batch_size):
-                        xvb = torch.from_numpy(X_val[i:i + eff_batch_size]).to(device)
+                    for i in range(0, len(rg_val_indices), 1024):
+                        vidx = rg_val_indices[i:i + 1024]
+                        xvb = torch.from_numpy(
+                            gather_windows(rg_scaled, vidx, offsets)).to(device)
                         with torch.amp.autocast('cuda', enabled=use_amp):
                             vo = model_tmp(xvb)
                         all_preds.append(vo.cpu().numpy())
                 all_preds_np = np.concatenate(all_preds)
-                regime_sharpes = compute_regime_sharpes(all_preds_np, y_val, trade_threshold)
+                regime_sharpes = compute_regime_sharpes(
+                    all_preds_np, rg_y_val, trade_threshold,
+                    forward_bars=cfg['forward_bars'], asset_type=asset_type)
                 trial.set_user_attr('regime_sharpes', regime_sharpes)
                 # Penalize if any regime has negative Sharpe
                 if regime_sharpes['min'] < -0.5:
                     score *= 0.7  # 30% penalty
+                del rg_scaled
             except Exception as e:
                 print(f"  [REGIME] Penalty eval failed: {e}")
             finally:
@@ -710,6 +831,183 @@ def create_objective(all_features, all_returns_by_fb, tickers, ticker_boundaries
         return score
 
     return objective
+
+
+# ---------------------------------------------------------------------------
+# LightGBM ensemble training
+# ---------------------------------------------------------------------------
+
+LGB_MAX_ROWS = 120_000  # cap flattened-feature memory (~250MB at 24x23 cols)
+
+
+def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
+                       all_times, all_label_times, tickers, ticker_boundaries):
+    """Train the LightGBM leg of the ensemble on the winning config.
+
+    Tree ensembles are the stronger learner at this data size (Grinsztajn
+    et al. 2022; every top-50 M5 entry used LightGBM) — model_lgb.py was
+    fully built but never trained, so predict_now's ensemble path always
+    fell back to LSTM-only. Trains on the same scaled features, same
+    horizon, same time split (holdout excluded); predict_now's
+    flatten_sequence ordering == windows.reshape(-1).
+    """
+    try:
+        from model_lgb import train_lgb, save_lgb_model
+    except ImportError:
+        print("[LGB] lightgbm not installed — skipping ensemble leg")
+        return None
+    try:
+        seq_len = cfg['seq_len']
+        fb = cfg.get('forward_bars', 24)
+        returns = all_returns_by_fb.get(fb) or list(all_returns_by_fb.values())[0]
+
+        folds = get_walk_forward_folds(all_times, all_label_times, tickers,
+                                       ticker_boundaries, seq_len)
+        if not folds:
+            return None
+        train_idx, val_idx = folds[-1]  # largest train window, latest val
+        train_idx = train_idx[~np.isnan(returns[train_idx])]
+        val_idx = val_idx[~np.isnan(returns[val_idx])]
+        if len(train_idx) > LGB_MAX_ROWS:  # most recent rows
+            train_idx = train_idx[np.argsort(all_times[train_idx])][-LGB_MAX_ROWS:]
+        if len(val_idx) > 30_000:
+            val_idx = val_idx[np.argsort(all_times[val_idx])][-30_000:]
+
+        all_scaled = scaler.transform(all_features).astype(np.float32)
+        offsets = np.arange(-seq_len, 0)
+        X_train = gather_windows(all_scaled, train_idx, offsets).reshape(len(train_idx), -1)
+        X_val = gather_windows(all_scaled, val_idx, offsets).reshape(len(val_idx), -1)
+        y_train, y_val = returns[train_idx], returns[val_idx]
+
+        print(f"[LGB] Training on {X_train.shape[0]} rows x {X_train.shape[1]} "
+              f"flattened features (fb={fb})")
+        booster = train_lgb(X_train, y_train, X_val, y_val)
+        save_lgb_model(booster, prefix=prefix.rstrip('_'))
+        del X_train, X_val, all_scaled
+        gc.collect()
+        return booster
+    except Exception as e:
+        print(f"[LGB] Ensemble training failed (non-fatal): {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Holdout evaluation + atomic save
+# ---------------------------------------------------------------------------
+
+def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
+                        all_times, all_label_times, tickers, ticker_boundaries,
+                        input_dim, asset_type, n_trials, trial_values):
+    """Score the winning config ONCE on the untouched final time slice.
+
+    Returns {'sharpe', 'dsr', 'dsr_min', 'n_trades', 'n_rows'} or None.
+    """
+    from validation import dsr_from_trade_returns, DSR_MIN
+    try:
+        seq_len = cfg['seq_len']
+        fb = cfg.get('forward_bars', 24)
+        threshold = cfg['trade_threshold']
+        holdout_idx = get_holdout_indices(all_times, tickers, ticker_boundaries, seq_len)
+        returns = all_returns_by_fb.get(fb)
+        if returns is None:
+            returns = list(all_returns_by_fb.values())[0]
+        holdout_idx = holdout_idx[~np.isnan(returns[holdout_idx])]
+        if len(holdout_idx) < 200:
+            print(f"  [HOLDOUT] only {len(holdout_idx)} usable rows — gate fails closed")
+            return {'sharpe': 0.0, 'dsr': 0.0, 'dsr_min': DSR_MIN,
+                    'n_trades': 0, 'n_rows': int(len(holdout_idx))}
+
+        scaled = scaler.transform(all_features).astype(np.float32)
+        offsets = np.arange(-seq_len, 0)
+        mdl = RegressionLSTM(input_dim, cfg['hidden_dim'], cfg['num_layers'],
+                             cfg['dropout'], cfg['n_heads']).to(device)
+        mdl.load_state_dict(state)
+        mdl.eval()
+        preds = []
+        use_amp = device.type == 'cuda'
+        with torch.inference_mode():
+            for i in range(0, len(holdout_idx), 1024):
+                vidx = holdout_idx[i:i + 1024]
+                xvb = torch.from_numpy(gather_windows(scaled, vidx, offsets)).to(device)
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    vo = mdl(xvb)
+                preds.append(vo.cpu().numpy())
+        preds = np.concatenate(preds)
+        y = returns[holdout_idx]
+
+        sharpe = compute_sharpe(preds, y, threshold, forward_bars=fb,
+                                asset_type=asset_type)
+        trade_returns = simulate_trades(preds, y, threshold, fb,
+                                        TXN_COST_PCT.get(asset_type, 0.6))
+        # Null-parameterized deflation: each of n_trials configs' SR
+        # estimate scatters ~1/sqrt(n_trades) under no-skill.
+        dsr = dsr_from_trade_returns(trade_returns, n_trials=n_trials)
+        del mdl, scaled
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return {'sharpe': round(float(sharpe), 4),
+                'dsr': round(float(dsr['dsr']), 4),
+                'dsr_min': DSR_MIN,
+                'n_trades': int(dsr['n']),
+                'n_rows': int(len(holdout_idx))}
+    except Exception as e:
+        print(f"  [HOLDOUT] evaluation failed: {e} — gate fails closed")
+        return None
+
+
+def save_model_atomically(prefix, state, best_cfg, input_dim, config, scaler,
+                          feature_cols, score=0.0):
+    """Write all four artifacts via tmp+rename, then a manifest LAST.
+
+    The four files were previously written non-atomically while bots
+    hot-reload on the .pth mtime alone — a reload mid-save could pair new
+    weights with an old scaler. Bots now key reloads on the manifest,
+    which only appears after every artifact is fully on disk.
+    """
+    mdl = RegressionLSTM(input_dim, best_cfg['hidden_dim'],
+                         best_cfg['num_layers'], best_cfg['dropout'],
+                         best_cfg['n_heads'])
+    mdl.load_state_dict(state)
+
+    artifacts = {
+        f'{prefix}model_v2.pth': lambda p: torch.save(mdl.state_dict(), p),
+        f'{prefix}config_v2.pkl': lambda p: joblib.dump(config, p),
+        f'{prefix}scaler_v2.pkl': lambda p: joblib.dump(scaler, p),
+        f'{prefix}feature_cols_v2.pkl': lambda p: joblib.dump(feature_cols, p),
+    }
+    # Keep the outgoing model as .prev so the policy-backtest gate
+    # (backtest.py --gate) can roll back a promotion that fails on policy
+    # P&L even though it cleared the fit-level holdout.
+    import shutil
+    for path in list(artifacts) + [f'{prefix}model_v2.manifest.json',
+                                   f'{prefix}lgb_model.txt']:
+        if os.path.exists(path):
+            try:
+                shutil.copy2(path, f'{path}.prev')
+            except OSError:
+                pass
+    for path, writer in artifacts.items():
+        tmp = f'{path}.tmp.{os.getpid()}'
+        writer(tmp)
+        os.replace(tmp, path)
+
+    manifest = {
+        'saved_at': datetime.now().isoformat(),
+        'score': round(float(score), 4),
+        'files': list(artifacts.keys()),
+        'config': {k: v for k, v in config.items() if k != 'holdout'},
+        'holdout': config.get('holdout'),
+    }
+    mpath = f'{prefix}model_v2.manifest.json'
+    tmp = f'{mpath}.tmp.{os.getpid()}'
+    with open(tmp, 'w') as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp, mpath)
+
+    for path in artifacts:
+        print(f"Saved: {path}")
+    print(f"Manifest: {mpath}")
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +1057,8 @@ def main():
 
     storage = f'sqlite:///{db_path}'
 
-    (all_features, all_returns_by_fb, tickers, ticker_boundaries,
+    (all_features, all_returns_by_fb, all_times, all_label_times,
+     tickers, ticker_boundaries,
      feature_cols, input_dim, preset_name,
      has_multi_horizon) = load_data(args.data, preset_override=args.preset,
                                      max_rows=args.max_rows)
@@ -879,8 +1178,10 @@ def main():
             print(f"Prior best score={best_state_holder['score']:.3f} — new trials must beat this")
 
     objective_fn = create_objective(all_features, all_returns_by_fb,
+                                    all_times, all_label_times,
                                     tickers, ticker_boundaries, input_dim,
-                                    _state_cache, has_multi_horizon=has_multi_horizon,
+                                    _state_cache, asset_type=asset_type,
+                                    has_multi_horizon=has_multi_horizon,
                                     adaptive_space=adaptive_space)
     study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback],
                    catch=(Exception,))
@@ -895,51 +1196,81 @@ def main():
     # Check if new best exceeds the existing model's score (protect against regression)
     existing_score = adaptive_state.get('best_score', 0.0)
     new_score = best_state_holder['score']
+    holdout_report = None
+    model_saved = False
 
     if best_state_holder['state'] is not None and new_score > existing_score:
         best_cfg = best_state_holder['cfg']
         best_scaler = best_state_holder['scaler']
 
-        print(f"\nNew best model (score={new_score:.3f} > existing {existing_score:.3f}):")
-        for k, v in best_cfg.items():
-            print(f"  {k}: {v}")
+        # --- FINAL HOLDOUT GATE -------------------------------------------
+        # The winner was selected, early-stopped, AND scored on the same
+        # validation slices across hundreds of trials. Before deployment it
+        # must clear a time slice Optuna NEVER saw, deflated for the size
+        # of the selection pool (Bailey & Lopez de Prado DSR).
+        completed_trials = [t for t in study.trials
+                            if t.state == optuna.trial.TrialState.COMPLETE
+                            and t.value is not None]
+        holdout_report = evaluate_on_holdout(
+            best_state_holder['state'], best_scaler, best_cfg,
+            all_features, all_returns_by_fb, all_times, all_label_times,
+            tickers, ticker_boundaries, input_dim, asset_type,
+            n_trials=max(len(completed_trials), 2),
+            trial_values=[t.value for t in completed_trials],
+        )
+        gate_ok = (holdout_report is not None
+                   and holdout_report['sharpe'] > 0
+                   and holdout_report['dsr'] >= holdout_report['dsr_min'])
 
-        mdl = RegressionLSTM(input_dim, best_cfg['hidden_dim'],
-                              best_cfg['num_layers'], best_cfg['dropout'],
-                              best_cfg['n_heads'])
-        mdl.load_state_dict(best_state_holder['state'])
-        torch.save(mdl.state_dict(), f'{prefix}model_v2.pth')
+        if not gate_ok:
+            print(f"\nModel NOT saved: failed holdout gate "
+                  f"({holdout_report})")
+            print("A higher in-search score that cannot clear unseen data "
+                  "is selection bias, not skill.")
+        else:
+            print(f"\nNew best model (score={new_score:.3f} > existing {existing_score:.3f}, "
+                  f"holdout sharpe={holdout_report['sharpe']:.2f}, "
+                  f"DSR={holdout_report['dsr']:.2f}):")
+            for k, v in best_cfg.items():
+                print(f"  {k}: {v}")
 
-        config = {
-            'model_version': 2,
-            'input_dim': input_dim,
-            'hidden_dim': best_cfg['hidden_dim'],
-            'num_layers': best_cfg['num_layers'],
-            'n_heads': best_cfg['n_heads'],
-            'dropout': best_cfg['dropout'],
-            'seq_len': best_cfg['seq_len'],
-            'trade_threshold': best_cfg['trade_threshold'],
-            'forward_bars': best_cfg.get('forward_bars', 24),
-            'huber_delta': best_cfg['huber_delta'],
-            'prefix': args.prefix,
-            'indicator_preset': preset_name,
-        }
-        joblib.dump(config, f'{prefix}config_v2.pkl')
-        joblib.dump(best_scaler, f'{prefix}scaler_v2.pkl')
-        joblib.dump(feature_cols, f'{prefix}feature_cols_v2.pkl')
+            config = {
+                'model_version': 2,
+                'input_dim': input_dim,
+                'hidden_dim': best_cfg['hidden_dim'],
+                'num_layers': best_cfg['num_layers'],
+                'n_heads': best_cfg['n_heads'],
+                'dropout': best_cfg['dropout'],
+                'seq_len': best_cfg['seq_len'],
+                'trade_threshold': best_cfg['trade_threshold'],
+                'forward_bars': best_cfg.get('forward_bars', 24),
+                'huber_delta': best_cfg['huber_delta'],
+                'prefix': args.prefix,
+                'indicator_preset': preset_name,
+                'holdout': holdout_report,
+            }
+            save_model_atomically(prefix, best_state_holder['state'], best_cfg,
+                                  input_dim, config, best_scaler, feature_cols,
+                                  score=new_score)
+            model_saved = True
 
-        print(f"\nModel saved: {prefix}model_v2.pth")
-        print(f"Config saved: {prefix}config_v2.pkl")
-        print(f"Scaler saved: {prefix}scaler_v2.pkl")
-        print(f"Features saved: {prefix}feature_cols_v2.pkl")
+            # Train the LightGBM ensemble leg on the winning config
+            train_lgb_ensemble(prefix, best_scaler, best_cfg,
+                               all_features, all_returns_by_fb,
+                               all_times, all_label_times,
+                               tickers, ticker_boundaries)
     elif best_state_holder['state'] is not None:
         print(f"\nModel NOT saved: new best {new_score:.3f} <= existing {existing_score:.3f}")
         print("Existing model preserved (higher score).")
     else:
         print(f"\nNo new best found (prior best score={best_state_holder['score']:.3f})")
 
-    # Update adaptive state with results
+    # Update adaptive state with results. When the holdout gate REJECTED the
+    # winner, do NOT ratchet best_score — otherwise future (honest) models
+    # would have to beat a score that belongs to an unsaved, overfit config.
     final_score = best_state_holder['score']
+    if not model_saved:
+        final_score = min(final_score, existing_score)
     final_params = best_state_holder.get('cfg', {})
     if final_score > 0 and final_params:
         adaptive_state = update_after_search(adaptive_state, final_score, final_params,
@@ -968,6 +1299,18 @@ def main():
                 print(f"  {param}: {imp:.3f}")
         except Exception:
             pass
+
+    # Probability of backtest overfitting (coarse CSCV over fold scores)
+    if len(completed) >= 10:
+        try:
+            from validation import pbo_from_fold_scores
+            rows = [t.user_attrs.get('fold_sharpes') for t in completed]
+            pbo = pbo_from_fold_scores([r for r in rows if r])
+            if pbo is not None:
+                print(f"\nPBO (coarse CSCV from fold Sharpes): {pbo:.2f}"
+                      f"{'  WARNING: >0.25 suggests overfitting' if pbo > 0.25 else ''}")
+        except Exception as e:
+            print(f"  PBO computation failed: {e}")
 
     # Monte Carlo robustness test on completed trials
     if len(completed) >= 20 and best_state_holder['score'] > 0:

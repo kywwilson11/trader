@@ -229,7 +229,13 @@ def fetch_crypto_sentiment_history(start_date=None, end_date=None):
     inserted = 0
     for entry in data:
         ts = int(entry['timestamp'])
-        date_str = datetime.date.fromtimestamp(ts).isoformat()
+        # alternative.me timestamps are midnight UTC of the day the value is
+        # PUBLISHED. Bucketing with the local timezone shifted every value
+        # one day (US hosts), giving training bars up to 24h of future
+        # sentiment. UTC bucketing makes day D's bars see exactly the value
+        # known at D 00:00 UTC.
+        date_str = datetime.datetime.fromtimestamp(
+            ts, tz=datetime.timezone.utc).date().isoformat()
         if date_str < start_date or date_str > end_date:
             continue
         if date_str in cached_dates:
@@ -400,10 +406,13 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
                 summary = a.get('summary', '').strip()
                 url = a.get('url', '').strip()
 
-                # Determine article date from datetime field
+                # Determine article date from datetime field (UTC — local
+                # bucketing shifted dates and leaked future articles into
+                # the prior day's training bars)
                 article_ts = a.get('datetime', 0)
                 if article_ts:
-                    article_date = datetime.date.fromtimestamp(article_ts).isoformat()
+                    article_date = datetime.datetime.fromtimestamp(
+                        article_ts, tz=datetime.timezone.utc).date().isoformat()
                 else:
                     article_date = window_start.isoformat()
 
@@ -472,10 +481,12 @@ def get_daily_sentiment(symbol, date_str):
 
 
 def get_live_daily_sentiment(symbol, asset_type='crypto'):
-    """Get today's sentiment for live inference.
+    """Get the sentiment value live inference should see RIGHT NOW.
 
-    Crypto: reads today's FnG (via existing sentiment.get_fear_greed())
-    Stocks: reads today's daily_sentiment from DB, or returns 0.0
+    Crypto: today's FnG (published at 00:00 UTC — fully known intraday).
+    Stocks: YESTERDAY's completed daily score — training attributes day
+    D-1's aggregate to day-D bars (a day-D aggregate includes articles
+    published after the current bar), so serving must match.
 
     Returns float in [-1, 1], defaults 0.0.
     """
@@ -489,10 +500,10 @@ def get_live_daily_sentiment(symbol, asset_type='crypto'):
             pass
         return 0.0
     else:
-        today = datetime.date.today().isoformat()
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
         # Clean symbol for DB lookup (strip any exchange suffix)
         clean = symbol.replace('/', '').replace('-USD', '')
-        return get_daily_sentiment(clean, today)
+        return get_daily_sentiment(clean, yesterday)
 
 
 # ---------------------------------------------------------------------------
@@ -532,12 +543,232 @@ def get_backfill_stats():
     }
 
 
+# ---------------------------------------------------------------------------
+# Gemini Batch API backfill (50% price, separate quota from live calls)
+# ---------------------------------------------------------------------------
+
+_BATCH_CHUNK = 25            # articles per generateContent request
+_BATCH_MAX_ARTICLES = 2000   # per batch job
+_BATCH_POLL_SEC = 120
+_batch_unavailable_until = 0.0
+
+_BATCH_SCORE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "scores": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "i": {"type": "INTEGER"},
+                    "s": {"type": "NUMBER"},
+                },
+                "required": ["i", "s"],
+            },
+        },
+    },
+    "required": ["scores"],
+}
+
+_BATCH_SCORE_PROMPT = """\
+Score the market sentiment of each numbered financial news item for the
+bracketed symbol, on a -1.0 to +1.0 scale. Anchor examples:
+  -0.8: bankruptcy filing, fraud charges, delisting notice
+  -0.3: earnings miss, guidance cut, analyst downgrade
+   0.0: routine/neutral news, no market implication
+  +0.3: earnings beat, contract win, analyst upgrade
+  +0.8: transformative acquisition at premium, blockbuster approval
+Use precise values (e.g. -0.45, +0.2). Score the impact on the BRACKETED
+symbol specifically, not the market. Respond per the JSON schema with one
+entry per item, keyed by its number `i`.
+
+Items:
+"""
+
+
+def _batch_state_get(db):
+    row = db.execute("SELECT value FROM state WHERE key='pending_batch'").fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        import json as _json
+        return _json.loads(row[0])
+    except Exception:
+        return None
+
+
+def _batch_state_set(db, payload):
+    import json as _json
+    if payload is None:
+        db.execute("DELETE FROM state WHERE key='pending_batch'")
+    else:
+        db.execute(
+            "INSERT INTO state (key, value) VALUES ('pending_batch', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_json.dumps(payload),))
+    db.commit()
+
+
+def _gemini_batch_http(method, url_path, body=None, api_key=''):
+    import json as _json
+    import urllib.request
+    url = f"https://generativelanguage.googleapis.com/v1beta/{url_path}"
+    data = _json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key})
+    resp = urllib.request.urlopen(req, timeout=60)
+    return _json.loads(resp.read())
+
+
+def submit_sentiment_batch(db, model=None) -> bool:
+    """Submit unscored articles as ONE Gemini Batch job (inline requests).
+
+    Batch pricing is 50% of interactive and draws from a SEPARATE enqueued
+    quota — the old synchronous 8-RPM worker competed with the live trading
+    loops for the same RPM/RPD all day.
+    """
+    global _batch_unavailable_until
+    from llm_config import load_llm_config
+    from llm_client import get_recommended_model
+
+    config = load_llm_config()
+    api_key = config.get("models", {}).get("gemini", {}).get("api_key", "")
+    if not api_key or not config.get("enabled"):
+        return False
+
+    rows = db.execute(
+        """SELECT id, symbol, date, headline, summary FROM articles
+           WHERE llm_score IS NULL ORDER BY date DESC LIMIT ?""",
+        (_BATCH_MAX_ARTICLES,)).fetchall()
+    if not rows:
+        return False
+
+    model = model or get_recommended_model('backfill')
+    requests_payload = []
+    id_map = []  # per chunk: [[article_id, symbol, date], ...]
+    for start in range(0, len(rows), _BATCH_CHUNK):
+        chunk = rows[start:start + _BATCH_CHUNK]
+        lines = []
+        for i, (aid, symbol, date, headline, summary) in enumerate(chunk):
+            text = headline if not summary else f"{headline} — {summary[:200]}"
+            lines.append(f"{i}. [{symbol}] {text}")
+        prompt = _BATCH_SCORE_PROMPT + "\n".join(lines)
+        requests_payload.append({
+            "request": {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 2048,
+                    "responseMimeType": "application/json",
+                    "responseSchema": _BATCH_SCORE_SCHEMA,
+                },
+            },
+            "metadata": {"key": f"chunk-{start // _BATCH_CHUNK}"},
+        })
+        id_map.append([[aid, symbol, date] for aid, symbol, date, _h, _s in chunk])
+
+    body = {"batch": {
+        "display_name": f"sentiment-backfill-{datetime.date.today().isoformat()}",
+        "input_config": {"requests": {"requests": requests_payload}},
+    }}
+    try:
+        resp = _gemini_batch_http('POST', f"models/{model}:batchGenerateContent",
+                                  body, api_key)
+        name = resp.get('name')
+        if not name:
+            raise ValueError(f"no batch name in response: {str(resp)[:200]}")
+        _batch_state_set(db, {'name': name, 'model': model, 'id_map': id_map,
+                              'submitted_at': datetime.datetime.now().isoformat()})
+        print(f"[BACKFILL] Batch submitted: {name} "
+              f"({len(rows)} articles in {len(requests_payload)} chunks)")
+        return True
+    except Exception as e:
+        print(f"[BACKFILL] Batch submit failed ({e}) — sync fallback for 1h")
+        _batch_unavailable_until = time.time() + 3600
+        return False
+
+
+def poll_and_ingest_batch(db) -> str:
+    """Poll the pending batch job. Returns 'none'|'pending'|'ingested'|'failed'."""
+    import json as _json
+    from llm_config import load_llm_config
+
+    state = _batch_state_get(db)
+    if not state:
+        return 'none'
+    config = load_llm_config()
+    api_key = config.get("models", {}).get("gemini", {}).get("api_key", "")
+    if not api_key:
+        return 'none'
+
+    try:
+        resp = _gemini_batch_http('GET', state['name'], None, api_key)
+    except Exception as e:
+        print(f"[BACKFILL] Batch poll failed: {e}")
+        return 'pending'  # transient — try again next pass
+
+    job_state = (resp.get('metadata') or {}).get('state', '')
+    if job_state in ('JOB_STATE_FAILED', 'JOB_STATE_CANCELLED', 'JOB_STATE_EXPIRED'):
+        print(f"[BACKFILL] Batch {job_state} — clearing")
+        _batch_state_set(db, None)
+        return 'failed'
+    if job_state != 'JOB_STATE_SUCCEEDED':
+        return 'pending'
+
+    # Ingest: inlinedResponses are POSITIONAL per submitted chunk
+    inlined = ((resp.get('response') or {}).get('inlinedResponses')) or []
+    id_map = state.get('id_map', [])
+    now_iso = datetime.datetime.now().isoformat()
+    scored = 0
+    updated_pairs = set()
+    for chunk_idx, item in enumerate(inlined):
+        if chunk_idx >= len(id_map):
+            break
+        chunk_ids = id_map[chunk_idx]
+        cand = (item.get('response') or {}).get('candidates') or []
+        if not cand:
+            continue
+        parts = (cand[0].get('content') or {}).get('parts') or []
+        text = next((p.get('text', '') for p in reversed(parts)
+                     if p.get('text', '').strip()), '')
+        try:
+            payload = _json.loads(text)
+            entries = payload.get('scores', [])
+        except (ValueError, AttributeError):
+            continue
+        for entry in entries:
+            try:
+                i = int(entry['i'])
+                s = max(-1.0, min(1.0, float(entry['s'])))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= i < len(chunk_ids):
+                aid, symbol, date = chunk_ids[i]
+                db.execute(
+                    "UPDATE articles SET llm_score=?, llm_scored_at=? WHERE id=?",
+                    (s, now_iso, aid))
+                updated_pairs.add((symbol, date))
+                scored += 1
+
+    for symbol, date_str in updated_pairs:
+        _aggregate_daily(db, symbol, date_str)
+    db.commit()
+    _batch_state_set(db, None)
+    print(f"[BACKFILL] Batch ingested: {scored} articles scored, "
+          f"{len(updated_pairs)} daily aggregates refreshed")
+    return 'ingested'
+
+
 def run_backfill_worker(max_rpm=8):
     """Background worker: LLM-score unscored articles, newest first.
 
-    Respects live_mode flag — pauses when trading bots are active.
-    Rate-limits to max_rpm requests per minute (default 8, leaving headroom
-    for live sentiment calls at 15 RPM).
+    Runs WHILE the bots trade (max_rpm=8 deliberately leaves quota headroom
+    for live calls) and PAUSES during training windows, when the Jetson's
+    memory and the LLM quota both belong to the retrain. The old check was
+    inverted: it paused whenever live_mode was set (i.e. roughly always,
+    since the crypto bot runs 24/7) and only ran during retrains —
+    exactly backwards.
 
     Args:
         max_rpm: Maximum LLM API calls per minute
@@ -553,12 +784,30 @@ def run_backfill_worker(max_rpm=8):
     min_interval = 60.0 / max_rpm  # seconds between batches
 
     while True:
-        # Check live mode — sleep longer when bots are trading
-        if _is_live_mode():
+        # live_mode=True -> bots trading -> we run (throttled).
+        # live_mode=False -> training window -> we pause.
+        if not _is_live_mode():
             time.sleep(60)
             continue
 
         db = _get_db()
+
+        # --- Batch-first: Gemini Batch API is 50% price on a SEPARATE
+        # quota (zero contention with the live loops). Poll any pending
+        # job; otherwise submit a new one. Synchronous scoring below is
+        # the fallback when batch is unavailable.
+        if time.time() >= _batch_unavailable_until:
+            status = poll_and_ingest_batch(db)
+            if status == 'pending':
+                time.sleep(_BATCH_POLL_SEC)
+                continue
+            if status == 'ingested':
+                continue  # check immediately for more work
+            # 'none' or 'failed' — try submitting a fresh job
+            if submit_sentiment_batch(db):
+                time.sleep(_BATCH_POLL_SEC)
+                continue
+            # submit returned False: nothing unscored, or batch unavailable
 
         # Get next batch of unscored articles (newest first)
         rows = db.execute(

@@ -123,50 +123,59 @@ def fetch_with_fallback(ticker: str, start_date: str, api=None,
     from market_data import flatten_yfinance_columns, fetch_historical_bars
     import yfinance as yf
 
-    frames = []
+    frames = []          # in PRIORITY order: Alpaca, yfinance, CryptoCompare
     source_names = []
 
-    # 1. Alpaca (primary — best for long history)
+    def _to_utc(frame):
+        if frame.index.tz is None:
+            frame.index = frame.index.tz_localize('UTC')
+        else:
+            frame.index = frame.index.tz_convert('UTC')
+        return frame
+
+    # 1. Alpaca (primary — the venue we trade; split/dividend-adjusted)
+    alpaca_ok = False
     if api is not None:
         alpaca_sym = ticker.replace('-', '/') if asset_type == 'crypto' else ticker
         try:
             alpaca_df = fetch_historical_bars(api, alpaca_sym, start_date,
                                               asset_type=asset_type)
             if alpaca_df is not None and not alpaca_df.empty:
-                if alpaca_df.index.tz is None:
-                    alpaca_df.index = alpaca_df.index.tz_localize('UTC')
-                else:
-                    alpaca_df.index = alpaca_df.index.tz_convert('UTC')
-                frames.append(alpaca_df)
+                frames.append(_to_utc(alpaca_df))
                 source_names.append('Alpaca')
+                alpaca_ok = True
         except Exception as e:
             print(f"  [ALPACA] {ticker}: {e}")
         time.sleep(2)
 
-    # 2. yfinance (secondary — up to 730 days for hourly)
-    try:
-        print(f"  [YF] Fetching {ticker}...")
-        kwargs = {'progress': False}
-        if asset_type == 'stock':
-            kwargs['prepost'] = True
-        yf_df = yf.download(ticker, period='max', interval='1h', **kwargs)
-        yf_df = flatten_yfinance_columns(yf_df)
-        if yf_df is not None and not yf_df.empty:
-            if yf_df.index.tz is None:
-                yf_df.index = yf_df.index.tz_localize('UTC')
-            else:
-                yf_df.index = yf_df.index.tz_convert('UTC')
-            frames.append(yf_df)
-            source_names.append('yfinance')
-    except Exception as e:
-        print(f"  [YF] {ticker}: {e}")
+    # 2. yfinance (FALLBACK)
+    # Stocks: yfinance hourly bars are :30-aligned (9:30, 10:30, ...) while
+    # Alpaca's are :00-aligned — merging both interleaves two bar grids with
+    # mixed adjustment conventions, so indicator windows and Target_Return_fb
+    # meant different wall-clock spans across the dataset. For stocks,
+    # yfinance is used ONLY when Alpaca returned nothing.
+    # Crypto: yfinance 1h bars are :00-aligned 24/7, so a true merge is safe.
+    if asset_type != 'stock' or not alpaca_ok:
+        try:
+            print(f"  [YF] Fetching {ticker}...")
+            yf_df = yf.download(ticker, period='max', interval='1h',
+                                progress=False, auto_adjust=True,
+                                prepost=False)
+            yf_df = flatten_yfinance_columns(yf_df)
+            if yf_df is not None and not yf_df.empty:
+                frames.append(_to_utc(yf_df))
+                source_names.append('yfinance')
+        except Exception as e:
+            print(f"  [YF] {ticker}: {e}")
 
-    # 3. CryptoCompare (tertiary — crypto only, good for filling gaps)
+    # 3. CryptoCompare (tertiary — crypto only, fills gaps; NOT preferred
+    # over Alpaca: inference serves Alpaca bars, so training on CC prices
+    # where both exist would create train/serve skew)
     if asset_type == 'crypto':
         try:
             cc_df = fetch_cryptocompare_hourly(ticker, start_date)
             if cc_df is not None and not cc_df.empty:
-                frames.append(cc_df)
+                frames.append(_to_utc(cc_df))
                 source_names.append('CryptoCompare')
         except Exception as e:
             print(f"  [CC] {ticker}: {e}")
@@ -175,16 +184,10 @@ def fetch_with_fallback(ticker: str, start_date: str, api=None,
         print(f"  [DATA] {ticker}: all sources failed")
         return None
 
-    # Normalize all frames to UTC before merging
-    for i, frame in enumerate(frames):
-        if frame.index.tz is None:
-            frames[i].index = frame.index.tz_localize('UTC')
-        else:
-            frames[i].index = frame.index.tz_convert('UTC')
-
-    # Merge: concat, keep last occurrence (newest data wins, matches data_utils.py)
+    # Merge in PRIORITY order: keep='first' so the highest-priority source
+    # wins on timestamp collisions (the old keep='last' inverted this).
     combined = pd.concat(frames)
-    combined = combined[~combined.index.duplicated(keep='last')]
+    combined = combined[~combined.index.duplicated(keep='first')]
     combined = combined.sort_index()
 
     sources = ' + '.join(source_names)

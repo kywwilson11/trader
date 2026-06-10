@@ -12,6 +12,12 @@ Bar-fetching and ATR logic live in market_data.py.
 import joblib
 import os
 import torch
+
+# Tiny-LSTM CPU inference is fastest with 1-2 threads; the default 6-thread
+# spawn just steals cores from training during the weekly retrain window.
+if os.environ.get('CUDA_VISIBLE_DEVICES', None) == '':
+    torch.set_num_threads(int(os.environ.get('TORCH_NUM_THREADS', '2')))
+
 from model_v2 import RegressionLSTM
 from indicators import compute_features, compute_stock_features
 from market_data import (

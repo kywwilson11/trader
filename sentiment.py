@@ -600,6 +600,7 @@ def _llm_score_chunk(chunk_articles, full_texts, model=None):
 
 def _fetch_full_texts(articles):
     """Fetch article bodies in parallel. Returns list of text or None."""
+    import concurrent.futures
     from concurrent.futures import ThreadPoolExecutor, as_completed
     urls = [a.get('url', '') for a in articles]
     full_texts = [None] * len(articles)
@@ -612,7 +613,10 @@ def _fetch_full_texts(articles):
                     full_texts[futures[fut]] = fut.result()
                 except Exception:
                     pass
-        except TimeoutError:
+        except concurrent.futures.TimeoutError:
+            # On Python 3.10 (the Jetson), futures.TimeoutError is NOT a
+            # subclass of builtins TimeoutError — catching only the builtin
+            # let a slow article fetch kill the whole backfill worker.
             pass
     return full_texts
 

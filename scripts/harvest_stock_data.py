@@ -38,16 +38,14 @@ FORWARD_BARS = get_forward_bars_list('stock')
 def _get_alpaca_api():
     """Build Alpaca REST client, or None if credentials missing."""
     try:
-        import alpaca_trade_api as tradeapi
         # Increase SDK internal retry backoff (default 3s is too aggressive)
         os.environ.setdefault('APCA_RETRY_WAIT', '10')
         os.environ.setdefault('APCA_RETRY_MAX', '5')
-        key = os.getenv('ALPACA_API_KEY')
-        secret = os.getenv('ALPACA_API_SECRET')
-        url = os.getenv('ALPACA_BASE_URL')
-        if not key or not secret:
+        if not os.getenv('ALPACA_API_KEY') or not os.getenv('ALPACA_API_SECRET'):
             return None
-        return tradeapi.REST(key, secret, url, api_version='v2')
+        # Shared constructor: legacy SDK with automatic alpaca-py fallback
+        from trading_utils import get_api
+        return get_api()
     except Exception as e:
         print(f"WARNING: Could not create Alpaca API client: {e}")
         return None
@@ -165,19 +163,24 @@ def main():
     final_df = pd.concat(all_data)
     final_df = final_df.sort_index()
 
-    # Add historical sentiment
+    # Add historical sentiment — LAGGED one day for point-in-time integrity.
+    # The daily score for day D aggregates ALL of day D's articles
+    # (including ones published after each bar), so giving day-D bars the
+    # day-D score leaked intraday-future news into training. Day-D bars now
+    # see day D-1's COMPLETED score — exactly what live inference can know.
     try:
+        import datetime as _dt
         from sentiment_history import fetch_stock_sentiment_history
-        start_date = str(final_df.index.min().date())
+        start_date = str((final_df.index.min() - pd.Timedelta(days=1)).date())
         end_date = str(final_df.index.max().date())
         sentiment = fetch_stock_sentiment_history(
             STOCK_TICKERS, start_date, end_date, cached_only=True)
         final_df['Daily_Sentiment'] = [
-            sentiment.get((ticker, str(date)), 0.0)
+            sentiment.get((ticker, str(date - _dt.timedelta(days=1))), 0.0)
             for ticker, date in zip(final_df['Ticker'], final_df.index.date)
         ]
         filled = sum(1 for v in final_df['Daily_Sentiment'] if v != 0.0)
-        print(f"Daily_Sentiment: {filled}/{len(final_df)} bars have sentiment")
+        print(f"Daily_Sentiment (lagged 1d): {filled}/{len(final_df)} bars have sentiment")
     except Exception as e:
         print(f"WARNING: Could not load stock sentiment history: {e}")
         final_df['Daily_Sentiment'] = 0.0
