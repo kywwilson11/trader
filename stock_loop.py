@@ -607,6 +607,20 @@ class StockLoop(BaseTradingLoop):
             except Exception:
                 pass
 
+            # Corporate-event veto: fresh 8-K solvency/credibility items
+            # and pending-M&A targets (price pinned to deal terms) — the
+            # model's technical signals are invalid in both states
+            try:
+                from edgar_events import entry_blocked
+                ev_blocked, ev_reason = entry_blocked(symbol)
+                if ev_blocked:
+                    log_decision({"symbol": symbol, "action": "skip",
+                                  "skip_reason": "edgar_event",
+                                  "detail": ev_reason})
+                    continue
+            except Exception:
+                pass
+
             pred = preds.get(symbol)
             if pred is None or pred < self.trade_threshold:
                 continue

@@ -211,6 +211,9 @@ class BaseTradingLoop(ABC):
         logger.info("--- CYCLE %d: %s ---", self.cycle,
                     datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
+        # Remote /flatten request (Telegram kill switch or GUI)
+        self._check_flatten_request()
+
         # Pre-trade checks (also refreshes self._buys_allowed)
         self._circuit_breaker_check()
 
@@ -1323,13 +1326,58 @@ class BaseTradingLoop(ABC):
             return False
         return True
 
+    def _check_flatten_request(self):
+        """Honor a remote /flatten: liquidate this book, halt, clear flag.
+
+        The flag is cleared BEFORE flattening so a partial failure can't
+        re-trigger liquidation every 30s; failures are notified instead.
+        """
+        try:
+            from notify import (flatten_requested, clear_flatten_request,
+                                set_halt, notify)
+            if not flatten_requested():
+                return
+        except Exception:
+            return
+        logger.warning("[FLATTEN] remote flatten requested — liquidating %s book",
+                       self.get_asset_type())
+        clear_flatten_request()
+        set_halt('remote flatten')
+        try:
+            failures = emergency_flatten(self.api,
+                                         symbols=self.get_symbol_universe())
+            self.positions.clear()
+            self._save_position_state()
+            notify(f"FLATTEN {self.get_asset_type()}: done "
+                   f"({'failures: ' + ', '.join(failures) if failures else 'all positions closed'}). "
+                   f"Trading halted — /resume to re-enable entries.",
+                   level='critical', dedupe_key=f'flatten-{self.get_asset_type()}')
+        except Exception as e:
+            logger.error("[FLATTEN] failed: %s", e)
+            try:
+                from notify import notify as _n
+                _n(f"FLATTEN {self.get_asset_type()} FAILED: {e} — "
+                   f"intervene manually", level='critical')
+            except Exception:
+                pass
+
     def _entries_allowed(self) -> bool:
         """Book-level entry gate shared by both loops (exits never gated).
 
-        Currently: scheduled macro-event stand-down (FOMC/CPI windows) —
-        an hourly-bar model has no edge against an 8:30 CPI print, in
-        stocks OR crypto.
+        Gates: manual halt flag (Telegram /halt, GUI, or `touch
+        trading_halt.flag`), then the scheduled macro-event stand-down
+        (FOMC/CPI windows) — an hourly-bar model has no edge against an
+        8:30 CPI print, in stocks OR crypto.
         """
+        try:
+            from notify import halt_active
+            if halt_active():
+                if self.cycle % 10 == 1:
+                    logger.warning("[HALT] trading_halt.flag active — "
+                                   "entries blocked (/resume to clear)")
+                return False
+        except Exception:
+            pass
         try:
             from macro_calendar import macro_standdown, calendar_exhausted
             blocked, reason = macro_standdown()

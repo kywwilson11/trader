@@ -54,6 +54,64 @@ def _print(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def _sd_notify(msg: bytes):
+    """systemd notify protocol (READY=1 / WATCHDOG=1) — stdlib only.
+
+    No-op outside systemd (NOTIFY_SOCKET unset). Lets trader.service use
+    Type=notify + WatchdogSec so a hung pipeline gets auto-restarted.
+    """
+    sock_path = os.environ.get('NOTIFY_SOCKET')
+    if not sock_path:
+        return
+    try:
+        import socket
+        if sock_path.startswith('@'):
+            sock_path = '\0' + sock_path[1:]
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            s.connect(sock_path)
+            s.send(msg)
+        finally:
+            s.close()
+    except OSError:
+        pass
+
+
+def _check_telegram_commands(log_fh, status):
+    """Telegram kill switch: /halt /resume /flatten /status."""
+    try:
+        from notify import (poll_telegram_commands, set_halt, clear_halt,
+                            halt_active, request_flatten, notify)
+        for cmd in poll_telegram_commands():
+            log_fh.write(f"[TELEGRAM] command: {cmd}\n")
+            log_fh.flush()
+            if cmd == '/halt':
+                set_halt('telegram /halt')
+                notify("HALT engaged — no new entries until /resume. "
+                       "Open positions keep their stops/exits.",
+                       level='critical', dedupe_key='tg-halt')
+            elif cmd == '/resume':
+                clear_halt()
+                notify("Halt cleared — entries re-enabled.",
+                       level='warning', dedupe_key='tg-resume')
+            elif cmd == '/flatten':
+                request_flatten('telegram /flatten')
+                notify("Flatten requested — each bot liquidates its book "
+                       "within one cycle (~30s) and halts.",
+                       level='critical', dedupe_key='tg-flatten')
+            elif cmd == '/status':
+                notify(f"phase={status.get('phase')} "
+                       f"halted={halt_active()} "
+                       f"crypto_bot={status.get('crypto_bot_running')} "
+                       f"stock_bot={status.get('stock_bot_running')}",
+                       level='info', dedupe_key=f'tg-status-{time.time():.0f}')
+    except Exception as e:
+        try:
+            log_fh.write(f"[TELEGRAM] poll failed: {e}\n")
+        except Exception:
+            pass
+
+
 _last_drift_check_date = None
 
 
@@ -182,11 +240,12 @@ _heartbeat_lock = threading.Lock()
 
 
 def _heartbeat_loop():
-    """Background thread: re-write status file every 30s."""
+    """Background thread: re-write status file + systemd watchdog every 30s."""
     while not _heartbeat_stop.wait(30):
         with _heartbeat_lock:
             if _heartbeat_status is not None:
                 write_status(_heartbeat_status, force=True)
+        _sd_notify(b'WATCHDOG=1')
 
 
 def write_status(status, force=False):
@@ -915,6 +974,7 @@ def main():
     _heartbeat_status = status
     hb = threading.Thread(target=_heartbeat_loop, daemon=True)
     hb.start()
+    _sd_notify(b'READY=1')
 
     try:
         # =============================================================
@@ -1127,6 +1187,7 @@ def main():
                 _update_per_bot_status(bots, status)
                 write_status(status)
                 _maybe_run_drift_check(log_fh)
+                _check_telegram_commands(log_fh, status)
                 manual_trigger = _check_retrain_trigger()
                 if manual_trigger:
                     msg = (f"\n[MANUAL RETRAIN] Triggered from GUI: "

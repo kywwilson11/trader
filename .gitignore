@@ -80,3 +80,8 @@ stock_pred_history.jsonl
 drift_state.json
 retrain_requested.flag
 stock_retrain_requested.flag
+edgar_cache.json
+edgar_tickers.json
+trading_halt.flag
+flatten_request.flag
+telegram_offset.json

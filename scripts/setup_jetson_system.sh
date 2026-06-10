@@ -126,7 +126,72 @@ else
   echo "[monitoring] jtop already installed."
 fi
 
-# --- 5. Power-mode guidance (printed, not applied) --------------------------
+# --- 5. Time sync (chrony) ---------------------------------------------------
+# The Orin Nano dev kit has NO RTC battery: every cold boot starts with a
+# bogus clock until NTP syncs. The bots compare bar/quote timestamps for
+# staleness rejection and GTC order bookkeeping — a wrong clock silently
+# breaks both. chrony with makestep corrects large offsets immediately
+# instead of slewing for hours like systemd-timesyncd.
+if ! command -v chronyd >/dev/null 2>&1; then
+  apt-get install -y chrony >/dev/null 2>&1 \
+    && echo "[chrony] installed." \
+    || echo "[chrony] install failed — apt-get install chrony manually."
+fi
+if command -v chronyd >/dev/null 2>&1; then
+  if ! grep -q '^makestep' /etc/chrony/chrony.conf 2>/dev/null; then
+    echo 'makestep 1.0 -1' >> /etc/chrony/chrony.conf
+    echo "[chrony] makestep enabled (always step large offsets — no RTC battery)."
+  fi
+  systemctl enable --now chrony >/dev/null 2>&1 || true
+  systemctl disable systemd-timesyncd >/dev/null 2>&1 || true
+  echo "[chrony] active. Verify: chronyc tracking"
+fi
+
+# --- 6. systemd service with watchdog --------------------------------------
+# Type=notify + WatchdogSec: run_pipeline sends READY=1 at startup and
+# WATCHDOG=1 every 30s from its heartbeat thread. A hung pipeline (not
+# just a dead one) gets killed and restarted automatically.
+TRADER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TRADER_USER="${SUDO_USER:-$(whoami)}"
+PYBIN="$(command -v python3)"
+if [[ ! -f /etc/systemd/system/trader.service ]]; then
+  cat > /etc/systemd/system/trader.service <<UNIT
+[Unit]
+Description=Trader pipeline (bots + weekly retrain)
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=${TRADER_USER}
+WorkingDirectory=${TRADER_DIR}
+Environment=CUDA_VISIBLE_DEVICES=
+ExecStart=${PYBIN} -u run_pipeline.py --combined-bots --bot-only
+Restart=on-failure
+RestartSec=30
+WatchdogSec=900
+# OOM: kill the pipeline before the kernel picks a victim at random
+OOMScoreAdjust=200
+MemoryMax=6G
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  echo "[systemd] trader.service installed (NOT enabled — review ExecStart"
+  echo "          flags first, e.g. drop --bot-only to retrain on boot)."
+  echo "          Enable with: sudo systemctl enable --now trader.service"
+else
+  echo "[systemd] trader.service already exists — left untouched."
+fi
+
+# --- 7. State backups -------------------------------------------------------
+echo "[backup] Daily state backup: add to ${TRADER_USER}'s crontab:"
+echo "  30 2 * * * /bin/bash ${TRADER_DIR}/scripts/backup_state.sh >> \$HOME/trader_backups/backup.log 2>&1"
+echo "  (restic mode: export RESTIC_REPOSITORY + RESTIC_PASSWORD first)"
+
+# --- 8. Power-mode guidance (printed, not applied) --------------------------
 cat <<'EOF'
 
 [power] Recommended usage (JetPack >= 6.2 "Super" modes):
@@ -135,6 +200,10 @@ cat <<'EOF'
                           sudo jetson_clocks      # pin clocks during training
   - Check current mode:   sudo nvpmodel -q
   run_pipeline's wait_for_cool_gpu already throttles on temperature.
+
+[kill switch] With TRADER_TELEGRAM_BOT_TOKEN/CHAT_ID set, the pipeline
+  accepts /halt /resume /flatten /status from the configured chat.
+  Manual equivalent: touch trading_halt.flag in the trader directory.
 
 Done. Reboot to apply headless/zram changes:  sudo reboot
 EOF

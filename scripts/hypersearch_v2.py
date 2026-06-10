@@ -77,6 +77,7 @@ def _write_pipeline_status(status):
 NUM_TRIALS = 300
 MAX_EPOCHS = 60
 EARLY_STOP_PATIENCE = 10
+SOUP_K = 4  # checkpoint-soup size (avg weights of the K best epochs)
 PRUNE_WARMUP_EPOCHS = 12
 PRUNE_STARTUP_TRIALS = 60
 NUM_FOLDS = 3
@@ -481,6 +482,20 @@ def gather_windows(all_scaled, indices, offsets):
     return all_scaled[indices[:, None] + offsets[None, :]]
 
 
+def average_states(states: list[dict]) -> dict:
+    """Uniform weight soup over checkpoint state_dicts (same architecture,
+    same run). Non-float buffers (counters) take the first checkpoint's
+    value; float tensors are element-wise averaged."""
+    avg = {}
+    for k in states[0]:
+        v0 = states[0][k]
+        if torch.is_floating_point(v0):
+            avg[k] = torch.stack([s[k].float() for s in states]).mean(0).to(v0.dtype)
+        else:
+            avg[k] = v0.clone()
+    return avg
+
+
 # ---------------------------------------------------------------------------
 # Objective function
 # ---------------------------------------------------------------------------
@@ -684,6 +699,7 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
 
             best_val_loss = float('inf')
             best_state = None
+            top_states: list[tuple[float, dict]] = []  # K-best checkpoint soup
             counter = 0
 
             for epoch in range(MAX_EPOCHS):
@@ -756,16 +772,35 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                     print(f"  [TIMEOUT] Trial {trial.number} at epoch {epoch} fold {fold_idx}")
                     break
 
+                # K-best checkpoint pool for the weight soup. clone() is
+                # load-bearing: on CPU training, .cpu() returns a VIEW of
+                # the live weights and later epochs would mutate the
+                # "snapshot" in place.
+                if len(top_states) < SOUP_K or val_loss < top_states[-1][0]:
+                    snap = {k: v.detach().cpu().clone()
+                            for k, v in model.state_dict().items()}
+                    top_states.append((val_loss, snap))
+                    top_states.sort(key=lambda t: t[0])
+                    del top_states[SOUP_K:]
+
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    best_state = {k: v.cpu() for k, v in model.state_dict().items()}
                     counter = 0
                 else:
                     counter += 1
                     if counter >= EARLY_STOP_PATIENCE:
                         break
 
-            # Compute fold Sharpe with best model
+            # Checkpoint soup (SWA-style): uniform weight average of the
+            # K best-val-loss epochs. Within one run the checkpoints share
+            # a loss basin, and the average sits in a flatter region than
+            # any single epoch (Izmailov et al. 2018; Wortsman et al.
+            # 2022) — fold Sharpe, threshold selection, the holdout gate
+            # and the saved artifact all flow from this averaged state.
+            if top_states:
+                best_state = average_states([s for _, s in top_states])
+
+            # Compute fold Sharpe with best (souped) model
             if best_state is not None:
                 model.load_state_dict(best_state)
                 model.eval()
