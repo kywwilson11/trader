@@ -892,13 +892,27 @@ class BaseTradingLoop(ABC):
         except Exception:
             pass
 
+    def get_fresh_headlines(self, symbol: str) -> list[str]:
+        """Headlines with stale reprints filtered out (novelty.py).
+
+        Fresh news carries ~1.7x the price response of reprints; feeding
+        the LLM the same wire story five times re-counts one event five
+        times. Fail open to the raw list.
+        """
+        headlines = self.get_headlines(symbol)
+        try:
+            from novelty import filter_novel
+            return filter_novel(symbol, headlines)
+        except Exception:
+            return headlines
+
     def _build_llm_candidates(self, preds: dict) -> list[dict]:
         """Build candidate list for LLM analysis. Override for stock-specific fundamentals."""
         candidates = []
         for symbol in self.get_symbol_universe():
             fund = get_fundamentals(symbol, self.get_asset_type())
             fund_text = format_fundamentals_for_llm(symbol, fund)
-            headlines = self.get_headlines(symbol)
+            headlines = self.get_fresh_headlines(symbol)
             candidates.append({
                 'symbol': symbol,
                 'pred_return': preds.get(symbol),

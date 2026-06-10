@@ -85,3 +85,4 @@ edgar_tickers.json
 trading_halt.flag
 flatten_request.flag
 telegram_offset.json
+novelty_store.json

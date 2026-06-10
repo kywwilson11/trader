@@ -430,7 +430,7 @@ class StockLoop(BaseTradingLoop):
             insider = get_insider_activity(symbol)
             filing_sum = get_filing_summary(symbol)
             fund_text = format_fundamentals_for_llm(symbol, fund, insider, filing_sum)
-            headlines = self.get_headlines(symbol)
+            headlines = self.get_fresh_headlines(symbol)
             candidates.append({
                 'symbol': symbol,
                 'pred_return': preds.get(symbol),
