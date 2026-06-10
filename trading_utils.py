@@ -148,7 +148,8 @@ def predict_symbol(api, symbol, model, config, scaler_X, feature_cols,
 _TRADE_MEMORY_FILE = Path(__file__).resolve().parent / "trade_memory.json"
 
 
-def compute_kelly_fraction(min_trades: int = 50) -> float | None:
+def compute_kelly_fraction(min_trades: int = 50,
+                           asset_type: str | None = None) -> float | None:
     """Compute half-Kelly fraction from trade history.
 
     Uses trade_memory.json to calculate:
@@ -157,6 +158,10 @@ def compute_kelly_fraction(min_trades: int = 50) -> float | None:
 
     Args:
         min_trades: Minimum trades required before Kelly activates
+        asset_type: 'crypto'/'stock' restricts the sample to that book —
+            the two books have different edge distributions (fee scale,
+            horizon, vol), so a hot stock fortnight must not ramp crypto
+            sizing (or vice versa). None pools everything.
 
     Returns:
         Half-Kelly fraction (0.0 to 1.0), or None if insufficient history.
@@ -169,17 +174,26 @@ def compute_kelly_fraction(min_trades: int = 50) -> float | None:
     except (OSError, json.JSONDecodeError):
         return None
 
-    # Flatten all trades across symbols. Exclude 'estimated' records —
-    # unconfirmed exits journaled at pre-slippage quote midpoints (worst on
-    # exactly the stop-outs) inflate avg_win/avg_loss and thus Kelly.
+    # Flatten trades across symbols (optionally one book). Exclude
+    # 'estimated' records — unconfirmed exits journaled at pre-slippage
+    # quote midpoints (worst on exactly the stop-outs) inflate
+    # avg_win/avg_loss and thus Kelly.
     all_trades = []
-    for trades in data.values():
+    for symbol, trades in data.items():
+        is_crypto = '/' in symbol
+        if asset_type == 'crypto' and not is_crypto:
+            continue
+        if asset_type == 'stock' and is_crypto:
+            continue
         all_trades.extend(t for t in trades if not t.get('estimated'))
 
     if len(all_trades) < min_trades:
         return None
 
-    # Use last 200 trades for recency
+    # Recency means TIME: the flat list is grouped by symbol, so slicing
+    # without this sort kept "all trades of whichever symbols happened to
+    # iterate last" instead of the newest 200
+    all_trades.sort(key=lambda t: t.get('ts', ''))
     recent = all_trades[-200:]
     wins = [t for t in recent if t.get('pnl_pct', 0) > 0]
     losses = [t for t in recent if t.get('pnl_pct', 0) < 0]

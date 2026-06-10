@@ -1127,7 +1127,7 @@ class BaseTradingLoop(ABC):
 
         # --- 2. Fractional Kelly from confirmed history (bounded) ---
         kelly_mult = 1.0
-        kelly_f = compute_kelly_fraction()
+        kelly_f = compute_kelly_fraction(asset_type=self.get_asset_type())
         if kelly_f is not None:
             kelly_f = min(kelly_f, KELLY_CAP)
             # 0.125 (mid of the [0.05, 0.25] clamp) maps to 1.0x

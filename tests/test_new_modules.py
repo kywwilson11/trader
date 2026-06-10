@@ -329,3 +329,48 @@ class TestCircuitBreakerErrorHandling:
         tripped, dd = check_circuit_breaker(FakeAPI())
         assert not tripped
         assert dd is None
+
+
+class TestKellyScoping:
+    """Per-book Kelly + time-ordered recency (the dict-order slice bug)."""
+
+    def _mk_memory(self, tmp_path, monkeypatch, data):
+        import json
+        import trading_utils
+        f = tmp_path / 'trade_memory.json'
+        f.write_text(json.dumps(data))
+        monkeypatch.setattr(trading_utils, '_TRADE_MEMORY_FILE', f)
+
+    @staticmethod
+    def _trades(n, pnl, day0=1):
+        return [{'ts': f'2026-05-{day0 + i // 24:02d}T{i % 24:02d}:00:00',
+                 'action': 'sell', 'pnl_pct': pnl, 'estimated': False}
+                for i in range(n)]
+
+    def test_asset_type_scopes_the_sample(self, tmp_path, monkeypatch):
+        from trading_utils import compute_kelly_fraction
+        # Crypto: strong winners; stocks: heavy losers
+        self._mk_memory(tmp_path, monkeypatch, {
+            'BTC/USD': self._trades(30, 2.0) + self._trades(30, -0.5, day0=3),
+            'NVDA': self._trades(60, -2.0, day0=6),
+        })
+        k_crypto = compute_kelly_fraction(asset_type='crypto')
+        k_stock = compute_kelly_fraction(asset_type='stock')
+        assert k_crypto is not None and k_crypto > 0.05
+        # All-loser stock book: no wins -> None (Kelly stays inactive)
+        assert k_stock is None
+
+    def test_recency_is_time_ordered_not_dict_ordered(self, tmp_path, monkeypatch):
+        from trading_utils import compute_kelly_fraction
+        # Newest window: 190 winners + 10 small losers. Oldest block:
+        # 200 heavy losers. Dict order puts the winners FIRST in the
+        # flat list, so a naive [-200:] slice saw only old losers
+        # (here: all-loss -> None). Time-sorted recency sees the
+        # winner-dominated newest 200.
+        self._mk_memory(tmp_path, monkeypatch, {
+            'ETH/USD': self._trades(190, 3.0, day0=20),       # newest
+            'BTC/USD': (self._trades(200, -3.0, day0=1)       # oldest
+                        + self._trades(10, -1.0, day0=29)),   # newest tail
+        })
+        k = compute_kelly_fraction(asset_type='crypto')
+        assert k is not None and k > 0.10
