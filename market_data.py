@@ -5,6 +5,7 @@ plus a live ATR helper used by the trading loops for adaptive stop-losses.
 """
 
 import calendar
+import threading
 import time
 
 import pandas as pd
@@ -14,6 +15,61 @@ import pandas as pd
 import yfinance as yf
 
 from indicators import compute_atr
+
+
+# --- LIVE BAR CACHE ---
+# One trading cycle re-uses the same bars for prediction, sizing (GARCH),
+# ATR, and post-fill bookkeeping. A short TTL cache collapses those 3-4
+# REST calls per symbol per cycle into one.
+
+BAR_CACHE_TTL = 20.0  # seconds — shorter than the 30s loop interval
+_bar_cache: dict[tuple, tuple[float, pd.DataFrame]] = {}
+_bar_cache_lock = threading.Lock()
+
+
+def _bar_cache_get(key):
+    with _bar_cache_lock:
+        hit = _bar_cache.get(key)
+    if hit is not None and (time.monotonic() - hit[0]) < BAR_CACHE_TTL:
+        # Copy so callers adding indicator columns don't pollute the cache
+        return hit[1].copy()
+    return None
+
+
+def _bar_cache_put(key, df):
+    with _bar_cache_lock:
+        _bar_cache[key] = (time.monotonic(), df)
+        if len(_bar_cache) > 256:  # bound the cache
+            cutoff = time.monotonic() - BAR_CACHE_TTL
+            for k in [k for k, v in _bar_cache.items() if v[0] < cutoff]:
+                del _bar_cache[k]
+
+
+def _filter_bad_prints(df):
+    """Drop bars whose Close is wildly off its local neighborhood.
+
+    Brownlees-Gallo (2006)-style cleaning: flag a bar when its close is
+    more than 6 robust sigmas (MAD-scaled) away from the rolling 11-bar
+    median, with a 1% absolute floor so quiet series don't over-flag.
+    One bad print otherwise inflates ATR for days (wrong stop distances)
+    and can fire stops/features off a price that never traded in size.
+    Real crashes survive: a -15% hourly move shifts the rolling median
+    with it across consecutive bars; an isolated wick does not.
+    """
+    if df is None or len(df) < 15:
+        return df
+    close = df['Close']
+    med = close.rolling(11, center=True, min_periods=5).median()
+    mad = (close - med).abs().rolling(11, center=True, min_periods=5).median()
+    sigma = 1.4826 * mad
+    floor = med * 0.01
+    dev = (close - med).abs()
+    bad = dev > (6 * sigma).clip(lower=floor)
+    n_bad = int(bad.sum())
+    if n_bad:
+        print(f"  [BARS] Dropped {n_bad} outlier bar(s) (bad prints)")
+        return df[~bad]
+    return df
 
 
 # --- YFINANCE HELPERS ---
@@ -81,9 +137,16 @@ def fetch_bars_alpaca(api, symbol, limit=120):
         DataFrame with OHLCV columns and DatetimeIndex, or None on error.
     """
     from datetime import datetime, timedelta, timezone
+    cache_key = ('crypto', symbol, limit)
+    cached = _bar_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
-        start = datetime.now(timezone.utc) - timedelta(days=6)
-        bars = api.get_crypto_bars(symbol, '1Hour', start=start.isoformat(), limit=limit)
+        # Fetch a wider window than `limit` and keep the NEWEST bars.
+        # Alpaca returns bars ascending from `start`, so passing limit= to the
+        # API would truncate to the OLDEST bars and serve ~24h-stale data.
+        start = datetime.now(timezone.utc) - timedelta(hours=limit + 24)
+        bars = api.get_crypto_bars(symbol, '1Hour', start=start.isoformat())
         rows = []
         timestamps = []
         for bar in bars:
@@ -100,7 +163,11 @@ def fetch_bars_alpaca(api, symbol, limit=120):
         df = pd.DataFrame(rows)
         df.index = pd.DatetimeIndex(timestamps)
         df.index.name = 'Datetime'
-        return df
+        df = df.sort_index()
+        df = df[~df.index.duplicated(keep='last')]
+        df = _filter_bad_prints(df).tail(limit)
+        _bar_cache_put(cache_key, df)
+        return df.copy()
     except Exception as e:
         print(f"  [ALPACA BARS] Error fetching {symbol}: {e}")
         return None
@@ -133,10 +200,16 @@ def fetch_stock_bars_alpaca(api, symbol, limit=200):
         DataFrame with OHLCV columns and DatetimeIndex, or None on error.
     """
     from datetime import datetime, timedelta, timezone
+    cache_key = ('stock', symbol, limit)
+    cached = _bar_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         # 30 days gives ~150 market-hours bars — enough for SMA_100, Hurst, etc.
+        # Do NOT pass limit= to the API: bars come back ascending, so the API
+        # would truncate to the OLDEST bars and serve days-stale data.
         start = datetime.now(timezone.utc) - timedelta(days=30)
-        bars = api.get_bars(symbol, '1Hour', start=start.isoformat(), limit=limit)
+        bars = api.get_bars(symbol, '1Hour', start=start.isoformat())
         rows = []
         timestamps = []
         for bar in bars:
@@ -153,7 +226,11 @@ def fetch_stock_bars_alpaca(api, symbol, limit=200):
         df = pd.DataFrame(rows)
         df.index = pd.DatetimeIndex(timestamps)
         df.index.name = 'Datetime'
-        return df
+        df = df.sort_index()
+        df = df[~df.index.duplicated(keep='last')]
+        df = _filter_bad_prints(df).tail(limit)
+        _bar_cache_put(cache_key, df)
+        return df.copy()
     except Exception as e:
         print(f"  [ALPACA BARS] Error fetching {symbol}: {e}")
         return None
@@ -177,8 +254,12 @@ def _fetch_chunk(api, symbol, start_iso, end_iso, asset_type, max_retries=4):
                 bars = api.get_crypto_bars(
                     symbol, '1Hour', start=start_iso, end=end_iso)
             else:
+                # adjustment='all': Alpaca's default is RAW bars — an
+                # unadjusted 10:1 split would inject a fake -90% move into
+                # the training labels.
                 bars = api.get_bars(
-                    symbol, '1Hour', start=start_iso, end=end_iso)
+                    symbol, '1Hour', start=start_iso, end=end_iso,
+                    adjustment='all')
 
             rows = []
             for bar in bars:
@@ -311,10 +392,12 @@ def get_live_atr(api, symbol, asset_type='crypto', length=14):
         float ATR value, or None on error.
     """
     try:
+        # Use the default fetch limit so this hits the bar cache populated by
+        # the prediction pass instead of issuing a second REST call.
         if asset_type == 'crypto':
-            df = fetch_bars_alpaca(api, symbol, limit=max(60, length * 3))
+            df = fetch_bars_alpaca(api, symbol)
         else:
-            df = fetch_stock_bars_alpaca(api, symbol, limit=max(60, length * 3))
+            df = fetch_stock_bars_alpaca(api, symbol)
 
         if df is None or len(df) < length + 1:
             return None

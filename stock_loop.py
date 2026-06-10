@@ -20,7 +20,8 @@ from pathlib import Path
 from base_loop import BaseTradingLoop
 from order_utils import (
     get_stock_quote, place_stock_limit_order, manage_order_lifecycle,
-    get_all_positions, compute_limit_price,
+    get_all_positions, compute_limit_price, cancel_orders_for_symbol,
+    make_client_order_id,
 )
 from market_data import fetch_spy_bars_alpaca, get_live_atr
 from sentiment import sentiment_gate, get_market_sentiment, get_recent_headlines
@@ -51,31 +52,57 @@ class StockLoop(BaseTradingLoop):
     MAX_EXPOSURE = 50000
     ORDER_TIMEOUT = 30
     LOOP_INTERVAL = 30
-    COOLDOWN_MINUTES = 20
     MAX_PREDICTION_WORKERS = 5
     LLM_INTERVAL_SEC = 600
     CIRCUIT_BREAKER_PCT = 0.05
     MODEL_PREFIX = 'stock'
 
-    # ATR stops (stock-specific: tighter than crypto)
-    ATR_STOP_MULTIPLIER = 2.0
-    ATR_TRAIL_MULTIPLIER = 2.0
-    ATR_TRAIL_ACTIVATE_PCT = 0.01
-    ATR_STOP_FLOOR_PCT = 0.05
-    ATR_STOP_CEIL_PCT = 0.10
-    TAKE_PROFIT_RR = 3.0
-    TAKE_PROFIT_CEIL_PCT = 0.25
-    STOP_LOSS_PCT = 0.05
-    TRAIL_PCT = 0.04
+    # ATR stops — values come from strategy_config so the backtester
+    # validates the SAME policy the bot trades
+    from strategy_config import STOCK_POLICY as _P
+    ATR_STOP_MULTIPLIER = _P['atr_stop_mult']
+    ATR_TRAIL_MULTIPLIER = _P['atr_trail_mult']
+    ATR_TRAIL_ACTIVATE_PCT = _P['trail_activate_pct']
+    ATR_STOP_FLOOR_PCT = _P['stop_floor_pct']
+    ATR_STOP_CEIL_PCT = _P['stop_ceil_pct']
+    TAKE_PROFIT_RR = _P['tp_rr']
+    TAKE_PROFIT_CEIL_PCT = _P['tp_ceil_pct']
+    STOP_LOSS_PCT = _P['stop_fallback_pct']
+    TRAIL_PCT = _P['trail_fallback_pct']
+    COOLDOWN_MINUTES = _P['cooldown_min']
+    HARD_STOP_LOCKOUT_HOURS = _P['lockout_hours']
+    del _P
 
     def __init__(self):
         super().__init__()
         self.flattened_today = False
         self.last_date = None
         self.top_symbols: list[str] = []
+        self._clock_cache: tuple[float, object] = (0.0, None)
+        self._last_preds: dict[str, float] = {}
 
     def get_symbol_universe(self) -> list[str]:
         return [s for s in load_stock_universe() if '/' not in s]
+
+    def _get_clock(self):
+        """Alpaca market clock, cached ~60s.
+
+        The clock knows about holidays AND early closes (1:00 PM on
+        Nov 27 / Dec 24 etc.) — wall-clock 9:30-16:00 logic does not,
+        which previously left positions held overnight on exactly the
+        days with the worst gap risk.
+        """
+        now = time.monotonic()
+        ts, clock = self._clock_cache
+        if clock is not None and (now - ts) < 60:
+            return clock
+        try:
+            clock = self.api.get_clock()
+            self._clock_cache = (now, clock)
+            return clock
+        except Exception as e:
+            logger.warning("[CLOCK] get_clock failed (%s) — falling back to wall clock", e)
+            return None
 
     def check_market_hours(self) -> bool:
         now = self._get_eastern_now()
@@ -84,6 +111,11 @@ class StockLoop(BaseTradingLoop):
             self.flattened_today = False
             self.last_date = now.date()
 
+        clock = self._get_clock()
+        if clock is not None:
+            return bool(clock.is_open)
+
+        # Fallback: wall-clock schedule (no holiday/half-day awareness)
         if now.weekday() >= 5:
             return False
         market_open = now.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0)
@@ -116,15 +148,18 @@ class StockLoop(BaseTradingLoop):
             logger.error("[ORDER] %s: bracket order error: %s", symbol, e)
             return None
 
-    def place_sell_order(self, symbol, qty, quote) -> bool:
+    def place_sell_order(self, symbol, qty, quote):
+        """Sell and confirm. Returns the FILLED order object, or None."""
         if quote is not None:
             order = place_stock_limit_order(self.api, symbol, 'sell', int(qty), quote,
                                             time_in_force='day')
             if order:
                 result = manage_order_lifecycle(self.api, order.id, timeout=self.ORDER_TIMEOUT,
-                                                fallback_to_market=True)
-                return result and getattr(result, 'status', None) == 'filled'
-        return False
+                                                fallback_to_market=True,
+                                                time_in_force='day')
+                if result is not None and getattr(result, 'status', None) == 'filled':
+                    return result
+        return None
 
     def get_benchmark_close(self):
         try:
@@ -138,47 +173,226 @@ class StockLoop(BaseTradingLoop):
     def get_headlines(self, symbol: str) -> list[str]:
         return get_recent_headlines(symbol, 'stock')
 
-    def flatten_before_close(self):
-        """Flatten all stock positions at 3:50 PM ET."""
-        if self.flattened_today:
-            return
-
+    def _in_flatten_window(self) -> bool:
+        """True within the last 10 minutes before today's ACTUAL close."""
+        clock = self._get_clock()
+        if clock is not None:
+            try:
+                next_close = clock.next_close
+                if hasattr(next_close, 'to_pydatetime'):
+                    next_close = next_close.to_pydatetime()
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                close_utc = next_close.astimezone(datetime.timezone.utc)
+                # Only meaningful when the close is TODAY's session close
+                if bool(clock.is_open):
+                    return (close_utc - now_utc) <= datetime.timedelta(minutes=10)
+                return False
+            except Exception as e:
+                logger.warning("[FLATTEN] clock parse failed (%s) — wall-clock fallback", e)
         now = self._get_eastern_now()
         flatten_time = now.replace(hour=FLATTEN_HOUR, minute=FLATTEN_MINUTE, second=0)
         market_close = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0)
+        return flatten_time <= now < market_close
 
-        if not (flatten_time <= now < market_close):
+    def _in_entry_window(self) -> bool:
+        """True when new entries are allowed (open/close windows, ET).
+
+        Gao-Han-Li-Zhou (2018): intraday equity predictability concentrates
+        in the first and last half-hours; midday is mostly noise that pays
+        spread. Exits/stops run all day — only ENTRIES are windowed.
+        """
+        from strategy_config import STOCK_ENTRY_WINDOWS_ET, ENTRY_WINDOWS_ENABLED
+        if not ENTRY_WINDOWS_ENABLED:
+            return True
+        now = self._get_eastern_now()
+        minutes = now.hour * 60 + now.minute
+        for start_s, end_s in STOCK_ENTRY_WINDOWS_ET:
+            sh, sm = map(int, start_s.split(':'))
+            eh, em = map(int, end_s.split(':'))
+            if sh * 60 + sm <= minutes < eh * 60 + em:
+                return True
+        return False
+
+    def _select_overnight_keepers(self) -> set[str]:
+        """Pick the capped overnight sleeve (Lou-Polk-Skouras 2019).
+
+        Essentially all of the equity premium accrues overnight; flattening
+        100% of the book every day pays the spread twice AND forfeits that
+        premium. Keep up to OVERNIGHT_SLEEVE_MAX_POSITIONS positions that
+        (a) the model still predicts up, (b) fit under the per-name equity
+        cap, and (c) are not leveraged ETFs (daily-reset decay products).
+        GTC stops replace the day-TIF legs before the close
+        (_prepare_overnight_keepers).
+        """
+        from strategy_config import (OVERNIGHT_SLEEVE_ENABLED,
+                                     OVERNIGHT_SLEEVE_MAX_POSITIONS,
+                                     OVERNIGHT_SLEEVE_MAX_PCT_EQUITY,
+                                     OVERNIGHT_SLEEVE_MIN_PRED)
+        if not OVERNIGHT_SLEEVE_ENABLED or not self.positions:
+            return set()
+
+        # EARNINGS FAIL-CLOSED: GTC stops cannot protect against gaps (they
+        # fill at the open, wherever that lands). If the earnings calendar
+        # is unavailable we cannot prove a keeper is safe — keep nothing.
+        from events_calendar import calendar_available, blocks_overnight_hold
+        if not calendar_available():
+            logger.warning("[SLEEVE] earnings calendar unavailable — "
+                           "fail closed, no overnight keepers tonight")
+            return set()
+
+        candidates = []
+        for sym, info in self.positions.items():
+            if self._leveraged_etfs.get(sym, 1) > 1:
+                continue
+            if blocks_overnight_hold(sym):
+                logger.info("[SLEEVE] %s excluded — earnings print ahead", sym)
+                continue
+            pred = self._last_preds.get(sym)
+            if pred is None or pred < OVERNIGHT_SLEEVE_MIN_PRED:
+                continue
+            value = info.qty * info.entry_price
+            if value > OVERNIGHT_SLEEVE_MAX_PCT_EQUITY * max(self._equity, 1):
+                continue
+            candidates.append((pred, sym))
+        candidates.sort(reverse=True)
+        return {sym for _, sym in candidates[:OVERNIGHT_SLEEVE_MAX_POSITIONS]}
+
+    def flatten_before_close(self):
+        """Flatten stock positions ~10 min before the actual market close.
+
+        Every stock buy is a bracket order, so the shares are RESERVED by
+        the live stop/TP leg — selling without canceling those legs first
+        rejects with 'insufficient qty'. Cancel-and-confirm per symbol,
+        then sell with fill confirmation. flattened_today is only set once
+        the book is actually empty, so failures retry next cycle.
+        """
+        if self.flattened_today:
+            return
+        if not self._in_flatten_window():
             return
 
-        logger.info("[FLATTEN] Selling all stock positions before market close...")
-        for symbol in list(self.positions):
+        keepers = self._select_overnight_keepers()
+        if keepers:
+            logger.info("[FLATTEN] Overnight sleeve keeps: %s", ', '.join(sorted(keepers)))
+            self._prepare_overnight_keepers(keepers)
+
+        # Include ORPHANS: broker positions in our universe that tracking
+        # lost (e.g. after a desync) must not ride overnight either.
+        universe = set(self.get_symbol_universe())
+        targets = dict(self.positions)
+        broker_positions = get_all_positions(self.api)
+        if broker_positions:
+            for sym, pos in broker_positions.items():
+                if sym in universe and sym not in targets and '/' not in sym:
+                    logger.warning("[FLATTEN] Orphan broker position %s (%s shares) — flattening too",
+                                   sym, pos.qty)
+                    targets[sym] = None  # not tracked; sell whatever broker reports
+
+        failures = []
+        for symbol in targets:
+            if symbol in keepers:
+                continue
             try:
-                pos = self.api.get_position(symbol)
-                qty = int(float(pos.qty))
+                try:
+                    pos = self.api.get_position(symbol)
+                    qty = int(float(pos.qty))
+                except Exception:
+                    self.positions.pop(symbol, None)
+                    continue
                 if qty <= 0:
-                    del self.positions[symbol]
+                    self.positions.pop(symbol, None)
                     continue
 
+                # Free the shares: bracket/trailing legs hold them. Alpaca
+                # cancellation is async — wait until confirmed before selling.
+                if not cancel_orders_for_symbol(self.api, symbol, timeout=8):
+                    logger.error("[FLATTEN] %s: legs still pending cancel — will retry", symbol)
+                    failures.append(symbol)
+                    continue
+                tracked = self.positions.get(symbol)
+                if tracked is not None:
+                    tracked.stop_order_id = None
+
                 quote = get_stock_quote(self.api, symbol)
+                order = None
                 if quote is not None:
                     order = place_stock_limit_order(self.api, symbol, 'sell', qty, quote,
                                                     time_in_force='day', offset_bps=10)
-                    if order:
-                        result = manage_order_lifecycle(self.api, order.id, timeout=self.ORDER_TIMEOUT,
-                                                       fallback_to_market=True)
-                        if result:
-                            del self.positions[symbol]
-                            logger.info("[FLATTEN] %s: Sold %d shares", symbol, qty)
+                if order is None:
+                    order = self.api.submit_order(
+                        symbol=symbol, qty=qty, side='sell',
+                        type='market', time_in_force='day',
+                        client_order_id=make_client_order_id('flatten'))
+                result = manage_order_lifecycle(self.api, order.id, timeout=self.ORDER_TIMEOUT,
+                                                fallback_to_market=True,
+                                                time_in_force='day')
+                if result is not None and getattr(result, 'status', None) == 'filled':
+                    if tracked is not None:
+                        llm_info = self.llm_scores.get(symbol, {})
+                        self._record_confirmed_exit(symbol, tracked, result, quote,
+                                                    exit_reason='eod_flatten',
+                                                    llm_score=llm_info.get('s'),
+                                                    reasoning=llm_info.get('r', ''))
+                    self.positions.pop(symbol, None)
+                    logger.info("[FLATTEN] %s: Sold %d shares", symbol, qty)
                 else:
-                    self.api.submit_order(symbol=symbol, qty=qty, side='sell',
-                                         type='market', time_in_force='day')
-                    del self.positions[symbol]
+                    logger.error("[FLATTEN] %s: sell unconfirmed (status=%s) — will retry",
+                                 symbol, getattr(result, 'status', None))
+                    failures.append(symbol)
             except Exception as e:
                 logger.error("[FLATTEN] %s: Error: %s", symbol, e)
+                failures.append(symbol)
             time.sleep(0.5)
 
+        remaining = [s for s in self.positions if s not in keepers]
+        if failures or remaining:
+            stuck = sorted(set(failures) | set(remaining))
+            logger.error("[FLATTEN] Incomplete (%d unconfirmed) — retrying next cycle, NOT marking done",
+                         len(stuck))
+            try:
+                from notify import notify
+                notify(f"EOD FLATTEN INCOMPLETE: {', '.join(stuck)} still open "
+                       f"near the close — positions may ride overnight",
+                       level='critical', dedupe_key='flatten-incomplete')
+            except Exception:
+                pass
+            return
         self.flattened_today = True
-        logger.info("[FLATTEN] Done. No more trades today.")
+        logger.info("[FLATTEN] Done. No more entries today.")
+
+    def _prepare_overnight_keepers(self, keepers: set[str]):
+        """Replace day-TIF protective legs with GTC stops for kept names.
+
+        Day-TIF bracket legs expire at the close, which would leave sleeve
+        positions unprotected overnight. (Implementation used by the
+        overnight sleeve, Phase 3c.)
+        """
+        for symbol in keepers:
+            info = self.positions.get(symbol)
+            if info is None:
+                continue
+            try:
+                if not cancel_orders_for_symbol(self.api, symbol, timeout=8):
+                    logger.error("[SLEEVE] %s: could not clear day legs", symbol)
+                    continue
+                entry_atr = info.entry_atr
+                if entry_atr is not None and info.entry_price > 0:
+                    raw = (entry_atr * self.ATR_STOP_MULTIPLIER) / info.entry_price
+                    stop_dist = max(self.ATR_STOP_FLOOR_PCT, min(self.ATR_STOP_CEIL_PCT, raw))
+                else:
+                    stop_dist = self.STOP_LOSS_PCT
+                stop_price = round(info.entry_price * (1 - stop_dist), 2)
+                stop_order = self.api.submit_order(
+                    symbol=symbol, qty=int(info.qty), side='sell',
+                    type='stop', stop_price=stop_price,
+                    time_in_force='gtc',
+                    client_order_id=make_client_order_id('onstop'))
+                info.stop_order_id = stop_order.id
+                info.trailing_activated = False
+                logger.info("[SLEEVE] %s: GTC stop @ $%.2f for overnight hold", symbol, stop_price)
+            except Exception as e:
+                logger.error("[SLEEVE] %s: GTC stop placement failed: %s — flattening instead", symbol, e)
+                keepers.discard(symbol)
 
     def write_prediction_cache(self, preds, **kwargs):
         top_symbols = kwargs.get('top_symbols', self.top_symbols)
@@ -223,6 +437,7 @@ class StockLoop(BaseTradingLoop):
     def _get_predictions(self, benchmark_close):
         """Override to add top-N ranking."""
         preds, snapshots = super()._get_predictions(benchmark_close)
+        self._last_preds = dict(preds)  # sleeve selection reads these
 
         # Dynamic top N selection
         ranked = sorted(preds.items(), key=lambda x: x[1], reverse=True)
@@ -254,6 +469,16 @@ class StockLoop(BaseTradingLoop):
             except Exception as e:
                 err_str = str(e).lower()
                 if 'not found' in err_str or '404' in err_str or 'no position' in err_str:
+                    # Position closed at the broker outside our tracking
+                    # (e.g. TP leg filled between cycles) — journal it so
+                    # the Kelly sample isn't censored of these exits
+                    info = self.positions[symbol]
+                    quote = self.get_quote(symbol)
+                    px = quote['midpoint'] if quote else info.entry_price
+                    pnl = ((px - info.entry_price) / info.entry_price * 100
+                           if info.entry_price > 0 else 0.0)
+                    record_trade(symbol, 'sell', info.entry_price, px, pnl,
+                                 exit_reason='external_close', estimated=True)
                     del self.positions[symbol]
                 continue
 
@@ -277,14 +502,21 @@ class StockLoop(BaseTradingLoop):
                 continue
 
             info = self.positions[symbol]
-            if info.stop_order_id:
-                try:
-                    self.api.cancel_order(info.stop_order_id)
-                except Exception:
-                    pass
+            # Bracket/trailing legs reserve the shares; wait until the
+            # cancel is CONFIRMED or the sell will reject.
+            if not cancel_orders_for_symbol(self.api, symbol, timeout=8):
+                logger.warning("%s: legs still pending cancel — retrying next cycle", symbol)
+                continue
+            info.stop_order_id = None
 
             quote = self.get_quote(symbol)
-            if self.place_sell_order(symbol, qty, quote):
+            order = self.place_sell_order(symbol, qty, quote)
+            if order:
+                llm_info = self.llm_scores.get(symbol, {})
+                self._record_confirmed_exit(symbol, info, order, quote,
+                                            exit_reason='signal_sell',
+                                            llm_score=llm_info.get('s'),
+                                            reasoning=llm_info.get('r', ''))
                 del self.positions[symbol]
                 self.last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(0.5)
@@ -299,6 +531,15 @@ class StockLoop(BaseTradingLoop):
 
         if self.flattened_today:
             return
+
+        # Entry windows: predictability lives in the open/close half-hours
+        if not self._in_entry_window():
+            return
+
+        # Faber 200-day trend filter: below trend, only safe havens
+        from macro_indicators import get_spy_trend_ok
+        from stock_config import SAFE_HAVEN_SYMBOLS
+        trend_ok = get_spy_trend_ok(self.api)
 
         current_exposure = self._get_current_exposure()
         if current_exposure is None:
@@ -319,6 +560,19 @@ class StockLoop(BaseTradingLoop):
             if self._is_hard_stop_locked(symbol):
                 continue
 
+            if not self._trade_budget_ok(symbol):
+                continue
+
+            # No new entries within a day of a known earnings print
+            # (fail OPEN on calendar outage — the sleeve is fail-closed)
+            try:
+                from events_calendar import earnings_within_days
+                if earnings_within_days(symbol, days=1):
+                    logger.info("%s: blocked — earnings within 1 day", symbol)
+                    continue
+            except Exception:
+                pass
+
             pred = preds.get(symbol)
             if pred is None or pred < self.trade_threshold:
                 continue
@@ -327,7 +581,7 @@ class StockLoop(BaseTradingLoop):
             if quote is None:
                 continue
 
-            if not should_trade(pred, quote['spread_pct']):
+            if not should_trade(pred, quote['spread_pct'], asset_type='stock'):
                 continue
 
             # Winner's curse filter
@@ -355,34 +609,39 @@ class StockLoop(BaseTradingLoop):
 
             # VIX > 25: block risky entries, allow safe-havens
             if self.macro_regime and self.macro_regime.should_block_risky_entries:
-                from stock_config import SAFE_HAVEN_SYMBOLS
                 if symbol not in SAFE_HAVEN_SYMBOLS:
                     logger.info("%s: Blocked — VIX > 25 defensive (non-safe-haven)", symbol)
                     continue
 
-            # Compute position size
-            sized_notional = self._compute_position_size(symbol, pred, quote)
+            # SPY below its 200d SMA: block non-safe-haven entries (Faber)
+            if trend_ok is False and symbol not in SAFE_HAVEN_SYMBOLS:
+                logger.info("%s: Blocked — SPY below 200d SMA (trend filter)", symbol)
+                continue
 
-            # Sentiment gate
+            # Sentiment gate (veto first; multiplier folds into sizing tilt)
             gate, gate_reasons = sentiment_gate(symbol, 'stock')
             if gate <= 0:
                 log_decision({"symbol": symbol, "action": "skip", "skip_reason": "sentiment_block",
                               "pred_return": pred,
                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons})
                 continue
-            sized_notional = int(sized_notional * gate)
 
-            # LLM gate
+            # LLM gate (veto first; multiplier folds into sizing tilt)
             llm_info = self.llm_scores.get(symbol, {})
             llm_s = llm_info.get('s', 0.5)
             llm_reason = llm_info.get('r', '')
             if llm_s < LLM_VETO_THRESHOLD:
                 log_decision({"symbol": symbol, "action": "skip", "skip_reason": "llm_veto",
                               "pred_return": pred,
-                              "llm_multiplier": llm_s, "llm_reasoning": llm_reason})
+                              "llm_score": llm_s, "llm_reasoning": llm_reason})
                 continue
             llm_mult = 0.5 + llm_s
-            sized_notional = int(sized_notional * llm_mult)
+
+            # Single risk-based sizing call (all bounds enforced inside)
+            sized_notional = self._compute_position_size(
+                symbol, pred, quote, sentiment_mult=gate, llm_mult=llm_mult)
+            if sized_notional <= 0:
+                continue
 
             # Calculate qty (whole shares)
             price = quote['midpoint']
@@ -444,18 +703,27 @@ class StockLoop(BaseTradingLoop):
                         entry_atr=entry_atr,
                         take_profit_price=tp_price,
                     )
+                    decision_price = quote['midpoint']
+                    slippage_bps = ((fill_price - decision_price) / decision_price * 1e4
+                                    if decision_price > 0 else None)
                     log_decision({"symbol": symbol, "action": "buy",
                                   "pred_return": pred,
                                   "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
                                   "llm_multiplier": llm_mult, "llm_score": llm_s,
                                   "llm_reasoning": llm_reason,
                                   "final_notional": sized_notional,
+                                  "decision_price": decision_price,
+                                  "fill_price": fill_price,
+                                  "slippage_bps": round(slippage_bps, 2) if slippage_bps is not None else None,
                                   "skip_reason": None})
                     self.last_trade_time[symbol] = datetime.datetime.now()
-                    current_exposure += qty * fill_price
+                    self._count_trade(symbol)
+                    estimated_exposure = current_exposure + qty * fill_price
 
-                    # After fill confirmation
-                    current_exposure = self._get_current_exposure()
+                    # After fill confirmation (None on API error — fall back
+                    # to the local estimate instead of `None > int` crashing)
+                    refreshed = self._get_current_exposure()
+                    current_exposure = refreshed if refreshed is not None else estimated_exposure
                     if current_exposure > self.MAX_EXPOSURE:
                         logger.warning("[EXPOSURE] Exceeded cap after fill: $%.0f > $%.0f",
                                        current_exposure, self.MAX_EXPOSURE)
@@ -472,8 +740,18 @@ class StockLoop(BaseTradingLoop):
                     if stop_order.status == 'filled':
                         logger.info("[STOP-FILL] %s: Stop filled at $%s",
                                     symbol, stop_order.filled_avg_price)
+                        # Server-side exits were previously never journaled,
+                        # censoring exactly the losing trades out of the
+                        # Kelly sizing sample.
+                        llm_info = self.llm_scores.get(symbol, {})
+                        self._record_confirmed_exit(symbol, info, stop_order, None,
+                                                    exit_reason='server_stop',
+                                                    llm_score=llm_info.get('s'),
+                                                    reasoning=llm_info.get('r', ''))
                         del self.positions[symbol]
                         self.last_trade_time[symbol] = datetime.datetime.now()
+                        self.hard_stop_lockout[symbol] = datetime.datetime.now()
+                        self._save_hard_stop_lockout()
                         continue
                     elif stop_order.status in ('canceled', 'expired', 'rejected'):
                         info.stop_order_id = None
@@ -499,13 +777,18 @@ class StockLoop(BaseTradingLoop):
                     and current_price >= entry_price * (1 + self.ATR_TRAIL_ACTIVATE_PCT)
                     and info.stop_order_id):
                 try:
-                    self.api.cancel_order(info.stop_order_id)
-                    time.sleep(0.5)
+                    # Canceling one bracket leg cancels the whole OCO group;
+                    # wait for confirmation or the trailing submit rejects
+                    # with shares-held.
+                    if not cancel_orders_for_symbol(self.api, symbol, timeout=8):
+                        logger.warning("[TRAIL] %s: legs pending cancel — retry next cycle", symbol)
+                        continue
                     trail_order = self.api.submit_order(
                         symbol=symbol, qty=int(info.qty), side='sell',
                         type='trailing_stop',
                         trail_percent=round(trail_pct * 100, 1),
                         time_in_force='day',
+                        client_order_id=make_client_order_id('trail'),
                     )
                     info.stop_order_id = trail_order.id
                     info.trailing_activated = True
@@ -517,6 +800,52 @@ class StockLoop(BaseTradingLoop):
 
         # Also run base class stop management for software stops
         super()._manage_stops()
+
+    def _extra_tilt(self, symbol: str) -> float:
+        """Post-print vol haircut: ATR(14)/GARCH lag the 3-5x realized-vol
+        expansion after an earnings report by ~1 day — halve the first
+        post-print day's size instead of trading it at stale risk numbers."""
+        try:
+            from events_calendar import reported_recently
+            if reported_recently(symbol):
+                return 0.5
+        except Exception:
+            pass
+        return 1.0
+
+    def _replace_protective_stops(self):
+        """Re-place a server-side stop for every reconstructed stock position.
+
+        Startup cancels this bot's working orders (incl. bracket legs);
+        without re-placement, positions would depend on 30s software
+        polling — i.e. on this process staying alive — for protection.
+        """
+        for symbol, info in self.positions.items():
+            try:
+                entry_atr = info.entry_atr
+                if entry_atr is not None and info.entry_price > 0:
+                    raw = (entry_atr * self.ATR_STOP_MULTIPLIER) / info.entry_price
+                    stop_dist = max(self.ATR_STOP_FLOOR_PCT, min(self.ATR_STOP_CEIL_PCT, raw))
+                else:
+                    stop_dist = self.STOP_LOSS_PCT
+                # Anchor to the HWM so a restart doesn't widen an
+                # already-tightened trail back to entry-based distance
+                anchor = max(info.entry_price, info.high_water_mark)
+                stop_price = round(anchor * (1 - stop_dist), 2)
+                qty = int(float(info.qty))
+                if qty <= 0:
+                    continue
+                order = self.api.submit_order(
+                    symbol=symbol, qty=qty, side='sell',
+                    type='stop', stop_price=stop_price,
+                    time_in_force='day',
+                    client_order_id=make_client_order_id('restop'),
+                )
+                info.stop_order_id = order.id
+                logger.info("[RECONSTRUCT] %s: protective stop re-placed @ $%.2f", symbol, stop_price)
+            except Exception as e:
+                logger.error("[RECONSTRUCT] %s: stop re-placement failed: %s "
+                             "(software stops still active)", symbol, e)
 
     def _get_current_exposure(self) -> float | None:
         """Calculate total stock exposure."""

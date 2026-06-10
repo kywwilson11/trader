@@ -39,7 +39,8 @@ def _save(data: dict):
 def record_trade(symbol: str, action: str, entry_price: float,
                  exit_price: float, pnl_pct: float,
                  llm_score: float = None, reasoning: str = "",
-                 news_context: str = "", exit_reason: str = ""):
+                 news_context: str = "", exit_reason: str = "",
+                 estimated: bool = False):
     """Record a completed trade for future reference.
 
     Args:
@@ -52,6 +53,10 @@ def record_trade(symbol: str, action: str, entry_price: float,
         reasoning: LLM reasoning at entry
         news_context: Key news at time of trade
         exit_reason: Why the trade was exited (stop_loss, take_profit, etc.)
+        estimated: True when exit_price is a quote estimate rather than a
+            confirmed fill. Estimated records are excluded from Kelly sizing —
+            stop exits have the worst slippage and recording them at
+            pre-slippage midpoints inflates the Kelly fraction.
     """
     data = _load()
     trades = data.setdefault(symbol, [])
@@ -66,6 +71,7 @@ def record_trade(symbol: str, action: str, entry_price: float,
         "reasoning": reasoning[:200],
         "news": news_context[:200],
         "exit_reason": exit_reason,
+        "estimated": estimated,
     }
     trades.append(record)
 

@@ -64,7 +64,10 @@ def get_journal_summary(date: str = None) -> dict:
     buys = sum(1 for e in entries if e.get("action") == "buy")
     sells = sum(1 for e in entries if e.get("action") == "sell")
     skips = sum(1 for e in entries if e.get("action") == "skip")
-    llm_blocks = sum(1 for e in entries if e.get("skip_reason") == "llm_block")
+    # Writers emit 'llm_veto' — the old 'llm_block' key was never written,
+    # so this metric was permanently zero
+    llm_blocks = sum(1 for e in entries
+                     if e.get("skip_reason") in ("llm_veto", "llm_block"))
 
     multipliers = [e["llm_multiplier"] for e in entries if "llm_multiplier" in e and e["llm_multiplier"] is not None]
     avg_mult = sum(multipliers) / len(multipliers) if multipliers else 1.0

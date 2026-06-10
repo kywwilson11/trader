@@ -8,6 +8,24 @@ breaker, and emergency flatten.
 import time
 import math
 import datetime
+import uuid
+
+
+def make_client_order_id(tag: str) -> str:
+    """Generate a unique client_order_id (Alpaca cap: 48 chars).
+
+    Tagging orders lets us (a) avoid duplicate submissions on retry and
+    (b) scope cleanup to this bot's own orders instead of the whole account.
+    """
+    return f"{tag[:14]}-{uuid.uuid4().hex[:20]}"
+
+
+def _symbol_variants(symbol: str) -> set[str]:
+    """All spellings Alpaca may use for a symbol ('BTC/USD' <-> 'BTCUSD')."""
+    variants = {symbol}
+    if '/' in symbol:
+        variants.add(symbol.replace('/', ''))
+    return variants
 
 
 # --- SPREAD / QUOTE HELPERS ---
@@ -34,6 +52,28 @@ def get_quote(api, symbol, asset_type='crypto'):
         ask = float(q.ap)
         spread = ask - bid
         midpoint = (bid + ask) / 2.0
+        if midpoint <= 0 or bid <= 0 or ask <= 0:
+            # Degenerate quote (halted/stale feed). Treating it as valid leads
+            # to division-by-zero limit prices downstream — reject instead.
+            print(f"  [QUOTE] {symbol}: degenerate quote bid={bid} ask={ask}, ignoring")
+            return None
+
+        # STALENESS: a frozen feed means stops silently never fire — the
+        # loop happily compares positions against a price that stopped
+        # updating. Reject quotes older than 3 minutes (and let callers'
+        # quote-unavailable paths handle it loudly).
+        try:
+            qt = getattr(q, 't', None)
+            if qt is not None:
+                if hasattr(qt, 'to_pydatetime'):
+                    qt = qt.to_pydatetime()
+                age = (datetime.datetime.now(datetime.timezone.utc)
+                       - qt.astimezone(datetime.timezone.utc)).total_seconds()
+                if age > 180:
+                    print(f"  [QUOTE] {symbol}: quote is {age:.0f}s stale, ignoring")
+                    return None
+        except Exception:
+            pass  # unparseable timestamp — don't block on the check itself
         spread_pct = (spread / midpoint) * 100.0 if midpoint > 0 else 0.0
         return {
             'bid': bid,
@@ -86,19 +126,23 @@ def compute_limit_price(side, quote_info, offset_bps=5):
 # --- ORDER PLACEMENT ---
 
 def place_limit_order(api, symbol, side, notional, quote_info,
-                      time_in_force='gtc', offset_bps=5):
+                      time_in_force='gtc', offset_bps=5,
+                      client_order_id=None):
     """Place a limit order. Computes qty from notional/price since Alpaca
     only supports `notional` for market orders.
     Returns the order object or None on error.
     """
-    limit_price = compute_limit_price(side, quote_info, offset_bps)
-    qty = math.floor((notional / limit_price) * 1e8) / 1e8  # 8 decimal places for crypto
-
-    if qty <= 0:
-        print(f"  [ORDER] {symbol}: qty too small (notional=${notional}, price=${limit_price})")
-        return None
-
     try:
+        limit_price = compute_limit_price(side, quote_info, offset_bps)
+        if limit_price <= 0:
+            print(f"  [ORDER] {symbol}: invalid limit price {limit_price}")
+            return None
+        qty = math.floor((notional / limit_price) * 1e8) / 1e8  # 8 dp for crypto
+
+        if qty <= 0:
+            print(f"  [ORDER] {symbol}: qty too small (notional=${notional}, price=${limit_price})")
+            return None
+
         order = api.submit_order(
             symbol=symbol,
             qty=qty,
@@ -106,6 +150,7 @@ def place_limit_order(api, symbol, side, notional, quote_info,
             type='limit',
             limit_price=limit_price,
             time_in_force=time_in_force,
+            client_order_id=client_order_id or make_client_order_id('trader'),
         )
         print(f"  [ORDER] {symbol}: {side} {qty} @ ${limit_price} (mid=${quote_info['midpoint']:.4f}, "
               f"spread={quote_info['spread_pct']:.3f}%)")
@@ -116,15 +161,18 @@ def place_limit_order(api, symbol, side, notional, quote_info,
 
 
 def place_stock_limit_order(api, symbol, side, qty, quote_info,
-                            time_in_force='day', offset_bps=5):
+                            time_in_force='day', offset_bps=5,
+                            client_order_id=None):
     """Place a limit order for stocks (integer qty, day TIF)."""
-    limit_price = compute_limit_price(side, quote_info, offset_bps)
-
     if qty <= 0:
         print(f"  [ORDER] {symbol}: qty must be > 0")
         return None
 
     try:
+        limit_price = compute_limit_price(side, quote_info, offset_bps)
+        if limit_price <= 0:
+            print(f"  [ORDER] {symbol}: invalid limit price {limit_price}")
+            return None
         order = api.submit_order(
             symbol=symbol,
             qty=qty,
@@ -132,6 +180,7 @@ def place_stock_limit_order(api, symbol, side, qty, quote_info,
             type='limit',
             limit_price=round(limit_price, 2),
             time_in_force=time_in_force,
+            client_order_id=client_order_id or make_client_order_id('trader'),
         )
         print(f"  [ORDER] {symbol}: {side} {qty} @ ${limit_price:.2f} (mid=${quote_info['midpoint']:.2f}, "
               f"spread={quote_info['spread_pct']:.3f}%)")
@@ -143,17 +192,29 @@ def place_stock_limit_order(api, symbol, side, qty, quote_info,
 
 # --- ORDER LIFECYCLE ---
 
-def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2, fallback_to_market=True):
+def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2,
+                           fallback_to_market=True, time_in_force='gtc'):
     """Poll order status. Cancel if unfilled after timeout.
-    If fallback_to_market is True, places a market order after cancellation.
+    If fallback_to_market is True, places a market order for the REMAINING
+    (unfilled) quantity after cancellation — never the full original qty,
+    which would double-buy any partially filled portion.
     Returns the final order object.
     """
     # Save order params upfront for market fallback (in case later get_order fails)
     saved_symbol = saved_qty = saved_side = None
+    saved_filled = 0.0
     consecutive_errors = 0
     elapsed = 0
     while elapsed < timeout:
-        time.sleep(poll_interval)
+        # If the trade_updates stream already saw a terminal state, skip the
+        # wait and make one authoritative REST fetch instead of N polls
+        try:
+            from order_stream import get_order_state, TERMINAL
+            streamed = get_order_state(order_id)
+        except Exception:
+            streamed = None
+        if streamed is None or streamed.get('status') not in TERMINAL:
+            time.sleep(poll_interval)
         elapsed += poll_interval
         try:
             order = api.get_order(order_id)
@@ -162,7 +223,12 @@ def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2, fallback_
             consecutive_errors += 1
             print(f"  [LIFECYCLE] Error checking order {order_id} ({consecutive_errors}x): {e}")
             if consecutive_errors >= 3:
-                print(f"  [LIFECYCLE] Giving up after {consecutive_errors} consecutive errors")
+                # Don't leave a live working order orphaned — best-effort cancel
+                print(f"  [LIFECYCLE] Giving up after {consecutive_errors} consecutive errors, canceling order")
+                try:
+                    api.cancel_order(order_id)
+                except Exception:
+                    pass
                 return None
             continue
 
@@ -171,6 +237,10 @@ def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2, fallback_
             saved_symbol = order.symbol
             saved_qty = order.qty
             saved_side = order.side
+        try:
+            saved_filled = float(order.filled_qty or 0)
+        except (TypeError, ValueError):
+            pass
 
         if order.status == 'filled':
             print(f"  [LIFECYCLE] Order {order_id} FILLED ({order.filled_qty} @ ${order.filled_avg_price})")
@@ -187,24 +257,40 @@ def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2, fallback_
     except Exception as e:
         print(f"  [LIFECYCLE] Cancel error: {e}")
 
-    # Check final state after cancel
+    # Check final state after cancel (may have filled during the race)
     try:
         order = api.get_order(order_id)
         if order.status == 'filled':
             print(f"  [LIFECYCLE] Order filled during cancel (race condition), keeping.")
             return order
+        try:
+            saved_filled = float(order.filled_qty or 0)
+        except (TypeError, ValueError):
+            pass
     except Exception:
         pass
 
     if fallback_to_market and saved_symbol:
-        print(f"  [LIFECYCLE] Falling back to market order...")
+        # Only chase the unfilled remainder
+        try:
+            remaining = float(saved_qty) - saved_filled
+        except (TypeError, ValueError):
+            remaining = None
+        if remaining is not None and remaining <= 0:
+            print(f"  [LIFECYCLE] Fully filled during cancel ({saved_filled}), no fallback needed.")
+            try:
+                return api.get_order(order_id)
+            except Exception:
+                return None
+        print(f"  [LIFECYCLE] Falling back to market order ({remaining or saved_qty} remaining)...")
         try:
             market_order = api.submit_order(
                 symbol=saved_symbol,
-                qty=saved_qty,
+                qty=remaining if remaining is not None else saved_qty,
                 side=saved_side,
                 type='market',
-                time_in_force='gtc',
+                time_in_force=time_in_force,
+                client_order_id=make_client_order_id('mktfb'),
             )
             print(f"  [LIFECYCLE] Market fallback submitted: {market_order.id}")
             # Poll briefly for fill
@@ -258,31 +344,98 @@ def get_all_positions(api):
 
 # --- TRADE GATING ---
 
-def should_trade(predicted_return, spread_pct, min_edge=2.0):
-    """Only trade if predicted return > min_edge * round-trip spread cost.
+def should_trade(predicted_return, spread_pct, min_edge=2.0,
+                 asset_type='crypto', maker=False):
+    """Only trade if predicted return clears min_edge x the FULL round-trip
+    cost: venue fees (crypto: 25 bps taker / 15 bps maker per side) plus
+    spread. The old spread-only hurdle ignored the dominant crypto cost.
+
     predicted_return: expected % move (e.g. 0.5 means +0.5%)
     spread_pct: current spread as % of price
-    min_edge: multiplier — predicted return must exceed this * spread to trade
+    min_edge: multiplier — predicted return must exceed this x cost to trade
+    asset_type: 'crypto' or 'stock' (fee schedule differs ~10x)
+    maker: True when entries rest as maker limit orders
     """
-    round_trip_cost = spread_pct  # approximate: pay ~half spread each way
-    threshold = round_trip_cost * min_edge
+    from fees import required_edge_pct
+    threshold = required_edge_pct(asset_type, spread_pct, maker, min_edge)
     return abs(predicted_return) > threshold
 
 
 # --- CLEANUP ---
 
-def cancel_all_open_orders(api):
-    """Cancel all open orders. Call on startup to clean stale state."""
+def cancel_all_open_orders(api, symbols=None):
+    """Cancel open orders. Call on startup to clean stale state.
+
+    Args:
+        symbols: if given, cancel ONLY orders for these symbols (this bot's
+            universe). Both bots share one account — an account-wide
+            cancel_all_orders() from one bot strips the other bot's
+            protective bracket/stop legs.
+    """
     try:
         orders = api.list_orders(status='open')
-        if orders:
-            print(f"  [CLEANUP] Canceling {len(orders)} open order(s)...")
+        if not orders:
+            print("  [CLEANUP] No open orders to cancel.")
+            return
+        if symbols is None:
+            print(f"  [CLEANUP] Canceling {len(orders)} open order(s) (account-wide)...")
             api.cancel_all_orders()
             time.sleep(1)
-        else:
-            print("  [CLEANUP] No open orders to cancel.")
+            return
+        allowed = set()
+        for s in symbols:
+            allowed |= _symbol_variants(s)
+        mine = [o for o in orders if getattr(o, 'symbol', None) in allowed]
+        print(f"  [CLEANUP] Canceling {len(mine)}/{len(orders)} open order(s) in this bot's universe...")
+        for o in mine:
+            try:
+                api.cancel_order(o.id)
+            except Exception as e:
+                print(f"  [CLEANUP] Cancel {o.symbol} {o.id}: {e}")
+        if mine:
+            time.sleep(1)
     except Exception as e:
         print(f"  [CLEANUP] Error canceling orders: {e}")
+
+
+def cancel_orders_for_symbol(api, symbol, timeout=5, poll_interval=0.5):
+    """Cancel all open orders for one symbol and WAIT until they are gone.
+
+    Alpaca cancellation is async (`pending_cancel`); selling shares that are
+    still reserved by a live stop/take-profit leg rejects with
+    'insufficient qty'. Returns True when no open orders remain for the
+    symbol, False if any survive past the timeout.
+    """
+    variants = _symbol_variants(symbol)
+    try:
+        open_orders = [o for o in api.list_orders(status='open')
+                       if getattr(o, 'symbol', None) in variants]
+    except Exception as e:
+        print(f"  [CANCEL] {symbol}: list_orders error: {e}")
+        return False
+    if not open_orders:
+        return True
+
+    for o in open_orders:
+        try:
+            api.cancel_order(o.id)
+        except Exception as e:
+            # Already terminal is fine; anything else we'll catch on re-poll
+            print(f"  [CANCEL] {symbol}: cancel {o.id}: {e}")
+
+    elapsed = 0.0
+    while elapsed < timeout:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        try:
+            remaining = [o for o in api.list_orders(status='open')
+                         if getattr(o, 'symbol', None) in variants]
+            if not remaining:
+                return True
+        except Exception:
+            pass
+    print(f"  [CANCEL] {symbol}: open orders still pending after {timeout}s")
+    return False
 
 
 # --- POSITION RECONSTRUCTION ---
@@ -320,7 +473,11 @@ def reconstruct_positions(api, symbols, asset_type='crypto'):
 
 def check_circuit_breaker(api, max_drawdown_pct=0.05):
     """Check if daily equity drawdown exceeds threshold.
-    Returns (tripped: bool, drawdown_pct: float).
+
+    Returns (tripped: bool, drawdown_pct: float | None).
+    drawdown_pct is None when the account API is unreachable — callers should
+    treat that as "unknown risk state" and skip NEW entries (fail closed)
+    rather than trade as if everything is fine.
     """
     try:
         account = api.get_account()
@@ -332,36 +489,84 @@ def check_circuit_breaker(api, max_drawdown_pct=0.05):
         return drawdown >= max_drawdown_pct, drawdown
     except Exception as e:
         print(f"  [CIRCUIT BREAKER] API error: {e}")
-        return False, 0.0
+        return False, None
 
 
 # --- EMERGENCY FLATTEN ---
 
-def emergency_flatten(api):
-    """Market-sell all positions immediately."""
-    print("[EMERGENCY] Flattening all positions...")
-    try:
-        api.cancel_all_orders()
-        time.sleep(1)
-    except Exception as e:
-        print(f"  [EMERGENCY] Cancel orders error: {e}")
+def emergency_flatten(api, symbols=None, tif_for_symbol=None):
+    """Market-sell positions immediately and VERIFY the sells went through.
+
+    Args:
+        symbols: if given, flatten ONLY positions in these symbols (this
+            bot's universe). Both bots share one account — an unscoped
+            flatten from the crypto loop would liquidate the stock book
+            (and vice versa).
+        tif_for_symbol: optional callable symbol -> time_in_force. Defaults
+            to 'gtc' for crypto-style symbols and 'day' for stocks.
+
+    Returns:
+        list of symbols whose flatten could not be confirmed.
+    """
+    scope = "scoped" if symbols is not None else "ALL"
+    print(f"[EMERGENCY] Flattening {scope} positions...")
+
+    allowed = None
+    if symbols is not None:
+        allowed = set()
+        for s in symbols:
+            allowed |= _symbol_variants(s)
 
     try:
         all_positions = api.list_positions()
     except Exception as e:
         print(f"  [EMERGENCY] List positions error: {e}")
-        return
+        return ['<list_positions failed>']
 
-    for pos in all_positions:
+    targets = [p for p in all_positions
+               if allowed is None or getattr(p, 'symbol', None) in allowed]
+
+    # Cancel working orders first (scoped) so shares aren't reserved
+    if allowed is None:
         try:
-            side = 'sell' if float(pos.qty) > 0 else 'buy'
-            api.submit_order(
-                symbol=pos.symbol,
-                qty=abs(float(pos.qty)),
+            api.cancel_all_orders()
+            time.sleep(1)
+        except Exception as e:
+            print(f"  [EMERGENCY] Cancel orders error: {e}")
+    else:
+        for pos in targets:
+            cancel_orders_for_symbol(api, pos.symbol, timeout=5)
+
+    failures = []
+    for pos in targets:
+        sym = pos.symbol
+        try:
+            qty = float(pos.qty)
+            side = 'sell' if qty > 0 else 'buy'
+            if tif_for_symbol is not None:
+                tif = tif_for_symbol(sym)
+            else:
+                tif = 'gtc' if ('/' in sym or sym.endswith('USD') and len(sym) > 5) else 'day'
+            order = api.submit_order(
+                symbol=sym,
+                qty=abs(qty),
                 side=side,
                 type='market',
-                time_in_force='gtc',
+                time_in_force=tif,
+                client_order_id=make_client_order_id('flatten'),
             )
-            print(f"  [EMERGENCY] {pos.symbol}: Market {side} {pos.qty}")
+            print(f"  [EMERGENCY] {sym}: Market {side} {pos.qty}")
+            # Verify the sell reached a terminal good state
+            result = manage_order_lifecycle(api, order.id, timeout=15,
+                                            fallback_to_market=False)
+            status = getattr(result, 'status', None)
+            if status != 'filled':
+                print(f"  [EMERGENCY] {sym}: flatten NOT confirmed (status={status})")
+                failures.append(sym)
         except Exception as e:
-            print(f"  [EMERGENCY] {pos.symbol}: {e}")
+            print(f"  [EMERGENCY] {sym}: {e}")
+            failures.append(sym)
+
+    if failures:
+        print(f"  [EMERGENCY] UNCONFIRMED flattens: {', '.join(failures)}")
+    return failures

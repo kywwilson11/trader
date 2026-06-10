@@ -127,23 +127,35 @@ def get_cached_sigma(symbol: str, returns: np.ndarray) -> float | None:
     return None
 
 
+BARS_PER_YEAR = {'crypto': 8760, 'stock': 1638}
+
+
 def compute_vol_adjusted_size(base_notional: float, sigma: float,
-                              target_vol: float = 0.02) -> float:
-    """Volatility-targeted position sizing.
+                              asset_type: str = 'crypto') -> float:
+    """Volatility-targeted position sizing (Moreira & Muir 2017).
 
     Adjusts notional so each position targets approximately the same
     dollar volatility. Higher vol assets get smaller positions.
 
+    The target is derived from the ANNUALIZED portfolio vol target in
+    strategy_config, converted to per-bar units. The old code compared a
+    2% PER-HOURLY-BAR target (≈ 187%/yr crypto!) against the 1-step
+    hourly sigma — typically <1% — so the "vol target" silently doubled
+    nearly every position via the 2.0x clamp.
+
     Args:
         base_notional: Base dollar amount per trade
-        sigma: GARCH sigma (decimal)
-        target_vol: Target per-bar volatility (default 2%)
+        sigma: GARCH 1-bar-ahead sigma (decimal, hourly)
+        asset_type: 'crypto' or 'stock'
 
     Returns:
-        Adjusted notional (clamped to 0.5x - 2.0x base).
+        Adjusted notional (clamped to 0.5x - 1.5x base).
     """
     if sigma <= 0:
         return base_notional
-    ratio = target_vol / sigma
-    ratio = max(0.5, min(2.0, ratio))
+    from strategy_config import PORTFOLIO_VOL_TARGET
+    annual_target = PORTFOLIO_VOL_TARGET.get(asset_type, 0.25)
+    target_per_bar = annual_target / np.sqrt(BARS_PER_YEAR.get(asset_type, 8760))
+    ratio = target_per_bar / sigma
+    ratio = max(0.5, min(1.5, ratio))
     return base_notional * ratio

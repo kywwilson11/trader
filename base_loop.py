@@ -26,7 +26,7 @@ from order_utils import (
 from predict_now import load_models
 from trading_utils import (
     get_api, get_model_mtime, choose_inference_device, cooldown_ok,
-    predict_symbol, kelly_position_size, compute_kelly_fraction,
+    predict_symbol, compute_kelly_fraction,
     LLM_VETO_THRESHOLD, THERMAL_THROTTLE_TEMP, TEMP_LOG_EVERY_N_CYCLES,
 )
 from hw_monitor import get_gpu_temp
@@ -88,12 +88,29 @@ class BaseTradingLoop(ABC):
         self._load_hard_stop_lockout()
         self.llm_scores: dict = {}
         self._last_llm_time = 0.0
+        self._last_llm_symbols: set[str] = set()
+        self._last_stale_force = 0.0
         self.model_mtime = 0
         self.cycle = 0
         self.macro_regime: MacroRegime | None = None
         self.corr_matrix: dict = {}
         self._equity: float = 100_000
         self._peak_equity: float = 100_000
+        self._buys_allowed: bool = True
+        self._halted_until: datetime.datetime | None = None
+        # Per-symbol daily trade budget: caps fee bleed from signal jitter
+        # re-trading the same name all day
+        self._daily_trades: dict[str, int] = {}   # symbol -> count (today)
+        self._daily_trades_date: str = datetime.date.today().isoformat()
+        # Stop-breach confirmation state (2-consecutive-reading rule)
+        self._pending_breach: dict[str, str] = {}
+        # LLM veto strikes: liquidation needs 2 consecutive vetoing analyses
+        self._veto_strikes: dict[str, int] = {}
+        # Persistent prediction pool: rebuilding an executor every cycle
+        # forced fresh thread spawns + per-thread SQLite connections 2,880x/day
+        self._prediction_pool = ThreadPoolExecutor(
+            max_workers=self.MAX_PREDICTION_WORKERS,
+            thread_name_prefix=f'{self.get_asset_type()}-pred')
         from stock_config import LEVERAGED_ETFS
         self._leveraged_etfs = LEVERAGED_ETFS
 
@@ -122,8 +139,12 @@ class BaseTradingLoop(ABC):
         """Place a buy order. Returns order object or None."""
 
     @abstractmethod
-    def place_sell_order(self, symbol: str, qty, quote: dict | None) -> bool:
-        """Place a sell order. Returns True if filled."""
+    def place_sell_order(self, symbol: str, qty, quote: dict | None):
+        """Place a sell order. Returns the FILLED order object, or None.
+
+        Returning the order (not a bool) lets callers journal the real
+        fill price instead of a pre-trade quote estimate.
+        """
 
     @abstractmethod
     def get_benchmark_close(self):
@@ -145,67 +166,95 @@ class BaseTradingLoop(ABC):
 
     def run(self):
         """Main trading loop skeleton."""
+        try:
+            from order_stream import start_order_stream
+            start_order_stream()  # no-op unless TRADER_ORDER_STREAM=1
+        except Exception:
+            pass
         self._load_models()
-        cancel_all_open_orders(self.api)
+        # Scope cleanup to this bot's own universe — both bots share one
+        # account, and an account-wide cancel would strip the other bot's
+        # protective bracket/stop legs.
+        cancel_all_open_orders(self.api, symbols=self.get_symbol_universe())
         self._reconstruct_positions()
         self._print_startup()
 
         while True:
-            self.cycle += 1
-
-            if not self.check_market_hours():
-                if self.cycle == 1 or self.cycle % 20 == 0:
-                    logger.info("[WAIT] Market closed. Next check in %ds...", self.LOOP_INTERVAL)
+            try:
+                self._run_one_cycle()
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                # A single bad cycle (API blip, parse error) must never kill
+                # the process: a crash-restart cancels working orders and
+                # resets in-memory state, which is worse than skipping a beat.
+                logger.exception("[CYCLE] Unhandled error in cycle %d — continuing", self.cycle)
+                try:
+                    from notify import notify
+                    notify(f"{self.get_asset_type()} loop cycle error: {e}",
+                           level='warning',
+                           dedupe_key=f'cycle-error-{self.get_asset_type()}')
+                except Exception:
+                    pass
                 time.sleep(self.LOOP_INTERVAL)
-                continue
 
-            logger.info("--- CYCLE %d: %s ---", self.cycle,
-                        datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    def _run_one_cycle(self):
+        """One iteration of the trading loop."""
+        self.cycle += 1
 
-            # Pre-trade checks
-            if self._circuit_breaker_check():
-                continue
+        if not self.check_market_hours():
+            if self.cycle == 1 or self.cycle % 20 == 0:
+                logger.info("[WAIT] Market closed. Next check in %ds...", self.LOOP_INTERVAL)
+            time.sleep(self.LOOP_INTERVAL)
+            return
 
-            self.flatten_before_close()
+        logger.info("--- CYCLE %d: %s ---", self.cycle,
+                    datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
-            # Hot-reload model
-            self._hot_reload_check()
+        # Pre-trade checks (also refreshes self._buys_allowed)
+        self._circuit_breaker_check()
 
-            # Update macro regime (every 10 cycles to save API calls)
-            if self.cycle % 10 == 1:
-                self._update_macro_regime()
-                self._update_equity()
-                self._update_correlations()
+        self.flatten_before_close()
 
-            # Log GPU temp periodically
-            if self.cycle % TEMP_LOG_EVERY_N_CYCLES == 0:
-                temp = get_gpu_temp()
-                if temp is not None:
-                    logger.info("[HW] GPU temp: %.0fC", temp)
+        # Hot-reload model
+        self._hot_reload_check()
 
-            # Stop-loss management
-            self._manage_stops()
+        # Update macro regime (every 10 cycles to save API calls)
+        if self.cycle % 10 == 1:
+            self._update_macro_regime()
+            self._update_equity()
+            self._update_correlations()
 
-            # Predictions
-            benchmark = self.get_benchmark_close()
-            if benchmark is None:
-                logger.warning("[BENCHMARK] Benchmark data unavailable — predictions will lack relative strength")
-            preds, snapshots = self._get_predictions(benchmark)
+        # Log GPU temp periodically
+        if self.cycle % TEMP_LOG_EVERY_N_CYCLES == 0:
+            temp = get_gpu_temp()
+            if temp is not None:
+                logger.info("[HW] GPU temp: %.0fC", temp)
 
-            # LLM analysis (throttled)
-            self._run_llm_analysis(preds)
+        # Stop-loss management
+        self._manage_stops()
 
-            # Sell bearish positions
-            self._execute_sells(preds)
+        # Predictions
+        benchmark = self.get_benchmark_close()
+        if benchmark is None:
+            logger.warning("[BENCHMARK] Benchmark data unavailable — predictions will lack relative strength")
+        preds, snapshots = self._get_predictions(benchmark)
 
-            # LLM veto sells
-            self._execute_llm_veto_sells()
+        # LLM analysis (throttled)
+        self._run_llm_analysis(preds)
 
-            # Buy
+        # Sell bearish positions
+        self._execute_sells(preds)
+
+        # LLM veto sells
+        self._execute_llm_veto_sells()
+
+        # Buy (suppressed while halted or when risk state is unknown)
+        if self._buys_allowed:
             self._execute_buys(preds, snapshots)
 
-            # Thermal throttling
-            self._sleep()
+        # Thermal throttling
+        self._sleep()
 
     # --- Shared implementations ---
 
@@ -219,16 +268,56 @@ class BaseTradingLoop(ABC):
             self.trade_threshold = self.config.get('trade_threshold', 0.15)
             logger.info("Model loaded (trade_threshold=%.2f)", self.trade_threshold)
         except FileNotFoundError:
-            logger.warning("Model files not found. Running without prediction gating.")
+            logger.warning("Model files not found. Buys are DISABLED until a model exists "
+                           "(fail closed); exits and stops still run.")
 
-        model_file = f'{self.MODEL_PREFIX}_model_v2.pth' if self.MODEL_PREFIX else 'model_v2.pth'
-        self.model_mtime = get_model_mtime(model_file)
+        from trading_utils import model_reload_key
+        self.model_mtime = model_reload_key(self.MODEL_PREFIX)
+
+    def _position_state_file(self) -> str:
+        name = f'{self.MODEL_PREFIX}_position_state.json' if self.MODEL_PREFIX else 'position_state.json'
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+    def _save_position_state(self):
+        """Persist high-water marks and cooldown timers across restarts.
+
+        Without this, every restart resets trailing-stop HWMs to
+        max(entry, current) — loosening stops — and clears cooldowns,
+        allowing immediate re-entries after a crash loop.
+        """
+        try:
+            data = {
+                'hwm': {s: p.high_water_mark for s, p in self.positions.items()},
+                'trailing': {s: p.trailing_activated for s, p in self.positions.items()},
+                'last_trade': {s: t.timestamp() for s, t in self.last_trade_time.items()},
+                'daily_trades': {'date': self._daily_trades_date,
+                                 'counts': self._daily_trades},
+            }
+            tmp = self._position_state_file() + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(data, f)
+            os.replace(tmp, self._position_state_file())
+        except Exception as e:
+            logger.debug("[STATE] Failed to save position state: %s", e)
+
+    def _load_position_state(self) -> dict:
+        try:
+            with open(self._position_state_file()) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        except Exception as e:
+            logger.debug("[STATE] Failed to load position state: %s", e)
+            return {}
 
     def _reconstruct_positions(self):
         """Rebuild positions from API (survive restarts)."""
         from market_data import get_live_atr
         symbols = self.get_symbol_universe()
         raw_positions = reconstruct_positions(self.api, symbols, asset_type=self.get_asset_type())
+        saved = self._load_position_state()
+        saved_hwm = saved.get('hwm', {})
+        saved_trailing = saved.get('trailing', {})
         for sym, info in raw_positions.items():
             entry_atr = get_live_atr(self.api, sym, asset_type=self.get_asset_type())
             tp_price = None
@@ -237,16 +326,52 @@ class BaseTradingLoop(ABC):
                 stop_dist = max(self.ATR_STOP_FLOOR_PCT, min(self.ATR_STOP_CEIL_PCT, raw_stop_dist))
                 tp_dist = min(self.TAKE_PROFIT_CEIL_PCT, stop_dist * self.TAKE_PROFIT_RR)
                 tp_price = info['entry_price'] * (1 + tp_dist)
+            # Restore the persisted high-water mark so trailing stops don't
+            # loosen across restarts
+            hwm = max(info['high_water_mark'], float(saved_hwm.get(sym, 0.0)))
             self.positions[sym] = Position(
                 qty=info['qty'],
                 entry_price=info['entry_price'],
-                high_water_mark=info['high_water_mark'],
+                high_water_mark=hwm,
                 entry_atr=entry_atr,
                 take_profit_price=tp_price,
+                trailing_activated=bool(saved_trailing.get(sym, False)),
             )
+
+        # Restore cooldown timers (in-memory only before; a crash-restart
+        # cleared them and allowed instant re-trades)
+        for sym, ts in saved.get('last_trade', {}).items():
+            try:
+                self.last_trade_time[sym] = datetime.datetime.fromtimestamp(float(ts))
+            except (TypeError, ValueError, OSError):
+                pass
+
+        # Restore today's per-symbol trade counts (budget survives restarts)
+        dt = saved.get('daily_trades', {})
+        if dt.get('date') == datetime.date.today().isoformat():
+            self._daily_trades = {k: int(v) for k, v in (dt.get('counts') or {}).items()}
+            self._daily_trades_date = dt['date']
+
+        self._replace_protective_stops()
 
         if self.positions:
             logger.info("Existing positions: %s", ', '.join(self.positions))
+
+    def _replace_protective_stops(self):
+        """Re-place server-side protection after a restart (subclass hook).
+
+        Startup cancels this bot's working orders (including bracket legs),
+        and reconstruction previously left stop_order_id=None forever.
+        Stocks re-place a stop order; crypto re-places a resting GTC
+        stop_limit (Alpaca crypto supports market/limit/STOP_LIMIT — an
+        earlier comment here claimed otherwise, which left 24/7 crypto
+        positions dependent on this process staying alive).
+        """
+
+    def _after_entry_protection(self, symbol: str, pos):
+        """Place server-side protection right after a confirmed entry
+        (subclass hook). Stocks use bracket legs at order time; crypto
+        overrides this to place a resting GTC stop_limit."""
 
     def _print_startup(self):
         """Print startup configuration."""
@@ -269,27 +394,86 @@ class BaseTradingLoop(ABC):
             pass
 
     def _circuit_breaker_check(self) -> bool:
-        """Check circuit breaker. Returns True if tripped (caller should continue)."""
+        """Check circuit breaker and update self._buys_allowed.
+
+        Trip behavior: flatten THIS bot's book once, then halt new entries
+        until the daily baseline (Alpaca last_equity) resets at the next
+        market close — the old sleep(3600) re-tripped hourly against the
+        same baseline and re-flattened/re-cancelled all day while also
+        blocking stop management.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if self._halted_until and now < self._halted_until:
+            self._buys_allowed = False
+            return True
+        self._halted_until = None
+
         try:
             tripped, dd = check_circuit_breaker(self.api, max_drawdown_pct=self.CIRCUIT_BREAKER_PCT)
         except Exception as e:
             logger.error("[CIRCUIT BREAKER] API error: %s", e)
+            self._buys_allowed = False  # unknown risk state — fail closed
+            return False
+
+        if dd is None:
+            # Account API unreachable: keep managing exits, skip new entries
+            logger.warning("[CIRCUIT BREAKER] Risk state unknown (API error) — buys suspended this cycle")
+            self._buys_allowed = False
             return False
 
         if tripped:
-            logger.warning("[CIRCUIT BREAKER] Drawdown %.1f%% >= %.0f%%, flattening!",
-                           dd * 100, self.CIRCUIT_BREAKER_PCT * 100)
-            emergency_flatten(self.api)
-            self.positions.clear()
-            logger.info("[CIRCUIT BREAKER] Sleeping 1 hour...")
-            time.sleep(3600)
+            logger.warning("[CIRCUIT BREAKER] Drawdown %.1f%% >= %.0f%%, flattening %s book!",
+                           dd * 100, self.CIRCUIT_BREAKER_PCT * 100, self.get_asset_type())
+            try:
+                from notify import notify
+                notify(f"CIRCUIT BREAKER tripped: {self.get_asset_type()} book "
+                       f"down {dd * 100:.1f}% — flattening and halting entries "
+                       f"until baseline reset", level='critical',
+                       dedupe_key=f'breaker-{self.get_asset_type()}')
+            except Exception:
+                pass
+            # Journal the forced exits (estimated — emergency fills aren't
+            # individually confirmed here) so Kelly's sample isn't censored
+            # of exactly the worst trades
+            for sym, pos in list(self.positions.items()):
+                quote = self.get_quote(sym)
+                px = quote['midpoint'] if quote else pos.entry_price
+                pnl = ((px - pos.entry_price) / pos.entry_price * 100
+                       if pos.entry_price > 0 else 0.0)
+                record_trade(sym, 'sell', pos.entry_price, px, pnl,
+                             exit_reason='circuit_breaker', estimated=True)
+            failures = emergency_flatten(self.api, symbols=self.get_symbol_universe())
+            if failures:
+                logger.error("[CIRCUIT BREAKER] Unconfirmed flattens: %s — will retry next cycle",
+                             ', '.join(failures))
+                # Keep failed symbols tracked so stops still manage them
+                self.positions = {s: p for s, p in self.positions.items() if s in failures}
+            else:
+                self.positions.clear()
+            self._halted_until = self._next_baseline_reset()
+            self._buys_allowed = False
+            logger.info("[CIRCUIT BREAKER] Halting new entries until %s (baseline reset)",
+                        self._halted_until.isoformat())
             return True
+
+        self._buys_allowed = True
         return False
 
+    @staticmethod
+    def _next_baseline_reset() -> datetime.datetime:
+        """Next time Alpaca's last_equity baseline rolls (~16:05 ET), in UTC."""
+        import zoneinfo
+        et = zoneinfo.ZoneInfo('US/Eastern')
+        now_et = datetime.datetime.now(et)
+        reset = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+        if now_et >= reset:
+            reset += datetime.timedelta(days=1)
+        return reset.astimezone(datetime.timezone.utc)
+
     def _hot_reload_check(self):
-        """Check if model files changed and reload."""
-        model_file = f'{self.MODEL_PREFIX}_model_v2.pth' if self.MODEL_PREFIX else 'model_v2.pth'
-        new_mtime = get_model_mtime(model_file)
+        """Check if model files changed and reload (keyed on the manifest)."""
+        from trading_utils import model_reload_key
+        new_mtime = model_reload_key(self.MODEL_PREFIX)
         if new_mtime != self.model_mtime:
             logger.info("[HOT-RELOAD] Model files changed, reloading...")
             try:
@@ -315,8 +499,8 @@ class BaseTradingLoop(ABC):
             if self.macro_regime.stablecoin_alert and self.get_asset_type() == 'crypto':
                 if self.macro_regime.sizing_mult == 0:
                     logger.warning("[CONTAGION] Stablecoin emergency! Flattening crypto...")
-                    emergency_flatten(self.api)
-                    self.positions.clear()
+                    failures = emergency_flatten(self.api, symbols=self.get_symbol_universe())
+                    self.positions = {s: p for s, p in self.positions.items() if s in failures}
         except Exception as e:
             logger.debug("[MACRO] Regime update failed: %s", e)
 
@@ -331,23 +515,58 @@ class BaseTradingLoop(ABC):
             pass
 
     def _update_correlations(self):
-        """Update correlation matrix for portfolio management."""
+        """Update correlation matrix for portfolio management (1h cache)."""
         try:
+            from portfolio import get_correlation_matrix_cached
             symbols = self.get_symbol_universe()
-            returns_dict = get_returns_for_symbols(self.api, symbols, self.get_asset_type())
-            if returns_dict:
-                self.corr_matrix = compute_correlation_matrix(returns_dict)
+            corr = get_correlation_matrix_cached(self.api, symbols,
+                                                 self.get_asset_type())
+            if corr:
+                self.corr_matrix = corr
         except Exception as e:
             logger.debug("[PORTFOLIO] Correlation update failed: %s", e)
+
+    def _maybe_update_resting_stop(self, symbol, pos, desired_stop_price):
+        """Tighten the server-side resting stop as the trail rises
+        (subclass hook; crypto overrides). Base: no-op."""
+
+    def _extra_tilt(self, symbol: str) -> float:
+        """Asset-specific advisory tilt hook (crypto: funding). Base: 1.0."""
+        return 1.0
 
     def _manage_stops(self):
         """Check stop-loss, trailing stop, and take-profit on open positions."""
         for symbol in list(self.positions):
+            pos = self.positions[symbol]
+
+            # Resting protective order (crypto GTC stop_limit) — detect
+            # server-side fills the loop would otherwise miss
+            if pos.stop_order_id and self.get_asset_type() == 'crypto':
+                try:
+                    so = self.api.get_order(pos.stop_order_id)
+                    status = getattr(so, 'status', None)
+                    if status == 'filled':
+                        logger.info("[STOP-FILL] %s: resting stop filled at $%s",
+                                    symbol, so.filled_avg_price)
+                        llm_info = self.llm_scores.get(symbol, {})
+                        self._record_confirmed_exit(symbol, pos, so, None,
+                                                    exit_reason='server_stop',
+                                                    llm_score=llm_info.get('s'),
+                                                    reasoning=llm_info.get('r', ''))
+                        del self.positions[symbol]
+                        self.last_trade_time[symbol] = datetime.datetime.now()
+                        self.hard_stop_lockout[symbol] = datetime.datetime.now()
+                        self._save_hard_stop_lockout()
+                        continue
+                    if status in ('canceled', 'expired', 'rejected'):
+                        pos.stop_order_id = None
+                except Exception:
+                    pass
+
             quote = self.get_quote(symbol)
             if quote is None:
                 continue
             current_price = quote['midpoint']
-            pos = self.positions[symbol]
             pos.high_water_mark = max(pos.high_water_mark, current_price)
             hwm = pos.high_water_mark
             entry_price = pos.entry_price
@@ -368,56 +587,124 @@ class BaseTradingLoop(ABC):
                 stop_dist *= self.macro_regime.stop_mult
                 trail_dist *= self.macro_regime.stop_mult
 
+            # Tighten the resting server-side stop as the trail rises
+            trailing_active = hwm >= entry_price * (1 + self.ATR_TRAIL_ACTIVATE_PCT)
+            desired_stop = entry_price * (1 - stop_dist)
+            if trailing_active:
+                desired_stop = max(desired_stop, hwm * (1 - trail_dist))
+            self._maybe_update_resting_stop(symbol, pos, desired_stop)
+
             stop_reason = None
             if current_price <= entry_price * (1 - stop_dist):
                 stop_reason = 'hard_stop'
             elif pos.take_profit_price and current_price >= pos.take_profit_price:
                 stop_reason = 'take_profit'
-            elif (hwm >= entry_price * (1 + self.ATR_TRAIL_ACTIVATE_PCT)
+            elif (trailing_active
                   and current_price <= hwm * (1 - trail_dist)):
                 stop_reason = 'trailing'
 
+            # Two-consecutive-reading confirmation: a single anomalous
+            # quote on Alpaca's thin crypto venue must not market-dump a
+            # healthy position. Costs one 30s cycle; genuine fast crashes
+            # are covered by the resting server-side stop, which has no
+            # such delay.
             if stop_reason:
-                logger.info("[STOP] %s: %s at $%.4f (entry=$%.4f, hwm=$%.4f, "
-                            "stop_d=%.1f%%, trail_d=%.1f%%, reason=%s)",
-                            symbol, stop_reason, current_price, entry_price, hwm,
-                            stop_dist * 100, trail_dist * 100, stop_reason)
-                try:
-                    self.api.submit_order(
-                        symbol=symbol, qty=pos.qty,
-                        side='sell', type='market', time_in_force='gtc',
-                    )
+                if self._pending_breach.get(symbol) == stop_reason:
+                    self._pending_breach.pop(symbol, None)
+                    logger.info("[STOP] %s: %s CONFIRMED at $%.4f (entry=$%.4f, hwm=$%.4f, "
+                                "stop_d=%.1f%%, trail_d=%.1f%%)",
+                                symbol, stop_reason, current_price, entry_price, hwm,
+                                stop_dist * 100, trail_dist * 100)
+                    self._execute_stop_exit(symbol, pos, stop_reason, current_price)
+                else:
+                    self._pending_breach[symbol] = stop_reason
+                    logger.info("[STOP] %s: %s breach at $%.4f — awaiting "
+                                "confirmation next cycle", symbol, stop_reason,
+                                current_price)
+            else:
+                self._pending_breach.pop(symbol, None)
+
+        # Persist HWM / cooldown state each cycle (tiny atomic JSON write)
+        self._save_position_state()
+
+    def _execute_stop_exit(self, symbol, pos, stop_reason, current_price):
+        """Sell a position for a stop/TP/trailing exit and confirm the fill.
+
+        Any resting order for this symbol (bracket stop/TP leg, trailing
+        stop) holds the shares — selling around it rejects with
+        'insufficient qty'. Cancel symbol-scoped orders first, confirm the
+        sell filled, and record the trade at the REAL fill price.
+        """
+        from order_utils import cancel_orders_for_symbol, make_client_order_id, verify_position
+
+        entry_price = pos.entry_price
+        tif = 'gtc' if self.get_asset_type() == 'crypto' else 'day'
+
+        # Free shares reserved by any working order (bracket leg, trailing stop)
+        if not cancel_orders_for_symbol(self.api, symbol, timeout=5):
+            logger.warning("[STOP] %s: working orders still pending cancel — retrying next cycle", symbol)
+            return
+        pos.stop_order_id = None
+
+        try:
+            order = self.api.submit_order(
+                symbol=symbol, qty=pos.qty,
+                side='sell', type='market', time_in_force=tif,
+                client_order_id=make_client_order_id('stop'),
+            )
+        except Exception as e:
+            err_msg = str(e).lower()
+            logger.error("[STOP] %s: Sell error: %s", symbol, e)
+            if ('insufficient qty' in err_msg
+                    or 'position does not exist' in err_msg
+                    or 'not found' in err_msg
+                    or 'available: 0' in err_msg):
+                # Only treat as desync if the broker REALLY has no position —
+                # the same rejection fires when shares are merely reserved by
+                # an order we failed to cancel.
+                if verify_position(self.api, symbol) is None:
+                    logger.warning("[DESYNC] %s: Position gone at broker, removing from tracking", symbol)
                     pnl_pct = ((current_price - entry_price) / entry_price) * 100
                     llm_info = self.llm_scores.get(symbol, {})
                     record_trade(symbol, 'sell', entry_price, current_price,
                                  pnl_pct, llm_score=llm_info.get('s'),
-                                 reasoning=llm_info.get('r', ''),
-                                 exit_reason=stop_reason)
-                    del self.positions[symbol]
+                                 reasoning='position desync — broker qty=0',
+                                 exit_reason='desync', estimated=True)
+                    self.positions.pop(symbol, None)
                     self.last_trade_time[symbol] = datetime.datetime.now()
-                    if stop_reason == 'hard_stop':
-                        self.hard_stop_lockout[symbol] = datetime.datetime.now()
-                        self._save_hard_stop_lockout()
-                        logger.info("[LOCKOUT] %s: %dh lockout after hard stop",
-                                    symbol, self.HARD_STOP_LOCKOUT_HOURS)
-                except Exception as e:
-                    err_msg = str(e).lower()
-                    logger.error("[STOP] %s: Sell error: %s", symbol, e)
-                    # Position no longer exists at broker — remove from tracking
-                    if ('insufficient qty' in err_msg
-                            or 'position does not exist' in err_msg
-                            or 'not found' in err_msg
-                            or 'available: 0' in err_msg):
-                        logger.warning("[DESYNC] %s: Position gone at broker, removing from tracking", symbol)
-                        pnl_pct = ((current_price - entry_price) / entry_price) * 100
-                        llm_info = self.llm_scores.get(symbol, {})
-                        record_trade(symbol, 'sell', entry_price, current_price,
-                                     pnl_pct, llm_score=llm_info.get('s'),
-                                     reasoning='position desync — broker qty=0',
-                                     exit_reason='desync')
-                        if symbol in self.positions:
-                            del self.positions[symbol]
-                        self.last_trade_time[symbol] = datetime.datetime.now()
+                else:
+                    logger.warning("[STOP] %s: position EXISTS but shares unavailable "
+                                   "(reserved by an open order?) — retrying next cycle", symbol)
+            return
+
+        result = manage_order_lifecycle(self.api, order.id, timeout=self.ORDER_TIMEOUT,
+                                        fallback_to_market=False, time_in_force=tif)
+        status = getattr(result, 'status', None)
+        if status == 'filled':
+            fill_price = float(result.filled_avg_price)
+            estimated = False
+        else:
+            logger.warning("[STOP] %s: exit fill unconfirmed (status=%s) — recording estimate",
+                           symbol, status)
+            fill_price = current_price
+            estimated = True
+            if status not in ('filled', 'partially_filled') and verify_position(self.api, symbol) is not None:
+                # Sell didn't go through and we still hold it — keep tracking
+                return
+
+        pnl_pct = ((fill_price - entry_price) / entry_price) * 100
+        llm_info = self.llm_scores.get(symbol, {})
+        record_trade(symbol, 'sell', entry_price, fill_price,
+                     pnl_pct, llm_score=llm_info.get('s'),
+                     reasoning=llm_info.get('r', ''),
+                     exit_reason=stop_reason, estimated=estimated)
+        self.positions.pop(symbol, None)
+        self.last_trade_time[symbol] = datetime.datetime.now()
+        if stop_reason == 'hard_stop':
+            self.hard_stop_lockout[symbol] = datetime.datetime.now()
+            self._save_hard_stop_lockout()
+            logger.info("[LOCKOUT] %s: %dh lockout after hard stop",
+                        symbol, self.HARD_STOP_LOCKOUT_HOURS)
 
     def _get_predictions(self, benchmark_close) -> tuple[dict, dict]:
         """Get predictions for all symbols in parallel."""
@@ -429,28 +716,27 @@ class BaseTradingLoop(ABC):
         inference_device = choose_inference_device()
         symbols = self.get_symbol_universe()
 
-        with ThreadPoolExecutor(max_workers=self.MAX_PREDICTION_WORKERS) as executor:
-            futures = {}
-            for symbol in symbols:
-                f = executor.submit(
-                    predict_symbol, self.api, symbol,
-                    self.model, self.config, self.scaler_X, self.feature_cols,
-                    inference_device, asset_type=self.get_asset_type(),
-                    benchmark_close=benchmark_close,
-                    return_snapshot=True,
-                )
-                futures[f] = symbol
+        futures = {}
+        for symbol in symbols:
+            f = self._prediction_pool.submit(
+                predict_symbol, self.api, symbol,
+                self.model, self.config, self.scaler_X, self.feature_cols,
+                inference_device, asset_type=self.get_asset_type(),
+                benchmark_close=benchmark_close,
+                return_snapshot=True,
+            )
+            futures[f] = symbol
 
-            for future in as_completed(futures):
-                symbol = futures[future]
-                try:
-                    sym, pred, snapshot = future.result()
-                    if pred is not None:
-                        preds[sym] = pred
-                    if snapshot is not None:
-                        snapshots[sym] = snapshot
-                except Exception as e:
-                    logger.error("%s: Prediction error: %s", symbol, e)
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                sym, pred, snapshot = future.result()
+                if pred is not None:
+                    preds[sym] = pred
+                if snapshot is not None:
+                    snapshots[sym] = snapshot
+            except Exception as e:
+                logger.error("%s: Prediction error: %s", symbol, e)
 
         return preds, snapshots
 
@@ -471,20 +757,65 @@ class BaseTradingLoop(ABC):
         if not candidates:
             return
 
+        fng_value = None
+        try:
+            from sentiment import get_fear_greed
+            fd = get_fear_greed()
+            fng_value = fd.get('value') if isinstance(fd, dict) else fd
+        except Exception:
+            pass
+
         new_scores = analyze_trades(
             candidates, self.get_asset_type(), equity=self._equity,
             positions=list(self.positions.keys()),
+            position_details={s: p.to_dict() for s, p in self.positions.items()},
+            fng_value=fng_value,
             model_config=self.config,
         )
+        self._last_llm_symbols = {c.get('symbol') for c in candidates}
         if new_scores:
             self.llm_scores = new_scores
             self._last_llm_time = now_ts
+            # Veto strikes: forced LIQUIDATION needs two consecutive
+            # vetoing analyses. Headlines are untrusted text concatenated
+            # into the prompt — a single injected/anomalous score must not
+            # be able to dump a position (measured attack vector:
+            # arXiv 2601.13082). New-entry blocking stays immediate.
+            for sym, v in new_scores.items():
+                if v.get('s', 0.5) < LLM_VETO_THRESHOLD:
+                    self._veto_strikes[sym] = self._veto_strikes.get(sym, 0) + 1
+                else:
+                    self._veto_strikes.pop(sym, None)
             logger.info("[LLM] Scores: %s",
                         ", ".join(f"{s}={v.get('s', 0.5):.2f}" for s, v in self.llm_scores.items()))
+            # Journal every scored candidate (not just traded ones) so
+            # llm_eval.py can measure whether the gate predicts returns —
+            # the system previously had no way to know if the LLM helped
+            preds_by_symbol = {c['symbol']: c.get('pred_return') for c in candidates}
+            log_decision({
+                "action": "llm_analysis",
+                "asset_type": self.get_asset_type(),
+                "forward_bars": self.config.get('forward_bars', 24) if self.config else 24,
+                "scores": {sym: {"s": v.get('s', 0.5),
+                                 "pred": preds_by_symbol.get(sym)}
+                           for sym, v in new_scores.items()},
+            })
 
     def _check_llm_staleness(self):
-        """Warn and force refresh if LLM scores on disk are stale (> 2 hours)."""
+        """Force a refresh if the scores for CURRENT candidates are stale.
+
+        Scoped to the symbols this bot actually analyzes: the stock bot only
+        refreshes its top-N, while the GUI writes the whole universe into
+        llm_analysis.json — judging staleness by the OLDEST entry in the
+        section made departed symbols permanently stale, collapsing the
+        600s cadence to ~60s (10x quota burn + loop stalls). Forced
+        refreshes are additionally rate-limited to one per LLM interval.
+        """
         if not self.llm_scores:
+            return
+        now_ts = time.time()
+        # Rate-limit both the disk parse and the forced refresh
+        if now_ts - self._last_stale_force < self.LLM_INTERVAL_SEC:
             return
         from llm_analyst import load_analysis
         from datetime import datetime, timezone
@@ -493,23 +824,24 @@ class BaseTradingLoop(ABC):
             section = data.get(self.get_asset_type(), {})
             if not section:
                 return
-            # Check oldest timestamp in section
-            oldest_ts = None
-            for sym, entry in section.items():
-                ts_str = entry.get('timestamp', '')
+            relevant = self._last_llm_symbols or set(self.llm_scores.keys())
+            newest_ts = None
+            for sym in relevant:
+                ts_str = (section.get(sym) or {}).get('timestamp', '')
                 if ts_str:
                     try:
                         ts = datetime.fromisoformat(ts_str)
-                        if oldest_ts is None or ts < oldest_ts:
-                            oldest_ts = ts
+                        if newest_ts is None or ts > newest_ts:
+                            newest_ts = ts
                     except ValueError:
                         pass
-            if oldest_ts is not None:
-                age_hours = (datetime.now(timezone.utc) - oldest_ts).total_seconds() / 3600
+            if newest_ts is not None:
+                age_hours = (datetime.now(timezone.utc) - newest_ts).total_seconds() / 3600
                 if age_hours > 2:
                     logger.warning("[LLM] Scores are %.1fh stale — forcing refresh next cycle",
                                    age_hours)
                     self._last_llm_time = 0  # Force refresh
+                    self._last_stale_force = now_ts
         except Exception:
             pass
 
@@ -528,35 +860,99 @@ class BaseTradingLoop(ABC):
             })
         return candidates
 
+    def _record_confirmed_exit(self, symbol, pos, order, quote, exit_reason,
+                               llm_score=None, reasoning=''):
+        """Journal an exit using the order's real fill price when available."""
+        fill_price = None
+        try:
+            fp = getattr(order, 'filled_avg_price', None)
+            if fp is not None:
+                fill_price = float(fp)
+        except (TypeError, ValueError):
+            pass
+        estimated = fill_price is None
+        if fill_price is None:
+            fill_price = quote['midpoint'] if quote else pos.entry_price
+        pnl_pct = ((fill_price - pos.entry_price) / pos.entry_price) * 100 \
+            if pos.entry_price > 0 else 0.0
+        record_trade(symbol, 'sell', pos.entry_price, fill_price, pnl_pct,
+                     llm_score=llm_score, reasoning=reasoning,
+                     exit_reason=exit_reason, estimated=estimated)
+        # Implementation-shortfall journal: decision price (quote when the
+        # exit fired) vs realized fill. Sells slip NEGATIVE of buys: a fill
+        # below the decision mid costs money, so flip the sign so positive
+        # slippage_bps always means "paid more than the decision price".
+        decision_price = quote['midpoint'] if quote else None
+        slippage_bps = None
+        if decision_price and decision_price > 0 and not estimated:
+            slippage_bps = round((decision_price - fill_price) / decision_price * 1e4, 2)
+        log_decision({"symbol": symbol, "action": "sell",
+                      "exit_reason": exit_reason,
+                      "pnl_pct": round(pnl_pct, 4),
+                      "decision_price": decision_price,
+                      "fill_price": fill_price,
+                      "slippage_bps": slippage_bps,
+                      "estimated": estimated})
+
     def _execute_sells(self, preds: dict):
         """Sell bearish positions."""
         for symbol in list(self.positions):
             pred = preds.get(symbol)
-            if pred is not None and pred > -self.trade_threshold:
+            if pred is None:
+                # Missing prediction = data failure, NOT a sell signal.
+                # Stops continue to protect the position; liquidating the
+                # book on a transient fetch error is how rate-limit bursts
+                # turn into forced sales.
+                continue
+            if pred > -self.trade_threshold:
                 continue
 
             if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
                 continue
 
-            reason = f"pred={pred:+.4f}%" if pred is not None else "no prediction"
-            logger.info("%s: SELLING (%s)", symbol, reason)
+            logger.info("%s: SELLING (pred=%+.4f%%)", symbol, pred)
 
             quote = self.get_quote(symbol)
             if quote is None:
                 logger.warning("%s: Skipping sell — quote unavailable", symbol)
                 continue
             pos = self.positions[symbol]
-            if self.place_sell_order(symbol, pos.qty, quote):
+            # A resting protective order HOLDS the qty — selling around it
+            # rejects with 'insufficient quantity available'
+            if pos.stop_order_id:
+                from order_utils import cancel_orders_for_symbol
+                if not cancel_orders_for_symbol(self.api, symbol, timeout=8):
+                    logger.warning("%s: resting orders pending cancel — retry next cycle", symbol)
+                    continue
+                pos.stop_order_id = None
+            llm_info = self.llm_scores.get(symbol, {})
+            order = self.place_sell_order(symbol, pos.qty, quote)
+            if order:
+                self._record_confirmed_exit(symbol, pos, order, quote,
+                                            exit_reason='signal_sell',
+                                            llm_score=llm_info.get('s'),
+                                            reasoning=llm_info.get('r', ''))
                 del self.positions[symbol]
                 self.last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(1)
 
     def _execute_llm_veto_sells(self):
-        """Sell positions with catastrophic LLM scores."""
+        """Sell positions with catastrophic LLM scores.
+
+        Liquidation requires the veto to PERSIST across two consecutive
+        analyses (strike count from _run_llm_analysis). One anomalous or
+        injected score blocks new entries immediately but cannot force a
+        sale on its own.
+        """
         for symbol in list(self.positions):
             llm_info = self.llm_scores.get(symbol, {})
             llm_s = llm_info.get('s', 0.5)
             if llm_s >= LLM_VETO_THRESHOLD:
+                continue
+            if self._veto_strikes.get(symbol, 0) < 2:
+                logger.info("%s: LLM VETO (%.2f) strike %d/2 — blocking entries, "
+                            "liquidation needs a second consecutive veto",
+                            symbol, llm_s, self._veto_strikes.get(symbol, 0))
                 continue
 
             if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
@@ -566,62 +962,78 @@ class BaseTradingLoop(ABC):
             logger.info("%s: LLM VETO SELL (%.2f — %s)", symbol, llm_s,
                         llm_info.get('r', ''))
             pos = self.positions[symbol]
+            # Free shares held by any resting protective order first
+            if pos.stop_order_id:
+                from order_utils import cancel_orders_for_symbol
+                if not cancel_orders_for_symbol(self.api, symbol, timeout=8):
+                    logger.warning("%s: resting orders pending cancel — retry next cycle", symbol)
+                    continue
+                pos.stop_order_id = None
             quote = self.get_quote(symbol)
-            if self.place_sell_order(symbol, pos.qty, quote):
-                pnl_pct = 0.0
-                if quote:
-                    pnl_pct = ((quote['midpoint'] - pos.entry_price) / pos.entry_price) * 100
-                record_trade(symbol, 'sell', pos.entry_price,
-                             quote['midpoint'] if quote else pos.entry_price,
-                             pnl_pct, llm_score=llm_s,
-                             reasoning=llm_info.get('r', ''),
-                             exit_reason='llm_veto')
+            order = self.place_sell_order(symbol, pos.qty, quote)
+            if order:
+                self._record_confirmed_exit(symbol, pos, order, quote,
+                                            exit_reason='llm_veto',
+                                            llm_score=llm_s,
+                                            reasoning=llm_info.get('r', ''))
                 del self.positions[symbol]
                 self.last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(1)
 
     def _compute_position_size(self, symbol: str, pred_return: float | None,
-                               quote: dict) -> int:
-        """Compute final position size with all adjustments.
+                               quote: dict, sentiment_mult: float = 1.0,
+                               llm_mult: float = 1.0) -> int:
+        """Risk-based position sizing.
 
-        Applies: confidence scaling, Kelly criterion, GARCH vol targeting,
-        macro regime, correlation, sentiment gate, LLM multiplier.
+        Replaces the old ~10-factor multiplier soup (which could stack to
+        ~32x base with per-symbol caps unenforced) with a structure where
+        each component has ONE job and a hard bound:
+
+          1. RISK BASE — risk a fixed fraction of equity to the stop:
+                 notional = equity * RISK_PCT_PER_TRADE / stop_dist
+             capped at NOTIONAL_PER_SYMBOL. Size now scales with the
+             account and with how far the stop is — the textbook
+             definition the old code never had.
+          2. KELLY — fractional Kelly (<= KELLY_CAP) from CONFIRMED trade
+             history, as a bounded multiplier [0.5, 1.5]. The old floor
+             meant Kelly could only ever INCREASE size.
+          3. VOL TARGET — GARCH per-bar sigma vs the annualized portfolio
+             target (volatility.py), bounded [0.5, 1.5].
+          4. TILT — everything advisory (confidence, macro, HMM,
+             correlation, drawdown ladder, VIX, sentiment, LLM) multiplies
+             into ONE tilt. Boosts are clamped at TILT_MAX (1.3x);
+             de-risking is honored down to 0.1x (a drawdown ladder that
+             says cut 75% must not be clipped).
+          5. CAPS — MAX_NOTIONAL_PER_SYMBOL enforced INCLUDING the new
+             order; orders below MIN_ORDER_NOTIONAL return 0 (fees eat dust).
         """
-        # Base: Kelly or fixed, scaled by VIX regime
-        # Research (arXiv 2508.16598): Kelly fraction should shrink in high-vol
-        vix = self.macro_regime.vix if self.macro_regime else None
-        if vix is not None:
-            if vix > 35:
-                kelly_scale = 0.3
-            elif vix > 25:
-                kelly_scale = 0.5
-            elif vix > 15:
-                kelly_scale = 0.7
-            else:
-                kelly_scale = 1.0
+        from strategy_config import (RISK_PCT_PER_TRADE, KELLY_CAP,
+                                     TILT_MAX, MIN_ORDER_NOTIONAL)
+        from market_data import get_live_atr
+
+        # --- 1. Risk base: equity at risk / stop distance ---
+        entry_atr = get_live_atr(self.api, symbol, asset_type=self.get_asset_type())
+        price = quote['midpoint']
+        if entry_atr is not None and price > 0:
+            raw_stop = (entry_atr * self.ATR_STOP_MULTIPLIER) / price
+            stop_dist = max(self.ATR_STOP_FLOOR_PCT,
+                            min(self.ATR_STOP_CEIL_PCT, raw_stop))
         else:
-            kelly_scale = 1.0
-        base = kelly_position_size(self.NOTIONAL_PER_SYMBOL, self._equity)
-        base = int(base * kelly_scale)
+            stop_dist = self.STOP_LOSS_PCT
+        risk_dollars = self._equity * RISK_PCT_PER_TRADE
+        risk_notional = risk_dollars / max(stop_dist, 1e-4)
+        base = min(risk_notional, self.NOTIONAL_PER_SYMBOL)
 
-        # Drawdown-based scaling: reduce size during drawdowns from peak equity
-        if self._peak_equity > 0:
-            dd = (self._peak_equity - self._equity) / self._peak_equity
-            if dd >= 0.20:
-                base = int(base * 0.25)  # 75% reduction at 20%+ drawdown
-            elif dd >= 0.15:
-                base = int(base * 0.50)  # 50% reduction at 15%+ drawdown
-            elif dd >= 0.10:
-                base = int(base * 0.75)  # 25% reduction at 10%+ drawdown
+        # --- 2. Fractional Kelly from confirmed history (bounded) ---
+        kelly_mult = 1.0
+        kelly_f = compute_kelly_fraction()
+        if kelly_f is not None:
+            kelly_f = min(kelly_f, KELLY_CAP)
+            # 0.125 (mid of the [0.05, 0.25] clamp) maps to 1.0x
+            kelly_mult = max(0.5, min(1.5, kelly_f / 0.125))
 
-        # Confidence scaling
-        if pred_return is not None and self.trade_threshold > 0.001:
-            confidence = min(2.0, max(0.5, pred_return / self.trade_threshold))
-        else:
-            confidence = 1.0
-        sized = base * confidence
-
-        # Fetch bars once for both GARCH and HMM
+        # --- 3. GARCH vol targeting (bounded inside the helper) ---
+        vol_mult = 1.0
         returns = None
         try:
             from market_data import fetch_bars_alpaca, fetch_stock_bars_alpaca
@@ -633,62 +1045,108 @@ class BaseTradingLoop(ABC):
                 returns = df['Close'].pct_change().dropna().values * 100
         except Exception:
             pass
-
-        # GARCH vol-targeted sizing
         if returns is not None:
             try:
                 sigma = get_cached_sigma(symbol, returns)
                 if sigma is not None:
-                    sized = compute_vol_adjusted_size(sized, sigma)
+                    vol_mult = compute_vol_adjusted_size(
+                        1.0, sigma, asset_type=self.get_asset_type())
             except Exception:
                 pass
 
-        # Macro regime multiplier
+        # --- 4. Advisory tilt (single product, asymmetric clamp) ---
+        tilt = 1.0
+        # Signal confidence (tamed: was 0.5-2.0)
+        if pred_return is not None and self.trade_threshold > 0.001:
+            tilt *= min(1.25, max(0.75, pred_return / self.trade_threshold))
+        # VIX ladder (arXiv 2508.16598: shrink Kelly in high vol)
+        vix = self.macro_regime.vix if self.macro_regime else None
+        if vix is not None:
+            tilt *= 0.3 if vix > 35 else 0.5 if vix > 25 else 0.7 if vix > 15 else 1.0
+        # Drawdown de-leveraging ladder
+        if self._peak_equity > 0:
+            dd = (self._peak_equity - self._equity) / self._peak_equity
+            if dd >= 0.20:
+                tilt *= 0.25
+            elif dd >= 0.15:
+                tilt *= 0.50
+            elif dd >= 0.10:
+                tilt *= 0.75
+        # Macro regime
         if self.macro_regime:
-            sized *= self.macro_regime.sizing_mult
-
-        # Correlation-based reduction
+            tilt *= self.macro_regime.sizing_mult
+        # Correlation with existing book
         if self.corr_matrix and self.positions:
-            corr_factor = get_correlation_sizing_factor(
+            tilt *= get_correlation_sizing_factor(
                 symbol, list(self.positions.keys()), self.corr_matrix)
-            sized *= corr_factor
-
-        # HMM regime multiplier + ensemble regime disagreement penalty
+        # HMM regime (advisory) + disagreement penalty
         hmm_label = 'unknown'
         if returns is not None and len(returns) > 200:
             try:
                 regime = get_cached_regime(symbol, returns)
-                sized *= regime['sizing_mult']
+                tilt *= regime['sizing_mult']
                 hmm_label = regime.get('label', 'unknown')
             except Exception:
                 pass
-
-        # Ensemble regime voting: penalize when signals disagree
-        # Map each signal to directional view: -1 (bearish), 0 (neutral), +1 (bullish)
         votes = []
         if self.macro_regime:
-            if self.macro_regime.sizing_mult < 0.6:
-                votes.append(-1)
-            elif self.macro_regime.sizing_mult > 0.9:
-                votes.append(1)
-            else:
-                votes.append(0)
-        if hmm_label in ('bull',):
+            votes.append(-1 if self.macro_regime.sizing_mult < 0.6
+                         else 1 if self.macro_regime.sizing_mult > 0.9 else 0)
+        if hmm_label == 'bull':
             votes.append(1)
-        elif hmm_label in ('bear',):
+        elif hmm_label == 'bear':
             votes.append(-1)
         elif hmm_label != 'unknown':
             votes.append(0)
         if len(votes) >= 2 and len(set(votes)) > 1:
-            # Signals disagree — reduce sizing by 20% for uncertainty
-            sized *= 0.8
+            tilt *= 0.8
+        # Regime-conditional Kelly cap: never let recent-win streaks scale
+        # size ABOVE baseline in stressed/bear regimes (procyclicality fix)
+        if (vix is not None and vix > 25) or hmm_label == 'bear':
+            kelly_mult = min(kelly_mult, 1.0)
+        # Sentiment gate and LLM conviction (veto handled by callers)
+        tilt *= sentiment_mult
+        tilt *= llm_mult
+        # Asset-specific extra tilt (crypto: funding-rate positioning)
+        tilt *= self._extra_tilt(symbol)
+        # Boosts capped; de-risking honored
+        tilt = max(0.1, min(TILT_MAX, tilt))
+
+        # DEGRADED-MODE CLAMP: the advisory gates share upstream data
+        # sources (yfinance, Alpaca bars), and each one silently defaults
+        # to NEUTRAL when its feed fails — so a yfinance outage during a
+        # VIX-40 crash made the system size at full tilt with its risk
+        # ladders blind. When 2+ advisory inputs are unavailable, treat
+        # the risk state as unknown and cap the tilt at 0.5x.
+        missing = sum([
+            vix is None,
+            returns is None,                # GARCH + HMM both blind
+            not self.corr_matrix,
+            kelly_f is None,
+        ])
+        if missing >= 2:
+            if tilt > 0.5:
+                logger.warning("[SIZING] %s: %d advisory inputs unavailable — "
+                               "degraded mode, tilt capped at 0.5x", symbol, missing)
+            tilt = min(tilt, 0.5)
+
+        sized = base * kelly_mult * vol_mult * tilt
+
+        # --- 5. Hard caps including the NEW order ---
+        existing_value = 0.0
+        if symbol in self.positions:
+            existing_value = self.positions[symbol].qty * self.positions[symbol].entry_price
+        room = self.MAX_NOTIONAL_PER_SYMBOL - existing_value
+        sized = min(sized, max(room, 0))
 
         # Leveraged ETF scaling: divide by leverage factor
         leverage = self._leveraged_etfs.get(symbol, 1)
         if leverage > 1:
             sized /= leverage
 
-        return max(1, int(sized))
+        if sized < MIN_ORDER_NOTIONAL:
+            return 0
+        return int(sized)
 
     def _load_hard_stop_lockout(self):
         """Load hard-stop lockout state from disk (survive restarts)."""
@@ -724,6 +1182,26 @@ class BaseTradingLoop(ABC):
         except Exception as e:
             logger.warning("[LOCKOUT] Failed to save lockout file: %s", e)
 
+    def _roll_trade_budget_date(self):
+        today = datetime.date.today().isoformat()
+        if today != self._daily_trades_date:
+            self._daily_trades = {}
+            self._daily_trades_date = today
+
+    def _count_trade(self, symbol: str):
+        self._roll_trade_budget_date()
+        self._daily_trades[symbol] = self._daily_trades.get(symbol, 0) + 1
+        self._save_position_state()
+
+    def _trade_budget_ok(self, symbol: str) -> bool:
+        """True if the symbol hasn't used up today's entry budget."""
+        from strategy_config import MAX_TRADES_PER_SYMBOL_PER_DAY
+        self._roll_trade_budget_date()
+        cap = MAX_TRADES_PER_SYMBOL_PER_DAY.get(self.get_asset_type(), 4)
+        if self._daily_trades.get(symbol, 0) >= cap:
+            return False
+        return True
+
     def _is_hard_stop_locked(self, symbol: str) -> bool:
         """Check if symbol is in hard-stop lockout period."""
         if symbol not in self.hard_stop_lockout:
@@ -745,14 +1223,25 @@ class BaseTradingLoop(ABC):
             if self._is_hard_stop_locked(symbol):
                 continue
 
+            if not self._trade_budget_ok(symbol):
+                continue
+
             # Position cap check
             if symbol in self.positions:
                 existing_value = self.positions[symbol].qty * self.positions[symbol].entry_price
                 if existing_value >= self.MAX_NOTIONAL_PER_SYMBOL:
                     continue
 
+            # FAIL CLOSED: no prediction or no quote means we don't know
+            # enough to buy. (Previously both gates sat inside an
+            # `if pred is not None` block, so a missing model or a data
+            # outage bought the whole universe ungated.)
             pred_return = preds.get(symbol)
+            if pred_return is None:
+                continue
             quote = self.get_quote(symbol)
+            if quote is None:
+                continue
 
             # Prediction gate (higher bar if recently hard-stopped or mean-reverting)
             effective_threshold = self.trade_threshold
@@ -763,13 +1252,10 @@ class BaseTradingLoop(ABC):
             if hurst is not None and hurst < 0.45:
                 effective_threshold = max(effective_threshold,
                                           self.trade_threshold * 1.3)
-            if pred_return is not None and quote is not None:
-                if not should_trade(pred_return, quote['spread_pct']):
-                    continue
-                if pred_return < effective_threshold:
-                    continue
-
-            if quote is None:
+            if not should_trade(pred_return, quote['spread_pct'],
+                                asset_type=self.get_asset_type()):
+                continue
+            if pred_return < effective_threshold:
                 continue
 
             # Winner's curse filter: if price > SMA20 + 2*ATR, require higher threshold
@@ -803,29 +1289,31 @@ class BaseTradingLoop(ABC):
                     logger.info("%s: Blocked — VIX > 25 defensive (non-safe-haven)", symbol)
                     continue
 
-            # Compute position size with all adjustments
-            sized_notional = self._compute_position_size(symbol, pred_return, quote)
-
-            # Sentiment gate
+            # Sentiment gate (veto first; multiplier folds into sizing tilt)
             gate, gate_reasons = sentiment_gate(symbol, self.get_asset_type())
             if gate <= 0:
                 log_decision({"symbol": symbol, "action": "skip", "skip_reason": "sentiment_block",
                               "pred_return": pred_return,
                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons})
                 continue
-            sized_notional = int(sized_notional * gate)
 
-            # LLM gate
+            # LLM gate (veto first; multiplier folds into sizing tilt)
             llm_info = self.llm_scores.get(symbol, {})
             llm_s = llm_info.get('s', 0.5)
             llm_reason = llm_info.get('r', '')
             if llm_s < LLM_VETO_THRESHOLD:
                 log_decision({"symbol": symbol, "action": "skip", "skip_reason": "llm_veto",
                               "pred_return": pred_return,
-                              "llm_multiplier": llm_s, "llm_reasoning": llm_reason})
+                              "llm_score": llm_s, "llm_reasoning": llm_reason})
                 continue
             llm_mult = 0.5 + llm_s
-            sized_notional = int(sized_notional * llm_mult)
+
+            # Single risk-based sizing call (all bounds enforced inside)
+            sized_notional = self._compute_position_size(
+                symbol, pred_return, quote,
+                sentiment_mult=gate, llm_mult=llm_mult)
+            if sized_notional <= 0:
+                continue
 
             # Order timing jitter (prevent pattern detection)
             import random
@@ -892,17 +1380,31 @@ class BaseTradingLoop(ABC):
                     take_profit_price=tp_price,
                     garch_sigma=garch_sigma,
                 )
+                # Server-side disaster backstop (crypto: resting GTC stop_limit)
+                self._after_entry_protection(symbol, self.positions[symbol])
+                decision_price = quote['midpoint']
+                slippage_bps = ((fill_price - decision_price) / decision_price * 1e4
+                                if decision_price > 0 else None)
                 log_decision({"symbol": symbol, "action": "buy",
                               "pred_return": pred_return,
                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
                               "llm_multiplier": llm_mult, "llm_score": llm_s,
                               "llm_reasoning": llm_reason,
                               "final_notional": notional,
+                              "decision_price": decision_price,
+                              "fill_price": fill_price,
+                              "slippage_bps": round(slippage_bps, 2) if slippage_bps is not None else None,
                               "skip_reason": None})
                 self.last_trade_time[symbol] = datetime.datetime.now()
+                self._count_trade(symbol)
 
     def _sleep(self):
         """Sleep with thermal throttling."""
+        try:
+            from notify import ping_heartbeat
+            ping_heartbeat(self.get_asset_type())
+        except Exception:
+            pass
         sleep_interval = self.LOOP_INTERVAL
         temp = get_gpu_temp()
         if temp is not None and temp > THERMAL_THROTTLE_TEMP:

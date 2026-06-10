@@ -43,7 +43,14 @@ def _set_cached(key: str, val):
 # --- VIX ---
 
 def fetch_vix() -> float | None:
-    """Fetch current VIX level from yfinance."""
+    """Fetch current VIX level: yfinance primary, FRED VIXCLS fallback.
+
+    yfinance is unofficial scraping and Yahoo's throttling correlates with
+    crash-day traffic — exactly when the VIX risk ladders matter most. A
+    VIX of None makes every ladder silently pass at 1.0x, so a 1-day-lagged
+    official FRED value is far better than blindness. (The sizing layer
+    additionally clamps tilt when multiple advisory inputs are missing.)
+    """
     cached = _get_cached('vix', _VIX_CACHE_TTL)
     if cached is not None:
         return cached
@@ -59,6 +66,23 @@ def fetch_vix() -> float | None:
             return val
     except Exception as e:
         logger.debug("[MACRO] VIX fetch error: %s", e)
+
+    # Fallback: FRED VIXCLS (official CBOE close, ~1 day lag, free CSV)
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            'https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS',
+            headers={'User-Agent': 'trader/1.0'})
+        body = urllib.request.urlopen(req, timeout=10).read().decode()
+        for line in reversed(body.strip().splitlines()):
+            parts = line.split(',')
+            if len(parts) == 2 and parts[1] not in ('.', 'VIXCLS', ''):
+                val = float(parts[1])
+                _set_cached('vix', val)
+                logger.info("[MACRO] VIX (FRED fallback, 1d lag): %.1f", val)
+                return val
+    except Exception as e:
+        logger.debug("[MACRO] FRED VIX fallback error: %s", e)
     return None
 
 
@@ -166,6 +190,36 @@ def check_stablecoin_pegs(api) -> dict:
 
     _set_cached('stablecoins', result)
     return result
+
+
+# --- SPY 200-day trend filter ---
+
+def get_spy_trend_ok(api) -> bool | None:
+    """True when SPY closes above its 200-day SMA (Faber's trend filter).
+
+    Faber (2007): the 200d MA filter cut max drawdown 83.7% -> 42.2% and
+    is the best-evidenced simple regime gate. Below trend, the stock loop
+    blocks non-safe-haven entries. Cached 1h. Returns None when data is
+    unavailable (callers should fail OPEN so a dead data feed doesn't
+    silently halt all trading — the VIX gates still protect).
+    """
+    cached = _get_cached('spy_trend', 3600)
+    if cached is not None:
+        return cached
+    try:
+        from datetime import datetime, timedelta, timezone
+        start = datetime.now(timezone.utc) - timedelta(days=320)
+        bars = api.get_bars('SPY', '1Day', start=start.isoformat(),
+                            adjustment='all')
+        closes = [float(b.c) for b in bars]
+        if len(closes) < 200:
+            return None
+        sma200 = sum(closes[-200:]) / 200
+        ok = closes[-1] > sma200
+        _set_cached('spy_trend', ok)
+        return ok
+    except Exception:
+        return None
 
 
 # --- Regime Computation ---

@@ -10,11 +10,30 @@ from log_config import get_logger
 
 logger = get_logger(__name__)
 
-# Cache
-_corr_cache: tuple[dict, float] | None = None
+# Cache (per asset class — the combined bot runner shares this module
+# between the crypto and stock threads)
+_corr_cache: dict[str, tuple[dict, float]] = {}
 _CORR_CACHE_TTL = 3600  # 1 hour
 
 MAX_AVG_CORRELATION = 0.7  # reject if avg pairwise > this
+
+
+def get_correlation_matrix_cached(api, symbols, asset_type='crypto'):
+    """Correlation matrix with a 1h TTL cache.
+
+    Pairwise correlations over 30 bars barely move cycle to cycle; the old
+    path serially refetched the whole universe and re-ran ~1,000
+    LedoitWolf fits every 10th cycle while this cache sat unused.
+    """
+    now = time.monotonic()
+    hit = _corr_cache.get(asset_type)
+    if hit is not None and (now - hit[1]) < _CORR_CACHE_TTL:
+        return hit[0]
+    returns_dict = get_returns_for_symbols(api, symbols, asset_type)
+    corr = compute_correlation_matrix(returns_dict) if returns_dict else {}
+    if corr:
+        _corr_cache[asset_type] = (corr, now)
+    return corr
 
 
 def compute_correlation_matrix(returns_dict: dict[str, np.ndarray],

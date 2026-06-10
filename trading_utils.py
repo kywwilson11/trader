@@ -11,11 +11,12 @@ import datetime
 from pathlib import Path
 
 import numpy as np
-import alpaca_trade_api as tradeapi
 from dotenv import load_dotenv
 
 from hw_monitor import is_gpu_available
-from predict_now import get_live_prediction
+# NOTE: predict_now (and through it torch, ~300MB RSS) is imported lazily
+# inside predict_symbol() — harvest scripts and the GUI construct API
+# clients through this module and must NOT pay the torch import.
 
 load_dotenv()
 
@@ -32,13 +33,29 @@ TEMP_LOG_EVERY_N_CYCLES = 10   # Log GPU temp every N cycles
 # --- API CONSTRUCTION ---
 
 def get_api():
-    """Build an Alpaca REST client from .env credentials."""
-    return tradeapi.REST(
-        os.getenv('ALPACA_API_KEY'),
-        os.getenv('ALPACA_API_SECRET'),
-        os.getenv('ALPACA_BASE_URL'),
-        api_version='v2',
-    )
+    """Build an Alpaca REST client from .env credentials.
+
+    Prefers the legacy alpaca-trade-api SDK (battle-tested in this repo)
+    but transparently switches to the maintained alpaca-py SDK via
+    alpaca_compat.CompatREST when:
+      - TRADER_USE_ALPACA_PY=1 is set (opt-in / testing), or
+      - alpaca-trade-api can no longer be imported (it is unmaintained
+        since 2022 and its dependency pins conflict with modern packages —
+        rot will eventually land).
+    """
+    key = os.getenv('ALPACA_API_KEY')
+    secret = os.getenv('ALPACA_API_SECRET')
+    base_url = os.getenv('ALPACA_BASE_URL')
+
+    if os.environ.get('TRADER_USE_ALPACA_PY') != '1':
+        try:
+            import alpaca_trade_api as tradeapi
+            return tradeapi.REST(key, secret, base_url, api_version='v2')
+        except ImportError:
+            print("[API] alpaca-trade-api unavailable — using alpaca-py adapter")
+
+    from alpaca_compat import CompatREST
+    return CompatREST(key, secret, base_url)
 
 
 # --- MODEL HOT-RELOAD HELPERS ---
@@ -49,6 +66,21 @@ def get_model_mtime(path):
         return os.path.getmtime(path)
     except OSError:
         return 0
+
+
+def model_reload_key(model_prefix=''):
+    """Reload key for hot-reload checks.
+
+    Prefers the save manifest (written LAST, after all four artifacts are
+    atomically in place) so a bot never reloads mid-save and pairs new
+    weights with an old scaler. Falls back to the .pth mtime for models
+    saved before manifests existed.
+    """
+    p = f'{model_prefix}_' if model_prefix else ''
+    manifest = f'{p}model_v2.manifest.json'
+    if os.path.exists(manifest):
+        return os.path.getmtime(manifest)
+    return get_model_mtime(f'{p}model_v2.pth')
 
 
 # --- INFERENCE DEVICE ---
@@ -91,6 +123,8 @@ def predict_symbol(api, symbol, model, config, scaler_X, feature_cols,
         (symbol, pred_return) tuple where pred_return is float or None
         If return_snapshot: (symbol, pred_return, snapshot_dict)
     """
+    from predict_now import get_live_prediction
+
     extra_kwargs = {}
     if asset_type == 'stock':
         extra_kwargs['spy_close'] = benchmark_close
@@ -135,10 +169,12 @@ def compute_kelly_fraction(min_trades: int = 50) -> float | None:
     except (OSError, json.JSONDecodeError):
         return None
 
-    # Flatten all trades across symbols
+    # Flatten all trades across symbols. Exclude 'estimated' records —
+    # unconfirmed exits journaled at pre-slippage quote midpoints (worst on
+    # exactly the stop-outs) inflate avg_win/avg_loss and thus Kelly.
     all_trades = []
     for trades in data.values():
-        all_trades.extend(trades)
+        all_trades.extend(t for t in trades if not t.get('estimated'))
 
     if len(all_trades) < min_trades:
         return None
@@ -158,7 +194,16 @@ def compute_kelly_fraction(min_trades: int = 50) -> float | None:
     if avg_loss == 0:
         return None
 
-    win_loss_ratio = avg_win / avg_loss
+    # SHRINKAGE toward a skeptical prior (50 pseudo-trades at breakeven:
+    # win_rate 0.5, payoff ratio 1.0). Raw Kelly from a hot recent sample
+    # ramps size at exactly the wrong time — regime tops — and Rising &
+    # Wyner show fractional Kelly is equivalent to shrinking the estimated
+    # edge toward a prior; this makes the shrinkage explicit so a 1.5x
+    # multiplier requires SUSTAINED evidence, not one lucky fortnight.
+    n = len(recent)
+    prior_n = 50
+    win_rate = (win_rate * n + 0.5 * prior_n) / (n + prior_n)
+    win_loss_ratio = (avg_win / avg_loss * n + 1.0 * prior_n) / (n + prior_n)
     kelly_f = (win_rate * win_loss_ratio - (1 - win_rate)) / win_loss_ratio
 
     # Half-Kelly, clamped to [0.05, 0.25]
