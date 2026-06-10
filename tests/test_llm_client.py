@@ -49,12 +49,14 @@ class TestCallGemini:
             assert call_gemini("test prompt") is None
 
     def test_parses_response(self):
+        """_call_gemini returns (text, usage_metadata)."""
         fake_response = json.dumps({
             "candidates": [{
                 "content": {
                     "parts": [{"text": "Hello world"}]
                 }
-            }]
+            }],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 3},
         }).encode()
 
         mock_resp = MagicMock()
@@ -64,9 +66,10 @@ class TestCallGemini:
         mock_resp.__exit__ = MagicMock(return_value=False)
 
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = _call_gemini("prompt", "", "fake-key", "model", 100, 10)
+            result, usage = _call_gemini("prompt", "", "fake-key", "model", 100, 10)
 
         assert result == "Hello world"
+        assert usage["promptTokenCount"] == 10
 
 
 class TestQuotaTracking:
@@ -190,7 +193,7 @@ class TestCallGeminiResponse:
         mock_resp.read.return_value = fake_response
         mock_resp.getheader.return_value = None
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = _call_gemini("prompt", "", "key", "model", 100, 10)
+            result, _usage = _call_gemini("prompt", "", "key", "model", 100, 10)
         assert result is None
 
     def test_missing_content_returns_none(self):
@@ -201,11 +204,25 @@ class TestCallGeminiResponse:
         mock_resp.read.return_value = fake_response
         mock_resp.getheader.return_value = None
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = _call_gemini("prompt", "", "key", "model", 100, 10)
+            result, _usage = _call_gemini("prompt", "", "key", "model", 100, 10)
         assert result is None
 
-    def test_system_message_added_to_contents(self):
-        """When system is provided, it should appear in the request body."""
+    def test_truncated_response_returns_none(self):
+        """MAX_TOKENS truncation is discarded so the caller's chain retries."""
+        fake_response = json.dumps({
+            "candidates": [{"finishReason": "MAX_TOKENS",
+                            "content": {"parts": [{"text": '{"partial":'}]}}]
+        }).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = fake_response
+        mock_resp.getheader.return_value = None
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result, _usage = _call_gemini("prompt", "", "key", "model", 100, 10)
+        assert result is None
+
+    def test_system_uses_system_instruction_field(self):
+        """System prompts go in systemInstruction — the old fake
+        user/'Understood.' turns weakened adherence and broke caching."""
         fake_response = json.dumps({
             "candidates": [{"content": {"parts": [{"text": "ok"}]}}]
         }).encode()
@@ -215,10 +232,30 @@ class TestCallGeminiResponse:
 
         with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
             _call_gemini("hello", "be helpful", "key", "model", 100, 10)
-            # Check the request body includes system turn
-            call_args = mock_open.call_args
-            req = call_args[0][0]
+            req = mock_open.call_args[0][0]
             body = json.loads(req.data.decode())
-            # Should have 3 content turns: system user, model ack, actual user
-            assert len(body["contents"]) == 3
-            assert body["contents"][0]["parts"][0]["text"] == "be helpful"
+            assert body["systemInstruction"]["parts"][0]["text"] == "be helpful"
+            # Only the actual user turn remains in contents
+            assert len(body["contents"]) == 1
+            assert body["contents"][0]["parts"][0]["text"] == "hello"
+
+    def test_json_schema_sets_response_schema(self):
+        """json_schema must reach generationConfig for ALL models — the old
+        '\"pro\" not in model' guard left the analyst call unenforced."""
+        fake_response = json.dumps({
+            "candidates": [{"content": {"parts": [{"text": "{}"}]}}]
+        }).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = fake_response
+        mock_resp.getheader.return_value = None
+
+        schema = {"type": "OBJECT", "properties": {"s": {"type": "NUMBER"}}}
+        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
+            _call_gemini("hello", "", "key", "gemini-2.5-pro", 100, 10,
+                         json_schema=schema, temperature=0.2)
+            req = mock_open.call_args[0][0]
+            body = json.loads(req.data.decode())
+            gc = body["generationConfig"]
+            assert gc["responseMimeType"] == "application/json"
+            assert gc["responseSchema"] == schema
+            assert gc["temperature"] == 0.2

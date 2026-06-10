@@ -106,18 +106,23 @@ class TestVolatility:
         assert stop == pytest.approx(97.0, abs=0.01)
 
     def test_compute_vol_adjusted_size(self):
-        from volatility import compute_vol_adjusted_size
-        # Low vol → bigger position
-        assert compute_vol_adjusted_size(1000, 0.01, target_vol=0.02) == 2000
-        # High vol → smaller position
-        assert compute_vol_adjusted_size(1000, 0.04, target_vol=0.02) == 500
+        """Target is now derived from ANNUALIZED portfolio vol converted to
+        per-bar units — the old 2%-per-hourly-bar target (~187%/yr!) was
+        above nearly every realistic sigma and silently ~doubled most
+        positions via the clamp."""
+        from volatility import compute_vol_adjusted_size, BARS_PER_YEAR
+        from strategy_config import PORTFOLIO_VOL_TARGET
+        target_bar = PORTFOLIO_VOL_TARGET['crypto'] / np.sqrt(BARS_PER_YEAR['crypto'])
+        # Sigma below target → bigger position; above target → smaller
+        assert compute_vol_adjusted_size(1000, target_bar / 1.2, asset_type='crypto') > 1000
+        assert compute_vol_adjusted_size(1000, target_bar * 2, asset_type='crypto') == 500
 
     def test_vol_adjusted_size_clamp(self):
         from volatility import compute_vol_adjusted_size
-        # Very high vol → clamped at 0.5x
-        assert compute_vol_adjusted_size(1000, 0.10, target_vol=0.02) == 500
-        # Very low vol → clamped at 2.0x
-        assert compute_vol_adjusted_size(1000, 0.005, target_vol=0.02) == 2000
+        # Very high vol (10%/hour) → clamped at 0.5x
+        assert compute_vol_adjusted_size(1000, 0.10, asset_type='crypto') == 500
+        # Very low vol → clamped at 1.5x (boost cap tightened from 2.0x)
+        assert compute_vol_adjusted_size(1000, 0.0001, asset_type='crypto') == 1500
 
 
 # --- portfolio ---
@@ -282,17 +287,18 @@ class TestKelly:
 # --- hypersearch_v2 (compute_sharpe with txn costs) ---
 
 class TestSharpeWithTxnCosts:
-    def test_txn_costs_reduce_sharpe(self):
+    def test_txn_costs_reduce_mean_trade_return(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-        from hypersearch_v2 import compute_sharpe
+        from hypersearch_v2 import simulate_trades
         np.random.seed(42)
         preds = np.random.randn(500) * 0.5
         rets = np.random.randn(500) * 1.0
 
-        sharpe_no_cost = compute_sharpe(preds, rets, 0.3, txn_cost_bps=0)
-        sharpe_with_cost = compute_sharpe(preds, rets, 0.3, txn_cost_bps=5)
-        # Transaction costs should reduce Sharpe
-        assert sharpe_with_cost < sharpe_no_cost
+        free = simulate_trades(preds, rets, 0.3, forward_bars=24, txn_cost_pct=0.0)
+        costed = simulate_trades(preds, rets, 0.3, forward_bars=24, txn_cost_pct=0.6)
+        assert len(free) == len(costed)
+        # Every trade pays exactly the round-trip cost
+        assert costed.mean() == pytest.approx(free.mean() - 0.6, abs=1e-9)
 
     def test_regime_sharpes(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
@@ -310,8 +316,10 @@ class TestSharpeWithTxnCosts:
 # --- order_utils (circuit breaker error handling) ---
 
 class TestCircuitBreakerErrorHandling:
-    def test_circuit_breaker_api_error(self):
-        """Circuit breaker should return (False, 0.0) on API error."""
+    def test_circuit_breaker_api_error_signals_unknown(self):
+        """On API error the breaker returns dd=None — 'unknown risk state'.
+        Callers FAIL CLOSED on None (skip new buys) instead of trading as
+        if everything were fine."""
         from order_utils import check_circuit_breaker
 
         class FakeAPI:
@@ -320,4 +328,4 @@ class TestCircuitBreakerErrorHandling:
 
         tripped, dd = check_circuit_breaker(FakeAPI())
         assert not tripped
-        assert dd == 0.0
+        assert dd is None

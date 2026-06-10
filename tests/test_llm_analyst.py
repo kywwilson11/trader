@@ -49,28 +49,23 @@ class TestParseResponse:
         result = _parse_response(response, ["TSLA"])
         assert result["TSLA"]["s"] == 0.5  # default neutral
 
-    def test_legacy_format_backward_compat(self):
-        """Old format with 'm' field should still work."""
-        response = json.dumps({
-            "TSLA": {"m": 1.2, "r": "strong momentum"},
-            "AAPL": {"m": 0.5, "r": "overvalued"},
-        })
-        result = _parse_response(response, ["TSLA", "AAPL"])
-        assert result["TSLA"]["m"] == 1.2
-        assert result["AAPL"]["m"] == 0.5
-        # s should be derived from m (m / 1.5)
-        assert abs(result["TSLA"]["s"] - 0.8) < 0.01
-        assert abs(result["AAPL"]["s"] - 0.3333) < 0.01
-
-    def test_clamps_legacy_multiplier_high(self):
-        response = json.dumps({"TSLA": {"m": 5.0, "r": "very bullish"}})
+    def test_clamps_score_high(self):
+        """Out-of-range s values are clamped (schema enforces NUMBER, not range)."""
+        response = json.dumps({"TSLA": {"s": 5.0, "r": "very bullish"}})
         result = _parse_response(response, ["TSLA"])
-        assert result["TSLA"]["m"] == 1.5  # clamped to max
+        assert result["TSLA"]["s"] == 1.0
+        assert result["TSLA"]["m"] == 1.5  # legacy field derived from s
 
-    def test_clamps_legacy_multiplier_low(self):
-        response = json.dumps({"TSLA": {"m": -2.0, "r": "bearish"}})
+    def test_clamps_score_low(self):
+        response = json.dumps({"TSLA": {"s": -2.0, "r": "bearish"}})
         result = _parse_response(response, ["TSLA"])
-        assert result["TSLA"]["m"] == 0.0  # clamped to min
+        assert result["TSLA"]["s"] == 0.0
+        assert result["TSLA"]["m"] == 0.0
+
+    def test_non_numeric_score_defaults_neutral(self):
+        response = json.dumps({"TSLA": {"s": "high", "r": "?"}})
+        result = _parse_response(response, ["TSLA"])
+        assert result["TSLA"]["s"] == 0.5
 
     def test_markdown_wrapped_json(self):
         response = '```json\n{"TSLA": {"s": 0.65, "r": "ok"}}\n```'

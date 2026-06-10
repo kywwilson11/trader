@@ -33,7 +33,7 @@ class TestLoadLLMConfig:
         assert config["enabled"] is False
         # Missing keys filled from defaults
         assert "models" in config
-        assert config["max_llm_latency_sec"] == 15
+        assert config["max_llm_latency_sec"] == 30
 
     def test_journal_enabled_default(self):
         assert _DEFAULTS["journal_enabled"] is True

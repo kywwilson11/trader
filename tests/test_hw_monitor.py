@@ -1,11 +1,24 @@
-"""Tests for hw_monitor.py — GPU temp, RAM usage, GPU availability."""
+"""Tests for hw_monitor.py — GPU temp (sysfs), RAM usage, GPU availability."""
 
 import os
 from unittest.mock import patch, mock_open, MagicMock
 
 import pytest
 
+import hw_monitor
 from hw_monitor import get_ram_usage, get_gpu_temp, is_gpu_available
+
+
+@pytest.fixture(autouse=True)
+def _reset_hw_monitor_caches():
+    """get_gpu_temp caches the zone path and the reading — reset per test."""
+    hw_monitor._zone_scan_done = False
+    hw_monitor._zone_path_cache = None
+    hw_monitor._temp_cache = (0.0, None)
+    yield
+    hw_monitor._zone_scan_done = False
+    hw_monitor._zone_path_cache = None
+    hw_monitor._temp_cache = (0.0, None)
 
 
 class TestGetRamUsage:
@@ -42,47 +55,101 @@ class TestGetRamUsage:
 
 
 class TestGetGpuTemp:
-    """Tests for get_gpu_temp() — tegrastats and thermal zone parsing."""
+    """Tests for get_gpu_temp() — sysfs thermal-zone reading.
 
-    @patch("hw_monitor.subprocess.run")
-    def test_tegrastats_output(self, mock_run):
-        mock_run.return_value = MagicMock(
-            stdout="RAM 3000/7453MB GPU@55C CPU@45C",
-            stderr="",
-        )
-        temp = get_gpu_temp()
-        assert temp == 55.0
+    The old tegrastats subprocess path is gone: `tegrastats --interval`
+    never exits, so subprocess.run(timeout=2) ALWAYS blocked 2 seconds and
+    discarded its output — ~1.6h/day of dead time per bot for zero data.
+    """
 
-    @patch("hw_monitor.subprocess.run", side_effect=FileNotFoundError)
-    def test_thermal_zone_fallback(self, mock_run):
+    def test_reads_discovered_zone(self, monkeypatch):
+        monkeypatch.setattr(hw_monitor, "_find_gpu_thermal_zone",
+                            lambda: "/sys/fake/thermal_zone1/temp")
         with patch("builtins.open", mock_open(read_data="52000\n")):
             temp = get_gpu_temp()
         assert temp == 52.0
 
-    @patch("hw_monitor.subprocess.run", side_effect=FileNotFoundError)
-    def test_unavailable_returns_none(self, mock_run):
-        with patch("builtins.open", side_effect=FileNotFoundError):
-            temp = get_gpu_temp()
-        assert temp is None
+    def test_zone_discovery_prefers_gpu_type(self, monkeypatch):
+        """Zone numbering varies across JetPack releases — discovery must
+        match the zone whose `type` says gpu, not a hardcoded index."""
+        files = {
+            os.path.join(hw_monitor._THERMAL_DIR, "thermal_zone0", "type"): "cpu-thermal\n",
+            os.path.join(hw_monitor._THERMAL_DIR, "thermal_zone1", "type"): "gpu-thermal\n",
+        }
+
+        real_open = open
+
+        def fake_open(path, *a, **k):
+            if path in files:
+                return mock_open(read_data=files[path])()
+            raise FileNotFoundError(path)
+
+        monkeypatch.setattr(hw_monitor.os, "listdir",
+                            lambda d: ["thermal_zone0", "thermal_zone1"])
+        with patch("builtins.open", side_effect=fake_open):
+            zone = hw_monitor._find_gpu_thermal_zone()
+        assert zone is not None and "thermal_zone1" in zone
+
+    def test_unavailable_returns_none(self, monkeypatch):
+        monkeypatch.setattr(hw_monitor, "_find_gpu_thermal_zone", lambda: None)
+        assert get_gpu_temp() is None
+
+    def test_reading_is_cached(self, monkeypatch):
+        monkeypatch.setattr(hw_monitor, "_find_gpu_thermal_zone",
+                            lambda: "/sys/fake/temp")
+        opened = {"n": 0}
+
+        def fake_open(path, *a, **k):
+            opened["n"] += 1
+            return mock_open(read_data="48000\n")()
+
+        with patch("builtins.open", side_effect=fake_open):
+            assert get_gpu_temp() == 48.0
+            assert get_gpu_temp() == 48.0  # served from the 20s cache
+        assert opened["n"] == 1
 
 
 class TestIsGpuAvailable:
-    """Tests for is_gpu_available() — CUDA check."""
+    """Tests for is_gpu_available() — CUDA check.
 
-    @patch("hw_monitor.torch")
-    def test_cuda_available(self, mock_torch):
+    torch is imported LAZILY inside the function (a module-level import
+    forced every consumer of get_gpu_temp() to pay the torch import), so
+    tests inject a fake torch into sys.modules.
+    """
+
+    def _patch_torch(self, monkeypatch, mock_torch):
+        import sys
+        monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    def test_cuda_available(self, monkeypatch):
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        mock_torch = MagicMock()
         mock_torch.cuda.is_available.return_value = True
+        mock_torch.cuda.OutOfMemoryError = RuntimeError
         mock_torch.zeros.return_value = MagicMock()
+        self._patch_torch(monkeypatch, mock_torch)
         assert is_gpu_available() is True
 
-    @patch("hw_monitor.torch")
-    def test_no_cuda(self, mock_torch):
+    def test_no_cuda(self, monkeypatch):
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        mock_torch = MagicMock()
         mock_torch.cuda.is_available.return_value = False
+        mock_torch.cuda.OutOfMemoryError = RuntimeError
+        self._patch_torch(monkeypatch, mock_torch)
         assert is_gpu_available() is False
 
-    @patch("hw_monitor.torch")
-    def test_oom_returns_false(self, mock_torch):
+    def test_oom_returns_false(self, monkeypatch):
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        mock_torch = MagicMock()
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.OutOfMemoryError = RuntimeError
         mock_torch.zeros.side_effect = RuntimeError("CUDA out of memory")
+        self._patch_torch(monkeypatch, mock_torch)
+        assert is_gpu_available() is False
+
+    def test_cuda_hidden_env_short_circuits(self, monkeypatch):
+        # Bot processes run with CUDA_VISIBLE_DEVICES='' — must return False
+        # WITHOUT importing torch (a stray check used to cost a permanent
+        # ~1GB CUDA context in the bot process)
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
         assert is_gpu_available() is False

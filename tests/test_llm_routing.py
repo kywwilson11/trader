@@ -107,68 +107,52 @@ def _setup_routing(daily_cost=0.0, tier='paid', model_calls=None,
     return config
 
 
-def test_paid_tier_low_spend_uses_pro():
-    """Daily cost < $0.10 → analyst=Pro."""
+def test_paid_tier_analyst_uses_flash_lite():
+    """The analyst gate routes to flash-lite at every spend level: it is a
+    SIZING input, not research — fast, schema-capable, ~$7/month. The old
+    pro routing blew the latency budget on thinking tokens and silently
+    demoted to an unschema'd fallback."""
     import llm_client
 
-    config = _setup_routing(daily_cost=0.02, tier='paid')
-    with mock.patch('llm_client.load_llm_config', return_value=config):
-        model = llm_client.get_recommended_model('analyst')
-    assert model == 'gemini-2.5-pro'
+    for cost in (0.02, 0.20, 0.50):
+        config = _setup_routing(daily_cost=cost, tier='paid')
+        with mock.patch('llm_client.load_llm_config', return_value=config):
+            model = llm_client.get_recommended_model('analyst')
+        assert model == 'gemini-2.5-flash-lite', cost
     llm_client._detected_tier = None
 
 
-def test_paid_tier_mid_spend_uses_flash():
-    """$0.10 <= daily cost < $0.40 → analyst=Flash."""
-    import llm_client
-
-    config = _setup_routing(daily_cost=0.20, tier='paid')
-    with mock.patch('llm_client.load_llm_config', return_value=config):
-        model = llm_client.get_recommended_model('analyst')
-    assert model == 'gemini-2.5-flash'
-    llm_client._detected_tier = None
-
-
-def test_paid_tier_high_spend_uses_lite():
-    """Daily cost >= $0.40 → analyst=Flash-Lite."""
-    import llm_client
-
-    config = _setup_routing(daily_cost=0.50, tier='paid')
-    with mock.patch('llm_client.load_llm_config', return_value=config):
-        model = llm_client.get_recommended_model('analyst')
-    assert model == 'gemini-2.5-flash-lite'
-    llm_client._detected_tier = None
-
-
-def test_free_tier_always_uses_best():
-    """Free tier → Pro for analyst regardless of cost."""
+def test_free_tier_analyst_uses_flash_lite():
+    """Pro was REMOVED from the Gemini free tier (May 2026); flash-lite has
+    the only generous free RPD bucket."""
     import llm_client
 
     config = _setup_routing(daily_cost=0.50, tier='free')
     config['tier_override'] = 'free'
     with mock.patch('llm_client.load_llm_config', return_value=config):
         model = llm_client.get_recommended_model('analyst')
-    assert model == 'gemini-2.5-pro'
+    assert model == 'gemini-2.5-flash-lite'
     llm_client._detected_tier = None
 
 
-def test_budget_exhausted_downgrades():
-    """Pro budget=0 → falls back to Flash."""
+def test_budget_exhausted_returns_model_gracefully():
+    """flash-lite budget exhausted → routing still returns a model (the call
+    itself fails gracefully against the per-model RPD check)."""
     import llm_client
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
     config = _setup_routing(
         daily_cost=0.02, tier='paid',
-        model_calls={'gemini-2.5-pro': 1000}  # exhausted
+        model_calls={'gemini-2.5-flash-lite': 5000}  # exhausted
     )
-    # Set quota_reset_date to today so _maybe_reset_quota doesn't clear _model_calls
     today = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
     llm_client._quota_reset_date = today
     with mock.patch('llm_client.load_llm_config', return_value=config):
         model = llm_client.get_recommended_model('analyst')
-    assert model == 'gemini-2.5-flash'
+    assert model in llm_client.GEMINI_MODELS
     llm_client._detected_tier = None
+    llm_client._model_calls = {}
 
 
 def test_manual_override_respected():
@@ -202,14 +186,14 @@ def test_get_routing_info():
     llm_client._detected_tier = None
 
 
-def test_sentiment_routing_low_spend():
-    """Low spend → sentiment gets Flash."""
+def test_sentiment_routing_uses_flash_lite():
+    """Sentiment scoring routes to flash-lite (cheap, schema-enforced)."""
     import llm_client
 
     config = _setup_routing(daily_cost=0.02, tier='paid')
     with mock.patch('llm_client.load_llm_config', return_value=config):
         model = llm_client.get_recommended_model('sentiment')
-    assert model == 'gemini-2.5-flash'
+    assert model == 'gemini-2.5-flash-lite'
     llm_client._detected_tier = None
 
 
@@ -228,7 +212,7 @@ def test_backfill_always_lite():
 # --- Budget tests ---
 
 def test_tier_aware_budgets():
-    """Free tier has lower budgets than paid."""
+    """Free tier has lower budgets than paid; Pro is gone from free tier."""
     import llm_client
 
     llm_client._detected_tier = 'free'
@@ -236,7 +220,8 @@ def test_tier_aware_budgets():
         'tier_override': None, 'detected_tier': 'free',
     }):
         budgets = llm_client._get_budgets()
-    assert budgets['gemini-2.5-pro'] == 50  # free tier limit
+    assert budgets['gemini-2.5-pro'] == 0       # removed from free tier (May 2026)
+    assert budgets['gemini-2.5-flash-lite'] == 1000
 
     llm_client._detected_tier = 'paid'
     with mock.patch('llm_client.load_llm_config', return_value={
