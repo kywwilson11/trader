@@ -193,6 +193,20 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         else:
             df['Daily_Sentiment'] = 0.0
 
+    # Inject live funding features if the model was trained with them
+    # (crypto only; same constant-across-window approach as sentiment)
+    if asset_type == 'crypto' and 'Funding_Rate_Ann' in feature_cols \
+            and 'Funding_Rate_Ann' not in df.columns:
+        ff = None
+        try:
+            from funding import live_funding_features
+            alp_sym = symbol.replace('-', '/') if '-' in symbol else symbol
+            ff = live_funding_features(alp_sym)
+        except Exception:
+            pass
+        for col in ('Funding_Rate_Ann', 'Funding_Z', 'Funding_Chg_24h'):
+            df[col] = (ff or {}).get(col, 0.0)
+
     try:
         current_features = df[feature_cols].values
     except KeyError as e:
@@ -256,7 +270,9 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             'SMA_20', 'Price_SMA20_Ratio', 'BBL_20_2.0', 'BBU_20_2.0',
             'BBP_20_2.0', 'BBB_20_2.0',
             'ROC', 'Return_4h', 'Return_12h', 'Volatility_12h',
-            'Daily_Sentiment',
+            'Daily_Sentiment', 'Hurst',  # Hurst was missing — the loop's
+            # mean-reversion filter read snapshot['Hurst'] and always got
+            # None, so that gate never fired; meta features need it too
             # Cross-asset (may not exist for all asset types)
             'BTC_Return_1h', 'BTC_SMA_Ratio', 'BTC_RSI',
             'RS_vs_SPY', 'Price_VWAP_Ratio', 'ATR_Pct',

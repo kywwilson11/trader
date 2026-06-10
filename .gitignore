@@ -71,3 +71,12 @@ execution_report.json
 funding_history.json
 earnings_calendar.json
 *_heartbeat
+*meta_model.txt
+*meta_calib.pkl
+*meta_meta.json
+funding_archive.parquet
+pred_history.jsonl
+stock_pred_history.jsonl
+drift_state.json
+retrain_requested.flag
+stock_retrain_requested.flag

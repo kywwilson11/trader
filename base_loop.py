@@ -534,6 +534,59 @@ class BaseTradingLoop(ABC):
         """Asset-specific advisory tilt hook (crypto: funding). Base: 1.0."""
         return 1.0
 
+    def _desired_stop_for(self, pos) -> tuple[float, float, float, bool]:
+        """Current protective stop for a position — ONE source of truth.
+
+        Returns (desired_stop, stop_dist, trail_dist, trailing_active).
+        Used by stop management AND book-risk accounting so the cap can
+        never disagree with the stops actually being enforced.
+        """
+        entry_price = pos.entry_price
+        hwm = pos.high_water_mark
+        entry_atr = pos.entry_atr
+        if entry_atr is not None and entry_price > 0:
+            raw_stop_dist = (entry_atr * self.ATR_STOP_MULTIPLIER) / entry_price
+            stop_dist = max(self.ATR_STOP_FLOOR_PCT,
+                            min(self.ATR_STOP_CEIL_PCT, raw_stop_dist))
+            raw_trail_dist = ((entry_atr * self.ATR_TRAIL_MULTIPLIER) / hwm
+                              if hwm > 0 else stop_dist)
+            trail_dist = max(self.ATR_STOP_FLOOR_PCT,
+                             min(self.ATR_STOP_CEIL_PCT, raw_trail_dist))
+        else:
+            stop_dist = self.STOP_LOSS_PCT
+            trail_dist = self.TRAIL_PCT
+
+        # Apply macro regime stop tightening
+        if self.macro_regime and self.macro_regime.stop_mult < 1.0:
+            stop_dist *= self.macro_regime.stop_mult
+            trail_dist *= self.macro_regime.stop_mult
+
+        trailing_active = hwm >= entry_price * (1 + self.ATR_TRAIL_ACTIVATE_PCT)
+        desired_stop = entry_price * (1 - stop_dist)
+        if trailing_active:
+            desired_stop = max(desired_stop, hwm * (1 - trail_dist))
+        return desired_stop, stop_dist, trail_dist, trailing_active
+
+    def _book_stop_risks(self) -> list[float]:
+        """Open stop-risk per position as a fraction of equity.
+
+        Initial-risk bookkeeping (anchored at entry): once the trail moves
+        a stop above entry, that position's principal risk is 0 and it
+        stops consuming book risk budget. Giveback of unrealized gains is
+        the drawdown ladder's job, not this cap's.
+        """
+        if self._equity <= 0:
+            return []
+        risks = []
+        for pos in self.positions.values():
+            try:
+                stop, *_ = self._desired_stop_for(pos)
+                risks.append(max(0.0, pos.entry_price - stop)
+                             * pos.qty / self._equity)
+            except Exception:
+                risks.append(0.0)
+        return risks
+
     def _manage_stops(self):
         """Check stop-loss, trailing stop, and take-profit on open positions."""
         for symbol in list(self.positions):
@@ -571,27 +624,10 @@ class BaseTradingLoop(ABC):
             hwm = pos.high_water_mark
             entry_price = pos.entry_price
 
-            # Determine stop distances
-            entry_atr = pos.entry_atr
-            if entry_atr is not None and entry_price > 0:
-                raw_stop_dist = (entry_atr * self.ATR_STOP_MULTIPLIER) / entry_price
-                stop_dist = max(self.ATR_STOP_FLOOR_PCT, min(self.ATR_STOP_CEIL_PCT, raw_stop_dist))
-                raw_trail_dist = (entry_atr * self.ATR_TRAIL_MULTIPLIER) / hwm if hwm > 0 else stop_dist
-                trail_dist = max(self.ATR_STOP_FLOOR_PCT, min(self.ATR_STOP_CEIL_PCT, raw_trail_dist))
-            else:
-                stop_dist = self.STOP_LOSS_PCT
-                trail_dist = self.TRAIL_PCT
-
-            # Apply macro regime stop tightening
-            if self.macro_regime and self.macro_regime.stop_mult < 1.0:
-                stop_dist *= self.macro_regime.stop_mult
-                trail_dist *= self.macro_regime.stop_mult
+            (desired_stop, stop_dist, trail_dist,
+             trailing_active) = self._desired_stop_for(pos)
 
             # Tighten the resting server-side stop as the trail rises
-            trailing_active = hwm >= entry_price * (1 + self.ATR_TRAIL_ACTIVATE_PCT)
-            desired_stop = entry_price * (1 - stop_dist)
-            if trailing_active:
-                desired_stop = max(desired_stop, hwm * (1 - trail_dist))
             self._maybe_update_resting_stop(symbol, pos, desired_stop)
 
             stop_reason = None
@@ -737,6 +773,14 @@ class BaseTradingLoop(ABC):
                     snapshots[sym] = snapshot
             except Exception as e:
                 logger.error("%s: Prediction error: %s", symbol, e)
+
+        # Rolling prediction log for the PSI drift monitor (one line per
+        # cycle; monitor_drift.py prunes it to 7 days)
+        try:
+            from monitor_drift import log_predictions
+            log_predictions(self.MODEL_PREFIX, preds)
+        except Exception:
+            pass
 
         return preds, snapshots
 
@@ -980,9 +1024,33 @@ class BaseTradingLoop(ABC):
                 self.last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(1)
 
+    def _meta_gate(self, symbol: str, pred_return, snapshots: dict):
+        """Meta-labeling gate: calibrated P(this trade profits net of costs).
+
+        Returns (allowed, meta_mult). No trained meta model -> neutral.
+        """
+        try:
+            from meta_label import (meta_probability_live, meta_size_mult,
+                                    META_VETO_PROB)
+            p = meta_probability_live(self.MODEL_PREFIX,
+                                      snapshots.get(symbol, {}) or {},
+                                      pred_return)
+            if p is None:
+                return True, 1.0
+            if p < META_VETO_PROB:
+                log_decision({"symbol": symbol, "action": "skip",
+                              "skip_reason": "meta_veto",
+                              "pred_return": pred_return,
+                              "meta_prob": round(p, 4)})
+                return False, 1.0
+            return True, meta_size_mult(p)
+        except Exception:
+            return True, 1.0
+
     def _compute_position_size(self, symbol: str, pred_return: float | None,
                                quote: dict, sentiment_mult: float = 1.0,
-                               llm_mult: float = 1.0) -> int:
+                               llm_mult: float = 1.0,
+                               meta_mult: float = 1.0) -> int:
         """Risk-based position sizing.
 
         Replaces the old ~10-factor multiplier soup (which could stack to
@@ -1104,11 +1172,21 @@ class BaseTradingLoop(ABC):
         # size ABOVE baseline in stressed/bear regimes (procyclicality fix)
         if (vix is not None and vix > 25) or hmm_label == 'bear':
             kelly_mult = min(kelly_mult, 1.0)
-        # Sentiment gate and LLM conviction (veto handled by callers)
+        # Sentiment gate, LLM conviction, meta-label probability
+        # (vetoes handled by callers)
         tilt *= sentiment_mult
         tilt *= llm_mult
+        tilt *= meta_mult
         # Asset-specific extra tilt (crypto: funding-rate positioning)
         tilt *= self._extra_tilt(symbol)
+        # Book-level realized-vol scalar (EWMA of the account equity
+        # curve; de-risk only — catches correlation buildup that
+        # per-position GARCH targeting can't see)
+        try:
+            from portfolio import get_book_vol_scalar_cached
+            tilt *= get_book_vol_scalar_cached(self.api, self.get_asset_type())
+        except Exception:
+            pass
         # Boosts capped; de-risking honored
         tilt = max(0.1, min(TILT_MAX, tilt))
 
@@ -1131,6 +1209,38 @@ class BaseTradingLoop(ABC):
             tilt = min(tilt, 0.5)
 
         sized = base * kelly_mult * vol_mult * tilt
+
+        # --- 4b. Correlation-adjusted BOOK risk cap (ENB) ---
+        # Per-trade risk alone lets N near-lockstep positions stack
+        # N*0.5% of equity behind one factor move. Cap the
+        # equicorrelation book risk at MAX_BOOK_RISK_PCT by shrinking
+        # the entry into the remaining budget (0 budget = no entry).
+        if self.positions and self._equity > 0:
+            try:
+                from portfolio import avg_book_correlation, book_risk_budget
+                from strategy_config import MAX_BOOK_RISK_PCT
+                book = list(self.positions.keys())
+                # No correlation data -> assume a fairly correlated book
+                # (crypto pairwise corr typically 0.6-0.9) rather than 0
+                rho = (avg_book_correlation(book + [symbol], self.corr_matrix)
+                       if self.corr_matrix else 0.5)
+                budget = book_risk_budget(self._book_stop_risks(), rho,
+                                          MAX_BOOK_RISK_PCT)
+                cand_risk = sized * stop_dist / self._equity
+                if cand_risk > budget:
+                    scaled = budget * self._equity / max(stop_dist, 1e-4)
+                    if scaled < MIN_ORDER_NOTIONAL:
+                        logger.info("[BOOK-RISK] %s: book stop-risk budget "
+                                    "exhausted (rho=%.2f, %d positions) — "
+                                    "entry blocked", symbol, rho,
+                                    len(self.positions))
+                        return 0
+                    logger.info("[BOOK-RISK] %s: entry shrunk to fit book "
+                                "risk cap ($%d -> $%d, rho=%.2f)",
+                                symbol, int(sized), int(scaled), rho)
+                    sized = scaled
+            except Exception:
+                pass
 
         # --- 5. Hard caps including the NEW order ---
         existing_value = 0.0
@@ -1308,10 +1418,15 @@ class BaseTradingLoop(ABC):
                 continue
             llm_mult = 0.5 + llm_s
 
+            # Meta-labeling gate (veto + bounded sizing multiplier)
+            meta_ok, meta_mult = self._meta_gate(symbol, pred_return, snapshots)
+            if not meta_ok:
+                continue
+
             # Single risk-based sizing call (all bounds enforced inside)
             sized_notional = self._compute_position_size(
                 symbol, pred_return, quote,
-                sentiment_mult=gate, llm_mult=llm_mult)
+                sentiment_mult=gate, llm_mult=llm_mult, meta_mult=meta_mult)
             if sized_notional <= 0:
                 continue
 
@@ -1326,19 +1441,38 @@ class BaseTradingLoop(ABC):
                                       gate, gate_reasons, llm_s, llm_mult, llm_reason)
             time.sleep(1)
 
+    def _execute_entry_order(self, symbol, notional, quote):
+        """Place and confirm the entry order. Returns (final_order, tactic).
+
+        Base: marketable limit at mid+offset with market fallback.
+        Crypto overrides with the maker bid-join ladder.
+        """
+        from order_utils import place_limit_order
+        order = place_limit_order(self.api, symbol, 'buy', notional, quote)
+        if order is None:
+            return None, 'marketable'
+        result = manage_order_lifecycle(self.api, order.id,
+                                        timeout=self.ORDER_TIMEOUT,
+                                        fallback_to_market=True)
+        return result, 'marketable'
+
     def _place_and_track_buy(self, symbol, notional, pred_return, quote,
                              gate, gate_reasons, llm_s, llm_mult, llm_reason):
         """Place buy order and update position tracking. Override in subclasses for bracket orders."""
         from market_data import get_live_atr
-        from order_utils import place_limit_order
 
-        order = place_limit_order(self.api, symbol, 'buy', notional, quote)
-        if order is None:
-            return
-
-        result = manage_order_lifecycle(self.api, order.id, timeout=self.ORDER_TIMEOUT,
-                                        fallback_to_market=True)
-        if result and getattr(result, 'status', None) == 'filled':
+        result, entry_tactic = self._execute_entry_order(symbol, notional, quote)
+        # Judge by ACQUIRED qty, not final order status: a partially
+        # filled rung that timed out still bought coins that must be
+        # tracked (and protected) — the old status=='filled' check left
+        # partial fills invisible to stop management.
+        try:
+            partial_qty = float(getattr(result, 'filled_qty', 0) or 0)
+        except (TypeError, ValueError):
+            partial_qty = 0.0
+        acquired = result is not None and (
+            getattr(result, 'status', None) == 'filled' or partial_qty > 0)
+        if acquired:
             from order_utils import verify_position
             pos = verify_position(self.api, symbol)
             if pos:
@@ -1394,6 +1528,8 @@ class BaseTradingLoop(ABC):
                               "decision_price": decision_price,
                               "fill_price": fill_price,
                               "slippage_bps": round(slippage_bps, 2) if slippage_bps is not None else None,
+                              "entry_tactic": entry_tactic,
+                              "maker": entry_tactic.startswith('maker'),
                               "skip_reason": None})
                 self.last_trade_time[symbol] = datetime.datetime.now()
                 self._count_trade(symbol)

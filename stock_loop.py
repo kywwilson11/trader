@@ -46,7 +46,11 @@ FLATTEN_MINUTE = 50
 class StockLoop(BaseTradingLoop):
     """Market-hours stock trading loop."""
 
-    TOP_N = 10
+    # Rank hysteresis (Garleanu-Pedersen no-trade band): enter only the
+    # strongest names, but keep holding well past the entry cutoff so a
+    # name oscillating around the boundary doesn't churn round-trip costs
+    TOP_N = 7          # entry: rank <= 7
+    HOLD_RANK = 15     # hold:  rank <= 15
     NOTIONAL_PER_SYMBOL = 5000
     MAX_NOTIONAL_PER_SYMBOL = 5000
     MAX_EXPOSURE = 50000
@@ -78,6 +82,7 @@ class StockLoop(BaseTradingLoop):
         self.flattened_today = False
         self.last_date = None
         self.top_symbols: list[str] = []
+        self.hold_symbols: set[str] = set()
         self._clock_cache: tuple[float, object] = (0.0, None)
         self._last_preds: dict[str, float] = {}
 
@@ -439,9 +444,10 @@ class StockLoop(BaseTradingLoop):
         preds, snapshots = super()._get_predictions(benchmark_close)
         self._last_preds = dict(preds)  # sleeve selection reads these
 
-        # Dynamic top N selection
+        # Dynamic top N selection with hold buffer
         ranked = sorted(preds.items(), key=lambda x: x[1], reverse=True)
         self.top_symbols = [sym for sym, _ in ranked[:self.TOP_N]]
+        self.hold_symbols = {sym for sym, _ in ranked[:self.HOLD_RANK]}
         if self.top_symbols:
             logger.info("[RANK] Top %d: %s", self.TOP_N,
                         ', '.join(f'{s}({preds[s]:+.4f})' for s in self.top_symbols))
@@ -486,8 +492,10 @@ class StockLoop(BaseTradingLoop):
             pred = preds.get(symbol)
             if pred is not None and pred < -self.trade_threshold:
                 sell_reason = f"pred={pred:+.4f}%"
-            elif symbol not in self.top_symbols and pred is not None and pred < 0:
-                sell_reason = f"dropped from top {self.TOP_N} (pred={pred:+.4f}%)"
+            elif (symbol not in self.hold_symbols
+                  and pred is not None and pred < 0):
+                sell_reason = (f"fell below hold rank {self.HOLD_RANK} "
+                               f"(pred={pred:+.4f}%)")
 
             if sell_reason is None:
                 continue
@@ -637,9 +645,15 @@ class StockLoop(BaseTradingLoop):
                 continue
             llm_mult = 0.5 + llm_s
 
+            # Meta-labeling gate (veto + bounded sizing multiplier)
+            meta_ok, meta_mult = self._meta_gate(symbol, pred, snapshots)
+            if not meta_ok:
+                continue
+
             # Single risk-based sizing call (all bounds enforced inside)
             sized_notional = self._compute_position_size(
-                symbol, pred, quote, sentiment_mult=gate, llm_mult=llm_mult)
+                symbol, pred, quote, sentiment_mult=gate, llm_mult=llm_mult,
+                meta_mult=meta_mult)
             if sized_notional <= 0:
                 continue
 

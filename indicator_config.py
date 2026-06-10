@@ -16,7 +16,8 @@ _FILE = Path(__file__).resolve().parent / "indicator_config.json"
 _DEFAULTS = {"preset": "standard"}
 
 # Columns only present in crypto training data
-CRYPTO_ONLY_COLS = ["BTC_Return_1h", "BTC_SMA_Ratio", "BTC_RSI"]
+CRYPTO_ONLY_COLS = ["BTC_Return_1h", "BTC_SMA_Ratio", "BTC_RSI",
+                    "Funding_Rate_Ann", "Funding_Z", "Funding_Chg_24h"]
 
 # Columns only present in stock training data
 STOCK_ONLY_COLS = ["VWAP", "Price_VWAP_Ratio", "Gap_Pct", "ATR_Pct", "RS_vs_SPY"]
@@ -60,6 +61,8 @@ _STANDARD_FEATURES = _MINIMAL_FEATURES + [
     "Hurst",
     # Calendar effects
     "Month_sin", "Month_cos", "Turn_of_Month",
+    # Perp funding positioning (crypto only)
+    "Funding_Rate_Ann", "Funding_Z", "Funding_Chg_24h",
 ]
 
 # Stationary features only — no raw prices/volumes that trend over time.
@@ -82,6 +85,10 @@ _STATIONARY_FEATURES = [
     "Hurst",
     # Sentiment (bounded)
     "Daily_Sentiment",
+    # Perp funding positioning (crypto only; stationary rates/z-scores;
+    # BIS 'Crypto Carry': extreme funding marks crowded positioning that
+    # precedes crashes at this system's 12-48h horizon)
+    "Funding_Rate_Ann", "Funding_Z", "Funding_Chg_24h",
 ]
 
 PRESETS = {

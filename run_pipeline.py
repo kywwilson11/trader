@@ -54,6 +54,54 @@ def _print(*args, **kwargs):
         print(*args, **kwargs)
 
 
+_last_drift_check_date = None
+
+
+def _maybe_run_drift_check(log_fh):
+    """Once-daily in-process PSI drift check. Writes the retrain flags
+    that the Phase C wait loop consumes on its next iteration — no
+    external cron needed on the Jetson."""
+    global _last_drift_check_date
+    today = datetime.date.today().isoformat()
+    if _last_drift_check_date == today:
+        return
+    _last_drift_check_date = today
+    try:
+        from monitor_drift import run_check
+        for prefix, label in (('', 'crypto'), ('stock', 'stock')):
+            r = run_check(prefix, label)
+            if r is not None:
+                log_fh.write(f"[DRIFT] {label}: PSI={r['psi']} "
+                             f"({r['level']}, n={r['n']})\n")
+        log_fh.flush()
+    except Exception as e:
+        try:
+            log_fh.write(f"[DRIFT] daily check failed: {e}\n")
+            log_fh.flush()
+        except Exception:
+            pass
+
+
+def _check_drift_trigger():
+    """Check for and consume drift-monitor retrain flags.
+
+    monitor_drift.py writes {prefix}retrain_requested.flag after PSI
+    exceeds the action level on consecutive days. Same contract as the
+    GUI trigger: returns {'crypto': bool, 'stock': bool} or None.
+    """
+    found = {}
+    for key, fname in (('crypto', 'retrain_requested.flag'),
+                       ('stock', 'stock_retrain_requested.flag')):
+        path = os.path.join(BASE_DIR, fname)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                found[key] = True
+            except OSError:
+                pass
+    return found or None
+
+
 def _check_retrain_trigger():
     """Check for and consume a manual retrain trigger file from the GUI.
 
@@ -635,6 +683,11 @@ def _build_training_phases(trials, train_crypto, train_stock, mode=''):
             'trials': trials,
         })
         phases.append({
+            'id': 'crypto_meta',
+            'label': 'Training Crypto Meta-Labeler',
+            'cmd': [PYTHON, '-u', 'meta_label.py'],
+        })
+        phases.append({
             'id': 'crypto_backtest_gate',
             'label': 'Crypto Policy Backtest Gate',
             'cmd': [PYTHON, '-u', 'backtest.py', '--days', '60',
@@ -652,6 +705,11 @@ def _build_training_phases(trials, train_crypto, train_stock, mode=''):
             'label': 'Training Stock Regression Model',
             'cmd': cmd,
             'trials': trials,
+        })
+        phases.append({
+            'id': 'stock_meta',
+            'label': 'Training Stock Meta-Labeler',
+            'cmd': [PYTHON, '-u', 'meta_label.py', '--prefix', 'stock'],
         })
         phases.append({
             'id': 'stock_backtest_gate',
@@ -1068,9 +1126,19 @@ def main():
                 _check_restart_bots(bots, log_fh)
                 _update_per_bot_status(bots, status)
                 write_status(status)
+                _maybe_run_drift_check(log_fh)
                 manual_trigger = _check_retrain_trigger()
                 if manual_trigger:
                     msg = (f"\n[MANUAL RETRAIN] Triggered from GUI: "
+                           f"crypto={manual_trigger.get('crypto', False)}, "
+                           f"stock={manual_trigger.get('stock', False)}\n")
+                    log_fh.write(msg)
+                    log_fh.flush()
+                    _print(msg, end='')
+                    break
+                manual_trigger = _check_drift_trigger()
+                if manual_trigger:
+                    msg = (f"\n[DRIFT RETRAIN] PSI drift monitor requested: "
                            f"crypto={manual_trigger.get('crypto', False)}, "
                            f"stock={manual_trigger.get('stock', False)}\n")
                     log_fh.write(msg)

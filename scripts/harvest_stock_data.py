@@ -110,6 +110,15 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
         future_close = df['Close'].shift(-fb)
         df[f'Target_Return_{fb}'] = (future_close - df['Close']) / df['Close'] * 100
 
+    # Triple-barrier targets matched to the LIVE exit stack (ATR stop /
+    # trailing / TP / EOD flatten — the same policy_exits kernel the
+    # backtester runs). For stocks the EOD barrier fixes the structural
+    # label mismatch: raw Target_Return_12..48 spans 1.8-7.4 trading days
+    # while live stock holds are capped at ~6.5h by the 15:50 flatten.
+    from policy_exits import compute_tb_labels
+    for col, vals in compute_tb_labels(df, FORWARD_BARS, 'stock').items():
+        df[col] = vals
+
     # Backward compat: Target_Return = shortest horizon
     df['Target_Return'] = df[f'Target_Return_{FORWARD_BARS[0]}']
 

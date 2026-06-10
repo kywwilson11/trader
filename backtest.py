@@ -127,37 +127,46 @@ def _entry_window_mask(times) -> np.ndarray:
     return mask
 
 def simulate_ticker(tdf, preds, asset_type: str, threshold: float,
-                    policy: dict) -> list[dict]:
+                    policy: dict, meta_probs=None) -> list[dict]:
     """Replay the live exit stack on one ticker. Returns trade dicts.
 
-    Bar-level approximations of the 30s loop:
-      - entries at the bar close that produced the signal, plus half-spread
-      - stop touched if the NEXT bars' Low <= stop (filled at min(stop, Open)
-        to model gap-throughs)
-      - TP touched if High >= tp (stop checked FIRST when both touch — the
-        conservative assumption)
-      - trailing tracked on bar Highs after activation
-      - stocks flatten on each day's last bar
+    The exit walk itself runs in policy_exits.exit_walk — the SAME kernel
+    that generates triple-barrier training labels and the meta-labeling
+    dataset, so the backtest cannot drift from label semantics. This
+    function keeps only the ENTRY policy: threshold + cost-floor gates,
+    stock entry windows, cooldowns/lockouts, and the meta-probability veto
+    (applied when a trained meta model produced `meta_probs`, mirroring
+    the live loop).
+
+    Bar-level approximations of the 30s loop: entries at the signal bar's
+    close; gap-aware stops (filled at min(stop, open)); stop checked
+    before TP when both touch in one bar (conservative).
     """
+    from policy_exits import exit_walk, eod_mask_from_index, REASON_NAMES
+    from meta_label import META_VETO_PROB
+
     closes = tdf['Close'].values
     highs = tdf['High'].values if 'High' in tdf.columns else closes
     lows = tdf['Low'].values if 'Low' in tdf.columns else closes
+    opens = tdf['Open'].values if 'Open' in tdf.columns else closes
     atr = tdf['ATR'].values if 'ATR' in tdf.columns else np.full(len(closes), np.nan)
     times = tdf.index
 
+    is_eod = eod_mask_from_index(times, asset_type)
     if asset_type == 'stock':
-        dates = np.array([t.date() for t in times])
-        is_last_bar_of_day = np.ones(len(times), dtype=bool)
-        is_last_bar_of_day[:-1] = dates[:-1] != dates[1:]
         entry_ok = _entry_window_mask(times)
     else:
-        is_last_bar_of_day = np.zeros(len(times), dtype=bool)
         entry_ok = np.ones(len(times), dtype=bool)
 
     rt_cost = round_trip_cost_pct(asset_type, SPREAD_PCT[asset_type])
     edge_floor = required_edge_pct(asset_type, SPREAD_PCT[asset_type])
     cooldown_bars = max(1, int(math.ceil(policy['cooldown_min'] / 60)))
     lockout_bars = int(policy['lockout_hours'])
+
+    exit_idx, exit_px, reason_code = exit_walk(
+        closes, highs, lows, opens, atr, is_eod, policy,
+        preds=preds, threshold=threshold, cooldown_bars=cooldown_bars,
+        max_hold=0, use_signal_exit=True)
 
     trades = []
     n = len(closes)
@@ -167,70 +176,25 @@ def simulate_ticker(tdf, preds, asset_type: str, threshold: float,
         p = preds[i]
         if (np.isnan(p) or i < next_entry_allowed
                 or p < threshold or p < edge_floor
-                or is_last_bar_of_day[i]
-                or not entry_ok[i]):
+                or is_eod[i]
+                or not entry_ok[i]
+                or (meta_probs is not None
+                    and not np.isnan(meta_probs[i])
+                    and meta_probs[i] < META_VETO_PROB)):
             i += 1
             continue
 
-        # --- ENTER at this bar's close ---
-        entry_i = i
         entry_price = closes[i]
-        entry_atr = atr[i]
-        if np.isfinite(entry_atr) and entry_price > 0:
-            raw = (entry_atr * policy['atr_stop_mult']) / entry_price
-            stop_dist = min(max(raw, policy['stop_floor_pct']), policy['stop_ceil_pct'])
-            raw_tr = (entry_atr * policy['atr_trail_mult']) / entry_price
-            trail_dist = min(max(raw_tr, policy['stop_floor_pct']), policy['stop_ceil_pct'])
-        else:
-            stop_dist = policy['stop_fallback_pct']
-            trail_dist = policy['trail_fallback_pct']
-        tp_dist = min(policy['tp_ceil_pct'], stop_dist * policy['tp_rr'])
-        stop_price = entry_price * (1 - stop_dist)
-        tp_price = entry_price * (1 + tp_dist)
-        hwm = entry_price
-        trailing_active = False
-
-        exit_price = None
-        exit_reason = None
-        j = i + 1
-        while j < n:
-            lo, hi, cl = lows[j], highs[j], closes[j]
-            # Gap-aware stop check first (conservative ordering)
-            eff_stop = max(stop_price,
-                           hwm * (1 - trail_dist) if trailing_active else 0.0)
-            if lo <= eff_stop:
-                open_j = tdf['Open'].values[j] if 'Open' in tdf.columns else cl
-                exit_price = min(eff_stop, open_j) if open_j < eff_stop else eff_stop
-                exit_reason = 'hard_stop' if eff_stop == stop_price else 'trailing'
-                break
-            if hi >= tp_price:
-                exit_price = tp_price
-                exit_reason = 'take_profit'
-                break
-            hwm = max(hwm, hi)
-            if not trailing_active and hwm >= entry_price * (1 + policy['trail_activate_pct']):
-                trailing_active = True
-            pj = preds[j]
-            if not np.isnan(pj) and pj < -threshold and (j - entry_i) >= cooldown_bars:
-                exit_price = cl
-                exit_reason = 'signal_sell'
-                break
-            if is_last_bar_of_day[j]:
-                exit_price = cl
-                exit_reason = 'eod_flatten'
-                break
-            j += 1
-        if exit_price is None:  # ran off the data
-            exit_price = closes[n - 1]
-            exit_reason = 'end_of_data'
-            j = n - 1
+        j = int(exit_idx[i])
+        exit_price = float(exit_px[i])
+        exit_reason = REASON_NAMES.get(int(reason_code[i]), 'end_of_data')
 
         gross = (exit_price - entry_price) / entry_price * 100.0
         net = gross - rt_cost
         trades.append({
-            'entry_time': str(times[entry_i]), 'exit_time': str(times[j]),
-            'entry': float(entry_price), 'exit': float(exit_price),
-            'bars_held': int(j - entry_i), 'gross_pct': round(gross, 4),
+            'entry_time': str(times[i]), 'exit_time': str(times[j]),
+            'entry': float(entry_price), 'exit': exit_price,
+            'bars_held': int(j - i), 'gross_pct': round(gross, 4),
             'net_pct': round(net, 4), 'reason': exit_reason,
         })
 
@@ -285,7 +249,8 @@ def aggregate_metrics(all_trades: list[dict], asset_type: str,
 
 ARTIFACT_SUFFIXES = ['model_v2.pth', 'config_v2.pkl', 'scaler_v2.pkl',
                      'feature_cols_v2.pkl', 'model_v2.manifest.json',
-                     'lgb_model.txt']
+                     'lgb_model.txt', 'meta_model.txt', 'meta_calib.pkl',
+                     'meta_meta.json']
 
 
 def restore_previous_model(prefix: str) -> bool:
@@ -335,7 +300,16 @@ def run_backtest(prefix: str = '', days: int = 60,
             continue
         preds = _predict_ticker(model, scaler, config, feature_cols, tdf,
                                 lgb_model=lgb_model)
-        trades = simulate_ticker(tdf, preds, asset_type, threshold, policy)
+        # Meta-labeling parity: the live loops veto entries with low
+        # calibrated meta probability, so the gate must too
+        meta_probs = None
+        try:
+            from meta_label import predict_meta_array
+            meta_probs = predict_meta_array(prefix, tdf, preds)
+        except Exception:
+            pass
+        trades = simulate_ticker(tdf, preds, asset_type, threshold, policy,
+                                 meta_probs=meta_probs)
         all_trades.extend(trades)
         print(f"  {ticker}: {len(trades)} trades")
 

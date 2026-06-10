@@ -76,3 +76,112 @@ class TestShouldTrade:
                             asset_type='stock', min_edge=10.0) is False
         assert should_trade(predicted_return=0.5, spread_pct=0.05,
                             asset_type='stock', min_edge=1.0) is True
+
+
+class _FakeOrder:
+    def __init__(self, id, status='new', filled_qty=0, filled_avg_price=None,
+                 symbol='BTC/USD', qty=1.0, side='buy'):
+        self.id = id
+        self.status = status
+        self.filled_qty = filled_qty
+        self.filled_avg_price = filled_avg_price
+        self.symbol = symbol
+        self.qty = qty
+        self.side = side
+
+
+class _FakeAPI:
+    """Scripted API: each submit_order returns the next scripted order;
+    get_order returns its (possibly mutated) terminal state."""
+
+    def __init__(self, script):
+        self.script = list(script)   # list of _FakeOrder terminal states
+        self.submitted = []          # kwargs of every submit_order call
+        self.canceled = []
+        self._orders = {}
+
+    def submit_order(self, **kw):
+        terminal = self.script.pop(0)
+        self.submitted.append(kw)
+        self._orders[terminal.id] = terminal
+        return _FakeOrder(terminal.id, status='new',
+                          symbol=kw.get('symbol', 'BTC/USD'),
+                          qty=kw.get('qty', 0), side=kw.get('side', 'buy'))
+
+    def get_order(self, order_id):
+        return self._orders[order_id]
+
+    def cancel_order(self, order_id):
+        self.canceled.append(order_id)
+
+
+class TestPlaceMakerBuy:
+    QUOTE = {'bid': 100.0, 'ask': 100.2, 'midpoint': 100.1,
+             'spread': 0.2, 'spread_pct': 0.2}
+
+    def _run(self, api, monkeypatch, notional=1000):
+        from order_utils import place_maker_buy
+        import time as _t
+        monkeypatch.setattr(_t, 'sleep', lambda s: None)
+        return place_maker_buy(api, 'BTC/USD', notional,
+                               lambda: dict(self.QUOTE), stage_timeout=4)
+
+    def test_first_rung_fill_is_maker(self, monkeypatch):
+        api = _FakeAPI([_FakeOrder('o1', 'filled', 10.0, 100.0)])
+        result, tactic = self._run(api, monkeypatch)
+        assert tactic == 'maker'
+        assert result.status == 'filled'
+        # Bid-join: limit placed AT the bid, never above
+        assert api.submitted[0]['limit_price'] == 100.0
+        assert api.submitted[0]['type'] == 'limit'
+
+    def test_reprice_then_fill(self, monkeypatch):
+        api = _FakeAPI([
+            _FakeOrder('o1', 'canceled', 0, None),       # rung 1 times out
+            _FakeOrder('o2', 'filled', 10.0, 100.0),     # rung 2 fills
+        ])
+        result, tactic = self._run(api, monkeypatch)
+        assert tactic == 'maker_reprice'
+        assert result.status == 'filled'
+        assert len(api.submitted) == 2
+
+    def test_taker_fallback_after_rungs_fail(self, monkeypatch):
+        api = _FakeAPI([
+            _FakeOrder('o1', 'canceled', 0, None),
+            _FakeOrder('o2', 'canceled', 0, None),
+            _FakeOrder('o3', 'filled', 9.98, 100.15),    # marketable fallback
+        ])
+        result, tactic = self._run(api, monkeypatch)
+        assert tactic == 'taker_fallback'
+        assert result.status == 'filled'
+        # Fallback limit crosses toward the ask (mid + offset), above bid
+        assert api.submitted[2]['limit_price'] > 100.0
+
+    def test_partial_fill_chases_only_remainder(self, monkeypatch):
+        # Rung 1 fills 60% then times out; rung 2 must chase ~40%
+        api = _FakeAPI([
+            _FakeOrder('o1', 'canceled', 6.0, 100.0),    # $600 of $1000
+            _FakeOrder('o2', 'filled', 4.0, 100.0),
+        ])
+        result, tactic = self._run(api, monkeypatch)
+        assert tactic == 'maker_reprice'
+        qty2 = api.submitted[1]['qty']
+        assert abs(qty2 - 4.0) < 0.01  # ~$400 remainder at bid=100
+
+    def test_partial_to_dust_counts_as_maker(self, monkeypatch):
+        # 99.5% filled -> remainder is dust, no chase, judged by qty
+        api = _FakeAPI([_FakeOrder('o1', 'canceled', 9.95, 100.0)])
+        result, tactic = self._run(api, monkeypatch)
+        assert tactic == 'maker_partial'
+        assert float(result.filled_qty) > 0
+        assert len(api.submitted) == 1
+
+    def test_no_quote_returns_unfilled(self, monkeypatch):
+        from order_utils import place_maker_buy
+        import time as _t
+        monkeypatch.setattr(_t, 'sleep', lambda s: None)
+        api = _FakeAPI([])
+        result, tactic = place_maker_buy(api, 'BTC/USD', 1000, lambda: None,
+                                         stage_timeout=4)
+        assert result is None and tactic == 'unfilled'
+        assert api.submitted == []

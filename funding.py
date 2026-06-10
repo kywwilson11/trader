@@ -99,6 +99,44 @@ def get_funding_rate(symbol: str) -> float | None:
     return rate
 
 
+def live_funding_features(symbol: str) -> dict | None:
+    """Live values for the model's funding FEATURES (training parity).
+
+    Combines the Binance archive (the same series the harvest trained on)
+    with the current OKX rate so the live z-score uses the same trailing
+    distribution as training — without this, live z would read 0 until
+    30 days of local samples accumulated (train/serve skew).
+    Returns {'Funding_Rate_Ann', 'Funding_Z', 'Funding_Chg_24h'} or None.
+    """
+    rate = get_funding_rate(symbol)
+    if rate is None:
+        return None
+    try:
+        from funding_archive import get_funding_series
+        s = get_funding_series(symbol)
+    except Exception:
+        s = None
+
+    ann = rate * 3 * 365
+    z = 0.0
+    chg = 0.0
+    samples = None
+    if s is not None and len(s) >= 33:
+        samples = list(s.values[-90:])
+    else:
+        hist = _load_history().get(symbol, [])
+        if len(hist) >= 33:
+            samples = hist[-90:]
+    if samples is not None:
+        import statistics
+        mu = statistics.fmean(samples)
+        sd = statistics.pstdev(samples)
+        if sd > 1e-12:
+            z = (rate - mu) / sd
+        chg = (rate - samples[-3]) * 3 * 365
+    return {'Funding_Rate_Ann': ann, 'Funding_Z': z, 'Funding_Chg_24h': chg}
+
+
 def funding_tilt(symbol: str) -> float:
     """Bounded entry-size tilt from funding positioning. 1.0 = neutral.
 

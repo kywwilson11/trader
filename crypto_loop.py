@@ -94,6 +94,18 @@ class CryptoLoop(BaseTradingLoop):
                                         fallback_to_market=True)
         return result
 
+    def _execute_entry_order(self, symbol, notional, quote):
+        """Crypto entries try the maker ladder first (15bps maker vs
+        25bps taker, plus the half-spread when joined passively). Falls
+        back to the marketable path when disabled."""
+        from strategy_config import MAKER_ENTRIES_ENABLED, MAKER_STAGE_TIMEOUT
+        if not MAKER_ENTRIES_ENABLED:
+            return super()._execute_entry_order(symbol, notional, quote)
+        from order_utils import place_maker_buy
+        return place_maker_buy(self.api, symbol, notional,
+                               lambda: self.get_quote(symbol),
+                               stage_timeout=MAKER_STAGE_TIMEOUT)
+
     def place_sell_order(self, symbol, qty, quote):
         """Sell and confirm. Returns the FILLED order object, or None."""
         from order_utils import make_client_order_id

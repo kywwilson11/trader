@@ -150,6 +150,7 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
 
     exclude_cols = ['Ticker', 'Date', 'Datetime', 'NextClose']
     exclude_cols += [c for c in df.columns if c.startswith('Target_Return')]
+    exclude_cols += [c for c in df.columns if c.startswith('TB_')]
     feature_cols = [c for c in df.columns if c not in exclude_cols]
     feature_cols = [c for c in feature_cols if df[c].dtype in ['float64', 'float32', 'int64', 'int32']]
 
@@ -178,6 +179,8 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
     # Per-ticker data arrays (scaler fit deferred to per-fold)
     all_features_list = []
     all_returns_dict = {fb: [] for fb in FORWARD_BARS}
+    all_tb_dict = {fb: [] for fb in FORWARD_BARS}
+    has_tb = any(f'TB_Ret_{fb}' in df.columns for fb in FORWARD_BARS)
     all_times_list = []
     all_label_times_list = []
     ticker_boundaries = {}
@@ -205,6 +208,9 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
                 all_returns_dict[fb].append(tdf[col].values.astype(np.float32))
             else:
                 all_returns_dict[fb].append(tdf['Target_Return'].values.astype(np.float32))
+            tb_col = f'TB_Ret_{fb}'
+            if has_tb and tb_col in tdf.columns:
+                all_tb_dict[fb].append(tdf[tb_col].values.astype(np.float32))
 
         ticker_boundaries[ticker] = (offset, offset + len(features))
         offset += len(features)
@@ -216,8 +222,16 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
     for fb in FORWARD_BARS:
         if all_returns_dict[fb]:
             all_returns_by_fb[fb] = np.concatenate(all_returns_dict[fb])
+        # Triple-barrier (exit-stack-matched) targets, when the harvest
+        # produced them: stored under the 'tb' key namespace so the
+        # search can choose target_kind per trial
+        if has_tb and all_tb_dict[fb] and len(all_tb_dict[fb]) == len(all_returns_dict[fb]):
+            all_returns_by_fb[('tb', fb)] = np.concatenate(all_tb_dict[fb])
+    if has_tb:
+        print(f"Triple-barrier targets available: "
+              f"{sorted(k[1] for k in all_returns_by_fb if isinstance(k, tuple))}")
 
-    del all_features_list, all_returns_dict, all_times_list, all_label_times_list, df
+    del all_features_list, all_returns_dict, all_tb_dict, all_times_list, all_label_times_list, df
     gc.collect()
 
     print(f"Contiguous arrays: {all_features.shape}, {all_features.nbytes / 1e6:.1f} MB")
@@ -518,6 +532,15 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
         trade_threshold = trial.suggest_float('trade_threshold', tt_range[0], tt_range[1], step=0.01)
         scheduler = trial.suggest_categorical('scheduler', ['cosine', 'plateau'])
 
+        # Target kind: raw fb-bar forward return vs triple-barrier
+        # (exit-stack-matched) return. When TB labels exist, the search
+        # itself decides which target produces the better POLICY Sharpe —
+        # both flow through the same cost-aware simulator and gates.
+        if ('tb', forward_bars) in all_returns_by_fb:
+            target_kind = trial.suggest_categorical('target_kind', ['raw', 'tb'])
+        else:
+            target_kind = 'raw'
+
         cfg = {
             'seq_len': seq_len, 'hidden_dim': hidden_dim,
             'num_layers': num_layers, 'n_heads': n_heads,
@@ -525,14 +548,19 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
             'batch_size': batch_size, 'weight_decay': weight_decay,
             'huber_delta': huber_delta, 'trade_threshold': trade_threshold,
             'scheduler': scheduler, 'forward_bars': forward_bars,
+            'target_kind': target_kind,
         }
         trial.set_user_attr('cfg', cfg)
 
-        # Select returns for this horizon
-        if forward_bars in all_returns_by_fb:
+        # Select returns for this horizon + target kind
+        key = ('tb', forward_bars) if target_kind == 'tb' else forward_bars
+        if key in all_returns_by_fb:
+            trial_returns = all_returns_by_fb[key]
+        elif forward_bars in all_returns_by_fb:
             trial_returns = all_returns_by_fb[forward_bars]
         else:
-            trial_returns = list(all_returns_by_fb.values())[0]
+            trial_returns = next(v for k, v in all_returns_by_fb.items()
+                                 if not isinstance(k, tuple))
 
         try:
             return _train_walk_forward(
@@ -859,7 +887,13 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
     try:
         seq_len = cfg['seq_len']
         fb = cfg.get('forward_bars', 24)
-        returns = all_returns_by_fb.get(fb) or list(all_returns_by_fb.values())[0]
+        key = ('tb', fb) if cfg.get('target_kind') == 'tb' else fb
+        returns = all_returns_by_fb.get(key)
+        if returns is None:
+            returns = all_returns_by_fb.get(fb)
+        if returns is None:
+            returns = next(v for k, v in all_returns_by_fb.items()
+                           if not isinstance(k, tuple))
 
         folds = get_walk_forward_folds(all_times, all_label_times, tickers,
                                        ticker_boundaries, seq_len)
@@ -908,9 +942,14 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
         fb = cfg.get('forward_bars', 24)
         threshold = cfg['trade_threshold']
         holdout_idx = get_holdout_indices(all_times, tickers, ticker_boundaries, seq_len)
-        returns = all_returns_by_fb.get(fb)
+        # Evaluate the holdout on the SAME target kind the trial trained on
+        key = ('tb', fb) if cfg.get('target_kind') == 'tb' else fb
+        returns = all_returns_by_fb.get(key)
         if returns is None:
-            returns = list(all_returns_by_fb.values())[0]
+            returns = all_returns_by_fb.get(fb)
+        if returns is None:
+            returns = next(v for k, v in all_returns_by_fb.items()
+                           if not isinstance(k, tuple))
         holdout_idx = holdout_idx[~np.isnan(returns[holdout_idx])]
         if len(holdout_idx) < 200:
             print(f"  [HOLDOUT] only {len(holdout_idx)} usable rows — gate fails closed")
@@ -950,7 +989,11 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                 'dsr': round(float(dsr['dsr']), 4),
                 'dsr_min': DSR_MIN,
                 'n_trades': int(dsr['n']),
-                'n_rows': int(len(holdout_idx))}
+                'n_rows': int(len(holdout_idx)),
+                # Reference distribution for the live PSI drift monitor:
+                # deciles of the holdout predictions (monitor_drift.py)
+                'pred_deciles': [round(float(x), 6) for x in
+                                 np.percentile(preds, np.arange(0, 101, 10))]}
     except Exception as e:
         print(f"  [HOLDOUT] evaluation failed: {e} — gate fails closed")
         return None
@@ -1244,6 +1287,7 @@ def main():
                 'seq_len': best_cfg['seq_len'],
                 'trade_threshold': best_cfg['trade_threshold'],
                 'forward_bars': best_cfg.get('forward_bars', 24),
+                'target_kind': best_cfg.get('target_kind', 'raw'),
                 'huber_delta': best_cfg['huber_delta'],
                 'prefix': args.prefix,
                 'indicator_preset': preset_name,

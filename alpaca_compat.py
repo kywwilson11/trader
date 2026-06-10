@@ -164,6 +164,17 @@ class CompatREST:
         req = GetCalendarRequest(start=start, end=end)
         return self._trading.get_calendar(req)
 
+    def get_portfolio_history(self, period='1M', timeframe='1D',
+                              extended_hours=None, **_ignored):
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+        req = GetPortfolioHistoryRequest(period=period, timeframe=timeframe,
+                                         extended_hours=extended_hours)
+        h = self._trading.get_portfolio_history(req)
+        return SimpleNamespace(
+            equity=[float(e) for e in (h.equity or []) if e is not None],
+            timestamp=list(h.timestamp or []),
+        )
+
     # --- Market data ---
 
     @staticmethod

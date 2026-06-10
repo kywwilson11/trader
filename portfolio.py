@@ -146,9 +146,14 @@ def check_portfolio_correlation(current_positions: list[str],
 def get_correlation_sizing_factor(candidate: str,
                                   current_positions: list[str],
                                   corr_matrix: dict[tuple[str, str], float]) -> float:
-    """Reduce sizing proportionally to correlation with existing positions.
+    """Variance-correct sizing factor: 1/sqrt(1 + n*rho_bar).
 
-    Returns multiplier between 0.5 (highly correlated) and 1.0 (uncorrelated).
+    A candidate entering a book of n positions at average |corr| rho_bar
+    contributes marginal variance ~ (1 + n*rho_bar) times its standalone
+    variance; scaling size by the inverse square root keeps its RISK
+    contribution constant as the book fills up. The old linear heuristic
+    (1 - 0.5*corr) ignored n entirely — the 5th BTC-clone got the same
+    haircut as the 1st. Floored at 0.4.
     """
     if not current_positions:
         return 1.0
@@ -160,7 +165,113 @@ def get_correlation_sizing_factor(candidate: str,
         c = corr_matrix.get(pair, corr_matrix.get(alt_pair, 0.0))
         correlations.append(abs(c))
 
-    avg_corr = np.mean(correlations) if correlations else 0.0
-    # Linear scale: corr=0 → 1.0x, corr=0.7 → 0.65x, corr=1.0 → 0.5x
-    factor = max(0.5, 1.0 - 0.5 * avg_corr)
-    return factor
+    avg_corr = float(np.mean(correlations)) if correlations else 0.0
+    n = len(current_positions)
+    return max(0.4, 1.0 / float(np.sqrt(1.0 + n * avg_corr)))
+
+
+def avg_book_correlation(symbols: list[str],
+                         corr_matrix: dict[tuple[str, str], float]) -> float:
+    """Average absolute pairwise correlation across a set of symbols."""
+    if len(symbols) < 2 or not corr_matrix:
+        return 0.0
+    vals = []
+    for i, s1 in enumerate(symbols):
+        for s2 in symbols[i + 1:]:
+            c = corr_matrix.get((s1, s2), corr_matrix.get((s2, s1)))
+            if c is not None:
+                vals.append(abs(c))
+    return float(np.mean(vals)) if vals else 0.0
+
+
+def diversified_book_risk(risks: list[float], avg_corr: float) -> float:
+    """Book stop-risk under the equicorrelation model.
+
+    With per-position stop-risks r_i (fractions of equity) and constant
+    pairwise correlation rho, portfolio risk is exactly
+        sqrt((1-rho) * sum(r_i^2) + rho * (sum r_i)^2)
+    — between sqrt-sum-of-squares (independent book) and the plain sum
+    (lockstep book). This is the effective-number-of-bets view:
+    correlated books get less headroom for the same gross risk.
+    """
+    r = np.asarray([x for x in risks if x and x > 0], dtype=float)
+    if r.size == 0:
+        return 0.0
+    rho = min(max(float(avg_corr), 0.0), 1.0)
+    return float(np.sqrt(max(
+        (1.0 - rho) * np.sum(r ** 2) + rho * np.sum(r) ** 2, 0.0)))
+
+
+def book_risk_budget(existing_risks: list[float], avg_corr: float,
+                     cap: float) -> float:
+    """Max stop-risk (fraction of equity) a NEW position may add.
+
+    Solves diversified_book_risk(existing + [r_c]) = cap for r_c under
+    equicorrelation: with S1 = sum(r_i) and A = current book risk^2,
+        r_c = -rho*S1 + sqrt(rho^2*S1^2 + cap^2 - A)
+    Returns 0 when the cap is already used up.
+    """
+    rho = min(max(float(avg_corr), 0.0), 1.0)
+    r = np.asarray([x for x in existing_risks if x and x > 0], dtype=float)
+    s1 = float(np.sum(r))
+    a = (1.0 - rho) * float(np.sum(r ** 2)) + rho * s1 ** 2  # book risk^2
+    if cap ** 2 <= a:
+        return 0.0
+    return float(-rho * s1 + np.sqrt(rho ** 2 * s1 ** 2 + cap ** 2 - a))
+
+
+# --- Book-level realized-vol scalar (closes the loop that per-asset GARCH
+# targeting leaves open: correlation buildup raises BOOK vol even when each
+# position individually sits at its own target) ---
+
+_book_vol_cache: dict[str, tuple[float, float]] = {}
+_BOOK_VOL_TTL = 3600
+
+EWMA_LAMBDA = 0.94          # RiskMetrics daily decay
+_TRADING_DAYS = 252
+
+
+def ewma_annualized_vol(equity_curve, lam: float = EWMA_LAMBDA) -> float | None:
+    """Annualized EWMA volatility of a daily equity curve, or None."""
+    eq = np.asarray([e for e in (equity_curve or []) if e], dtype=float)
+    if eq.size < 11:
+        return None
+    rets = np.diff(eq) / eq[:-1]
+    rets = rets[np.isfinite(rets)]
+    if rets.size < 10:
+        return None
+    var = float(np.var(rets))
+    for x in rets:
+        var = lam * var + (1.0 - lam) * x * x
+    return float(np.sqrt(var * _TRADING_DAYS))
+
+
+def get_book_vol_scalar_cached(api, asset_type: str = 'crypto') -> float:
+    """De-risk-only sizing scalar from REALIZED account vol (EWMA λ=0.94).
+
+    Moreira-Muir (2017): volatility-managed sizing adds value mostly by
+    CUTTING exposure when realized vol runs hot — so this clamps to
+    [0.5, 1.0] and never boosts (a mostly-cash paper account shows tiny
+    realized vol; boosting on that signal would be spurious). Neutral 1.0
+    on any data failure. Cached 1h per asset class.
+    """
+    now = time.monotonic()
+    hit = _book_vol_cache.get(asset_type)
+    if hit is not None and (now - hit[1]) < _BOOK_VOL_TTL:
+        return hit[0]
+    scalar = 1.0
+    try:
+        hist = api.get_portfolio_history(period='3M', timeframe='1D')
+        realized = ewma_annualized_vol(getattr(hist, 'equity', None))
+        if realized is not None and realized > 1e-6:
+            from strategy_config import PORTFOLIO_VOL_TARGET
+            target = PORTFOLIO_VOL_TARGET.get(asset_type, 0.25)
+            scalar = min(max(target / realized, 0.5), 1.0)
+            if scalar < 1.0:
+                logger.info("[BOOK-VOL] %s: realized %.0f%% > target %.0f%% "
+                            "-> %.2fx entries", asset_type, realized * 100,
+                            target * 100, scalar)
+    except Exception as e:
+        logger.debug("[BOOK-VOL] unavailable (%s) — neutral 1.0", e)
+    _book_vol_cache[asset_type] = (scalar, now)
+    return scalar

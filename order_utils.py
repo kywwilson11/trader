@@ -125,6 +125,74 @@ def compute_limit_price(side, quote_info, offset_bps=5):
 
 # --- ORDER PLACEMENT ---
 
+def place_maker_buy(api, symbol, notional, quote_fn, stage_timeout=25,
+                    max_reprices=1):
+    """Crypto entry ladder: join the bid (maker fee + half-spread saved),
+    reprice once at the fresh bid, then go marketable for any remainder.
+
+    Alpaca crypto charges 15bps maker vs 25bps taker per side; a bid-join
+    that fills passively also avoids paying the half-spread. With a
+    12-48h signal horizon, risking ~1 minute of passive waiting for
+    10bps+spread is positive expectancy. Safe to wait now that entries
+    get a resting server-side stop the moment they're tracked.
+
+    quote_fn: zero-arg callable returning a fresh quote dict (or None) —
+    each rung reprices off live data, not the stale decision quote.
+
+    Returns (final_order_or_None, tactic) where tactic is one of
+    'maker', 'maker_reprice', 'maker_partial', 'taker_fallback',
+    'unfilled'. The caller must judge success by acquired quantity
+    (filled_qty / live position), NOT by the last order's status — a
+    95%-filled maker rung that times out is a success.
+    """
+    remaining = float(notional)
+    last = None
+    for attempt in range(1 + max_reprices):
+        quote = quote_fn()
+        bid = (quote or {}).get('bid')
+        if not bid or bid <= 0:
+            break
+        qty = math.floor((remaining / bid) * 1e8) / 1e8
+        if qty <= 0:
+            break
+        try:
+            order = api.submit_order(
+                symbol=symbol, qty=qty, side='buy', type='limit',
+                limit_price=round(bid, 4), time_in_force='gtc',
+                client_order_id=make_client_order_id('maker'))
+        except Exception as e:
+            print(f"  [MAKER] {symbol}: bid-join error: {e}")
+            break
+        print(f"  [MAKER] {symbol}: joining bid @ ${bid} "
+              f"(${remaining:.0f}, attempt {attempt + 1})")
+        result = manage_order_lifecycle(api, order.id, timeout=stage_timeout,
+                                        fallback_to_market=False)
+        if result is not None and getattr(result, 'status', None) == 'filled':
+            return result, ('maker' if attempt == 0 else 'maker_reprice')
+        # Chase only the unfilled remainder on the next rung
+        try:
+            filled_qty = float(getattr(result, 'filled_qty', 0) or 0)
+            px = float(getattr(result, 'filled_avg_price', 0) or 0) or bid
+            remaining -= filled_qty * px
+        except (TypeError, ValueError):
+            pass
+        if result is not None:
+            last = result
+        if remaining < 10:  # dust left — maker rungs covered the entry
+            return last, 'maker_partial'
+
+    # Marketable fallback for whatever's left
+    quote = quote_fn()
+    if quote is None:
+        return last, 'unfilled'
+    order = place_limit_order(api, symbol, 'buy', remaining, quote)
+    if order is None:
+        return last, 'unfilled'
+    result = manage_order_lifecycle(api, order.id, timeout=stage_timeout + 5,
+                                    fallback_to_market=True)
+    return result, 'taker_fallback'
+
+
 def place_limit_order(api, symbol, side, notional, quote_info,
                       time_in_force='gtc', offset_bps=5,
                       client_order_id=None):

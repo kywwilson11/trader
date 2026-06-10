@@ -41,6 +41,8 @@ STOCK_POLICY = {
 
 # --- Sizing (risk-based; replaces the unbounded multiplier soup) ---
 RISK_PCT_PER_TRADE = 0.005       # 0.5% of equity at risk per trade (to the stop)
+MAX_BOOK_RISK_PCT = 0.025        # correlation-adjusted stop-risk cap per book
+                                 # (equicorrelation ENB model in portfolio.py)
 KELLY_CAP = 0.25                 # fractional Kelly ceiling (MacLean-Thorp-Ziemba)
 PORTFOLIO_VOL_TARGET = {         # annualized portfolio volatility targets
     'crypto': 0.35,
@@ -57,10 +59,17 @@ MAX_TRADES_PER_SYMBOL_PER_DAY = {
     'stock': 3,
 }
 
+# --- Crypto maker entries (Alpaca fees: 15bps maker / 25bps taker) ---
+MAKER_ENTRIES_ENABLED = True
+MAKER_STAGE_TIMEOUT = 25         # seconds per bid-join rung (2 rungs max)
+
 # --- Stock entry windows (Gao-Han-Li-Zhou 2018: intraday predictability
-# concentrates in the first/last half-hours; midday is noise+costs) ---
+# concentrates in the first/last half-hours; midday is noise+costs).
+# Start at 9:45, not 9:30: the first 15 minutes are dominated by the
+# opening auction unwind — wide spreads and quote-driven adverse
+# selection that an hourly-bar model has no edge against. ---
 STOCK_ENTRY_WINDOWS_ET = [
-    ('09:30', '11:00'),
+    ('09:45', '11:00'),
     ('14:30', '15:30'),
 ]
 ENTRY_WINDOWS_ENABLED = True
