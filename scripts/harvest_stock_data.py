@@ -25,7 +25,13 @@ from data_utils import (load_training_data, save_training_data,
 
 load_dotenv()
 
-STOCK_TICKERS = [t for t in load_stock_universe() if '/' not in t]
+from stock_config import TRAINING_CANDIDATE_POOL, AS_OF_TOP_K, CANDIDATE_START
+
+_UNIVERSE = [t for t in load_stock_universe() if '/' not in t]
+# Universe + sector-diverse candidates (training-only; bots don't trade
+# the extras). Candidates fetch from CANDIDATE_START to bound memory.
+STOCK_TICKERS = sorted(set(_UNIVERSE) | set(TRAINING_CANDIDATE_POOL))
+_CANDIDATE_ONLY = set(TRAINING_CANDIDATE_POOL) - set(_UNIVERSE)
 
 BENCHMARK = 'SPY'
 
@@ -127,25 +133,56 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     return df
 
 
+def _asof_membership_mask(df, top_k=AS_OF_TOP_K):
+    """Keep rows whose name ranked top-K by 30d dollar volume AS OF that
+    day. With this, a 2024 listing contributes no 2021 rows, and a name
+    only contributes history from periods a mechanical liquidity rule
+    would have selected it — membership look-ahead removed."""
+    import pandas as pd
+    if '_DV30' not in df.columns or 'Ticker' not in df.columns:
+        return df
+    key = pd.DataFrame({'day': df.index.normalize(),
+                        'tick': df['Ticker'].values,
+                        'dv': df['_DV30'].values})
+    rep = key.groupby(['day', 'tick'])['dv'].max()
+    ranks = rep.groupby(level=0).rank(ascending=False, method='min')
+    keep = ranks[ranks <= top_k]
+    flag = key.merge(keep.rename('rank').reset_index(),
+                     on=['day', 'tick'], how='left')['rank'].notna()
+    kept = df[flag.values]
+    dropped = len(df) - len(kept)
+    if dropped:
+        print(f"[AS-OF] membership mask: dropped {dropped}/{len(df)} rows "
+              f"outside the as-of top-{top_k} by dollar volume")
+    return kept
+
+
 # As-of tradability floors. Several CURRENT universe names traded as
 # illiquid sub-$2 stocks in 2021-23 (POET, QBTS, RDW...). Training on
 # those rows injects look-ahead — "this name later became liquid enough
 # to make today's list" — and teaches microstructure (cent-wide books,
 # halts, 20% gaps) the bot will never trade at today's notionals.
-# NOTE: this removes the LISTING/LIQUIDITY part of survivorship bias
-# only; the winners-only panel itself (faded names absent from today's
-# universe) needs the rule-based candidate-pool harvest on the roadmap.
+# Together with the candidate pool + as-of membership mask this removes
+# the listing/liquidity AND membership look-ahead; the residual is names
+# that faded before today (no free historical-membership data exists).
 MIN_DOLLAR_VOLUME = 5_000_000   # 30d median daily $ volume
 MIN_PRICE = 3.0                  # institutional-floor convention
 
 
 def _asof_tradability_mask(df, ticker):
-    """Drop rows from periods when the name wasn't realistically tradable."""
+    """Drop rows from periods when the name wasn't realistically tradable.
+
+    Also stamps _DV30 (trailing 30d median daily dollar volume) used by
+    the cross-sectional as-of membership mask after the harvest concat.
+    """
     try:
         daily_dv = (df['Close'] * df['Volume']).resample('1D').sum()
         daily_dv = daily_dv[daily_dv > 0]
         med_dv = daily_dv.rolling('30D').median()
-        dv_ok = med_dv.reindex(df.index, method='ffill') >= MIN_DOLLAR_VOLUME
+        dv_aligned = med_dv.reindex(df.index, method='ffill')
+        df = df.copy()
+        df['_DV30'] = dv_aligned.values
+        dv_ok = dv_aligned >= MIN_DOLLAR_VOLUME
         px_ok = df['Close'] >= MIN_PRICE
         mask = (dv_ok & px_ok).values
         dropped = int((~mask).sum())
@@ -182,7 +219,7 @@ def main():
     for t in STOCK_TICKERS:
         # For incremental: extract this ticker's existing OHLCV
         existing_ohlcv = None
-        start = ALPACA_START
+        start = CANDIDATE_START if t in _CANDIDATE_ONLY else ALPACA_START
         if is_incremental and available_ohlcv and 'Ticker' in existing.columns:
             ticker_data = existing[existing['Ticker'] == t]
             if not ticker_data.empty:
@@ -203,6 +240,10 @@ def main():
         return
     final_df = pd.concat(all_data)
     final_df = final_df.sort_index()
+
+    # Cross-sectional as-of membership (uses _DV30 stamped per ticker)
+    final_df = _asof_membership_mask(final_df)
+    final_df = final_df.drop(columns=['_DV30'], errors='ignore')
 
     # Add historical sentiment — LAGGED one day for point-in-time integrity.
     # The daily score for day D aggregates ALL of day D's articles

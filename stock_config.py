@@ -65,6 +65,45 @@ LEVERAGED_ETFS = {
 # Safe-haven symbols allowed to trade during VIX > 25 defensive regimes
 SAFE_HAVEN_SYMBOLS = {'GLD', 'SLV', 'PALL', 'PPLT', 'OXY', 'COPX'}
 
+# --- Training candidate pool (survivorship mitigation; NOT traded) ---
+# The trading universe is ~50 hand-picked high-beta names — a winner-
+# tilted panel. Training on it alone teaches patterns conditioned on
+# eventual success (documented +1.6-4.9pp/yr backtest inflation). The
+# harvest therefore trains on universe + this sector-diverse liquid pool,
+# masked to the AS-OF top-K by trailing dollar volume, so each name
+# contributes rows only from periods a mechanical rule would have
+# selected it. Residual bias: names that faded BEFORE today are still
+# absent (no free historical-membership data source).
+TRAINING_CANDIDATE_POOL = [
+    # Financials / payments
+    'JPM', 'BAC', 'WFC', 'GS', 'MS', 'V', 'MA', 'AXP',
+    # Energy
+    'XOM', 'CVX', 'COP', 'SLB',
+    # Healthcare
+    'JNJ', 'PFE', 'MRK', 'LLY', 'UNH', 'ABBV',
+    # Consumer / staples
+    'PG', 'KO', 'PEP', 'WMT', 'MCD', 'HD', 'LOW',
+    # Industrials
+    'CAT', 'DE', 'BA', 'GE', 'HON', 'UPS',
+    # Telecom
+    'T', 'VZ',
+    # Megacap / legacy tech
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'INTC', 'CSCO', 'ORCL', 'IBM',
+    'TXN', 'QCOM',
+    # Index ETFs (always top-of-rank; regime diversity)
+    'SPY', 'QQQ', 'IWM',
+]
+
+# As-of membership: keep a training row only when its name ranked in the
+# top K of the harvested panel by trailing 30d median dollar volume AT
+# THAT TIME
+AS_OF_TOP_K = 60
+
+# Candidates fetch from here (not 2016): bounds the Jetson concat spike,
+# and the row-capped trainer mostly samples the recent era anyway
+CANDIDATE_START = '2021-01-01'
+
+
 # --- Sector buckets (factor-crowding caps) ---
 # The ranked top-N clusters into one theme on exactly the days that theme
 # runs hot; per-name correlation sizing helps but a hard bucket notional
