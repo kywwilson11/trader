@@ -78,3 +78,32 @@ class TestTradabilityStampsDV:
         out = _asof_tradability_mask(df, 'TEST')
         assert '_DV30' in out.columns
         assert (out['_DV30'] > 0).all()
+
+
+class TestArchiveFeatureFill:
+    """Regression: dropna() must not eat rows that predate the archives."""
+
+    def test_leading_nans_become_neutral_not_dropped(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+        from harvest_crypto_data import _fill_archive_features
+        idx = pd.date_range('2021-01-01', periods=100, freq='h', tz='UTC')
+        df = pd.DataFrame({'Close': 100.0, 'RSI': 50.0}, index=idx)
+        # OI archive only covers the last 20 rows (2023+ in reality)
+        oi = np.full(100, np.nan)
+        oi[-20:] = 1.5
+        df['OI_Z'] = oi
+        df['Funding_Z'] = np.nan  # archive entirely missing
+        out = _fill_archive_features(df).dropna()
+        assert len(out) == 100          # zero rows lost
+        assert (out['OI_Z'].iloc[:80] == 0.0).all()
+        assert (out['OI_Z'].iloc[-20:] == 1.5).all()
+        assert (out['Funding_Z'] == 0.0).all()
+
+    def test_non_archive_nans_still_drop(self):
+        from harvest_crypto_data import _fill_archive_features
+        idx = pd.date_range('2021-01-01', periods=10, freq='h', tz='UTC')
+        df = pd.DataFrame({'Close': 100.0}, index=idx)
+        df['RSI'] = [np.nan] * 5 + [50.0] * 5  # indicator warmup
+        df['OI_Z'] = np.nan
+        out = _fill_archive_features(df).dropna()
+        assert len(out) == 5            # indicator warmup still drops

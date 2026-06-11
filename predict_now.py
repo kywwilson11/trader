@@ -236,6 +236,19 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             pass
         df['TT_LS_Z'] = (lf or {}).get('TT_LS_Z', 0.0)
 
+    # Inject live taker flow imbalance (crypto only; OKX taker-volume
+    # history in one call — no cold start)
+    if asset_type == 'crypto' and 'Taker_Imb_24h' in feature_cols \
+            and 'Taker_Imb_24h' not in df.columns:
+        tf = None
+        try:
+            from oi_archive import live_taker_features
+            alp_sym = symbol.replace('-', '/') if '-' in symbol else symbol
+            tf = live_taker_features(alp_sym)
+        except Exception:
+            pass
+        df['Taker_Imb_24h'] = (tf or {}).get('Taker_Imb_24h', 0.0)
+
     try:
         current_features = df[feature_cols].values
     except KeyError as e:

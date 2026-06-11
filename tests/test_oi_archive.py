@@ -196,3 +196,82 @@ class TestLSFeatures:
 
         monkeypatch.setattr(urllib.request, 'urlopen', boom)
         assert oi_archive.live_ls_features('BTC/USD') is None
+
+
+# --- taker flow features ---
+
+class TestTakerFeatures:
+    def test_parse_zip_taker_mean_averages_the_hour(self):
+        # Build a day where taker_ratio alternates 1.0/2.0 per 5-min row:
+        # hourly LAST would read 1.0 or 2.0; hourly MEAN must read ~1.5
+        header = ("create_time,symbol,sum_open_interest,"
+                  "sum_open_interest_value,count_toptrader_long_short_ratio,"
+                  "sum_toptrader_long_short_ratio,count_long_short_ratio,"
+                  "sum_taker_long_short_vol_ratio")
+        rows = []
+        t0 = dt.datetime.fromisoformat('2026-06-01T00:05:00')
+        for i in range(288):
+            ts = t0 + dt.timedelta(minutes=5 * i)
+            rows.append(f"{ts:%Y-%m-%d %H:%M:%S},BTCUSDT,1,1,1,1.4,1,"
+                        f"{1.0 if i % 2 else 2.0}")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w') as zf:
+            zf.writestr('x.csv', header + '\n' + '\n'.join(rows))
+        out = _parse_zip(buf.getvalue())
+        assert 'taker_mean' in out.columns
+        assert out['taker_mean'].iloc[0] == pytest.approx(1.5)
+
+    def _archive(self, tmp_path, monkeypatch, taker_means):
+        monkeypatch.setattr(oi_archive, 'ARCHIVE_FILE',
+                            tmp_path / 'oi.parquet')
+        idx = pd.date_range('2026-05-01', periods=len(taker_means),
+                            freq='h', tz='UTC')
+        arc = pd.DataFrame({'symbol': 'BTC/USD', 'ts': idx, 'oi': 1.0,
+                            'oi_value': 7e9, 'tt_ls_ratio': 1.4,
+                            'taker_ratio': 1.0, 'taker_mean': taker_means})
+        arc.to_parquet(tmp_path / 'oi.parquet')
+        return idx
+
+    def test_taker_imbalance_sign(self, tmp_path, monkeypatch):
+        # Balanced flow -> ~0; sustained buy pressure -> positive log
+        vals = [1.0] * 100 + [1.5] * 100
+        idx = self._archive(tmp_path, monkeypatch, vals)
+        feats = oi_archive.taker_features_for_index('BTC/USD', idx[-2:])
+        assert feats is not None
+        assert feats['Taker_Imb_24h'][-1] == pytest.approx(np.log(1.5), abs=0.01)
+        mid = oi_archive.taker_features_for_index('BTC/USD', idx[50:52])
+        assert abs(mid['Taker_Imb_24h'][-1]) < 0.01
+
+    def test_taker_none_without_column(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(oi_archive, 'ARCHIVE_FILE',
+                            tmp_path / 'oi.parquet')
+        idx = pd.date_range('2026-05-01', periods=300, freq='h', tz='UTC')
+        arc = pd.DataFrame({'symbol': 'BTC/USD', 'ts': idx, 'oi': 1.0,
+                            'oi_value': 7e9, 'tt_ls_ratio': 1.4,
+                            'taker_ratio': 1.0})  # pre-upgrade archive
+        arc.to_parquet(tmp_path / 'oi.parquet')
+        assert oi_archive.taker_features_for_index('BTC/USD', idx) is None
+
+    def test_live_taker_from_okx(self, monkeypatch):
+        import io as _io, json as _json, urllib.request
+        oi_archive._taker_cache.clear()
+        # rows: [ts, sellVol, buyVol] — buy 20% above sell all day
+        payload = {'code': '0',
+                   'data': [[str(1781146800000 - i * 3600000),
+                             '100.0', '120.0'] for i in range(30)]}
+        monkeypatch.setattr(urllib.request, 'urlopen',
+                            lambda req, timeout=10: _io.BytesIO(
+                                _json.dumps(payload).encode()))
+        out = oi_archive.live_taker_features('BTC/USD')
+        assert out is not None
+        assert out['Taker_Imb_24h'] == pytest.approx(np.log(1.2), abs=1e-6)
+
+    def test_live_taker_none_on_error(self, monkeypatch):
+        import urllib.request
+        oi_archive._taker_cache.clear()
+
+        def boom(req, timeout=10):
+            raise OSError('down')
+
+        monkeypatch.setattr(urllib.request, 'urlopen', boom)
+        assert oi_archive.live_taker_features('BTC/USD') is None

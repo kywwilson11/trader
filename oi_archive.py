@@ -103,8 +103,16 @@ def _parse_zip(data: bytes):
             # Right-labeled buckets: every snapshot inside a bucket is
             # <= its label, so ffill onto bar grids can never leak a
             # future snapshot regardless of bar-stamp convention
-            frames.append(out.resample('1h', label='right', closed='right')
-                          .last().dropna(how='all'))
+            hourly = (out.resample('1h', label='right', closed='right')
+                      .last())
+            # Flow needs AVERAGING, not a last-5-min snapshot: taker
+            # buy/sell ratio is per-window flow, so the hourly value is
+            # the mean of the hour's 5-min readings
+            if 'taker_ratio' in out.columns:
+                hourly['taker_mean'] = (
+                    out['taker_ratio']
+                    .resample('1h', label='right', closed='right').mean())
+            frames.append(hourly.dropna(how='all'))
     if not frames:
         return None
     import pandas as pd
@@ -119,7 +127,8 @@ def load_archive():
         except Exception:
             pass
     return pd.DataFrame(columns=['symbol', 'ts', 'oi', 'oi_value',
-                                 'tt_ls_ratio', 'taker_ratio', 'src_day'])
+                                 'tt_ls_ratio', 'taker_ratio', 'taker_mean',
+                                 'src_day'])
 
 
 def sync(symbols=None, start: str = OI_START,
@@ -263,6 +272,37 @@ def ls_features_for_index(alpaca_symbol: str, index):
     return {'TT_LS_Z': z.reindex(idx, method='ffill').values}
 
 
+def taker_features_for_index(alpaca_symbol: str, index):
+    """Aggressive-flow imbalance feature aligned to hourly bars.
+
+      Taker_Imb_24h  log of the 24h mean taker buy/sell volume ratio
+                     (>0 net aggressive buying, <0 net selling)
+
+    Completes the triad with FLOW: funding prices crowding, OI sizes it,
+    TT_LS signs the positioning, this measures who is hitting the tape.
+    Uses the hourly-MEAN taker column (taker_mean); archives synced
+    before that column existed return None until re-synced days land.
+    """
+    import numpy as np
+    import pandas as pd
+    arc = load_archive()
+    if arc.empty or 'taker_mean' not in arc.columns:
+        return None
+    sub = arc[arc['symbol'] == alpaca_symbol]
+    if sub.empty:
+        return None
+    s = sub.set_index('ts')['taker_mean'].sort_index()
+    s = s[~s.index.duplicated(keep='last')].dropna()
+    if len(s) < 48:
+        return None
+    m24 = s.rolling(24, min_periods=12).mean()
+    feat = np.log(m24.where(m24 > 0))
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is None:
+        idx = idx.tz_localize('UTC')
+    return {'Taker_Imb_24h': feat.reindex(idx, method='ffill').values}
+
+
 # --- Live serving (OKX; venue-consistent local history) ---
 
 _live_cache: dict[str, tuple[float, float]] = {}
@@ -380,6 +420,40 @@ def live_ls_features(symbol: str) -> dict | None:
     z = (cur - mu) / sd if sd > 1e-12 else 0.0
     out = {'TT_LS_Z': z}
     _ls_cache[symbol] = (now, out)
+    return out
+
+
+_taker_cache: dict[str, tuple[float, dict]] = {}
+
+
+def live_taker_features(symbol: str) -> dict | None:
+    """Live Taker_Imb_24h from OKX taker-volume history (one call,
+    no cold start). Response rows are [ts, sellVol, buyVol] newest
+    first (OKX rubik docs); hourly ratio = buy/sell, feature = log of
+    the newest-24h mean — venue-local dynamics, same as OI/TT_LS."""
+    import math
+    base = symbol.split('/')[0]
+    now = time.monotonic()
+    hit = _taker_cache.get(symbol)
+    if hit and (now - hit[0]) < _LIVE_CACHE_TTL:
+        return hit[1]
+    try:
+        url = ("https://www.okx.com/api/v5/rubik/stat/taker-volume"
+               f"?ccy={base}&instType=CONTRACTS&period=1H")
+        req = urllib.request.Request(url, headers={'User-Agent': 'trader/1.0'})
+        data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        rows = data.get('data', [])[:24]  # newest 24 hours
+        ratios = []
+        for r in rows:
+            sell, buy = float(r[1]), float(r[2])
+            if sell > 0 and buy > 0:
+                ratios.append(buy / sell)
+    except Exception:
+        return None
+    if len(ratios) < 12:
+        return None
+    out = {'Taker_Imb_24h': math.log(sum(ratios) / len(ratios))}
+    _taker_cache[symbol] = (now, out)
     return out
 
 

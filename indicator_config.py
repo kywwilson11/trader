@@ -18,7 +18,7 @@ _DEFAULTS = {"preset": "standard"}
 # Columns only present in crypto training data
 CRYPTO_ONLY_COLS = ["BTC_Return_1h", "BTC_SMA_Ratio", "BTC_RSI",
                     "Funding_Rate_Ann", "Funding_Z", "Funding_Chg_24h",
-                    "OI_Chg_24h", "OI_Z", "TT_LS_Z"]
+                    "OI_Chg_24h", "OI_Z", "TT_LS_Z", "Taker_Imb_24h"]
 
 # Columns only present in stock training data
 STOCK_ONLY_COLS = ["VWAP", "Price_VWAP_Ratio", "Gap_Pct", "ATR_Pct", "RS_vs_SPY"]
@@ -68,6 +68,8 @@ _STANDARD_FEATURES = _MINIMAL_FEATURES + [
     "OI_Chg_24h", "OI_Z",
     # Top-trader long/short positioning (crypto only)
     "TT_LS_Z",
+    # Aggressive taker flow imbalance (crypto only)
+    "Taker_Imb_24h",
 ]
 
 # Stationary features only — no raw prices/volumes that trend over time.
@@ -100,6 +102,9 @@ _STATIONARY_FEATURES = [
     # Top-trader long/short positioning z (crypto only; direction of
     # crowding — funding prices it, OI sizes it, this signs it)
     "TT_LS_Z",
+    # Aggressive taker flow imbalance (crypto only; log 24h mean
+    # buy/sell taker ratio — who is hitting the tape)
+    "Taker_Imb_24h",
 ]
 
 PRESETS = {

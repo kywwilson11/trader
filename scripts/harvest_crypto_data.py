@@ -127,10 +127,13 @@ def prepare_data(ticker, btc_close=None, api=None, existing_ohlcv=None,
     # Open-interest + top-trader positioning (Binance metrics archive,
     # hourly point-in-time)
     try:
-        from oi_archive import oi_features_for_index, ls_features_for_index
+        from oi_archive import (oi_features_for_index,
+                                ls_features_for_index,
+                                taker_features_for_index)
         alpaca_sym = ticker.replace('-', '/')
         for feats in (oi_features_for_index(alpaca_sym, df.index),
-                      ls_features_for_index(alpaca_sym, df.index)):
+                      ls_features_for_index(alpaca_sym, df.index),
+                      taker_features_for_index(alpaca_sym, df.index)):
             if feats is not None:
                 for col, vals in feats.items():
                     df[col] = vals
@@ -153,7 +156,29 @@ def prepare_data(ticker, btc_close=None, api=None, existing_ohlcv=None,
     # Backward compat: Target_Return = shortest horizon
     df['Target_Return'] = df[f'Target_Return_{FORWARD_BARS[0]}']
 
+    df = _fill_archive_features(df)
     df = df.dropna()
+    return df
+
+
+# Archive-derived feature columns (Binance funding/metrics merges)
+ARCHIVE_FEATURES = ['Funding_Rate_Ann', 'Funding_Z', 'Funding_Chg_24h',
+                    'OI_Chg_24h', 'OI_Z', 'TT_LS_Z', 'Taker_Imb_24h']
+
+
+def _fill_archive_features(df):
+    """Neutral-fill archive features so dropna() can't eat their rows.
+
+    These columns are NaN before their archive's first print (OI starts
+    2023; the first OI sync covers ~1y until back-fill finishes) and
+    during z-score warmups. Letting dropna() drop those rows would
+    silently discard YEARS of training data. 0.0 is the exact value
+    live serving injects when history is missing, so train and serve
+    agree that "no data" reads as "neutral signal".
+    """
+    for col in ARCHIVE_FEATURES:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
     return df
 
 
