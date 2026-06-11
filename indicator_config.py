@@ -21,7 +21,13 @@ CRYPTO_ONLY_COLS = ["BTC_Return_1h", "BTC_SMA_Ratio", "BTC_RSI",
                     "OI_Chg_24h", "OI_Z", "TT_LS_Z", "Taker_Imb_24h"]
 
 # Columns only present in stock training data
-STOCK_ONLY_COLS = ["VWAP", "Price_VWAP_Ratio", "Gap_Pct", "ATR_Pct", "RS_vs_SPY"]
+STOCK_ONLY_COLS = ["VWAP", "Price_VWAP_Ratio", "Gap_Pct", "ATR_Pct", "RS_vs_SPY",
+                   "ROD_Ret", "Same_Hour_Mean_40d",
+                   "CS_Rank_Return_4h", "CS_Rank_Return_12h", "CS_Rank_ROC",
+                   "CS_Rank_RSI", "CS_Rank_ATR_Pct", "CS_Rank_Volume_Ratio",
+                   "CS_Rank_Price_SMA20_Ratio", "CS_Rank_RS_vs_SPY",
+                   "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret",
+                   "CS_Dispersion", "CS_Breadth"]
 
 # --- Preset definitions ---
 # Each preset lists column names. "full" uses None (all columns).
@@ -70,6 +76,14 @@ _STANDARD_FEATURES = _MINIMAL_FEATURES + [
     "TT_LS_Z",
     # Aggressive taker flow imbalance (crypto only)
     "Taker_Imb_24h",
+    # Return-of-day + same-hour periodicity (stock only; BDS 2025 / HKS)
+    "ROD_Ret", "Same_Hour_Mean_40d",
+    # Cross-sectional panel ranks + context (stock only; GKX rank
+    # transform — selection is a RELATIVE decision)
+    "CS_Rank_Return_4h", "CS_Rank_Return_12h", "CS_Rank_ROC",
+    "CS_Rank_RSI", "CS_Rank_ATR_Pct", "CS_Rank_Volume_Ratio",
+    "CS_Rank_Price_SMA20_Ratio", "CS_Rank_RS_vs_SPY",
+    "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret", "CS_Dispersion", "CS_Breadth",
 ]
 
 # Stationary features only — no raw prices/volumes that trend over time.
@@ -105,6 +119,17 @@ _STATIONARY_FEATURES = [
     # Aggressive taker flow imbalance (crypto only; log 24h mean
     # buy/sell taker ratio — who is hitting the tape)
     "Taker_Imb_24h",
+    # Return-of-day + same-hour periodicity (stock only; stationary
+    # returns; BDS 2025 loser-bounce / HKS intraday periodicity)
+    "ROD_Ret", "Same_Hour_Mean_40d",
+    # Cross-sectional panel ranks, bounded [-1,1] + context (stock only;
+    # GKX/FNW rank transform: the models finally see each name's
+    # standing WITHIN the panel this hour — the relative information
+    # the top-7 selection actually turns on)
+    "CS_Rank_Return_4h", "CS_Rank_Return_12h", "CS_Rank_ROC",
+    "CS_Rank_RSI", "CS_Rank_ATR_Pct", "CS_Rank_Volume_Ratio",
+    "CS_Rank_Price_SMA20_Ratio", "CS_Rank_RS_vs_SPY",
+    "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret", "CS_Dispersion", "CS_Breadth",
 ]
 
 PRESETS = {

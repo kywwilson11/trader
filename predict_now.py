@@ -38,6 +38,16 @@ _q10_models: dict[str, tuple[object, float] | None] = {}
 # Missing-feature sets already warned about (once per set, not per cycle)
 _warned_missing: set[tuple] = set()
 
+# Live cross-sectional panel features, registered each cycle by the stock
+# loop's panel pre-pass (panel_ranks.compute_live_panel_ranks)
+_panel_features: dict[str, dict] = {}
+
+
+def set_panel_features(panel: dict[str, dict]) -> None:
+    """Register {symbol: {CS_*: value}} computed by the panel pre-pass."""
+    global _panel_features
+    _panel_features = panel or {}
+
 # --- CONFIGURATION ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -252,6 +262,17 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             pass
         df['Taker_Imb_24h'] = (tf or {}).get('Taker_Imb_24h', 0.0)
 
+    # Inject live cross-sectional panel features (stocks; registered by
+    # the loop's hourly panel pre-pass). 0.0 = median rank / neutral
+    # context — the same value training's neutral fill uses, and what a
+    # name outside the live top-K membership correctly reads as.
+    cs_needed = [c for c in feature_cols
+                 if c.startswith('CS_') and c not in df.columns]
+    if cs_needed:
+        sym_panel = _panel_features.get(symbol, {})
+        for col in cs_needed:
+            df[col] = float(sym_panel.get(col, 0.0))
+
     # SAFETY NET: a model trained with a column live can't produce
     # (absent archive, missed injection branch) previously raised
     # KeyError and bricked predictions for the symbol. The realistically
@@ -362,7 +383,7 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             'SMA_20', 'Price_SMA20_Ratio', 'BBL_20_2.0', 'BBU_20_2.0',
             'BBP_20_2.0', 'BBB_20_2.0',
             'ROC', 'Return_4h', 'Return_12h', 'Volatility_12h',
-            'Daily_Sentiment', 'Hurst',  # Hurst was missing — the loop's
+            'Daily_Sentiment', 'Hurst', 'ROD_Ret', 'Same_Hour_Mean_40d',  # Hurst was missing — the loop's
             # mean-reversion filter read snapshot['Hurst'] and always got
             # None, so that gate never fired; meta features need it too
             # Cross-asset (may not exist for all asset types)

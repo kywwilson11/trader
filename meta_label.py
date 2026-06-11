@@ -44,6 +44,10 @@ META_FEATURES = [
     'pred', 'RSI', 'Price_SMA20_Ratio', 'BBB_20_2.0', 'Volatility_12h',
     'Return_4h', 'Return_12h', 'ATR_Pct', 'Daily_Sentiment', 'Hurst',
     'hour_sin', 'hour_cos',
+    # Return-of-day (BDS 2025): SOFT feature only — the meta-learner can
+    # discover the PM-window loser-bounce interaction with hour_sin/cos;
+    # a hard rule died in red-team (winner-leg effect is ~0)
+    'ROD_Ret',
 ]
 
 

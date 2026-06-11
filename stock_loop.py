@@ -258,6 +258,14 @@ class StockLoop(BaseTradingLoop):
             value = info.qty * info.entry_price
             if value > OVERNIGHT_SLEEVE_MAX_PCT_EQUITY * max(self._equity, 1):
                 continue
+            # Loser-bounce exclusion (Baltussen-Da-Soebhag 2025 Table 6):
+            # a day-loser that bounced hard into the close is transitory
+            # liquidity pressure that fully reverts by the next OPEN —
+            # exactly the wrong name to hold for the overnight premium
+            if self._is_bounced_loser(sym):
+                logger.info("[SLEEVE] %s: excluded — EOD loser-bounce "
+                            "reverts at the open", sym)
+                continue
             candidates.append((pred, sym))
         candidates.sort(reverse=True)
         return {sym for _, sym in candidates[:OVERNIGHT_SLEEVE_MAX_POSITIONS]}
@@ -441,6 +449,18 @@ class StockLoop(BaseTradingLoop):
 
     def _get_predictions(self, benchmark_close):
         """Override to add top-N ranking."""
+        # Panel pre-pass (wave-3 flagship): compute live cross-sectional
+        # ranks over the SAME as-of top-K panel training ranked over, and
+        # register them for predict_now's CS_* injection. Hourly-cached
+        # inside; fail-open to neutral ranks.
+        try:
+            from panel_ranks import compute_live_panel_ranks
+            from predict_now import set_panel_features
+            set_panel_features(compute_live_panel_ranks(
+                self.api, spy_close=benchmark_close))
+        except Exception as e:
+            logger.warning("[PANEL] live pre-pass failed (%s) — "
+                           "neutral ranks this cycle", e)
         preds, snapshots = super()._get_predictions(benchmark_close)
         self._last_preds = dict(preds)  # sleeve selection reads these
 
@@ -868,16 +888,78 @@ class StockLoop(BaseTradingLoop):
         super()._manage_stops()
 
     def _extra_tilt(self, symbol: str) -> float:
-        """Post-print vol haircut: ATR(14)/GARCH lag the 3-5x realized-vol
-        expansion after an earnings report by ~1 day — halve the first
-        post-print day's size instead of trading it at stale risk numbers."""
+        """Stock-specific sizing tilts (post-print vol + PM-tape ROD)."""
+        tilt = 1.0
+        # Post-print vol haircut: ATR(14)/GARCH lag the 3-5x realized-vol
+        # expansion after an earnings report by ~1 day — halve the first
+        # post-print day's size instead of trading at stale risk numbers
         try:
             from events_calendar import reported_recently
             if reported_recently(symbol):
-                return 0.5
+                tilt *= 0.5
         except Exception:
             pass
+        # SPY rest-of-day momentum gate for the PM window: on a strongly
+        # DOWN tape (|ROD| > 0.5x daily vol), the documented last-hour
+        # continuation runs against fresh longs — halve PM entries.
+        # Strong-up tapes ride at full size (continuation helps longs).
+        try:
+            tilt *= self._spy_rod_pm_tilt()
+        except Exception:
+            pass
+        return tilt
+
+    def _spy_rod_pm_tilt(self) -> float:
+        """0.5 when entering the 14:30-15:30 window into a strong-down
+        SPY tape; 1.0 otherwise. Uses the cached SPY benchmark series."""
+        now = self._get_eastern_now()
+        if not (14 <= now.hour < 16):
+            return 1.0
+        spy = self.get_benchmark_close()
+        if spy is None or len(spy) < 200:
+            return 1.0
+        dates = spy.index.normalize()
+        last_date = dates[-1]
+        prior = spy[dates < last_date]
+        if prior.empty:
+            return 1.0
+        prev_close = float(prior.iloc[-1])
+        rod = (float(spy.iloc[-1]) / prev_close - 1.0) * 100
+        daily = spy.groupby(dates).last().pct_change().dropna() * 100
+        vol = float(daily.tail(20).std())
+        if vol <= 0:
+            return 1.0
+        if rod < -0.5 * vol:
+            logger.info("[ROD] SPY %.2f%% (-%.1f sigma-day) — PM entries "
+                        "halved (last-hour continuation risk)", rod,
+                        abs(rod) / vol)
+            return 0.5
         return 1.0
+
+    def _is_bounced_loser(self, symbol: str) -> bool:
+        """True when today's day-loser bounced hard in the late session
+        (prev-close-to-15:00 strongly negative AND 15:00-to-now strongly
+        positive) — the BDS transitory-pressure pattern."""
+        try:
+            from market_data import fetch_stock_bars_alpaca
+            bars = fetch_stock_bars_alpaca(self.api, symbol)
+            if bars is None or len(bars) < 30:
+                return False
+            close = bars['Close']
+            dates = close.index.normalize()
+            last_date = dates[-1]
+            today = close[dates == last_date]
+            prior = close[dates < last_date]
+            if len(today) < 2 or prior.empty:
+                return False
+            prev_close = float(prior.iloc[-1])
+            rod_now = float(today.iloc[-1]) / prev_close - 1.0
+            rod_early = float(today.iloc[-2]) / prev_close - 1.0
+            bounce = rod_now - rod_early
+            # Day loser (<-1.5%) that bounced >+0.75% in the final stretch
+            return rod_early < -0.015 and bounce > 0.0075
+        except Exception:
+            return False
 
     def _replace_protective_stops(self):
         """Re-place a server-side stop for every reconstructed stock position.

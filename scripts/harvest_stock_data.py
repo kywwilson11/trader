@@ -176,10 +176,8 @@ def _asof_tradability_mask(df, ticker):
     the cross-sectional as-of membership mask after the harvest concat.
     """
     try:
-        daily_dv = (df['Close'] * df['Volume']).resample('1D').sum()
-        daily_dv = daily_dv[daily_dv > 0]
-        med_dv = daily_dv.rolling('30D').median()
-        dv_aligned = med_dv.reindex(df.index, method='ffill')
+        from panel_ranks import dv30  # ONE dv implementation, shared with
+        dv_aligned = dv30(df)         # the live panel mask (parity)
         df = df.copy()
         df['_DV30'] = dv_aligned.values
         dv_ok = dv_aligned >= MIN_DOLLAR_VOLUME
@@ -244,6 +242,13 @@ def main():
     # Cross-sectional as-of membership (uses _DV30 stamped per ticker)
     final_df = _asof_membership_mask(final_df)
     final_df = final_df.drop(columns=['_DV30'], errors='ignore')
+
+    # Cross-sectional rank features over the surviving members (wave-3
+    # flagship: selection is a RELATIVE decision — give the models each
+    # name's rank within the panel THIS hour, not just its own history)
+    from panel_ranks import add_panel_ranks, neutral_fill_cs
+    final_df = add_panel_ranks(final_df)
+    final_df = neutral_fill_cs(final_df)
 
     # Add historical sentiment — LAGGED one day for point-in-time integrity.
     # The daily score for day D aggregates ALL of day D's articles

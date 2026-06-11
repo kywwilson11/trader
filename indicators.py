@@ -649,4 +649,22 @@ def compute_stock_features(df, spy_close=None):
     else:
         df['RS_vs_SPY'] = 1.0  # neutral if no benchmark
 
+    # Return-of-day: cumulative % return from the PRIOR session's close to
+    # this bar (Baltussen-Da-Soebhag 2025: the prev-close-to-15:00 return
+    # negatively predicts the last half-hour, loser side only — served to
+    # the models and the meta-labeler as a soft feature, never a hard rule)
+    dates = df.index.normalize() if hasattr(df.index, 'normalize') else df.index
+    session_last = df['Close'].groupby(dates).transform('last')
+    prev_close = session_last.groupby(dates).first().shift(1)
+    prev_close_aligned = pd.Series(dates, index=df.index).map(prev_close)
+    df['ROD_Ret'] = (df['Close'] / prev_close_aligned - 1.0) * 100
+
+    # Same-hour-of-day periodicity (Heston-Korajczyk-Sadka JF 2010,
+    # replicated 30y in Bogousslavsky JFE 2021): trailing 40-session mean
+    # of THIS clock-hour's bar return, shifted so today's bar is excluded
+    bar_ret = df['Close'].pct_change() * 100
+    df['Same_Hour_Mean_40d'] = (
+        bar_ret.groupby(df.index.hour)
+        .transform(lambda s: s.rolling(40, min_periods=10).mean().shift(1)))
+
     return df
