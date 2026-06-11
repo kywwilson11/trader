@@ -425,7 +425,12 @@ def should_trade(predicted_return, spread_pct, min_edge=2.0,
     maker: True when entries rest as maker limit orders
     """
     from fees import required_edge_pct
-    threshold = required_edge_pct(asset_type, spread_pct, maker, min_edge)
+    # live=True: the LIVE gate blends the crypto entry fee by REALIZED
+    # maker share (journals) so an overstated taker assumption doesn't
+    # reject genuinely positive-edge entries. Backtest/training paths
+    # call fees directly with the conservative static model.
+    threshold = required_edge_pct(asset_type, spread_pct, maker, min_edge,
+                                  live=True)
     return abs(predicted_return) > threshold
 
 

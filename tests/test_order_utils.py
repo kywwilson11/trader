@@ -60,10 +60,12 @@ class TestShouldTrade:
                             asset_type='stock') is False
 
     def test_maker_pricing_lowers_crypto_hurdle(self):
-        # maker RT = 0.30% + 0.1% = 0.40%; min_edge 2 -> 0.8%
-        assert should_trade(predicted_return=1.0, spread_pct=0.1,
+        # Exits are market/stop -> always taker. maker entry RT =
+        # (15+25)bps + 0.1% spread = 0.50%; min_edge 2 -> 1.0%.
+        # taker entry RT = (25+25)bps + 0.1% = 0.60% -> 1.2%.
+        assert should_trade(predicted_return=1.1, spread_pct=0.1,
                             asset_type='crypto', maker=True) is True
-        assert should_trade(predicted_return=1.0, spread_pct=0.1,
+        assert should_trade(predicted_return=1.1, spread_pct=0.1,
                             asset_type='crypto', maker=False) is False
 
     def test_negative_return_uses_abs(self):
