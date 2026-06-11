@@ -130,3 +130,60 @@ class TestModelLoading:
         assert model is not None
         assert cfg['trade_threshold'] == 0.30
         assert len(fc) == input_dim
+
+
+class TestMissingFeatureSafetyNet:
+    """Models trained on columns live can't produce must degrade
+    (neutral-fill few / fail closed many), never KeyError-brick."""
+
+    def _run(self, monkeypatch, feature_cols, df_cols):
+        import numpy as np
+        import pandas as pd
+        import torch
+        import predict_now
+
+        idx = pd.date_range('2026-06-01', periods=40, freq='h', tz='UTC')
+        bars = pd.DataFrame({c: np.full(40, 100.0)
+                             for c in ('Open', 'High', 'Low', 'Close',
+                                       'Volume')}, index=idx)
+        feat_df = bars.copy()
+        for c in df_cols:
+            feat_df[c] = 1.0
+
+        monkeypatch.setattr(predict_now, 'fetch_bars_yfinance',
+                            lambda s: bars)
+        monkeypatch.setattr(predict_now, 'compute_features',
+                            lambda df, btc_close=None: feat_df)
+        predict_now._warned_missing.clear()
+
+        class Scaler:
+            def transform(self, x):
+                return np.asarray(x, dtype=np.float32)
+
+        class Model:
+            def __call__(self, t):
+                return torch.tensor([0.42])
+
+        config = {'seq_len': 8, 'trade_threshold': 0.2, 'prefix': 'zz_nope'}
+        return predict_now.get_live_prediction(
+            'BTC-USD', Model(), Scaler(), config, feature_cols,
+            asset_type='crypto')
+
+    def test_small_missing_set_neutral_fills(self, monkeypatch):
+        # Fake_A/Fake_B have no injection branch (stays offline) and are
+        # absent from the live frame -> neutral-filled, prediction runs
+        cols = ['Close', 'Volume', 'RSI', 'Fake_A', 'Fake_B']
+        pred = self._run(monkeypatch, cols, df_cols=['RSI'])
+        assert pred == pytest.approx(0.42)
+
+    def test_large_missing_set_fails_closed(self, monkeypatch):
+        cols = ['Close', 'RSI', 'Fake_A', 'Fake_B', 'Fake_C',
+                'Fake_D', 'Fake_E', 'Fake_F']
+        # 6 of 8 missing (> 25%) -> no prediction
+        pred = self._run(monkeypatch, cols, df_cols=['RSI'])
+        assert pred is None
+
+    def test_nothing_missing_unchanged(self, monkeypatch):
+        cols = ['Close', 'Volume', 'RSI']
+        pred = self._run(monkeypatch, cols, df_cols=['RSI'])
+        assert pred == pytest.approx(0.42)

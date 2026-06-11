@@ -35,6 +35,9 @@ _sentiment_import_failed = False
 _lgb_models: dict[str, object | None] = {}
 _q10_models: dict[str, tuple[object, float] | None] = {}
 
+# Missing-feature sets already warned about (once per set, not per cycle)
+_warned_missing: set[tuple] = set()
+
 # --- CONFIGURATION ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -248,6 +251,28 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         except Exception:
             pass
         df['Taker_Imb_24h'] = (tf or {}).get('Taker_Imb_24h', 0.0)
+
+    # SAFETY NET: a model trained with a column live can't produce
+    # (absent archive, missed injection branch) previously raised
+    # KeyError and bricked predictions for the symbol. The realistically
+    # missing columns are the injected centered features (z-scores,
+    # log-ratios), where 0.0 is the trained "no signal" value — so
+    # neutral-fill a SMALL number with a loud once-per-set warning, and
+    # fail closed when too much of the vector is missing to trust.
+    missing = [c for c in feature_cols if c not in df.columns]
+    if missing:
+        if len(missing) > max(2, len(feature_cols) // 4):
+            print(f"  [FEATURES] {symbol}: {len(missing)}/{len(feature_cols)} "
+                  f"model features unavailable ({missing[:4]}...) — "
+                  f"prediction skipped")
+            return _none_ret
+        key = tuple(sorted(missing))
+        if key not in _warned_missing:
+            _warned_missing.add(key)
+            print(f"  [FEATURES] neutral-filling missing live columns "
+                  f"{missing} with 0.0 — check the injection paths")
+        for c in missing:
+            df[c] = 0.0
 
     try:
         current_features = df[feature_cols].values
