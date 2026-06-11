@@ -230,6 +230,39 @@ def oi_features_for_index(alpaca_symbol: str, index):
     }
 
 
+def ls_features_for_index(alpaca_symbol: str, index):
+    """Top-trader long/short positioning feature aligned to hourly bars.
+
+      TT_LS_Z  z-score of Binance top-trader long/short POSITION ratio
+               vs its trailing 30 days
+
+    Complements funding (the PRICE of crowding) and OI (its SIZE) with
+    its DIRECTION among the largest accounts. Stationary by z-scoring;
+    same point-in-time semantics as the OI features (right-labeled
+    hourly snapshots, ffill). None when under ~8 days of archive.
+    """
+    import numpy as np
+    import pandas as pd
+    arc = load_archive()
+    if arc.empty or 'tt_ls_ratio' not in arc.columns:
+        return None
+    sub = arc[arc['symbol'] == alpaca_symbol]
+    if sub.empty:
+        return None
+    s = sub.set_index('ts')['tt_ls_ratio'].sort_index()
+    s = s[~s.index.duplicated(keep='last')].dropna()
+    if len(s) < 200:
+        return None
+    roll = s.rolling(720, min_periods=168)
+    mu, sd = roll.mean(), roll.std()
+    z = ((s - mu) / sd).replace([np.inf, -np.inf], np.nan)
+    z = z.mask((sd == 0) & mu.notna(), 0.0)
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is None:
+        idx = idx.tz_localize('UTC')
+    return {'TT_LS_Z': z.reindex(idx, method='ffill').values}
+
+
 # --- Live serving (OKX; venue-consistent local history) ---
 
 _live_cache: dict[str, tuple[float, float]] = {}
@@ -308,6 +341,46 @@ def live_oi_features(symbol: str) -> dict | None:
         except OSError:
             pass
     return {'OI_Chg_24h': chg, 'OI_Z': z}
+
+
+_ls_cache: dict[str, tuple[float, dict]] = {}
+
+
+def live_ls_features(symbol: str) -> dict | None:
+    """Live TT_LS_Z from OKX's long/short-ratio history (one call covers
+    the full 30d z window — no local accumulation or cold start).
+
+    Definition note: the Binance archive feature is the TOP-TRADER
+    POSITION ratio; OKX serves the all-account ratio. Both measure
+    long-crowding direction, and as a z vs the SAME venue's trailing
+    window the dynamics are serving-consistent (the venue-local pattern
+    the OI features use).
+    """
+    base = symbol.split('/')[0]
+    now = time.monotonic()
+    hit = _ls_cache.get(symbol)
+    if hit and (now - hit[0]) < _LIVE_CACHE_TTL:
+        return hit[1]
+    try:
+        begin_ms = int((time.time() - 31 * 86400) * 1000)
+        url = ("https://www.okx.com/api/v5/rubik/stat/contracts/"
+               f"long-short-account-ratio?ccy={base}&period=1H"
+               f"&begin={begin_ms}")
+        req = urllib.request.Request(url, headers={'User-Agent': 'trader/1.0'})
+        data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        vals = [float(r[1]) for r in data.get('data', [])]  # newest first
+    except Exception:
+        return None
+    if len(vals) < 168:
+        return None
+    import statistics
+    cur = vals[0]
+    mu = statistics.fmean(vals)
+    sd = statistics.pstdev(vals)
+    z = (cur - mu) / sd if sd > 1e-12 else 0.0
+    out = {'TT_LS_Z': z}
+    _ls_cache[symbol] = (now, out)
+    return out
 
 
 if __name__ == '__main__':

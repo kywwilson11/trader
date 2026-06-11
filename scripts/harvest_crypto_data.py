@@ -124,14 +124,16 @@ def prepare_data(ticker, btc_close=None, api=None, existing_ohlcv=None,
     except Exception as e:
         print(f"  [FUNDING] {ticker}: feature merge skipped ({e})")
 
-    # Open-interest dynamics (Binance metrics archive, hourly point-in-time)
+    # Open-interest + top-trader positioning (Binance metrics archive,
+    # hourly point-in-time)
     try:
-        from oi_archive import oi_features_for_index
+        from oi_archive import oi_features_for_index, ls_features_for_index
         alpaca_sym = ticker.replace('-', '/')
-        ofeats = oi_features_for_index(alpaca_sym, df.index)
-        if ofeats is not None:
-            for col, vals in ofeats.items():
-                df[col] = vals
+        for feats in (oi_features_for_index(alpaca_sym, df.index),
+                      ls_features_for_index(alpaca_sym, df.index)):
+            if feats is not None:
+                for col, vals in feats.items():
+                    df[col] = vals
     except Exception as e:
         print(f"  [OI] {ticker}: feature merge skipped ({e})")
 

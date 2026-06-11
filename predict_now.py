@@ -223,6 +223,19 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         for col in ('OI_Chg_24h', 'OI_Z'):
             df[col] = (of or {}).get(col, 0.0)
 
+    # Inject live top-trader long/short positioning z (crypto only;
+    # OKX serves the full 30d window in one call — no cold start)
+    if asset_type == 'crypto' and 'TT_LS_Z' in feature_cols \
+            and 'TT_LS_Z' not in df.columns:
+        lf = None
+        try:
+            from oi_archive import live_ls_features
+            alp_sym = symbol.replace('-', '/') if '-' in symbol else symbol
+            lf = live_ls_features(alp_sym)
+        except Exception:
+            pass
+        df['TT_LS_Z'] = (lf or {}).get('TT_LS_Z', 0.0)
+
     try:
         current_features = df[feature_cols].values
     except KeyError as e:

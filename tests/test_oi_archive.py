@@ -136,3 +136,63 @@ def test_live_history_thinned_to_hourly(live_env, monkeypatch):
 def test_live_none_when_okx_down(live_env, monkeypatch):
     monkeypatch.setattr(oi_archive, '_fetch_okx_oi', lambda s: None)
     assert live_oi_features('BTC/USD') is None
+
+
+# --- top-trader long/short ratio features ---
+
+class TestLSFeatures:
+    def _archive(self, tmp_path, monkeypatch, ratios):
+        monkeypatch.setattr(oi_archive, 'ARCHIVE_FILE',
+                            tmp_path / 'oi.parquet')
+        idx = pd.date_range('2026-05-01', periods=len(ratios), freq='h',
+                            tz='UTC')
+        arc = pd.DataFrame({'symbol': 'BTC/USD', 'ts': idx,
+                            'oi': 1.0, 'oi_value': 7e9,
+                            'tt_ls_ratio': ratios, 'taker_ratio': 1.3})
+        arc.to_parquet(tmp_path / 'oi.parquet')
+        return idx
+
+    def test_ls_z_detects_crowding_surge(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(2)
+        ratios = list(1.4 + rng.normal(0, 0.05, 400))
+        ratios[-5:] = [2.4] * 5  # top traders pile long
+        idx = self._archive(tmp_path, monkeypatch, ratios)
+        feats = oi_archive.ls_features_for_index('BTC/USD', idx[-3:])
+        assert feats is not None
+        assert feats['TT_LS_Z'][-1] > 3
+
+    def test_ls_none_for_short_or_missing(self, tmp_path, monkeypatch):
+        idx = self._archive(tmp_path, monkeypatch, [1.4] * 50)  # < 200 rows
+        assert oi_archive.ls_features_for_index('BTC/USD', idx) is None
+        assert oi_archive.ls_features_for_index('ETH/USD', idx) is None
+
+    def test_live_ls_z_from_okx_history(self, monkeypatch):
+        import io, json as _json, urllib.request
+        oi_archive._ls_cache.clear()
+        rng = np.random.default_rng(3)
+        hist = list(1.5 + rng.normal(0, 0.05, 300))
+        hist[0] = 2.5  # newest reading: extreme long crowding
+        payload = {'code': '0',
+                   'data': [[str(1781143200000 - i * 3600000), f'{v:.4f}']
+                            for i, v in enumerate(hist)]}
+        monkeypatch.setattr(urllib.request, 'urlopen',
+                            lambda req, timeout=10: io.BytesIO(
+                                _json.dumps(payload).encode()))
+        out = oi_archive.live_ls_features('BTC/USD')
+        assert out is not None and out['TT_LS_Z'] > 3
+
+    def test_live_ls_none_on_thin_history_or_error(self, monkeypatch):
+        import io, json as _json, urllib.request
+        oi_archive._ls_cache.clear()
+        payload = {'code': '0', 'data': [['1781143200000', '1.5']] * 10}
+        monkeypatch.setattr(urllib.request, 'urlopen',
+                            lambda req, timeout=10: io.BytesIO(
+                                _json.dumps(payload).encode()))
+        assert oi_archive.live_ls_features('BTC/USD') is None
+        oi_archive._ls_cache.clear()
+
+        def boom(req, timeout=10):
+            raise OSError('down')
+
+        monkeypatch.setattr(urllib.request, 'urlopen', boom)
+        assert oi_archive.live_ls_features('BTC/USD') is None
