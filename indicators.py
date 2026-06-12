@@ -705,6 +705,66 @@ def compute_stock_features(df, spy_close=None, symbol=None):
     df['RM_252_21'] = daily_dates.map(rm.shift(1)).values
     df['Ret_21d'] = daily_dates.map(ret21.shift(1)).values
 
+    # Residual short-term reversal (wave 4; Nagel: short-horizon reversal
+    # is the return to LIQUIDITY PROVISION, priced up when intermediaries
+    # are constrained). Uses the same market-stripped residuals as RM.
+    # rr > 0 = recent idiosyncratic pop (reversal-DOWN candidate);
+    # rr < 0 = idiosyncratic dip (the peer-reviewed core of dip-buying).
+    if spy_close is not None:
+        rr5 = resid.rolling(5, min_periods=5).sum() * 100
+        rr21 = resid.rolling(21, min_periods=21).sum() * 100
+    else:
+        rr5 = pd.Series(np.nan, index=daily_close.index)
+        rr21 = rr5
+    df['RR_5'] = daily_dates.map(rr5.shift(1)).values
+    df['RR_21'] = daily_dates.map(rr21.shift(1)).values
+
+    # Multi-horizon MA distances (Han-Zhou-Zhu trend factor): trends at
+    # short/intermediate/long horizons carry INDEPENDENT information;
+    # serve the distances and let the learner weight them
+    for k in (10, 20, 50, 100, 200):
+        sma_k = daily_close.rolling(k, min_periods=k).mean()
+        dist = (daily_close / sma_k - 1.0) * 100
+        df[f'MA_Dist_{k}d'] = daily_dates.map(dist.shift(1)).values
+
+    # Session-decomposed momentum (Lou-Polk-Skouras tug of war): the
+    # momentum premium accrues OVERNIGHT (institutions trade intraday,
+    # retail at the open; overnight financing/lending frictions keep the
+    # two from being arbitraged together)
+    daily_open = df['Open'].resample('1D').first().reindex(daily_close.index)
+    on_ret = (daily_open / daily_close.shift(1) - 1.0) * 100
+    id_ret = (daily_close / daily_open - 1.0) * 100
+    df['ON_Mom_21'] = daily_dates.map(
+        on_ret.rolling(21, min_periods=15).mean().shift(1)).values
+    df['ON_Mom_252'] = daily_dates.map(
+        on_ret.rolling(252, min_periods=126).mean().shift(1)).values
+    df['TugOfWar_252'] = daily_dates.map(
+        (on_ret.rolling(252, min_periods=126).mean()
+         - id_ret.rolling(252, min_periods=126).mean()).shift(1)).values
+
+    # JKX image-scale distillation (Jiang-Kelly-Xiu JF 2023): the CNN's
+    # edge comes largely from the IMAGE SCALING — every chart renormalizes
+    # price by the window's high-low range, putting all names on a common
+    # 'pattern scale'. Distilled: position-in-range and midrange gap at
+    # the paper's window lengths, no CNN required.
+    for label, win_hi, win_lo, win_cl in (
+            ('20h', df['High'].rolling(20, min_periods=20).max(),
+             df['Low'].rolling(20, min_periods=20).min(), df['Close']),
+            ('60h', df['High'].rolling(60, min_periods=60).max(),
+             df['Low'].rolling(60, min_periods=60).min(), df['Close'])):
+        rng = (win_hi - win_lo).replace(0, np.nan)
+        df[f'Pos_Range_{label}'] = ((win_cl - win_lo) / rng).clip(0, 1)
+        df[f'MidRange_Gap_{label}'] = ((0.5 * (win_hi + win_lo) - win_cl)
+                                       / rng).clip(-1, 1)
+    d_hi = df['High'].resample('1D').max().reindex(daily_close.index)
+    d_lo = df['Low'].resample('1D').min().reindex(daily_close.index)
+    for k in (20, 60):
+        hi_k = d_hi.rolling(k, min_periods=k).max()
+        lo_k = d_lo.rolling(k, min_periods=k).min()
+        rng = (hi_k - lo_k).replace(0, np.nan)
+        pos = ((daily_close - lo_k) / rng).clip(0, 1)
+        df[f'Pos_Range_{k}d'] = daily_dates.map(pos.shift(1)).values
+
     return df
 
 

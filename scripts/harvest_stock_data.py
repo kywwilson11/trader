@@ -125,11 +125,48 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     for col, vals in compute_tb_labels(df, FORWARD_BARS, 'stock').items():
         df[col] = vals
 
+    # FINRA daily shorting-flow features (wave 4; informed sell-side
+    # pressure, day-D file maps to day-D+1 bars — point-in-time)
+    try:
+        from short_flow import svr_features_for_index
+        sf = svr_features_for_index(ticker, df.index)
+        if sf is not None:
+            for col, vals in sf.items():
+                df[col] = vals
+    except Exception as e:
+        print(f"  [SHORT-FLOW] {ticker}: merge skipped ({e})")
+
     # Backward compat: Target_Return = shortest horizon
     df['Target_Return'] = df[f'Target_Return_{FORWARD_BARS[0]}']
 
+    df = _fill_warmup_features(df)
     df = df.dropna()
     df = _asof_tradability_mask(df, ticker)
+    return df
+
+
+# Daily-window features with LONG warmups (RM needs 273 trading days).
+# Letting dropna() eat their warmup rows would discard a year-plus of
+# every name; 0.0 = "no signal yet", the same value live serves during
+# its own (rare) cold starts. Pos_Range warmups fill at 0.5 (mid-range).
+WARMUP_FEATURES_ZERO = [
+    'RM_252_21', 'Ret_21d', 'RR_5', 'RR_21', 'Same_Hour_Mean_40d',
+    'ROD_Ret', 'ON_Mom_21', 'ON_Mom_252', 'TugOfWar_252',
+    'MA_Dist_10d', 'MA_Dist_20d', 'MA_Dist_50d', 'MA_Dist_100d',
+    'MA_Dist_200d', 'SVR_21', 'SVR_Z',
+    'MidRange_Gap_20h', 'MidRange_Gap_60h',
+]
+WARMUP_FEATURES_HALF = ['Pos_Range_20h', 'Pos_Range_60h',
+                        'Pos_Range_20d', 'Pos_Range_60d']
+
+
+def _fill_warmup_features(df):
+    for col in WARMUP_FEATURES_ZERO:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
+    for col in WARMUP_FEATURES_HALF:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.5)
     return df
 
 
@@ -210,6 +247,15 @@ def main():
     else:
         print("No existing data — full harvest")
         available_ohlcv = []
+
+    # Sync the FINRA daily short-volume archive (newest-first, capped;
+    # back-fills across harvests like the OI archive)
+    try:
+        from short_flow import sync as sync_short_flow
+        sync_short_flow()
+    except Exception as e:
+        print(f"WARNING: short-flow sync failed ({e}) — "
+              f"SVR features omitted this harvest")
 
     spy_close = fetch_spy_close(api=api)
 

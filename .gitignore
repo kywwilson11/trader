@@ -92,3 +92,4 @@ stock_challenger_*
 meta_retrain.log
 oi_archive.parquet
 oi_history.json
+short_flow.parquet

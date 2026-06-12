@@ -45,6 +45,10 @@ CS_RANK_BASE_COLS = [
     'RM_252_21',   # residual momentum (Blitz-Huij-Martens)
     'Ret_21d',     # Medhat-Schmeling conditioning base
     'DV30',        # dollar-volume rank = the free turnover proxy
+    'ON_Mom_252',  # session-decomposed momentum (overnight component)
+    'RR_5',        # residual short-term reversal (dip/pop)
+    'Pos_Range_20d',  # JKX range-position
+    'MA_Dist_50d',    # HZZ intermediate trend
 ]
 CS_CONTEXT_COLS = ['CS_Dispersion', 'CS_Breadth']
 # MS_Interact = CS_Rank_Ret_21d x CS_Rank_DV30 (Medhat-Schmeling RFS

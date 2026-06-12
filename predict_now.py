@@ -262,6 +262,19 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             pass
         df['Taker_Imb_24h'] = (tf or {}).get('Taker_Imb_24h', 0.0)
 
+    # Inject FINRA shorting-flow features (stocks; latest completed-day
+    # values from the local archive — same information set as training)
+    if asset_type == 'stock' and 'SVR_21' in feature_cols \
+            and 'SVR_21' not in df.columns:
+        sf = None
+        try:
+            from short_flow import live_svr_features
+            sf = live_svr_features(symbol)
+        except Exception:
+            pass
+        for col in ('SVR_21', 'SVR_Z'):
+            df[col] = float((sf or {}).get(col, 0.0))
+
     # Inject live cross-sectional panel features (stocks; registered by
     # the loop's hourly panel pre-pass). 0.0 = median rank / neutral
     # context — the same value training's neutral fill uses, and what a
@@ -383,7 +396,8 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             'SMA_20', 'Price_SMA20_Ratio', 'BBL_20_2.0', 'BBU_20_2.0',
             'BBP_20_2.0', 'BBB_20_2.0',
             'ROC', 'Return_4h', 'Return_12h', 'Volatility_12h',
-            'Daily_Sentiment', 'Hurst', 'ROD_Ret', 'Same_Hour_Mean_40d',  # Hurst was missing — the loop's
+            'Daily_Sentiment', 'Hurst', 'ROD_Ret', 'Same_Hour_Mean_40d',
+            'ON_Mom_252', 'RR_5',  # Hurst was missing — the loop's
             # mean-reversion filter read snapshot['Hurst'] and always got
             # None, so that gate never fired; meta features need it too
             # Cross-asset (may not exist for all asset types)

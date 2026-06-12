@@ -267,8 +267,28 @@ class StockLoop(BaseTradingLoop):
                             "reverts at the open", sym)
                 continue
             candidates.append((pred, sym))
-        candidates.sort(reverse=True)
-        return {sym for _, sym in candidates[:OVERNIGHT_SLEEVE_MAX_POSITIONS]}
+        if not candidates:
+            return set()
+        # Rank-blend: 70% model prediction, 30% overnight-component
+        # momentum (wave 4 / Lou-Polk-Skouras: the momentum premium
+        # accrues OVERNIGHT — the sleeve is exactly where that component
+        # belongs). Falls back to pure pred ordering when ON_Mom_252 is
+        # missing from snapshots.
+        snaps = getattr(self, '_last_snapshots', {}) or {}
+        n = len(candidates)
+        pred_rank = {s: r for r, (_, s) in
+                     enumerate(sorted(candidates), 1)}
+        on_vals = {s: snaps.get(s, {}).get('ON_Mom_252') for _, s in candidates}
+        if n > 1 and any(v is not None for v in on_vals.values()):
+            on_sorted = sorted((v if v is not None else -1e9, s)
+                               for s, v in on_vals.items())
+            on_rank = {s: r for r, (_, s) in enumerate(on_sorted, 1)}
+            scored = [(0.7 * pred_rank[s] + 0.3 * on_rank[s], s)
+                      for _, s in candidates]
+        else:
+            scored = [(pred_rank[s], s) for _, s in candidates]
+        scored.sort(reverse=True)   # higher combined rank = better
+        return {sym for _, sym in scored[:OVERNIGHT_SLEEVE_MAX_POSITIONS]}
 
     def flatten_before_close(self):
         """Flatten stock positions ~10 min before the actual market close.
@@ -463,9 +483,30 @@ class StockLoop(BaseTradingLoop):
                            "neutral ranks this cycle", e)
         preds, snapshots = super()._get_predictions(benchmark_close)
         self._last_preds = dict(preds)  # sleeve selection reads these
+        self._last_snapshots = dict(snapshots)
 
         # Dynamic top N selection with hold buffer
         ranked = sorted(preds.items(), key=lambda x: x[1], reverse=True)
+        # High-VIX dip-preference tiebreak (wave 4 / Nagel: short-term
+        # reversal is the return to liquidity provision, priced UP when
+        # intermediaries are constrained). Among the model's own top
+        # candidates, demote names whose 5d residual return is a recent
+        # POP — tiebreak only, never overrides the model/meta/q10 gates.
+        vix = self.macro_regime.vix if self.macro_regime else None
+        if vix is not None and vix > 25 and len(ranked) > self.TOP_N:
+            window = ranked[:self.TOP_N + 3]
+            rr = {s: (snapshots.get(s, {}) or {}).get('RR_5') for s, _ in window}
+            vals = [v for v in rr.values() if v is not None]
+            if len(vals) >= 4:
+                import numpy as _np
+                pop_cut = float(_np.percentile(vals, 80))
+                poppers = {s for s, v in rr.items()
+                           if v is not None and v >= pop_cut and v > 0}
+                if poppers:
+                    window.sort(key=lambda kv: (kv[0] in poppers, -kv[1]))
+                    ranked = window + ranked[self.TOP_N + 3:]
+                    logger.info("[RR-TIEBREAK] VIX %.0f: demoted recent "
+                                "poppers %s", vix, ', '.join(sorted(poppers)))
         self.top_symbols = [sym for sym, _ in ranked[:self.TOP_N]]
         self.hold_symbols = {sym for sym, _ in ranked[:self.HOLD_RANK]}
         if self.top_symbols:

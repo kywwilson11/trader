@@ -29,7 +29,14 @@ STOCK_ONLY_COLS = ["VWAP", "Price_VWAP_Ratio", "Gap_Pct", "ATR_Pct", "RS_vs_SPY"
                    "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret",
                    "CS_Rank_RM_252_21", "CS_Rank_Ret_21d", "CS_Rank_DV30",
                    "CS_Dispersion", "CS_Breadth", "MS_Interact",
-                   "RM_252_21", "Ret_21d"]
+                   "RM_252_21", "Ret_21d",
+                   "RR_5", "RR_21", "MA_Dist_10d", "MA_Dist_20d", "MA_Dist_50d",
+                   "MA_Dist_100d", "MA_Dist_200d", "ON_Mom_21", "ON_Mom_252",
+                   "TugOfWar_252", "Pos_Range_20h", "Pos_Range_60h",
+                   "MidRange_Gap_20h", "MidRange_Gap_60h", "Pos_Range_20d",
+                   "Pos_Range_60d", "SVR_21", "SVR_Z",
+                   "CS_Rank_ON_Mom_252", "CS_Rank_RR_5",
+                   "CS_Rank_Pos_Range_20d", "CS_Rank_MA_Dist_50d"]
 
 # --- Preset definitions ---
 # Each preset lists column names. "full" uses None (all columns).
@@ -88,6 +95,15 @@ _STANDARD_FEATURES = _MINIMAL_FEATURES + [
     "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret",
     "CS_Rank_RM_252_21", "CS_Rank_Ret_21d", "CS_Rank_DV30",
     "CS_Dispersion", "CS_Breadth", "MS_Interact", "RM_252_21", "Ret_21d",
+    # Wave 4: residual reversal, HZZ MA distances, session momentum,
+    # JKX range-position distillation, FINRA shorting flow
+    "RR_5", "RR_21", "MA_Dist_10d", "MA_Dist_20d", "MA_Dist_50d",
+    "MA_Dist_100d", "MA_Dist_200d", "ON_Mom_21", "ON_Mom_252",
+    "TugOfWar_252", "Pos_Range_20h", "Pos_Range_60h",
+    "MidRange_Gap_20h", "MidRange_Gap_60h", "Pos_Range_20d",
+    "Pos_Range_60d", "SVR_21", "SVR_Z",
+    "CS_Rank_ON_Mom_252", "CS_Rank_RR_5",
+    "CS_Rank_Pos_Range_20d", "CS_Rank_MA_Dist_50d",
 ]
 
 # Stationary features only — no raw prices/volumes that trend over time.
@@ -136,6 +152,15 @@ _STATIONARY_FEATURES = [
     "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret",
     "CS_Rank_RM_252_21", "CS_Rank_Ret_21d", "CS_Rank_DV30",
     "CS_Dispersion", "CS_Breadth", "MS_Interact", "RM_252_21", "Ret_21d",
+    # Wave 4: residual reversal, HZZ MA distances, session momentum,
+    # JKX range-position distillation, FINRA shorting flow
+    "RR_5", "RR_21", "MA_Dist_10d", "MA_Dist_20d", "MA_Dist_50d",
+    "MA_Dist_100d", "MA_Dist_200d", "ON_Mom_21", "ON_Mom_252",
+    "TugOfWar_252", "Pos_Range_20h", "Pos_Range_60h",
+    "MidRange_Gap_20h", "MidRange_Gap_60h", "Pos_Range_20d",
+    "Pos_Range_60d", "SVR_21", "SVR_Z",
+    "CS_Rank_ON_Mom_252", "CS_Rank_RR_5",
+    "CS_Rank_Pos_Range_20d", "CS_Rank_MA_Dist_50d",
 ]
 
 PRESETS = {

@@ -1148,7 +1148,9 @@ class BaseTradingLoop(ABC):
             pass
         if returns is not None:
             try:
-                sigma = get_cached_sigma(symbol, returns)
+                from volatility import get_sigma
+                sigma = get_sigma(symbol, returns, bars=df,
+                                  asset_type=self.get_asset_type())
                 if sigma is not None:
                     vol_mult = compute_vol_adjusted_size(
                         1.0, sigma, asset_type=self.get_asset_type())
@@ -1611,7 +1613,9 @@ class BaseTradingLoop(ABC):
                         df = fetch_stock_bars_alpaca(self.api, symbol)
                     if df is not None and len(df) > 100:
                         returns = df['Close'].pct_change().dropna().values * 100
-                        garch_sigma = get_cached_sigma(symbol, returns)
+                        from volatility import get_sigma
+                        garch_sigma = get_sigma(symbol, returns, bars=df,
+                                                asset_type=self.get_asset_type())
                 except Exception:
                     pass
 
