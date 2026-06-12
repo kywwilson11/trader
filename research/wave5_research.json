@@ -1,0 +1,318 @@
+{
+  "summary": "Deep research: fewer/higher-conviction trades, short side, options, conviction architecture",
+  "agentCount": 29,
+  "logs": [
+    "[verify:Sell on information and model ] failed: You've hit your session limit · resets 9:50am (America/Los_Angeles)",
+    "[verify:Small-sample Kelly ruin: at ~2] failed: You've hit your session limit · resets 9:50am (America/Los_Angeles)",
+    "[verify:The low-frequency death spiral] failed: You've hit your session limit · resets 9:50am (America/Los_Angeles)",
+    "[verify:Retire the fixed 2:1 take-prof] failed: You've hit your session limit · resets 9:50am (America/Los_Angeles)",
+    "[verify:Cost-aware breakeven-probabili] failed: You've hit your session limit · resets 9:50am (America/Los_Angeles)",
+    "[verify:Conviction-lift saturation: 'h] failed: You've hit your session limit · resets 9:50am (America/Los_Angeles)",
+    "[verify:Selective prediction done righ] failed: You've hit your session limit · resets 9:50am (America/Los_Angeles)",
+    "13 findings survived red team, 1 refuted"
+  ],
+  "result": {
+    "plan": {
+      "flagship": "Conviction-gated dynamic top-K entry (k floats 0-5, tier-A/B risk sizing) in stock_loop.py — shipped measurement-first: journal rank instrumentation (Tier1-1) and the cross-sectional policy A/B engine (Tier1-2) land first, and the admission change activates only if Stage 0 shows ranks 6-7 carry materially less edge, the cap has bite vs the existing 18-gate stack, and the learning-loop liveness floor (>=30 fills/month) survives. It is the highest-conviction build because it directly implements the user directive ('fewer, very high confidence trades'), needs zero new data or broker capability, reuses every existing guardrail (ENB 2.5% book cap, sector caps, meta/q10/LLM/sentiment vetoes unchanged), and is reversible by one strategy_config flag with an auto-relax-to-7 liveness fallback.",
+      "stage0_experiments": [
+        {
+          "name": "Rank-edge gradient measurement (live + holdout)",
+          "test": "Two halves, both on existing artifacts. (a) Live: on the Jetson (journals/ is empty on the dev Mac), parse logs/ '[RANK] Top 7:' lines (stock_loop.py:513 logs the ranked top-7 with preds every cycle) and join to journals/*.jsonl buy/sell records by symbol+timestamp to assign an entry rank to every historical fill; bucket realized net P&L by entry rank 1-3 / 4-5 / 6-7. (b) Holdout: co-align backtest._predict_ticker outputs across all ~50 tickers into a point-in-time panel, compute per-bar cross-sectional rank, and score each rank bucket's triple-barrier net expectancy through policy_exits.exit_walk minus fees.round_trip_cost_pct.",
+          "pass_criterion": "PROCEED with the top-K cap only if rank 6-7 net expectancy is <= 0 OR < 50% of rank 1-3 expectancy in BOTH the live-journal and holdout-panel reconstructions. If ranks 6-7 are statistically indistinguishable from 1-3, the concentration cap is rejected and only conviction TIERING (sizing) survives to Tier 1."
+        },
+        {
+          "name": "Baseline admitted-k distribution and gate-redundancy audit",
+          "test": "From Jetson journals + logs, count per entry-window cycle how many of the ranked top-7 actually passed the full gate chain (stock_loop.py:639-770) and were bought, with veto attribution for the rest (sentiment_block, llm_veto, q10_tail_veto, edgar_event are journaled; cooldown/bucket/correlation/VIX/trend skips recovered from log lines). Produce the distribution of admitted-k per window over >=20 trading days.",
+          "pass_criterion": "Informative either way; the cap proceeds only if P(admitted-k >= 6) >= 10% of entry windows. If < 10%, the 18-gate stack already enforces concentration and Tier1-3 ships as tiering+instrumentation only (no cap), avoiding double-counted benefit claims."
+        },
+        {
+          "name": "Notional-cap bind audit (sizing-tier feasibility)",
+          "test": "For every journaled buy, recompute risk_notional = equity*0.005/stop_dist (replicating base_loop.py:1124-1126 from logged decision_price and ATR-derived stop) and compare with final_notional to measure how often the $5k NOTIONAL_PER_SYMBOL cap binds before risk-based sizing does.",
+          "pass_criterion": "Decision rule, not pass/fail: if the cap binds on > 60% of fills, tier-A sizing in Tier1-3 MUST include raising NOTIONAL_PER_SYMBOL/MAX_NOTIONAL_PER_SYMBOL to $7.5k for tier-A intraday entries (else the 0.75% risk tier is inert, as red-team showed); if <= 60%, tiers work through risk pct alone and caps stay at $5k."
+        },
+        {
+          "name": "Short-edge existence test: offline side=-1 label harvest",
+          "test": "Research-script-only mirrored exit walk (no live wiring): invert policy_exits barriers (stop above entry on highs filled at max(stop, open) on up-gaps, TP below, trailing on low-water-mark, signal exit pred > +threshold, same EOD mask) and harvest short-conditional TB outcomes over the full stock panel. Measure net-of-cost (15-20bps RT + spread) expectancy of bottom-K (K<=3) ranked candidates, restricted to the large-cap perpetually-ETB tier of stock_universe.json, unconditionally and conditioned on a backtestable overheat composite (VIX percentile + universe extension above MAs) and on SVR_Z.",
+          "pass_criterion": "Live short sleeve (Tier1-6) is built only if bottom-K short expectancy net of costs is > 0 in the top-quartile froth regime on purged-CV holdout AND the SYY conditionality reproduces (froth expectancy materially > non-froth, non-froth ~<= 0). If no regime clears zero, Tier1-6 is cancelled; short_gates and archiving (Tier1-5) still ship as future-proofing."
+        },
+        {
+          "name": "meta_short + q90 calibration sanity on inverted labels",
+          "test": "Train meta_short (LGB + isotonic, mirroring meta_label.py) and an LGB q90 right-tail model on the side=-1 harvest from the previous experiment; evaluate on the chronological holdout: reliability curve, Brier score, val AUC, and q90 empirical coverage (fraction of realized forward returns exceeding predicted q90).",
+          "pass_criterion": "Val AUC >= 0.55, calibration slope in [0.8, 1.2] (comparable to the long meta's holdout calibration), and q90 coverage in 8-15%. Failure blocks Tier1-6 activation but not Tier1-4 (kernel work stands regardless); confirms the red-team point that a sign-flipped long meta is mis-specified by construction."
+        },
+        {
+          "name": "Overnight-sleeve gap-tail audit (options insurance value)",
+          "test": "From historical daily bars for sleeve-eligible names plus journaled sleeve keepers, measure the close-to-open gap distribution beyond the GTC stop distance on NON-earnings nights (earnings nights are already fail-closed in _select_overnight_keepers). Compute expected annual cost of gap-beyond-stop slippage at sleeve size ($5k/position, 2 positions) vs estimated debit-vertical friction (4-10% of a 0.5%-equity debit on 1-3 substitutions/week).",
+          "pass_criterion": "The Tier-2 options overlay gets built only if expected annual gap-tail cost >= 2x estimated annual vertical friction. Otherwise verticals are deferred indefinitely and only the chain-archiving cron (Tier1-7) continues."
+        },
+        {
+          "name": "Learning-loop liveness budget",
+          "test": "From journals and meta_meta.json: current stock fills/day; Kelly sample age for the trailing-50-trade window (trading_utils.compute_kelly_fraction min_trades=50); CUSUM outcome arrival rate vs monitor_drift.py thresholds (MIN_LIVE_SAMPLES=50, CUSUM_K=0.05, H=4.0); meta replay row count (panel-based, 200-row floor in meta_label.py:288 — expected unaffected). Then simulate projected fill counts under k_max in {3,4,5} using the admitted-k distribution from experiment 2.",
+          "pass_criterion": "Concentration config must keep projected fills >= 30/month (>= ~1.5/trading day) so the Kelly 50-trade window spans <= ~7-8 weeks and hit-rate CUSUM retains < ~6-week detection latency. The k floor that preserves this becomes a hard constraint in Tier1-3 (auto-relax rule), and slippage/LLM-eval sample-rate impacts are documented in the same report."
+        }
+      ],
+      "tiers": [
+        {
+          "tier": 1,
+          "items": [
+            {
+              "name": "Conviction instrumentation layer (rank/admitted-k/tier journaling + concentration_skip counterfactuals)",
+              "why": "Every red-team verdict made measurement the prerequisite: entry rank is not recorded today (base_loop.py:1640-1651 logs pred_return only), so the rank-edge gradient of THIS model has never been measured. This makes Stage 0 reproducible forward and creates the counterfactual cohorts all later promotions rely on.",
+              "build_steps": [
+                "Add entry_rank, admitted_k, conviction_tier, meta_p, q10, q10_floor, book_risk_pct_used to the buy record at base_loop.py:1640-1651 (rank passed down from stock_loop ranked list).",
+                "Add log_decision skip records for the currently journal-silent gates (cooldown, bucket cap, correlation, VIX block, trend filter, winner's curse, threshold) so admitted-k is fully reconstructable from journals alone going forward.",
+                "Journal 'concentration_skip' rows for ranks that would have entered under always-7 but are excluded once Tier1-3 activates, with the full indicator snapshot so the exit kernel can score them nightly.",
+                "Journal zero-entry windows explicitly (action=no_trade, reason=concentration_skip|gates) so the designed no-trade region stays auditable."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/base_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/stock_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/trade_journal.py"
+              ],
+              "expected_impact": "Zero P&L impact by design; converts the concentration debate from literature extrapolation to in-house measurement within ~4-6 weeks of Jetson runtime, and permanently upgrades veto auditability.",
+              "risks": "Near-none: trade_journal.log_decision already swallows write errors (fail-open — journaling failure can never block trading). Only cost is journal size growth (~2-3x rows/day, trivial JSONL)."
+            },
+            {
+              "name": "Policy A/B engine: cross-sectional portfolio backtest mode + nightly counterfactual replay scorer",
+              "why": "backtest.py simulate_ticker (line 149) replays policy per ticker — the A/B 'always-7 vs dynamic 3-5' is not expressible today, and shadow.py dm_hln (line 153) compares forecast errors, so two entry policies sharing one forecast are invisible to it (red-team category error). Every wave-5 policy change (concentration, shorts, option routing) needs a policy-level harness; this is the shared validation plumbing.",
+              "build_steps": [
+                "Add simulate_portfolio() to backtest.py: co-align per-ticker _predict_ticker outputs into a point-in-time panel (reusing panel_ranks.py alignment helpers), apply per-bar ranking, gate proxies (threshold, fee gate, meta array via predict_meta_array, q10), top-K admission, sector-bucket and ENB caps, and walk exits through the unchanged policy_exits.exit_walk.",
+                "Wire it into the existing promotion gates: purged-CV folds, DSR on the holdout window (same 12% holdout convention as meta_label.py), and the policy-backtest gate, so portfolio-policy candidates face the same bar as model candidates.",
+                "Build policy_ab.py: nightly job that scores journaled counterfactual cohorts (concentration_skip rows, vetoed shorts, vertical-vs-spot pairs) through the kernel and runs a paired Diebold-Mariano test on DAILY POLICY P&L (live book vs counterfactual book), with a minimum 60-trading-day window — explicitly replacing the 14-28d forecast-level dm_hln for policy promotions.",
+                "Run the headline A/B (always-7 vs dynamic k<=5 with tier sizing) over the full panel history and publish the delta with DSR."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/backtest.py",
+                "/Users/kywwilson/Desktop/Projects/trader/panel_ranks.py",
+                "/Users/kywwilson/Desktop/Projects/trader/shadow.py",
+                "/Users/kywwilson/Desktop/Projects/trader/policy_exits.py",
+                "/Users/kywwilson/Desktop/Projects/trader/meta_label.py"
+              ],
+              "expected_impact": "Unblocks honest promotion of every wave-5 change; the concentration A/B becomes a one-command experiment instead of an unfalsifiable prior. Research-side only — no live order path touched.",
+              "risks": "Panel co-alignment must be strictly point-in-time (use the same shift discipline as panel_ranks); gate proxies for LLM/sentiment cannot be replayed historically and are modeled as pass-through — document this gap rather than fake it. Fail-open: offline tool, cannot affect live trading."
+            },
+            {
+              "name": "FLAGSHIP: conviction-gated dynamic top-K (0-5) with tier-A/B sizing in stock_loop.py",
+              "why": "Direct implementation of 'fewer, but very high confidence trades'. Skill-conditional top-of-rank convexity is directionally supported (GKX Table 7 verified; ACP/FK shapes consistent) but magnitude is unmeasured at this horizon — so it ships behind Stage-0 gates, fully reversible, with all existing guardrails (ENB 2.5%, sector caps, full veto stack) unchanged as the thing that makes concentration safe.",
+              "build_steps": [
+                "strategy_config.py: add CONCENTRATION_ENABLED=False, CONVICTION_K_MAX=5, TIER_A_RISK_PCT=0.0075, TIER_A_MAX_CONCURRENT=2, TIER_A_NOTIONAL_CAP=7500 (applied only if Stage-0 #3 showed cap-bind), LIVENESS_MIN_FILLS_PER_20D=24 — all replayable by the backtester per the single-source-of-truth contract.",
+                "stock_loop.py: replace fixed ranked[:TOP_N] admission (line 510 + loop at 639) with conviction-gated admission — iterate ranked candidates through the UNCHANGED gate chain, admit while admitted < CONVICTION_K_MAX; tier A = top-3 rank AND meta_p >= long-meta p* + 10pts (from the calibrated isotonic), tier B otherwise; HOLD_RANK stays 15 (entry/hold asymmetry widens deliberately).",
+                "base_loop.py: accept a per-trade risk_pct/notional-cap override in _compute_position_size so tier-A gets 0.75% risk and the raised cap; ENB book budget (1253-1278), sector caps, drawdown ladder, degraded-mode tilt cap all untouched; overnight sleeve keepers always sized tier-B ($5k, 0.5%) — single-name gap exposure does not scale with conviction.",
+                "Liveness guard: if trailing 20-session fill count < LIVENESS_MIN_FILLS_PER_20D, auto-relax k cap back to 7, journal 'liveness_relax', and alert — the learning loops (Kelly 50-trade window, CUSUM hit-rate at monitor_drift K=0.05/H=4.0, slippage and LLM-eval samples) keep their minimum feed rates by construction; meta retraining is panel-replay-based (meta_label.py) and is unaffected by live trade count.",
+                "Activation sequence: Stage-0 #1/#2/#7 pass -> Tier1-2 backtest A/B DSR-positive -> enable flag with concentration_skip counterfactual logging -> promote/revert after >=60 trading days via policy_ab.py paired daily-P&L test (skipped-cohort expectancy must be < admitted-cohort and book P&L not worse)."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/stock_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/base_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/strategy_config.py",
+                "/Users/kywwilson/Desktop/Projects/trader/backtest.py"
+              ],
+              "expected_impact": "If the measured rank gradient matches the literature shape, per-trade expectancy rises (top-3 of 50 ~94th pct vs top-7 ~86th) with unchanged per-trade cost and lower book correlation; if it does not, the experiment cleanly rejects and tiering alone survives. No new alpha claimed — concentration of measured edge.",
+              "risks": "Fewer trades slow Kelly/CUSUM/slippage learning (addressed by the auto-relax floor and counterfactual rows); if ranks 6-7 are net-positive, capping cuts gross P&L (the Stage-0 gate exists precisely to catch this); tier-A cap raise increases single-name intraday exposure (bounded by 0.75% risk-to-stop, $7.5k notional, ENB and sector caps, 2-concurrent limit). Fail-open: any error computing conviction inputs reverts that cycle to legacy top-7 admission; CONCENTRATION_ENABLED=False kill-switch restores status quo instantly."
+            },
+            {
+              "name": "Side-aware exit kernel + short label/meta/q90 stack (offline-first, no live path)",
+              "why": "policy_exits.py is long-hardcoded (verified: stops on lows below entry, HWM trailing, gap fill min(stop,open), TP above, signal exit p < -threshold) — shorts need a mirrored kernel, short-conditional labels, a dedicated meta_short, and a q90 right-tail veto, because P(profit|short) != 1 - P(profit|long) after costs and Bessembinder's right tail becomes the short's risk tail. This productionizes the Stage-0 #4/#5 research code with labels=backtest=live symmetry preserved.",
+              "build_steps": [
+                "policy_exits.py: add _exit_walk_kernel_short (separate njit function, long path byte-identical to avoid regression): stop at entry*(1+sd) checked on HIGHS, up-gap fill at max(stop, open), TP at entry*(1-tp_d) on lows, trailing on low-water-mark, signal-flip exit on pred > +threshold, same EOD mask; exit_walk(side=+1|-1) dispatch; compute_tb_labels(side=-1) variant.",
+                "Tests: mirror-invariance property test (short walk on a series == long walk on the reflected series), gap-direction tests, EOD-flatten parity.",
+                "meta_label.py: side parameter through _gen_meta_rows and train_meta('stock_short') producing stock_short_meta_model/calib with the same isotonic+holdout discipline (META_VETO_PROB=0.30 mirror); add q90 quantile model alongside the existing q10 in the LGB pipeline (model_lgb.py).",
+                "backtest.py: simulate_ticker(side=-1) support so the policy gate can replay short policy; purged CV + DSR holdout are the validation framework (no live promotion involved at this stage).",
+                "Feature set for meta_short = existing META_FEATURES + SVR_21/SVR_Z (already PIT-clean in short_flow.py); NO broker borrow flags as features (PIT violation — live-only filter)."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/policy_exits.py",
+                "/Users/kywwilson/Desktop/Projects/trader/meta_label.py",
+                "/Users/kywwilson/Desktop/Projects/trader/model_lgb.py",
+                "/Users/kywwilson/Desktop/Projects/trader/backtest.py",
+                "/Users/kywwilson/Desktop/Projects/trader/short_flow.py"
+              ],
+              "expected_impact": "Unblocks the entire short program at zero live risk and produces the decisive measurement: whether any net short edge exists in the ETB-tradable subset (literature says the anomaly-short alpha lives in HTB names Alpaca cannot short, so this must be earned by the in-house signal or not at all).",
+              "risks": "~100-200 LOC of new numba kernel — the main risk is silent asymmetry bugs, mitigated by the mirror-invariance tests; label volume is panel-scale (tens of thousands of rows) so the 200-row meta floor and training loops are statistically alive regardless of live trade counts. Fail-open: side defaults to +1 everywhere; nothing live consumes side=-1 until Tier1-6."
+            },
+            {
+              "name": "short_gates.py squeeze/crowding veto stack + shortability/borrow data archiving (starts the PIT clock now)",
+              "why": "Schultz-verified tiering (utilization <=25% ~ once/40yr squeezes vs >=90% ~ every 11 days) separates the universe's two demographics (NVDA/META megacaps vs MSTR/MARA/IONQ meme tier); Alpaca has no historical ETB data, so the archive must start immediately or short backtests can never condition on true shortability. This is risk control, not alpha — necessary-but-not-sufficient for any short book.",
+              "build_steps": [
+                "New short_gates.py with hard OR-vetoes, all thresholds in strategy_config.py for replay: SI/float > 10%, DTC > 5 days (SI / 20d ADV from Alpaca bars), easy_to_borrow flipped false within 5 sessions, IBKR indicative fee > 50bps or available shares collapsing day-over-day, SVR_Z spike on rising price (label it wholesaler-absorption, not 'covering' — covering never prints in short volume), price < $5 (Alpaca maintenance max(100%,$2.50/sh) below $5), SSR state (prior-day or intraday decline >= 9% => veto, uptick-only regime), LULD-halt awareness, and an explicit ETF carve-out (SOXL/TQQQ/GLD etc.: SI/float and DTC ill-defined under creation/redemption).",
+                "New etb_snapshot.py daily-morning cron: archive Alpaca assets shortable/easy_to_borrow flags to parquet (the assets table refreshes each morning per docs); flag-transition log doubles as a borrow-tightening signal and the held-position exit trigger.",
+                "short_flow.py: add bi-monthly FINRA Equity Short Interest ingestion timestamped by PUBLICATION date (settlement+7 business days, ~9-11 days stale — never settlement date), computing SI/float and DTC; same shift-1 discipline as the existing SVR pipeline.",
+                "Smoke-test IBKR shortstock FTP (ftp3.interactivebrokers.com, user 'shortstock') FROM THE JETSON on day 1 (sandbox-blocked here); begin daily fee/availability logging; design SI/DTC + Alpaca-flag legs as load-bearing and IBKR fee as enhancing.",
+                "Position-management rule wired for Tier1-6: held short whose flag flips ETB->HTB exits at next entry window (avoids round-lot (mv*rate)/360 fee bleed and recall); every veto journaled with the counterfactual snapshot so thresholds are tunable from data without live losses.",
+                "order_utils/alpaca_compat: classify rejection 42210000 by intent — a sell that CLOSES a long must never be treated as a short open (forum-documented misclassification can strand long exits); retry close-only sells, fail-closed only on opens."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/short_gates.py",
+                "/Users/kywwilson/Desktop/Projects/trader/etb_snapshot.py",
+                "/Users/kywwilson/Desktop/Projects/trader/short_flow.py",
+                "/Users/kywwilson/Desktop/Projects/trader/strategy_config.py",
+                "/Users/kywwilson/Desktop/Projects/trader/order_utils.py",
+                "/Users/kywwilson/Desktop/Projects/trader/alpaca_compat.py",
+                "/Users/kywwilson/Desktop/Projects/trader/trade_journal.py"
+              ],
+              "expected_impact": "Tail-trim, not alpha: avoids the squeeze/halt/HTB-fee regimes where retail shorts die (expect 10-30% of the high-beta universe excluded at any time, more in meme regimes); the archives convert future short backtests from fiction to point-in-time.",
+              "risks": "FINRA SI staleness (up to ~25 days between prints) — mitigated by the multi-signal OR with daily layers; IBKR FTP unverified from this sandbox; no retroactive flag history means the flag-transition veto is only replayable from archive start. Fail-closed for short ENTRIES (any missing data => no short = safe), strictly fail-open for the long book (gates never touch long entries or exits)."
+            },
+            {
+              "name": "Intraday ETB short sleeve v1 (froth-activated, bottom-K <= 2, flag-off by default)",
+              "why": "The red-team-approved shape of 'shorting must be an option': signal-symmetric directional shorts in liquid ETB names — intraday-only (zero borrow cost, zero recall, no overnight squeeze gap, fights ~zero overnight beta drift per Lou-Polk-Skouras), activated only in overheated states per the surviving SYY branch, and explicitly a diversification/capacity add, not an anomaly-short book.",
+              "build_steps": [
+                "stock_loop.py: when the overheat composite is high (VIX percentile low-to-rising + universe richly extended above MAs — the backtestable composite from Stage-0 #4; NO SPY<200d branch), admit up to 2 most-negative pooled-score candidates as shorts through: short_gates hard vetoes -> meta_short P(profit|short) >= 0.30-equivalent calibrated bar -> q90 right-tail veto -> fee gate via fees.required_edge_pct with short-side spread measured at decision time.",
+                "Execution: ETB+shortable verified same-morning (etb_snapshot), passive/limit entries only (short fills hit falling, widening books), position_intent sell_to_open distinguished from closes; 15:50 flatten mandatory; shorts hard-excluded from _select_overnight_keepers (stock_loop.py:221).",
+                "base_loop.py: signed position handling in exposure/ENB accounting (book_risk_budget with signed exposures), short sizing tier-B only (0.5% risk to stop), short-book stop-risk sub-cap 1.0% inside the 2.5% total, max 2 concurrent shorts, MAX_TRADES_PER_SYMBOL_PER_DAY applies.",
+                "strategy_config.py: SHORTS_ENABLED=False default, all activation/sizing thresholds replayable.",
+                "Liveness + promotion: shadow-log ALL short candidates in ALL regimes (counterfactual rows even when activation is off) so meta_short keeps learning from panel replay plus live counterfactuals; promote only on panel-level OOS calibration PLUS >=60-90 trading days of policy_ab.py paired daily-P&L (pooled long+short with side interaction) — explicitly not the 14-28d dm_hln; expect 0-3 shorts/day, which is why counterfactual logging carries the statistical load.",
+                "Treat paper fills as optimistic by construction (no SSR/LULD/borrow simulation): journal rows annotated fills_unverified for the short sleeve; SSR-aware gate from Tier1-5 is a precondition."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/stock_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/base_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/strategy_config.py",
+                "/Users/kywwilson/Desktop/Projects/trader/short_gates.py",
+                "/Users/kywwilson/Desktop/Projects/trader/meta_label.py",
+                "/Users/kywwilson/Desktop/Projects/trader/portfolio.py",
+                "/Users/kywwilson/Desktop/Projects/trader/fees.py"
+              ],
+              "expected_impact": "Planning prior only (cross-horizon extrapolation): 30-50% of long per-trade edge at the same ~15-20bps cost hurdle, plus genuine book diversification — shorts activate in down-tape hours when the long book is gated flat. Cancelled outright if Stage-0 #4 finds no net edge.",
+              "risks": "Largest-uncertainty item: no literature demonstrates net intraday single-name ML short alpha in liquid large caps; paper masks SSR/halt frictions in exactly the target regime; realized short-side spreads will exceed the long-side average. Mitigations: froth-only activation, ETB-only, $5 floor, intraday-only, tier-B sizing, 1.0% short sub-cap, fail-closed entries on any missing data, exits never gated, instant SHORTS_ENABLED kill-switch."
+            },
+            {
+              "name": "Options chain EOD archiving cron (PIT history starts now)",
+              "why": "Alpaca's free indicative feed is adequate for research archiving but historical options data only reaches back to ~Feb 2024 — every week of delay shrinks the future PIT window for the spread/IV liquidity gate and any option features. ~5MB/day on the Jetson, zero risk.",
+              "build_steps": [
+                "New options_archive.py nightly cron: for the ~50-name universe + SPY, snapshot ATM +/-3 strikes for the nearest 2 expiries (chain endpoint, feed=indicative, includes IV/greeks fields) into daily parquet.",
+                "Compute and store per-name median ATM quoted spread % of premium daily — the input to the eligibility screen (<= 3% selects the NVDA/TSLA/AAPL/AMD/META tier).",
+                "Cross-check effective spreads against the 15-min-delayed (real) trade prints vs indicative mid to bound the indicative feed's distortion before trusting the screen.",
+                "Schedule via the existing cron/run_pipeline pattern; failure alerts via notify.py; no trading-path dependency whatsoever."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/options_archive.py",
+                "/Users/kywwilson/Desktop/Projects/trader/run_pipeline.py",
+                "/Users/kywwilson/Desktop/Projects/trader/notify.py"
+              ],
+              "expected_impact": "Builds the only asset (point-in-time spread/IV history) that can later justify or kill the Tier-2 vertical overlay with data instead of priors; also feeds Stage-0 #6's friction estimates.",
+              "risks": "Indicative quotes are modified derivatives of OPRA — treat the spread screen as coarse until validated; Jetson disk growth trivial. Fail-open: pure archiver, cannot affect trading."
+            }
+          ]
+        },
+        {
+          "tier": 2,
+          "items": [
+            {
+              "name": "Defined-risk debit-vertical overlay for the overnight sleeve (paper-only, counterfactual-logged)",
+              "why": "The single option structure that survived: ATM/1-OTM debit verticals, 14-21 DTE, as gap-proof substitutes for top-conviction overnight sleeve holds — tail insurance + convexity bought at 4-10% of debit friction (the 3-5x delta-notional claim was refuted at current sleeve caps). Conditional on Stage-0 #6 showing gap-tail cost >= 2x friction and >=30 days of chain archive confirming an eligible tier.",
+              "build_steps": [
+                "alpaca_compat.py: mleg support via alpaca-py (OrderClass.MLEG + OptionLegRequest, legs[{symbol, ratio_qty, side, position_intent}], net-debit limit price); force the alpaca-py path (TRADER_USE_ALPACA_PY=1) — the legacy alpaca-trade-api default has zero options support.",
+                "fees.py: asset_type='option_vertical' in round_trip_cost_pct/required_edge_pct using measured chain spread + per-contract pass-throughs re-derived from the CURRENT fee PDF (~$0.10/contract RT; the wave's quoted constants were stale) so the same fee-aware gate pattern applies.",
+                "options_overlay.py: trigger inside _select_overnight_keepers — meta_p top-decile AND LLM tilt positive AND symbol spread-eligible (<=3% median ATM) AND no earnings/event gate AND expected move >= 1.5x HAR-RV-scaled horizon ATR (define this trigger explicitly via the existing HAR-RV machinery before first trade); builder buys ATM/1-ITM, sells 1-2 strikes OTM, sized so net_debit*100*qty = 0.5% equity, <= 2 concurrent, within OVERNIGHT_SLEEVE_MAX_POSITIONS.",
+                "Execution discipline: limit at midpoint walked toward NBBO in 2-3 re-prices; reject beyond mid+40% of half-spread and journal non-fills as first-class outcomes; exits at signal flip, +50-75% max profit, or T-1 before expiry; never hold same-day expiry past 15:30 ET (Alpaca auto-liquidation); skip/close through ex-div dates for short call legs (add ex-div to events_calendar).",
+                "Validation: every vertical journals its counterfactual spot expression (kernel-scored nightly via policy_ab.py); sleeve rows annotated fills_unverified=true; >=20 paper verticals with positive MODELED edge net of MEASURED spreads is only the trigger to consider OPRA — never a promotion; no live capital without OPRA data and 6-12 months of sample."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/options_overlay.py",
+                "/Users/kywwilson/Desktop/Projects/trader/alpaca_compat.py",
+                "/Users/kywwilson/Desktop/Projects/trader/fees.py",
+                "/Users/kywwilson/Desktop/Projects/trader/stock_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/events_calendar.py",
+                "/Users/kywwilson/Desktop/Projects/trader/strategy_config.py"
+              ],
+              "expected_impact": "Bounded: replaces at most 2 overnight slots 1-3x/week with hard max-loss structures; EV positive only if the conviction-subset edge is real and gap risk material — the counterfactual logs will say so empirically. Future put-vertical use for shorts (the strongest rationale) waits on Tier1-6 maturity.",
+              "risks": "Paper option fills are near-fictional (indicative feed, no liquidity model); friction is engineered-true only if the reject/walk discipline holds — expect many non-fills; long-only spot remains the default for ALL intraday signals. Fail-open: any chain/quote/mleg error falls back to the plain spot keeper path; thin-spread names are hard-gated dead on arrival."
+            },
+            {
+              "name": "Short-meta feature enrichment from accumulated archives",
+              "why": "Once etb_snapshot and IBKR fee logs span >=90 days and FINRA SI ingestion is live, the short stack's features upgrade from daily-SVR-only to the full crowding picture — publication-date-aligned, PIT-clean, free.",
+              "build_steps": [
+                "Retrain meta_short with SI/float, DTC, days-since-SI-publication, and IBKR fee/availability deltas as features (publication-date alignment, shift discipline identical to short_flow.py).",
+                "Backtest the short_gates thresholds (SI>10%, DTC>5) as REPLAYED policy in simulate_portfolio over the archived window and tune via the counterfactual veto cohort — never on live losses.",
+                "Promote the retrained meta_short through the existing challenger shadow path (model-level change, so dm_hln on forecasts IS the right tool here)."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/meta_label.py",
+                "/Users/kywwilson/Desktop/Projects/trader/short_flow.py",
+                "/Users/kywwilson/Desktop/Projects/trader/short_gates.py",
+                "/Users/kywwilson/Desktop/Projects/trader/backtest.py"
+              ],
+              "expected_impact": "Incremental precision on short veto/sizing; converts literature-anchored gate thresholds into measured ones.",
+              "risks": "Bi-monthly SI is structurally stale for meme dynamics — remains one OR-leg among daily signals, never sole gate. Fail-open: features default to 0.0 like all META_FEATURES when missing."
+            },
+            {
+              "name": "OPRA data upgrade decision gate (explicit deferred spend)",
+              "why": "$99/mo Algo Trader Plus = ~119bps/yr on a $100k book (the wave's 12bps figure was a 10x arithmetic error). The decision must be a gated spend with pre-registered criteria, not a default.",
+              "build_steps": [
+                "Pre-register the trigger in strategy_config/docs: >=20 filled paper verticals AND positive modeled edge net of measured spreads AND Stage-0 #6 insurance math still holding on live-sleeve data.",
+                "If triggered, run a 1-month OPRA trial comparing indicative-vs-NBBO spread screens and re-derive the eligibility tier; abort the options program if NBBO reveals the indicative screen understated friction beyond the EV margin."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/strategy_config.py",
+                "/Users/kywwilson/Desktop/Projects/trader/options_archive.py"
+              ],
+              "expected_impact": "Caps the only recurring-cost decision in the wave behind evidence; protects the free-data constraint.",
+              "risks": "None until triggered; the risk being managed is sunk subscription cost ahead of evidence."
+            },
+            {
+              "name": "EDGAR 13F/N-PORT best-ideas conviction overlay (exploratory)",
+              "why": "Optional external corroboration channel from the Best Ideas literature (public-date holdings retain alpha per ACP Fig. 4); free, PIT-stampable by filing date. Strictly a research feature for conviction tiering — the headline paper remains an unpublished WP, so expectations are low.",
+              "build_steps": [
+                "Quarterly EDGAR ingestion of 13F holdings for a curated list of concentrated funds; compute a per-name 'best-idea tilt' feature stamped by FILING date (45-day lag accepted).",
+                "Evaluate as a candidate feature in the panel (purged CV); only enters live tiering if it survives the same feature-promotion bar as everything else."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/edgar_events.py",
+                "/Users/kywwilson/Desktop/Projects/trader/panel_ranks.py"
+              ],
+              "expected_impact": "Likely small; cheap optionality on the conviction architecture.",
+              "risks": "Holdings-copy strategies decay post-publication (McLean-Pontiff); 45-day staleness; drop without ceremony if it fails CV. Fail-open: pure feature, defaults neutral when absent."
+            }
+          ]
+        }
+      ],
+      "rejected": [
+        {
+          "name": "Earnings-day directional re-entry / double-miss gap-down shorts (1-3 day hold)",
+          "reason": "Red-team refuted: no cited paper measures 1-3d conditioned post-gap drift in 2020s high-attention names (Martineau shows day-0 absorption in liquid names); internal contradiction between the claimed multi-day hold and the 15:50 flatten; free-data backtest not executable (Finnhub EPS-only, no PIT ETB history); Reg SHO SSR binds on exactly the qualifying days and Alpaca paper does not simulate it; would run outside every learned safety gate (long-only kernel/meta/q10); and the short leg is ~2-4 events/quarter — statistically dead (needs ~100 events for significance at 1% edge)."
+        },
+        {
+          "name": "Anomaly-style short book (short the overpriced decile as an alpha source)",
+          "reason": "Structurally uncapturable at Alpaca: MPP 2025 (JF 80(6)) shows 162 anomalies net -0.01%/mo after borrow fees and unprofitable even gross outside high-fee names; D&D show anomalies disappear in the low-fee 80%; Alpaca is ETB-only so the alpha-bearing HTB names cannot be shorted. Shorts enter only as a signal-symmetric directional/diversification sleeve (Tier1-6), never as an anomaly book."
+        },
+        {
+          "name": "SPY<200d bear-state short activation branch",
+          "reason": "Amputated by red-team: contradicts the SYY mechanism itself (short-leg alpha follows HIGH sentiment/froth, not bear states), walks into Daniel-Moskowitz momentum-crash rebound territory where SSR triggers and ETB->HTB flips cluster, and would delete the system's only force-flat de-risk state (the Faber filter at stock_loop.py:629-727). Froth-only activation is the sole surviving branch."
+        },
+        {
+          "name": "Sign-flipped long meta-labeler / q10 veto for shorts",
+          "reason": "Provably mis-calibrated by construction: the existing meta (meta_label.py) trains on long-conditional TB outcomes through long barriers; P(profit|short) != 1 - P(profit|long) after costs and asymmetric dynamics, and Bessembinder's single-stock right tail becomes the short's risk tail. Requires the dedicated meta_short + q90 stack (Tier1-4) instead."
+        },
+        {
+          "name": "Short positions in the overnight sleeve (v1)",
+          "reason": "ETB->HTB overnight transitions auto-cancel open short orders and start daily round-lot HTB fee accrual ((mv*rate)/360, 3 days over weekends); squeeze/gap right tails concentrate overnight; high-beta names flip HTB precisely in stress. Shorts are intraday-only with mandatory 15:50 flatten until a future wave re-litigates with archive data."
+        },
+        {
+          "name": "Naked/single-leg long options, weeklies, and OTM lottery structures",
+          "reason": "Alpaca bars naked short options at every level (mleg rejects uncovered legs); bought singles bleed the volatility risk premium and overpay embedded leverage (Frazzini-Pedersen t=8.6; Bakshi-Kapadia delta-hedged losses); retail-style weeklies average 12.6% bid-ask spreads with 3-9%/trade retail losses (BPS 2023). Only friction-gated debit verticals survived, and only as overnight-sleeve substitutes."
+        },
+        {
+          "name": "Immediate OPRA subscription or any live options promotion on paper fills",
+          "reason": "$99/mo = ~119bps/yr on a $100k book (the wave's '12bps' was a 10x arithmetic error); paper option fills simulate against an indicative feed Alpaca staff explicitly call unfit for testing strategy efficacy, with no liquidity/size model. Spend is gated behind pre-registered criteria (Tier-2), and DM-HLN must never certify an options challenger on paper fills — enforced in journal schema (fills_unverified), not convention."
+        },
+        {
+          "name": "Shipping dynamic top-3-5 concentration on literature priors without in-house measurement",
+          "reason": "The '+20-60% per-trade expectancy' and 'alpha stops at rank 6-7' numbers have zero in-system support (entry rank is not even journaled today); ACP 'Best Ideas' is a ~16-year unpublished working paper, Sapp-Yan 2008 is direct published counter-evidence on fund concentration, and GKX/FK are wrong-horizon. Hence the Stage-0 rank-gradient and admitted-k gates before any activation — measurement-first or not at all."
+        },
+        {
+          "name": "Broker shortable/ETB flags as model training features",
+          "reason": "Point-in-time violation: Alpaca flags are current-state-only with no free history; using them in training/backtests fabricates foresight. They are live-only execution filters, with the archive (etb_snapshot.py) building forward history that future models may use from its start date."
+        },
+        {
+          "name": "14-28d shadow.py DM-HLN as the promotion gate for policy changes (concentration, shorts, options routing)",
+          "reason": "Category error verified in code: shadow.py dm_hln (line 153) compares hourly FORECAST errors champion-vs-challenger — two entry policies sharing one forecast are indistinguishable to it, and at 0-3 marginal trades/day a 14-28d window yields ~15-60 trades (hopelessly underpowered). Replaced by policy_ab.py: paired Diebold-Mariano on daily policy P&L vs counterfactual books over >=60-90 trading days, with panel-level OOS calibration gates for the short/meta components. dm_hln remains correct for model-forecast challengers only."
+        }
+      ]
+    },
+    "survivors_count": 13,
+    "killed": [
+      "Earnings-day directional RE-ENTRY after the stand-down — and the app's first SHORTS on double-miss + guidance-cut gap-downs (1-3 day hold)"
+    ]
+  }
+}
