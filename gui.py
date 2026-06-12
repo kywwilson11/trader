@@ -12,6 +12,7 @@ import os
 import sys
 import re
 import json
+import time
 import pickle
 import datetime as dt
 from pathlib import Path
@@ -19,7 +20,8 @@ from collections import defaultdict
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-import alpaca_trade_api as tradeapi
+from trading_utils import get_api
+from notify import halt_active, set_halt, clear_halt, request_flatten
 
 from PySide6.QtCore import (
     Qt, QTimer, QThread, Signal, Slot, QObject,
@@ -53,6 +55,28 @@ class NumericTableItem(QTableWidgetItem):
 BASE_DIR = Path(__file__).resolve().parent
 TZ_CENTRAL = ZoneInfo("America/Chicago")
 
+_JETSON_PREFIX = "/home/kyle/miniforge3/envs/jetson"
+_JETSON_PY = _JETSON_PREFIX + "/bin/python"
+
+
+def _engine_python():
+    """Python interpreter for engine subprocesses (Jetson env if present)."""
+    return _JETSON_PY if os.path.exists(_JETSON_PY) else sys.executable
+
+
+def _engine_env(cusparselt=False):
+    """Environment for engine subprocesses (Jetson lib paths when present)."""
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    if os.path.exists(_JETSON_PY):
+        paths = [_JETSON_PREFIX + "/lib"]
+        if cusparselt:
+            paths.append(
+                _JETSON_PREFIX
+                + "/lib/python3.10/site-packages/nvidia/cusparselt/lib")
+        env["LD_LIBRARY_PATH"] = (
+            ":".join(paths) + ":" + os.environ.get("LD_LIBRARY_PATH", ""))
+    return env
+
 LOG_FILES = {
     "Pipeline": BASE_DIR / "pipeline_output.log",
     "Crypto Bot": BASE_DIR / "crypto_bot_output.log",
@@ -69,12 +93,56 @@ MODEL_FILES = {
     "Stock": BASE_DIR / "stock_model_v2.pth",
 }
 
+MANIFEST_FILES = {
+    "Crypto": BASE_DIR / "model_v2.manifest.json",
+    "Stock": BASE_DIR / "stock_model_v2.manifest.json",
+}
+
+# Shadow-mode challenger manifests (names per shadow.py challenger_manifest)
+CHALLENGER_MANIFESTS = {
+    "Crypto": BASE_DIR / "challenger_model_v2.manifest.json",
+    "Stock": BASE_DIR / "stock_challenger_model_v2.manifest.json",
+}
+
 STUDY_DBS = {
     "Crypto": ("v2_study.db", "v2_search"),
     "Stock": ("stock_v2_study.db", "stock_v2_search"),
 }
 
 PIPELINE_COMMAND = BASE_DIR / "pipeline_command.json"
+
+
+def _model_deployed_ts(name):
+    """Champion deployment timestamp (epoch seconds) or None.
+
+    Prefers the manifest's promoted_from_shadow (aware UTC) or saved_at
+    (naive local) over the .pth mtime: shadow promotion copies the
+    challenger artifacts with copy2 (mtime preserved), which makes a
+    freshly promoted champion's .pth look weeks old.
+    """
+    manifest = MANIFEST_FILES.get(name)
+    if manifest and manifest.exists():
+        try:
+            with open(manifest) as f:
+                man = json.load(f)
+            for key in ("promoted_from_shadow", "saved_at"):
+                val = man.get(key)
+                if val:
+                    # naive = local time (saved_at); aware = UTC (promotion)
+                    return dt.datetime.fromisoformat(val).timestamp()
+        except Exception:
+            pass
+        try:
+            return manifest.stat().st_mtime
+        except OSError:
+            pass
+    model_path = MODEL_FILES.get(name)
+    if model_path and model_path.exists():
+        try:
+            return model_path.stat().st_mtime
+        except OSError:
+            pass
+    return None
 
 
 def _get_best_score(name):
@@ -705,9 +773,8 @@ class DataFetcher(QObject):
         self._timer_orders.timeout.connect(self.fetch_orders)
         self._timer_orders.start(30_000)
 
-        self._timer_history = QTimer(self)
-        self._timer_history.timeout.connect(lambda: self.fetch_history())
-        self._timer_history.start(300_000)
+        # (history refresh is driven by the GUI's _perf_timer so it
+        # targets the active zoom, not always the default 1M)
 
         self._timer_hw = QTimer(self)
         self._timer_hw.timeout.connect(self.fetch_hw)
@@ -742,7 +809,7 @@ class DataFetcher(QObject):
     def stop_timers(self):
         """Stop all timers (must be called from this object's thread)."""
         for attr in ("_timer_account", "_timer_positions", "_timer_orders",
-                      "_timer_history", "_timer_hw", "_timer_news",
+                      "_timer_hw", "_timer_news",
                       "_timer_stocks"):
             timer = getattr(self, attr, None)
             if timer:
@@ -853,7 +920,7 @@ class DataFetcher(QObject):
     def fetch_news(self):
         """Fetch news headlines from Finnhub and Fear & Greed Index."""
         try:
-            from sentiment import get_fear_greed, get_cnn_fear_greed, _get_finnhub, score_article_batch, try_llm_upgrade
+            from sentiment import get_fear_greed, get_cnn_fear_greed, _get_finnhub, score_article_batch, try_llm_upgrade, _MODEL_RANK
             from stock_config import CRYPTO_SYMBOLS
             import datetime as _dt
 
@@ -958,10 +1025,15 @@ class DataFetcher(QObject):
 
             # Try to upgrade KW-scored or lower-tier articles to better models
             # Cap at 10 newest to avoid blocking the fetcher thread for minutes
+            _top_rank = max(_MODEL_RANK.values())
             upgradeable = [a for a in articles
-                           if a.get('_sent_method', '') != 'LLM'
-                           or a.get('_scored_by_model', '') != 'gemini-3.1-pro-preview']
+                           if _MODEL_RANK.get(
+                               a.get('_scored_by_model', ''), 0) < _top_rank]
             if upgradeable:
+                # Lowest-rank first so KW articles claim slots before
+                # already-LLM-scored ones (stable: newest-first within rank)
+                upgradeable.sort(key=lambda a: _MODEL_RANK.get(
+                    a.get('_scored_by_model', ''), 0))
                 upgradeable = upgradeable[:10]
                 upgrade_scores = try_llm_upgrade(upgradeable)
                 if upgrade_scores is not None:
@@ -1533,6 +1605,8 @@ def apply_theme(app):
 # Main Window
 # ---------------------------------------------------------------------------
 class TradingDashboard(QMainWindow):
+    _llm_test_done = Signal(bool, float, str)  # ok, elapsed_ms, error
+
     def __init__(self, api, app):
         super().__init__()
         self.api = api
@@ -1616,6 +1690,11 @@ class TradingDashboard(QMainWindow):
         self._model_timer.timeout.connect(self._refresh_models_tab)
         self._model_timer.start(60_000)
         self._refresh_models_tab()
+
+        # Performance-history refresh (every 5 min, targets active zoom)
+        self._perf_timer = QTimer(self)
+        self._perf_timer.timeout.connect(self._request_perf_history)
+        self._perf_timer.start(300_000)
 
         # Clock timer (every 1s)
         self._clock_timer = QTimer(self)
@@ -2146,8 +2225,8 @@ class TradingDashboard(QMainWindow):
         period, timeframe = self._perf_api_period(zoom)
         cached = self._perf_history_cache.get(period)
         if cached:
-            self._apply_perf_data(cached)
-        else:
+            self._apply_perf_data(cached)  # instant paint from snapshot
+        if not cached or time.monotonic() - cached.get("_fetched_at", 0.0) > 300:
             self._request_perf_history()
 
     def _request_perf_history(self):
@@ -2582,22 +2661,18 @@ class TradingDashboard(QMainWindow):
         QApplication.processEvents()
 
         import subprocess
-        python = "/home/kyle/miniforge3/envs/jetson/bin/python"
-        env = {
-            **os.environ,
-            "LD_LIBRARY_PATH": (
-                "/home/kyle/miniforge3/envs/jetson/lib:"
-                + os.environ.get("LD_LIBRARY_PATH", "")
-            ),
-            "PYTHONUNBUFFERED": "1",
-        }
+        python = _engine_python()
+        env = _engine_env()
         try:
-            proc = subprocess.Popen(
-                [python, "-u", "-c",
-                 f"from llm_analyst import refresh_one; refresh_one('{sym}', '{asset_type}')"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env=env, cwd=str(BASE_DIR), text=True,
-            )
+            # Log file, not PIPE: nothing reads the pipe, so a chatty
+            # child would fill it and hang forever
+            with open(BASE_DIR / "llm_refresh_one.log", "a") as lf:
+                proc = subprocess.Popen(
+                    [python, "-u", "-c",
+                     f"from llm_analyst import refresh_one; refresh_one('{sym}', '{asset_type}')"],
+                    stdout=lf, stderr=subprocess.STDOUT,
+                    env=env, cwd=str(BASE_DIR),
+                )
             self._llm_refresh_one_proc = proc
             self._llm_refresh_one_sym = sym
             from PySide6.QtCore import QTimer
@@ -2644,22 +2719,18 @@ class TradingDashboard(QMainWindow):
             f"color: {T['accent'].name()}; font-size: 11px;")
         QApplication.processEvents()
 
-        python = "/home/kyle/miniforge3/envs/jetson/bin/python"
+        python = _engine_python()
         script = str(BASE_DIR / "llm_analyst.py")
-        env = {
-            **os.environ,
-            "LD_LIBRARY_PATH": (
-                "/home/kyle/miniforge3/envs/jetson/lib:"
-                + os.environ.get("LD_LIBRARY_PATH", "")
-            ),
-            "PYTHONUNBUFFERED": "1",
-        }
+        env = _engine_env()
         try:
-            proc = subprocess.Popen(
-                [python, "-u", script, "--refresh-all"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env=env, cwd=str(BASE_DIR), text=True,
-            )
+            # Log file, not PIPE: nothing reads the pipe, so a chatty
+            # child would fill it and hang forever
+            with open(BASE_DIR / "llm_refresh.log", "a") as lf:
+                proc = subprocess.Popen(
+                    [python, "-u", script, "--refresh-all"],
+                    stdout=lf, stderr=subprocess.STDOUT,
+                    env=env, cwd=str(BASE_DIR),
+                )
             # Don't block GUI — check completion on timer
             self._llm_refresh_proc = proc
             from PySide6.QtCore import QTimer
@@ -2679,7 +2750,7 @@ class TradingDashboard(QMainWindow):
         proc = self._llm_refresh_proc
         rc = proc.poll()
         if rc is None:
-            # Still running — count symbols done from output
+            # Still running (output goes to llm_refresh.log)
             return
         # Done
         self._llm_refresh_timer.stop()
@@ -3053,10 +3124,11 @@ class TradingDashboard(QMainWindow):
         model_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         layout.addWidget(model_label)
 
-        self._model_table = QTableWidget(0, 10)
+        self._model_table = QTableWidget(0, 11)
         self._model_table.setHorizontalHeaderLabels(
             ["Model", "Status", "Score", "Last Trained", "Age",
-             "Hidden Dim", "Layers", "Seq Len", "Threshold", "Preset"]
+             "Hidden Dim", "Layers", "Seq Len", "Threshold", "Preset",
+             "Challenger"]
         )
         self._model_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._model_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -3165,6 +3237,24 @@ class TradingDashboard(QMainWindow):
         self._stock_stop_btn.clicked.connect(lambda: self._stop_bot_clicked("Stock"))
         bot_layout.addWidget(self._stock_start_btn)
         bot_layout.addWidget(self._stock_stop_btn)
+
+        # Kill switch (shared trading_halt.flag / flatten_request.flag
+        # contract with notify.py — Telegram /halt and ssh use the same file)
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.VLine)
+        sep2.setFrameShadow(QFrame.Sunken)
+        bot_layout.addWidget(sep2)
+
+        self._halt_btn = QPushButton(
+            "Resume Entries" if halt_active() else "Halt Entries")
+        self._flatten_btn = QPushButton("Flatten All")
+        for btn in [self._halt_btn, self._flatten_btn]:
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.PointingHandCursor)
+        self._halt_btn.clicked.connect(self._toggle_halt_clicked)
+        self._flatten_btn.clicked.connect(self._flatten_all_clicked)
+        bot_layout.addWidget(self._halt_btn)
+        bot_layout.addWidget(self._flatten_btn)
 
         self._bot_cmd_status = QLabel("")
         self._bot_cmd_status.setStyleSheet("font-size: 11px;")
@@ -3374,20 +3464,23 @@ class TradingDashboard(QMainWindow):
         role_layout.setColumnStretch(1, 1)
         role_layout.setColumnMinimumWidth(0, 70)
 
+        # Model combos offer only IDs the engine actually routes
+        # (llm_client.get_recommended_model silently ignores unknown IDs)
+        from llm_client import GEMINI_MODELS
+        model_labels = {
+            "gemini-2.5-pro": "2.5 Pro (best reasoning)",
+            "gemini-2.5-flash": "2.5 Flash (fast, capable)",
+            "gemini-2.5-flash-lite": "2.5 Flash Lite (budget)",
+        }
+
         # Analyst model override
         role_layout.addWidget(QLabel("Analyst:"), 0, 0)
         self._settings_analyst_model = QComboBox()
         self._settings_analyst_model.setMaximumWidth(320)
-        for mid, label in [
-            ("auto", "Auto (Smart Routing)"),
-            ("gemini-3.1-pro-preview", "3.1 Pro (best reasoning)"),
-            ("gemini-3-flash-preview", "3.0 Flash (fast, capable)"),
-            ("gemini-3.1-flash-lite-preview", "3.1 Flash Lite (budget)"),
-            ("gemini-2.5-pro", "2.5 Pro (legacy fallback)"),
-            ("gemini-2.5-flash", "2.5 Flash (legacy fallback)"),
-            ("gemini-2.5-flash-lite", "2.5 Flash Lite (cheapest)"),
-        ]:
-            self._settings_analyst_model.addItem(label, mid)
+        for mid in ["auto"] + GEMINI_MODELS:
+            self._settings_analyst_model.addItem(
+                "Auto (Smart Routing)" if mid == "auto"
+                else model_labels.get(mid, mid), mid)
         cur_analyst = config.get("analyst_model_override") or "auto"
         idx = self._settings_analyst_model.findData(cur_analyst)
         if idx >= 0:
@@ -3395,18 +3488,15 @@ class TradingDashboard(QMainWindow):
         self._settings_analyst_model.currentIndexChanged.connect(self._on_settings_changed)
         role_layout.addWidget(self._settings_analyst_model, 0, 1)
 
-        # Sentiment model override
+        # Sentiment model override (pro excluded — never routed for scoring)
         role_layout.addWidget(QLabel("Sentiment:"), 1, 0)
         self._settings_sentiment_model = QComboBox()
         self._settings_sentiment_model.setMaximumWidth(320)
-        for mid, label in [
-            ("auto", "Auto (Smart Routing)"),
-            ("gemini-3-flash-preview", "3.0 Flash (better accuracy)"),
-            ("gemini-3.1-flash-lite-preview", "3.1 Flash Lite (budget)"),
-            ("gemini-2.5-flash", "2.5 Flash (legacy fallback)"),
-            ("gemini-2.5-flash-lite", "2.5 Flash Lite (cheapest)"),
-        ]:
-            self._settings_sentiment_model.addItem(label, mid)
+        for mid in ["auto"] + [m for m in GEMINI_MODELS
+                               if m != "gemini-2.5-pro"]:
+            self._settings_sentiment_model.addItem(
+                "Auto (Smart Routing)" if mid == "auto"
+                else model_labels.get(mid, mid), mid)
         cur_sentiment = config.get("sentiment_model_override") or "auto"
         idx = self._settings_sentiment_model.findData(cur_sentiment)
         if idx >= 0:
@@ -3442,6 +3532,7 @@ class TradingDashboard(QMainWindow):
         bottom_row.addSpacing(12)
         self._settings_test_btn = QPushButton("Test Connection")
         self._settings_test_btn.clicked.connect(self._on_test_llm)
+        self._llm_test_done.connect(self._on_test_llm_done)
         bottom_row.addWidget(self._settings_test_btn)
         self._settings_test_status = QLabel("")
         bottom_row.addWidget(self._settings_test_status)
@@ -3532,43 +3623,60 @@ class TradingDashboard(QMainWindow):
         tier = self._settings_tier_override.currentData()
         config["tier_override"] = None if tier == "auto" else tier
 
-        # Model role overrides (None = smart routing)
+        # Model role overrides (None = smart routing); never persist an ID
+        # the engine doesn't route — it would be silently ignored
+        from llm_client import GEMINI_MODELS
         analyst = self._settings_analyst_model.currentData()
-        config["analyst_model_override"] = None if analyst == "auto" else analyst
+        config["analyst_model_override"] = (
+            analyst if analyst in GEMINI_MODELS else None)
         sentiment = self._settings_sentiment_model.currentData()
-        config["sentiment_model_override"] = None if sentiment == "auto" else sentiment
+        config["sentiment_model_override"] = (
+            sentiment if sentiment in GEMINI_MODELS else None)
 
         save_llm_config(config)
 
     def _on_test_llm(self):
-        """Test LLM connection with a trivial prompt."""
+        """Test LLM connection with a trivial prompt (off the UI thread)."""
         self._settings_test_btn.setEnabled(False)
         self._settings_test_status.setText("Testing...")
         self._settings_test_status.setStyleSheet("")
-        QApplication.processEvents()
 
         # Force-save first so the client reads current keys
+        # (touches widgets — must stay on the UI thread)
         self._on_settings_changed()
 
         import time
-        start = time.time()
-        try:
-            from llm_client import call_llm
-            result = call_llm("Respond with just the word OK.", max_tokens=16)
-            elapsed = (time.time() - start) * 1000
+        import threading
 
-            if result:
-                self._settings_test_status.setText(
-                    f"Connected to Gemini ({elapsed:.0f}ms)")
-                self._settings_test_status.setStyleSheet(f"color: {T['green'].name()};")
-            else:
-                self._settings_test_status.setText("No response — check API key")
-                self._settings_test_status.setStyleSheet(f"color: {T['red'].name()};")
-        except Exception as e:
-            self._settings_test_status.setText(f"Error: {e}")
+        def probe():
+            start = time.time()
+            try:
+                from llm_client import call_llm
+                result = call_llm("Respond with just the word OK.",
+                                  max_tokens=16)
+                self._llm_test_done.emit(
+                    bool(result), (time.time() - start) * 1000, "")
+            except RuntimeError:
+                pass  # window closed while the probe was in flight
+            except Exception as e:
+                self._llm_test_done.emit(
+                    False, (time.time() - start) * 1000, str(e))
+
+        threading.Thread(target=probe, daemon=True, name="llm-test").start()
+
+    @Slot(bool, float, str)
+    def _on_test_llm_done(self, ok, elapsed_ms, error):
+        if error:
+            self._settings_test_status.setText(f"Error: {error}")
             self._settings_test_status.setStyleSheet(f"color: {T['red'].name()};")
-        finally:
-            self._settings_test_btn.setEnabled(True)
+        elif ok:
+            self._settings_test_status.setText(
+                f"Connected to Gemini ({elapsed_ms:.0f}ms)")
+            self._settings_test_status.setStyleSheet(f"color: {T['green'].name()};")
+        else:
+            self._settings_test_status.setText("No response — check API key")
+            self._settings_test_status.setStyleSheet(f"color: {T['red'].name()};")
+        self._settings_test_btn.setEnabled(True)
 
     def _on_indicator_preset_changed(self, _index):
         """Save new preset and update feature display."""
@@ -3715,6 +3823,7 @@ class TradingDashboard(QMainWindow):
     @Slot(dict)
     def on_history(self, data):
         period = data.get("period", "1M")
+        data["_fetched_at"] = time.monotonic()
         self._perf_history_cache[period] = data
 
         # Only apply if this period matches the current zoom
@@ -4170,7 +4279,8 @@ class TradingDashboard(QMainWindow):
 
         if is_training:
             msg = (f"Training is already in progress.\n"
-                   f"Queue {target} retrain to start after current phase?")
+                   f"Queue {target} retrain to start after current "
+                   f"training completes?")
         else:
             msg = f"Start {target} retraining now?"
 
@@ -4187,7 +4297,9 @@ class TradingDashboard(QMainWindow):
             with open(tmp, "w") as f:
                 json.dump(trigger, f)
             os.replace(tmp, str(trigger_path))
-            self._retrain_status.setText(f"{target} retrain queued")
+            self._retrain_status.setText(
+                f"{target} retrain queued (trains challenger; "
+                f"promoted after shadow eval)")
             self._retrain_status.setStyleSheet(f"color: {T['green'].name()}; font-size: 11px;")
             self._schedule_models_refresh(5000)
         except Exception as e:
@@ -4208,6 +4320,22 @@ class TradingDashboard(QMainWindow):
         except OSError:
             return False
 
+    def _combined_bots_running(self):
+        """Detect a live combined-mode run_bots.py process.
+
+        run_pipeline.py --combined-bots runs both loops inside a single
+        'Bots' process that its per-bot status flags don't track, so the
+        status file reports both bots stopped while they are trading.
+        """
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "run_bots\\.py"],
+                capture_output=True, text=True, timeout=5)
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
+
     def _restart_pipeline_clicked(self):
         """Kill existing pipeline (if running) and start a fresh one."""
         import signal
@@ -4221,6 +4349,13 @@ class TradingDashboard(QMainWindow):
             f"color: {T['accent'].name()}; font-size: 11px;")
         QApplication.processEvents()
 
+        # Capture the deployment's launch flags so the restart preserves
+        # them (--combined-bots, --no-retrain, --retrain-day N, ...)
+        prev_flags = _read_pipeline_status().get("launch_args")
+        if not (isinstance(prev_flags, list)
+                and all(isinstance(a, str) for a in prev_flags)):
+            prev_flags = None
+
         # Find and kill existing pipeline process
         if was_running:
             try:
@@ -4229,6 +4364,20 @@ class TradingDashboard(QMainWindow):
                     capture_output=True, text=True, timeout=5)
                 pids = [int(p) for p in result.stdout.strip().split()
                         if p.strip()]
+                if prev_flags is None and pids:
+                    # No launch_args in status — read argv off the live
+                    # process before killing it
+                    try:
+                        ps = subprocess.run(
+                            ["ps", "-o", "command=", "-p", str(pids[0])],
+                            capture_output=True, text=True, timeout=5)
+                        argv = ps.stdout.strip().split()
+                        for i, a in enumerate(argv):
+                            if a.endswith("run_pipeline.py"):
+                                prev_flags = argv[i + 1:]
+                                break
+                    except Exception:
+                        pass
                 for pid in pids:
                     try:
                         os.kill(pid, signal.SIGTERM)
@@ -4251,24 +4400,18 @@ class TradingDashboard(QMainWindow):
                 except Exception:
                     break
 
-        # Start new pipeline
+        # Start new pipeline (preserved deployment flags + bot-only restart)
+        flags = [a for a in (prev_flags or [])
+                 if a not in ("--skip-harvest", "--bot-only")]
+        flags += ["--skip-harvest", "--bot-only"]
         pipeline_py = str(BASE_DIR / "run_pipeline.py")
-        python = "/home/kyle/miniforge3/envs/jetson/bin/python"
+        python = _engine_python()
         log_file = str(BASE_DIR / "pipeline_output.log")
-        env = {
-            **os.environ,
-            "LD_LIBRARY_PATH": (
-                "/home/kyle/miniforge3/envs/jetson/lib:"
-                "/home/kyle/miniforge3/envs/jetson/lib/python3.10/"
-                "site-packages/nvidia/cusparselt/lib:"
-                + os.environ.get("LD_LIBRARY_PATH", "")
-            ),
-            "PYTHONUNBUFFERED": "1",
-        }
+        env = _engine_env(cusparselt=True)
         try:
             with open(log_file, "a") as lf:
                 proc = subprocess.Popen(
-                    [python, "-u", pipeline_py, "--skip-harvest", "--bot-only"],
+                    [python, "-u", pipeline_py, *flags],
                     stdout=lf, stderr=subprocess.STDOUT,
                     env=env, cwd=str(BASE_DIR),
                     start_new_session=True,
@@ -4303,6 +4446,15 @@ class TradingDashboard(QMainWindow):
         """Handle Start button click for a bot."""
         if not self._is_pipeline_running():
             self._bot_cmd_status.setText("Pipeline not running")
+            self._bot_cmd_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+            return
+
+        if self._combined_bots_running():
+            # Combined run_bots.py process already runs both loops;
+            # starting a per-bot loop would duplicate order flow.
+            self._bot_cmd_status.setText(
+                "Bots already running (combined mode)")
             self._bot_cmd_status.setStyleSheet(
                 f"color: {T['red'].name()}; font-size: 11px;")
             return
@@ -4360,27 +4512,65 @@ class TradingDashboard(QMainWindow):
             self._bot_cmd_status.setStyleSheet(
                 f"color: {T['red'].name()}; font-size: 11px;")
 
+    def _toggle_halt_clicked(self):
+        """Toggle the trading_halt.flag kill switch (entries only)."""
+        if halt_active():
+            clear_halt()
+            self._bot_cmd_status.setText("Halt cleared — entries allowed")
+            self._bot_cmd_status.setStyleSheet(
+                f"color: {T['green'].name()}; font-size: 11px;")
+        else:
+            set_halt("GUI halt button")
+            self._bot_cmd_status.setText("Trading halted — entries blocked")
+            self._bot_cmd_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+        self._refresh_models_tab()
+
+    def _flatten_all_clicked(self):
+        """Request liquidation of all positions (bots flatten + self-halt)."""
+        reply = QMessageBox.question(
+            self, "Flatten All Positions",
+            "Liquidate ALL positions in both books and halt entries?\n\n"
+            "The bots pick up the request within one cycle and set the "
+            "halt flag themselves.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        request_flatten("GUI flatten button")
+        self._bot_cmd_status.setText("Flatten requested...")
+        self._bot_cmd_status.setStyleSheet(
+            f"color: {T['red'].name()}; font-size: 11px;")
+        self._refresh_models_tab()
+
     def _refresh_models_tab(self):
         now_ts = dt.datetime.now().timestamp()
         configs = []
         for name, cfg_path in CONFIG_FILES.items():
             cfg = read_config(cfg_path)
-            model_path = MODEL_FILES.get(name)
             mod_time = "\u2014"
             age_hours = None
-            if model_path and model_path.exists():
+            mtime = _model_deployed_ts(name)
+            if mtime is not None:
+                age_hours = (now_ts - mtime) / 3600
+                d = dt.datetime.fromtimestamp(mtime, tz=TZ_CENTRAL)
+                mod_time = d.strftime("%Y-%m-%d %I:%M %p")
+            # Challenger in shadow evaluation (retrains land here, not on
+            # the champion \u2014 promoted only after the shadow window)
+            chal_str = "\u2014"
+            chal_path = CHALLENGER_MANIFESTS.get(name)
+            if chal_path and chal_path.exists():
                 try:
-                    mtime = model_path.stat().st_mtime
-                    age_hours = (now_ts - mtime) / 3600
-                    d = dt.datetime.fromtimestamp(mtime, tz=TZ_CENTRAL)
-                    mod_time = d.strftime("%Y-%m-%d %I:%M %p")
+                    cts = chal_path.stat().st_mtime
+                    chal_str = ("in shadow since "
+                                + dt.datetime.fromtimestamp(
+                                    cts, tz=TZ_CENTRAL).strftime("%Y-%m-%d"))
                 except OSError:
-                    pass
-            configs.append((name, cfg, mod_time, age_hours))
+                    chal_str = "in shadow"
+            configs.append((name, cfg, mod_time, age_hours, chal_str))
 
         self._model_table.setUpdatesEnabled(False)
         self._model_table.setRowCount(len(configs))
-        for row, (name, cfg, mod_time, age_hours) in enumerate(configs):
+        for row, (name, cfg, mod_time, age_hours, chal_str) in enumerate(configs):
             # Determine status and age display
             if age_hours is None:
                 status, age_str = "Missing", "\u2014"
@@ -4406,10 +4596,11 @@ class TradingDashboard(QMainWindow):
                         str(cfg.get("num_layers", "?")),
                         str(cfg.get("seq_len", "?")),
                         str(cfg.get("trade_threshold", "?")),
-                        str(cfg.get("indicator_preset", "N/A"))]
+                        str(cfg.get("indicator_preset", "N/A")),
+                        chal_str]
             else:
                 vals = [name, status, score_str, "Not found", age_str,
-                        "\u2014", "\u2014", "\u2014", "\u2014", "\u2014"]
+                        "\u2014", "\u2014", "\u2014", "\u2014", "\u2014", chal_str]
             for col, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setTextAlignment(Qt.AlignCenter)
@@ -4417,6 +4608,8 @@ class TradingDashboard(QMainWindow):
                     item.setForeground(status_color)
                 elif col == 2 and best_score is not None:
                     item.setForeground(T["green"] if best_score > 3 else T["yellow"])
+                elif col == 10 and v != "\u2014":
+                    item.setForeground(T["yellow"])
                 self._model_table.setItem(row, col, item)
         self._model_table.setUpdatesEnabled(True)
 
@@ -4448,6 +4641,12 @@ class TradingDashboard(QMainWindow):
                 self._bot_cmd_status.setText("")
 
         bots_running = pinfo.get("bots_running", False)
+        # Combined-bots mode: per-bot flags in the status file don't track
+        # the single run_bots.py process — detect it directly.
+        combined_bots = (is_running and not bots_running
+                         and self._combined_bots_running())
+        if combined_bots:
+            bots_running = True
 
         if phase == "idle" or not is_running:
             status_color = T["muted"].name()
@@ -4472,6 +4671,23 @@ class TradingDashboard(QMainWindow):
             status_text += f" ({phase_idx + 1}/{total_phases})"
         if bots_running and phase != "trading":
             status_text += " + BOTS"
+
+        # Kill-switch indicator (flag may also be set via Telegram or ssh)
+        halted = halt_active()
+        if halted:
+            reason = ""
+            try:
+                reason = json.loads(
+                    (BASE_DIR / "trading_halt.flag").read_text()
+                    or "{}").get("reason", "")
+            except Exception:
+                pass  # `touch trading_halt.flag` leaves a non-JSON file
+            status_color = T["red"].name()
+            status_text += (" | HALTED — entries blocked"
+                            + (f" ({reason})" if reason else ""))
+        if hasattr(self, '_halt_btn'):
+            self._halt_btn.setText(
+                "Resume Entries" if halted else "Halt Entries")
 
         self._pipeline_status.setText(
             f"Status: <span style='color:{status_color}'>{status_text}</span>")
@@ -4554,17 +4770,30 @@ class TradingDashboard(QMainWindow):
         # --- Retrain button states ---
         trigger_path = BASE_DIR / "retrain_trigger.json"
         trigger_pending = trigger_path.exists()
-        # Auto-expire stale trigger (>5 min = pipeline didn't pick it up)
-        if trigger_pending:
-            try:
-                trigger_age = now_ts - trigger_path.stat().st_mtime
-                if trigger_age > 300:
-                    trigger_path.unlink()
-                    trigger_pending = False
-            except OSError:
-                trigger_pending = False
         is_actively_training = (is_running and phase not in
                                 ("trading", "idle", "failed", "complete", ""))
+        # Auto-expire stale trigger (>5 min unconsumed while the pipeline is
+        # in a trigger-polling state = pipeline didn't pick it up). During
+        # training the engine intentionally doesn't read it (only the trading
+        # wait loop does), so keep the mtime fresh instead — the 5-min clock
+        # starts once training ends.
+        if trigger_pending:
+            if is_actively_training or not is_running:
+                # During training the engine intentionally doesn't poll;
+                # with the pipeline DOWN it will consume the trigger on
+                # next startup — keep the queued intent alive in both
+                try:
+                    trigger_path.touch()
+                except OSError:
+                    pass
+            else:
+                try:
+                    trigger_age = now_ts - trigger_path.stat().st_mtime
+                    if trigger_age > 300:
+                        trigger_path.unlink()
+                        trigger_pending = False
+                except OSError:
+                    trigger_pending = False
 
         if trigger_pending:
             # Trigger written, waiting for pipeline to pick it up — show cancel
@@ -4601,16 +4830,18 @@ class TradingDashboard(QMainWindow):
                     self._retrain_status.setText("")
 
         # --- Per-bot status ---
-        crypto_running = pinfo.get("crypto_bot_running", False)
-        stock_running = pinfo.get("stock_bot_running", False)
+        crypto_running = pinfo.get("crypto_bot_running", False) or combined_bots
+        stock_running = pinfo.get("stock_bot_running", False) or combined_bots
 
         if is_running:
             if crypto_running:
-                self._crypto_bot_label.setText("Crypto Bot: Running")
+                self._crypto_bot_label.setText(
+                    "Crypto Bot: Running (combined)" if combined_bots
+                    else "Crypto Bot: Running")
                 self._crypto_bot_label.setStyleSheet(
                     f"font-size: 13px; font-weight: bold; color: {T['green'].name()};")
                 self._crypto_start_btn.setEnabled(False)
-                self._crypto_stop_btn.setEnabled(True)
+                self._crypto_stop_btn.setEnabled(not combined_bots)
             else:
                 self._crypto_bot_label.setText("Crypto Bot: Stopped")
                 self._crypto_bot_label.setStyleSheet(
@@ -4619,11 +4850,13 @@ class TradingDashboard(QMainWindow):
                 self._crypto_stop_btn.setEnabled(False)
 
             if stock_running:
-                self._stock_bot_label.setText("Stock Bot: Running")
+                self._stock_bot_label.setText(
+                    "Stock Bot: Running (combined)" if combined_bots
+                    else "Stock Bot: Running")
                 self._stock_bot_label.setStyleSheet(
                     f"font-size: 13px; font-weight: bold; color: {T['green'].name()};")
                 self._stock_start_btn.setEnabled(False)
-                self._stock_stop_btn.setEnabled(True)
+                self._stock_stop_btn.setEnabled(not combined_bots)
             else:
                 self._stock_bot_label.setText("Stock Bot: Stopped")
                 self._stock_bot_label.setStyleSheet(
@@ -4641,7 +4874,7 @@ class TradingDashboard(QMainWindow):
 
         # --- LLM Usage ---
         try:
-            from llm_client import get_daily_cost, get_budget
+            from llm_client import get_daily_cost, get_budget, GEMINI_MODELS
             spent, limit = get_daily_cost()
             pct = int(spent / limit * 100) if limit > 0 else 0
             self._llm_cost_label.setText(f"Cost: ${spent:.3f} / ${limit:.2f}")
@@ -4655,19 +4888,15 @@ class TradingDashboard(QMainWindow):
             self._llm_cost_bar.setStyleSheet(
                 f"QProgressBar::chunk {{ background-color: {cost_color}; }}")
 
-            for model, label in [
-                ("gemini-3.1-pro-preview", self._llm_pro_label),
-                ("gemini-3-flash-preview", self._llm_flash_label),
-                ("gemini-3.1-flash-lite-preview", self._llm_lite_label),
-            ]:
+            for model in GEMINI_MODELS:
                 remaining, total = get_budget(model)
                 # Extract readable short name from model ID
-                if "pro" in model:
-                    short_name = "Pro"
-                elif "flash-lite" in model or "flash_lite" in model:
-                    short_name = "Lite"
+                if "flash-lite" in model or "flash_lite" in model:
+                    label, short_name = self._llm_lite_label, "Lite"
+                elif "pro" in model:
+                    label, short_name = self._llm_pro_label, "Pro"
                 else:
-                    short_name = "Flash"
+                    label, short_name = self._llm_flash_label, "Flash"
                 label.setText(f"{short_name}: {remaining}/{total}")
         except Exception:
             pass
@@ -4678,6 +4907,7 @@ class TradingDashboard(QMainWindow):
         # 1. Stop main-thread timers immediately
         self._model_timer.stop()
         self._clock_timer.stop()
+        self._perf_timer.stop()
 
         # 2. Ask worker threads to stop their timers (queued → runs before quit)
         QMetaObject.invokeMethod(self._fetcher, "stop_timers", Qt.QueuedConnection)
@@ -4721,13 +4951,12 @@ def main():
 
     api_key = os.getenv("ALPACA_API_KEY")
     api_secret = os.getenv("ALPACA_API_SECRET")
-    base_url = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
     if not api_key or not api_secret:
         print("ERROR: ALPACA_API_KEY and ALPACA_API_SECRET must be set in .env")
         sys.exit(1)
 
-    api = tradeapi.REST(api_key, api_secret, base_url, api_version="v2")
+    api = get_api()
 
     try:
         acct = api.get_account()

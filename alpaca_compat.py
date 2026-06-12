@@ -116,13 +116,27 @@ class CompatREST:
     def get_order(self, order_id):
         return _shim_order(self._trading.get_order_by_id(order_id))
 
-    def list_orders(self, status='open', symbols=None, limit=None, **_ignored):
+    @staticmethod
+    def _parse_dt(v):
+        from datetime import datetime
+        if v is None or isinstance(v, datetime):
+            return v
+        return datetime.fromisoformat(str(v).replace('Z', '+00:00'))
+
+    def list_orders(self, status='open', symbols=None, limit=None,
+                    after=None, until=None, direction=None, **_ignored):
         from alpaca.trading.requests import GetOrdersRequest
         from alpaca.trading.enums import QueryOrderStatus
+        # after/until/direction were silently swallowed by **_ignored —
+        # the GUI's clean-slate cutoff (list_orders(after=...)) returned
+        # the full order history under the adapter
         req = GetOrdersRequest(
             status=QueryOrderStatus(status) if status else None,
             symbols=list(symbols) if symbols else None,
             limit=limit,
+            after=self._parse_dt(after),
+            until=self._parse_dt(until),
+            direction=direction,
         )
         return [_shim_order(o) for o in self._trading.get_orders(req)]
 
