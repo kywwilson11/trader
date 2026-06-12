@@ -65,6 +65,11 @@ LEVERAGED_ETFS = {
 # Safe-haven symbols allowed to trade during VIX > 25 defensive regimes
 SAFE_HAVEN_SYMBOLS = {'GLD', 'SLV', 'PALL', 'PPLT', 'OXY', 'COPX'}
 
+# ETFs in the universe/panel — residual momentum is hard-zeroed for these
+# (an index product's residual vs the index is degenerate noise)
+ETF_TICKERS = {'SPY', 'QQQ', 'IWM', 'GLD', 'SLV', 'PALL', 'PPLT', 'COPX',
+               'ARKK', 'TQQQ', 'SOXL'}
+
 # --- Training candidate pool (survivorship mitigation; NOT traded) ---
 # The trading universe is ~50 hand-picked high-beta names — a winner-
 # tilted panel. Training on it alone teaches patterns conditioned on

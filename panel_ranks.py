@@ -42,9 +42,16 @@ logger = get_logger(__name__)
 CS_RANK_BASE_COLS = [
     'Return_4h', 'Return_12h', 'ROC', 'RSI', 'ATR_Pct', 'Volume_Ratio',
     'Price_SMA20_Ratio', 'RS_vs_SPY', 'Gap_Pct', 'ROD_Ret',
+    'RM_252_21',   # residual momentum (Blitz-Huij-Martens)
+    'Ret_21d',     # Medhat-Schmeling conditioning base
+    'DV30',        # dollar-volume rank = the free turnover proxy
 ]
 CS_CONTEXT_COLS = ['CS_Dispersion', 'CS_Breadth']
-CS_FEATURE_COLS = [f'CS_Rank_{c}' for c in CS_RANK_BASE_COLS] + CS_CONTEXT_COLS
+# MS_Interact = CS_Rank_Ret_21d x CS_Rank_DV30 (Medhat-Schmeling RFS
+# 2022: 1-month return is MOMENTUM in low-turnover names and REVERSAL in
+# high-turnover names — the product lets trees split on both regimes)
+CS_FEATURE_COLS = ([f'CS_Rank_{c}' for c in CS_RANK_BASE_COLS]
+                   + CS_CONTEXT_COLS + ['MS_Interact'])
 
 _LIVE_TTL_SEC = 3300            # ranks change once per hourly bar
 _live_cache: tuple[float, dict] | None = None
@@ -96,6 +103,8 @@ def add_panel_ranks(df: pd.DataFrame) -> pd.DataFrame:
         breadth = above.groupby(ts).transform('mean')
         # Centered: 0 = half the panel above trend (neutral fill value)
         df['CS_Breadth'] = (breadth - 0.5) * 2.0
+    if 'CS_Rank_Ret_21d' in df.columns and 'CS_Rank_DV30' in df.columns:
+        df['MS_Interact'] = df['CS_Rank_Ret_21d'] * df['CS_Rank_DV30']
     return df
 
 
@@ -144,11 +153,13 @@ def compute_live_panel_ranks(api, spy_close=None,
             bars = fetch_stock_bars_alpaca(api, sym)
             if bars is None or len(bars) < 60:
                 continue
-            feats = compute_stock_features(bars, spy_close=spy_close)
-            last = feats.iloc[-1]
+            feats = compute_stock_features(bars, spy_close=spy_close,
+                                           symbol=sym)
             dv = dv30(bars).iloc[-1]
             if not np.isfinite(dv) or dv <= 0:
                 continue
+            last = feats.iloc[-1].copy()
+            last['DV30'] = float(dv)   # ranked as the turnover proxy
             rows[sym] = last
             dvs[sym] = float(dv)
         except Exception as e:
@@ -181,6 +192,8 @@ def compute_live_panel_ranks(api, spy_close=None,
     for s in members:
         out[s]['CS_Dispersion'] = disp if np.isfinite(disp) else 0.0
         out[s]['CS_Breadth'] = breadth if np.isfinite(breadth) else 0.0
+        out[s]['MS_Interact'] = (out[s].get('CS_Rank_Ret_21d', 0.0)
+                                 * out[s].get('CS_Rank_DV30', 0.0))
 
     logger.info("[PANEL] live cross-section: %d members ranked "
                 "(dispersion=%.2f, breadth=%+.2f)", len(members),

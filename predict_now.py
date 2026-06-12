@@ -177,7 +177,7 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
 
     # --- Compute technical features ---
     if asset_type == 'stock':
-        df = compute_stock_features(df, spy_close=spy_close)
+        df = compute_stock_features(df, spy_close=spy_close, symbol=symbol)
     else:
         df = compute_features(df, btc_close=btc_close)
     df = df.dropna()

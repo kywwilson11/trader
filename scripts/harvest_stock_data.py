@@ -109,7 +109,7 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
         return None
 
     # Recompute ALL features on full history (indicators need lookback windows)
-    df = compute_stock_features(ohlcv, spy_close=spy_close)
+    df = compute_stock_features(ohlcv, spy_close=spy_close, symbol=ticker)
 
     # Multi-horizon targets: return over N bars as a percentage
     for fb in FORWARD_BARS:
@@ -241,14 +241,17 @@ def main():
 
     # Cross-sectional as-of membership (uses _DV30 stamped per ticker)
     final_df = _asof_membership_mask(final_df)
-    final_df = final_df.drop(columns=['_DV30'], errors='ignore')
 
     # Cross-sectional rank features over the surviving members (wave-3
     # flagship: selection is a RELATIVE decision — give the models each
-    # name's rank within the panel THIS hour, not just its own history)
+    # name's rank within the panel THIS hour, not just its own history).
+    # DV30 (the dollar-volume turnover proxy) is exposed to the rank
+    # layer then dropped: only its RANK is a feature, never the level.
+    final_df['DV30'] = final_df['_DV30']
     from panel_ranks import add_panel_ranks, neutral_fill_cs
     final_df = add_panel_ranks(final_df)
     final_df = neutral_fill_cs(final_df)
+    final_df = final_df.drop(columns=['_DV30', 'DV30'], errors='ignore')
 
     # Add historical sentiment — LAGGED one day for point-in-time integrity.
     # The daily score for day D aggregates ALL of day D's articles

@@ -27,7 +27,9 @@ STOCK_ONLY_COLS = ["VWAP", "Price_VWAP_Ratio", "Gap_Pct", "ATR_Pct", "RS_vs_SPY"
                    "CS_Rank_RSI", "CS_Rank_ATR_Pct", "CS_Rank_Volume_Ratio",
                    "CS_Rank_Price_SMA20_Ratio", "CS_Rank_RS_vs_SPY",
                    "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret",
-                   "CS_Dispersion", "CS_Breadth"]
+                   "CS_Rank_RM_252_21", "CS_Rank_Ret_21d", "CS_Rank_DV30",
+                   "CS_Dispersion", "CS_Breadth", "MS_Interact",
+                   "RM_252_21", "Ret_21d"]
 
 # --- Preset definitions ---
 # Each preset lists column names. "full" uses None (all columns).
@@ -83,7 +85,9 @@ _STANDARD_FEATURES = _MINIMAL_FEATURES + [
     "CS_Rank_Return_4h", "CS_Rank_Return_12h", "CS_Rank_ROC",
     "CS_Rank_RSI", "CS_Rank_ATR_Pct", "CS_Rank_Volume_Ratio",
     "CS_Rank_Price_SMA20_Ratio", "CS_Rank_RS_vs_SPY",
-    "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret", "CS_Dispersion", "CS_Breadth",
+    "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret",
+    "CS_Rank_RM_252_21", "CS_Rank_Ret_21d", "CS_Rank_DV30",
+    "CS_Dispersion", "CS_Breadth", "MS_Interact", "RM_252_21", "Ret_21d",
 ]
 
 # Stationary features only — no raw prices/volumes that trend over time.
@@ -129,7 +133,9 @@ _STATIONARY_FEATURES = [
     "CS_Rank_Return_4h", "CS_Rank_Return_12h", "CS_Rank_ROC",
     "CS_Rank_RSI", "CS_Rank_ATR_Pct", "CS_Rank_Volume_Ratio",
     "CS_Rank_Price_SMA20_Ratio", "CS_Rank_RS_vs_SPY",
-    "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret", "CS_Dispersion", "CS_Breadth",
+    "CS_Rank_Gap_Pct", "CS_Rank_ROD_Ret",
+    "CS_Rank_RM_252_21", "CS_Rank_Ret_21d", "CS_Rank_DV30",
+    "CS_Dispersion", "CS_Breadth", "MS_Interact", "RM_252_21", "Ret_21d",
 ]
 
 PRESETS = {

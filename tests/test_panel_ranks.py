@@ -81,7 +81,7 @@ class TestLiveParity:
             }, index=idx)
             return base
 
-        def fake_features(bars, spy_close=None):
+        def fake_features(bars, spy_close=None, symbol=None):
             out = bars.copy()
             sym_dv = bars['Volume'].iloc[-1]
             for s, v in panel_vals.items():
@@ -197,3 +197,86 @@ class TestBouncedLoser:
         monkeypatch.setattr(market_data, 'fetch_stock_bars_alpaca',
                             lambda api, s: bars_for([102.0, 103.0, 104.0]))
         assert loop._is_bounced_loser('XYZ') is False
+
+
+class TestResidualMomentum:
+    def _bars(self, n_days=320, stock_drift=0.0, beta=1.0, seed=0):
+        """Daily-ish hourly bars where stock = beta*SPY + drift + noise."""
+        rng = np.random.default_rng(seed)
+        days = pd.date_range('2025-01-02', periods=n_days, freq='B')
+        spy_ret = rng.normal(0, 0.01, n_days)
+        stk_ret = beta * spy_ret + stock_drift + rng.normal(0, 0.001, n_days)
+        spy_px = 500 * np.cumprod(1 + spy_ret)
+        stk_px = 100 * np.cumprod(1 + stk_ret)
+        idx = []
+        s_rows, p_rows = [], []
+        for d, sp, st in zip(days, spy_px, stk_px):
+            for h in (14, 15, 16):
+                idx.append(pd.Timestamp(f'{d.date()} {h}:30', tz='UTC'))
+                s_rows.append(st)
+                p_rows.append(sp)
+        df = pd.DataFrame({'Close': s_rows}, index=pd.DatetimeIndex(idx))
+        for c in ('Open', 'High', 'Low'):
+            df[c] = df['Close']
+        df['Volume'] = 1e6
+        spy = pd.Series(p_rows, index=df.index)
+        return df, spy
+
+    def test_pure_beta_stock_has_no_residual_momentum(self):
+        from indicators import compute_stock_features
+        df, spy = self._bars(beta=2.0, stock_drift=0.0)
+        out = compute_stock_features(df, spy_close=spy)
+        rm = out['RM_252_21'].dropna()
+        assert len(rm) > 0
+        # 2x-SPY with no idiosyncratic drift: residual momentum ~ 0
+        assert abs(rm.iloc[-1]) < 1.0
+
+    def test_idiosyncratic_drift_scores_positive(self):
+        from indicators import compute_stock_features
+        df, spy = self._bars(beta=1.0, stock_drift=0.002)  # +20bps/day idio
+        out = compute_stock_features(df, spy_close=spy)
+        rm = out['RM_252_21'].dropna()
+        assert rm.iloc[-1] > 2.0  # strongly positive standardized momentum
+
+    def test_etf_hard_zeroed(self):
+        from indicators import compute_stock_features
+        df, spy = self._bars(beta=1.0, stock_drift=0.002)
+        out = compute_stock_features(df, spy_close=spy, symbol='SPY')
+        rm = out['RM_252_21'].dropna()
+        assert (rm == 0.0).all()
+
+    def test_ret21d_value_and_shift(self):
+        from indicators import compute_stock_features
+        df, spy = self._bars(n_days=60, beta=0.0, stock_drift=0.001, seed=3)
+        out = compute_stock_features(df, spy_close=spy)
+        # All bars of one day share the value computed through the PRIOR
+        # day (shift(1) before mapping to intraday bars)
+        last_day = out.index.normalize()[-1]
+        day_vals = out.loc[out.index.normalize() == last_day, 'Ret_21d']
+        assert day_vals.nunique() == 1
+        daily = df['Close'].resample('1D').last().dropna()
+        expected = (daily.iloc[-2] / daily.iloc[-23] - 1) * 100
+        assert day_vals.iloc[0] == pytest.approx(expected, rel=1e-6)
+
+
+class TestMSInteraction:
+    def test_harvest_interaction_product(self):
+        df = _panel_df({'A': [5.0, 9e7], 'B': [1.0, 1e7], 'C': [3.0, 5e7]},
+                       cols=['Ret_21d', 'DV30'])
+        out = add_panel_ranks(df).set_index('Ticker')
+        for s in 'ABC':
+            assert out.loc[s, 'MS_Interact'] == pytest.approx(
+                out.loc[s, 'CS_Rank_Ret_21d'] * out.loc[s, 'CS_Rank_DV30'])
+        # A: top return x top DV -> +1*+1 = 1 (high-turnover winner ->
+        # reversal candidate, the model learns the sign)
+        assert out.loc['A', 'MS_Interact'] == pytest.approx(1.0)
+
+    def test_live_interaction_present(self, monkeypatch):
+        helper = TestLiveParity()
+        vals = {f'S{i}': {'dv': (i + 1) * 1e7, 'Return_4h': float(i),
+                          'Ret_21d': float(i)} for i in range(12)}
+        live = helper._mk_live(monkeypatch, vals)
+        for s, d in live.items():
+            assert 'MS_Interact' in d
+            assert d['MS_Interact'] == pytest.approx(
+                d['CS_Rank_Ret_21d'] * d['CS_Rank_DV30'])

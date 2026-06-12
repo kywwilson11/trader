@@ -620,7 +620,7 @@ def compute_normalized_atr(high, low, close, length=14):
     return atr / close * 100
 
 
-def compute_stock_features(df, spy_close=None):
+def compute_stock_features(df, spy_close=None, symbol=None):
     """Compute all features for stocks. Includes base crypto features + stock-specific ones.
 
     Args:
@@ -667,4 +667,50 @@ def compute_stock_features(df, spy_close=None):
         bar_ret.groupby(df.index.hour)
         .transform(lambda s: s.rolling(40, min_periods=10).mean().shift(1)))
 
+    # --- Daily-frequency cross-sectional signals (computed on daily
+    # closes, shift(1) so intraday bars only see COMPLETED days, then
+    # ffilled onto the hourly grid) ---
+    daily_close = df['Close'].resample('1D').last().dropna()
+    r_d = daily_close.pct_change()
+
+    # Residual momentum rm_252_21 (Blitz-Huij-Martens JEmpFin 2011):
+    # 12-1-month momentum on MARKET-STRIPPED daily residuals, scaled by
+    # residual vol — momentum without the beta payload that crashes in
+    # high-vol rebounds. ETFs are hard-zeroed (an index fund's residual
+    # vs the index is degenerate noise).
+    if spy_close is not None:
+        spy_d = spy_close.resample('1D').last().reindex(daily_close.index).ffill()
+        rs_d = spy_d.pct_change()
+        cov = r_d.rolling(252, min_periods=126).cov(rs_d)
+        var = rs_d.rolling(252, min_periods=126).var()
+        beta = (cov / var).clip(-3, 5)
+        resid = r_d - beta * rs_d
+        form = resid.shift(21)  # skip the most recent month (reversal zone)
+        rm = (form.rolling(231, min_periods=110).sum()
+              / form.rolling(231, min_periods=110).std()
+              / np.sqrt(231))
+        rm = rm.replace([np.inf, -np.inf], np.nan)
+    else:
+        rm = pd.Series(np.nan, index=daily_close.index)
+    if symbol is not None and _is_etf(symbol):
+        rm = rm * 0.0
+
+    # Plain 21-day return — the Medhat-Schmeling (RFS 2022) conditioning
+    # base: it is MOMENTUM in low-turnover names and REVERSAL in
+    # high-turnover names; the panel layer crosses it with the
+    # dollar-volume rank so the model can learn both regimes
+    ret21 = daily_close.pct_change(21) * 100
+
+    daily_dates = pd.Series(df.index.normalize(), index=df.index)
+    df['RM_252_21'] = daily_dates.map(rm.shift(1)).values
+    df['Ret_21d'] = daily_dates.map(ret21.shift(1)).values
+
     return df
+
+
+def _is_etf(symbol: str) -> bool:
+    try:
+        from stock_config import ETF_TICKERS
+        return symbol.upper() in ETF_TICKERS
+    except Exception:
+        return False
