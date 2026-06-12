@@ -1,0 +1,182 @@
+{
+  "summary": "Deep research: novel stock selection + timing upgrades, adversarially verified",
+  "agentCount": 29,
+  "logs": [
+    "14 findings survived red team, 7 refuted"
+  ],
+  "result": {
+    "plan": {
+      "flagship": "Per-hour cross-sectional rank-normalized features + live panel pre-pass (Tier 1, item 1) — the wave's verified core diagnosis is that a per-hour RELATIVE decision (sorted top-7-of-50, stock_loop.py:442-450) is made by models that see only per-symbol history (indicators.compute_stock_features is 100% per-symbol; the only cross-sectional code in the repo is the harvest membership mask); this is the highest-adjusted-confidence (4/5), zero-new-data, methodological-consensus fix (GKX fn.29 / FNW / Tobek-Hronec), and it is the enabling substrate the wave's two novelty-5 items (lambdarank head, BDS rod_rank) both require — build it first.",
+      "tiers": [
+        {
+          "tier": 1,
+          "items": [
+            {
+              "name": "Per-hour cross-sectional rank-normalized features + live panel pre-pass (GKX/FNW rank transform)",
+              "why": "Verified in code: every live feature is computed from the symbol's own history (compute_stock_features at indicators.py:623; RS_vs_SPY:648 is a time-series ratio, not a rank), so no pooled model can know whether NVDA's momentum is strong relative to the other 49 names THIS hour — the only thing that determines top-7 membership. LightGBM splits are global thresholds and cannot reconstruct within-hour ranks from absolute features. Rank-to-[-1,1] per period is the missing half of the GKX recipe (pooled estimation already exists), replicated internationally (Tobek-Hronec) and in liquid universes at reduced magnitude (Avramov et al. 2023). Adjusted confidence 4/5, zero new data, zero mechanical turnover. Prerequisite for the lambdarank head and rod_rank.",
+              "build_steps": [
+                "scripts/harvest_stock_data.py main(): after _asof_membership_mask at line 245, group the concatenated panel by timestamp and emit cs_rank_<f> = 2*pct_rank-1 over the as-of top-60 members (NaN for non-members) for ~10-15 base columns: Return_1h/4h/12h, ret_1d/5d/20d, RSI14, ATR%, volume_surprise (hr volume / 20d same-hour avg), dollar volume (_DV30 already stamped by _asof_tradability_mask:172), distance-from-20d-high, overnight gap. Add 2-3 per-hour context scalars: cs_dispersion (std of ret_1d across members) and cs_breadth (% above 20d SMA) — these let any model condition on how separated the cross-section is right now.",
+                "REQUIRED before anything ships — fix the train/serve rank-population mismatch: training ranks are over the as-of top-60 of the ~96-name panel but the live loop only sees get_symbol_universe() (~50 high-beta names, which cluster at rank extremes in a diverse panel). Extend the live cycle to fetch bars for the full ~96-name panel and apply a live trailing-30d dollar-volume top-60 mask mirroring _asof_membership_mask (preferred), or restrict training ranks to live-universe membership.",
+                "Live pre-pass: in stock_loop._get_predictions (line 442) before per-symbol scoring (real hook — note the research's named 'update_predictions' does not exist), batch the per-symbol feature frames into one panel frame per hourly cycle, compute identical cs_rank_* and context columns, and inject them into each symbol's feature dict. Hourly cadence, no new scheduled jobs.",
+                "scripts/hypersearch_v2.py load_data (line 132): treat cs_rank_* as pre-normalized (skip z-scoring). Add an indicator_config.py PRESET (e.g. 'cs_rank', PRESETS at line 110) so the champion/challenger comparison isolates exactly the feature-set change.",
+                "Ship LightGBM-head-only first: add cs_rank_* to the LGB flat-feature path. Defer the LSTM leg — sequences need cs_rank at every lookback timestep, requiring a rolling panel-rank history cache; only do it if the LGB ablation wins.",
+                "Gating: hypersearch_v2 ablation with/without cs_rank_* -> DSR holdout (validation.py dsr_from_trade_returns:92) -> shadow challenger (shadow.py maybe_log_shadow:86, evaluate_and_maybe_promote:401) with DM-HLN. The shadow eval MUST also track realized turnover delta, not just accuracy — hourly ranks of fast features (ret_1h, volume_surprise) can churn top-7/15 boundaries despite the Garleanu-Pedersen hysteresis band (stock_loop.py:49-53)."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/scripts/harvest_stock_data.py",
+                "/Users/kywwilson/Desktop/Projects/trader/stock_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/base_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/scripts/hypersearch_v2.py",
+                "/Users/kywwilson/Desktop/Projects/trader/indicator_config.py",
+                "/Users/kywwilson/Desktop/Projects/trader/indicators.py",
+                "/Users/kywwilson/Desktop/Projects/trader/stock_config.py"
+              ],
+              "expected_impact": "Better ordering of the existing top-7 entry / top-15 hold slots across vol regimes (ranks are scale-invariant), at zero new data and ~zero cost. Honest framing per the adversarial pass: effect at hourly cadence on 50-96 names is unknown-until-shadow (all published evidence is monthly/thousands of names; closest support is Heston-Korajczyk-Sadka intraday continuation). Its larger payoff is as the substrate that makes the lambdarank challenger more than a re-sort and carries rod_rank.",
+              "risks": "Train/serve rank-population mismatch silently poisons everything if step 2 is skipped (the one conditional the verifier attached to survival). Fast-feature rank churn can raise turnover — must be measured in shadow against the 11bps+spread cost base. IEX feed is ~2-3% of consolidated volume, so volume-based ranks are noisy for thinner names (consistent train/live, so attenuated not biased). Monthly-to-hourly extrapolation is unproven; failure mode is a correctly-rejected challenger, which is cheap."
+            },
+            {
+              "name": "End-of-day loser-bounce + same-hour-of-day periodicity features (BDS 2025 ROD + HKS periodicity), with overnight-sleeve bounce penalty",
+              "why": "Highest novelty-x-adjusted-confidence single finding of the wave (5 x 4). Baltussen-Da-Soebhag (SSRN 5039009, verified against the actual April-2025 paper): prev-close-to-15:00 return negatively predicts the 15:30-16:00 return, t>10, effect ENTIRELY on the loser/long side (winner-quintile absolute effect ~ -0.22bps — which is why the hard-rule sibling was refuted), robust in the largest/most liquid names and to skipping the last 5 minutes. It maps exactly onto this app's structure: 14:30-15:30 entry window, 15:50 flatten sitting inside the bounce window, and the overnight sleeve exposed to the documented full next-morning reversion of the bounce. HKS (JF 2010) same-hour continuation is replicated over 30 years (Bogousslavsky JFE 2021). Zero new data; PIT trivial (own bars).",
+              "build_steps": [
+                "indicators.py compute_stock_features (line 623): add rod_ret = cumulative return from prior session close to current hourly bar, and same_hour_mean_40d = trailing 40-day mean of this symbol's return in this clock-hour (hour-bucketed rolling mean; compute in harvest and live from the already-cached ~200 hourly bars).",
+                "rod_rank = per-hour cross-sectional rank of rod_ret over the masked panel — rides item 1's pre-pass in both scripts/harvest_stock_data.py and stock_loop._get_predictions. This is the first payload through the new cross-sectional infrastructure.",
+                "Bar-provenance parity: live rod_ret must use the same bar source training saw. The signal-to-trade gap is built in (a 15:30 decision uses data through ~15:00), so 15-min-delayed SIP-consistent bars cover it with margin — do NOT 'improve' it with IEX last-15-min data training never saw.",
+                "meta_label.py: append a top-quintile-positive-ROD-in-PM-window flag to META_FEATURES (line 43) as a SOFT learned feature only. Explicitly no hard veto: the paper's asymmetry regression shows positive-ROD names have ~zero reversal slope, and a hard demotion would fight legitimate stock-level time-series momentum (this is exactly where the refuted hard-rule sibling died).",
+                "stock_loop._select_overnight_keepers (line 221): add a deterministic penalty/exclusion for names whose 15:00->15:50 bounce was large — the LH loser-bounce is transitory pressure that fully reverts by the next open (Table 6 of the paper), so bounced losers are the wrong names for the 2-position Lou-Polk-Skouras sleeve.",
+                "Let LightGBM learn hour-of-day interactions via existing Hour_sin/cos; gate the columns through the existing CV -> DSR holdout -> shadow path as a feature add. Set expectations: DM-HLN will likely NOT be able to confirm a sub-bp/day edge on a paper book — the justification is near-zero cost on trades already being made, not separate promotability."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/indicators.py",
+                "/Users/kywwilson/Desktop/Projects/trader/scripts/harvest_stock_data.py",
+                "/Users/kywwilson/Desktop/Projects/trader/meta_label.py",
+                "/Users/kywwilson/Desktop/Projects/trader/stock_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/scripts/hypersearch_v2.py"
+              ],
+              "expected_impact": "Low-single-digit bps/day on the affected PM-window picks (anchor: 3.41 bps/day largest-quintile 6-factor alpha across the full L-H spread, NOT the 6.86 EW headline; 15:30-15:50 holds capture roughly two-thirds of the documented window) plus protection of the overnight sleeve from next-morning give-back. It changes WHICH names get the PM slots, not trade count, so cost is ~zero.",
+              "risks": "Zero post-2019 out-of-sample evidence anywhere — sample ends Dec 2019 and the paper is 2025 vintage, so the McLean-Pontiff crowding clock starts now (treat published bps as upper bounds). The winner-side leg is ~0 and must stay a soft feature. The edge is small enough that the promotion gate will probably never separately confirm it; that is the expected outcome, not failure."
+            },
+            {
+              "name": "LightGBM LambdaMART ranker challenger (lambdarank / rank_xendcg) + rank-aware gate plumbing (top-K DSR simulator, rank-aware shadow loss)",
+              "why": "The wave's most novel idea (5/5) with a code-verified mechanism: training optimizes RMSE on raw returns (model_lgb.py:61) while the live decision is literally sorted(preds) -> top-7/top-15 with hysteresis (stock_loop.py:442-450) — an objective/decision mismatch. LambdaRank gradients concentrate learning on exactly the swaps that change the top-K book; GBDT LambdaMART remains SOTA for tabular ranking (Qin et al. ICLR 2021), Jetson-friendly, zero new dependencies (LightGBM>=4.0 pinned). Adjusted confidence 3/5: all finance evidence (Poh et al. Sharpe 2.16; independent Quantitativo net replication 1.62) is monthly/long-short/1000+ names — treat magnitudes as unanchored and the experiment's value as its low cost. Sequenced after item 1 because cs_rank features are what make the ranker more than a re-sort.",
+              "build_steps": [
+                "model_lgb.py: add train_lgb_ranker() beside train_lgb (line 43): params {objective: 'lambdarank' (variant: 'rank_xendcg'), metric: 'ndcg', ndcg_eval_at: [7,15], lambdarank_truncation_level: 20 (covers the top-15 hold band), num_leaves<=63, min_data_in_leaf>=500, feature_fraction~0.7}. This is a POOLED panel model — per-symbol lambdarank is impossible.",
+                "Labels: within each hourly timestamp, grade = TB-return quintile in {0..4} from the already-harvested triple-barrier returns keyed ('tb', fb) in all_returns_by_fb (hypersearch_v2.py:234). Dispersion-aware grading is a FIRST-CLASS requirement, not an afterthought: flatten the whole hour to grade 0 when the cross-sectional IQR of TB returns is below the cost hurdle (~11bps+spread), so the |delta-NDCG|-weighted gradient doesn't fit pure noise at the top of dispersion-less hours. Overlapping TB windows across consecutive hourly groups pseudo-replicate pairs — accept, but report fold metrics per non-overlapping day blocks.",
+                "scripts/hypersearch_v2.py: in get_walk_forward_folds (line 279) and the LGB ensemble train path, sort fold rows by timestamp and emit group vectors (row counts per timestamp, groups of ~50-96 docs). The existing purge logic carries over unchanged because groups nest within timestamps (purge operates on label times; whole timestamps purge together). Early-stop on purged-validation NDCG@7, never RMSE.",
+                "REQUIRED gate plumbing — both existing statistical gates are pointwise-shaped and cannot evaluate a ranker as-is: (a) build a top-K DSR simulator next to simulate_trades (line 345): per holdout hour, construct the actual top-7-entry/top-15-hold book WITH the hysteresis band from scores, feed realized TB returns into validation.py dsr_from_trade_returns (line 92). Note: this simulator also fixes a pre-existing misalignment for the INCUMBENT — the current threshold-in-return-units sim evaluates a different decision rule than the live top-7 book — so build it regardless of ranker outcome. (b) shadow.py evaluate_shadow (line 237): add a rank-aware loss — per-hour realized-TB-return differential between challenger-top-7 and champion-top-7 — and feed it to dm_hln (line 153); the existing variance-normalized squared forecast error is meaningless on unitless ranker scores.",
+                "Score combination: NEVER blend unitless ranker scores into ensemble_predict's 0.6/0.4 return-unit weighted average (model_lgb.py:137) — scale mismatch lets the ranker silently dominate. Selection ORDER comes from the ranker (or a rank-domain blend: mean of rank(LSTM pred) and rank(ranker score)); the existing regression ensemble stays untouched for every magnitude consumer: trade_threshold/fee-hurdle gating, q10 tail veto, and the meta-label's pred feature.",
+                "Run via the existing challenger machinery (shadow.py challenger_prefix/promote_challenger); promotion criterion = DM-HLN on per-hour top-7 realized-TB differentials. Measure realized turnover delta in shadow — hysteresis bounds churn but does not fix it, and a churnier ranker pays 11bps+spread per extra round trip."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/model_lgb.py",
+                "/Users/kywwilson/Desktop/Projects/trader/scripts/hypersearch_v2.py",
+                "/Users/kywwilson/Desktop/Projects/trader/shadow.py",
+                "/Users/kywwilson/Desktop/Projects/trader/validation.py",
+                "/Users/kywwilson/Desktop/Projects/trader/stock_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/base_loop.py"
+              ],
+              "expected_impact": "Aspirational 10-25% relative selection-Sharpe improvement; honest expectation per the adversarial pass is possibly-zero delta — the LightGBM-regression vs LightGBM-lambdarank comparison on identical features is an unpublished experiment this app will be running. Guaranteed side benefit: the top-K DSR simulator aligns the promotion gate with the live decision rule for the incumbent too. Compute is trivial (~minutes of CPU training on ~500k rows / ~7-8k groups).",
+              "risks": "Monthly/3000-name -> hourly/50-96-name transfer has zero published support; long-only top-7 of 50 liquid names is where ML selection alpha is weakest (Avramov-Cheng-Metzker). The gate rewrites are days of work BEFORE the challenger is even measurable — this is not a drop-in objective swap. Bounded failure mode: a non-promoted challenger, not losses."
+            },
+            {
+              "name": "SPY rest-of-day intraday-momentum gate for the 14:30-15:30 window (sizing modifier beside the VIX ladder)",
+              "why": "Every PM entry is force-flattened at 15:50, i.e., sold INTO the close; GHLZ (JFE 2018, OOS R^2 1.4%) + Baltussen-Da-Lammers-Martens (JFE 2021, 60+ futures, gamma/LETF flow mechanism) show the tape statistically continues its rest-of-day direction into the close, and Zarattini-Aziz-Barbon (2024) confirm net-of-cost through early 2024 spanning the 0DTE era. Code-verified gap: strategy_config.py entry windows cite GHLZ for timing but nothing anywhere conditions on tape DIRECTION (VIX ladder is level-based, SPY 200d is slow trend). Adjusted confidence 4/5 as a bounded sizing modifier; ~20-50 lines. Note: a hard/volume-amplified version of this family was separately refuted — this build is strictly the surviving soft form: index-level, sizing-only, shadow-validated.",
+              "build_steps": [
+                "market_data.py: add a fresh SPY fetch (latest minute bar or last trade). fetch_spy_bars_alpaca (line 239) returns 1Hour bars that are stale up to 59 minutes intra-bar — conditioning the gate on it would read stale tape.",
+                "stock_loop._execute_buys gate stack (insert immediately after the VIX>25 block / SPY-200d trend filter, before sentiment/LLM/meta/q10): PM window only (14:30-15:30 ET) — compute spy_rod = SPY_now/prev_close - 1, normalized by SPY 14d ATR; if spy_rod < -0.5*ATR14, scale the new-entry risk budget x0.5 (route through _compute_position_size or the existing _extra_tilt hook at line 870); if > +0.5*ATR14, normal/full sizing. Add a minimum absolute ROD floor so the gate is inert in calm regimes. Long-only de-risk: no new trades ever created.",
+                "Keep it index-level (SPY, optionally QQQ) ONLY — individual-stock and commodity-ETF replications are weaker; do not let this morph into per-name intraday momentum.",
+                "Train/live parity: emit spy_rod_ret (+hour-of-day interaction) as a panel column in scripts/harvest_stock_data.py from the same bar provenance, so the LGBM can learn the conditional pattern for the 15:50-flatten horizon. It is cross-sectionally constant, so its value flows through the gate and the absolute-prediction vetoes (meta-label, q10 inputs), not through ranking.",
+                "Validation before promotion: stamp the ROD bucket into log_decision on every PM entry, then evaluate conditional PnL of PM entries by ROD bucket in shadow; keep the sizing rule behind a strategy_config.py flag and promote through the existing DSR/DM-HLN machinery."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/market_data.py",
+                "/Users/kywwilson/Desktop/Projects/trader/stock_loop.py",
+                "/Users/kywwilson/Desktop/Projects/trader/strategy_config.py",
+                "/Users/kywwilson/Desktop/Projects/trader/scripts/harvest_stock_data.py",
+                "/Users/kywwilson/Desktop/Projects/trader/meta_label.py"
+              ],
+              "expected_impact": "1-3 bps saved per affected PM entry on strong-down-tape days (~5-7 affected entries/day when it fires), symmetric full-sizing on strong-up days letting the 15:30-15:50 leg ride documented continuation. Zero incremental trades; a risk-adjusted improvement even if mean PnL impact is ~0 (the claimed 2-5bps was downgraded by the verifier — the 15:50 flatten exits before the densest 15:50-16:00/MOC flow).",
+              "risks": "0DTE-era average-positive dealer gamma mutes momentum on typical days and the daily gamma sign is unobservable with free data (mitigated: gate fires only on |ROD|>0.5*ATR days where LETF same-direction flow dominates). Long calm-regime stretches where it adds nothing (2015-2019 standalone replications were weak). Halving size also halves the model's conditional alpha on those entries — net benefit must be validated in shadow, not assumed. Partial overlap with the VIX ladder in the tails; incremental value concentrates on moderate-VIX trending-down days."
+            }
+          ]
+        },
+        {
+          "tier": 2,
+          "items": [
+            {
+              "name": "Residual (idiosyncratic) momentum vs SPY + sector ETF — rm_252_21 primary formation, ETF tickers hard-zeroed",
+              "why": "De-betas the ranking signal for a high-beta book: raw momentum loads top-7 with the highest-beta names exactly after market rallies; residual momentum surfaces names outperforming their own factor benchmark. Rare anomaly with a POSITIVE post-publication record (Blitz-Hanauer-Vidojevic 2020 cross-region; Hanauer-Windmueller 2023 best of the enhanced-momentum family across 49 countries). Tier 2 because adjusted confidence is 3/5, the expected live effect is a modest selection tilt, and it carries the heaviest plumbing of the wave (daily-bar cache, sector-ETF map). SURVIVES ONLY WITH THE HORIZON FIX: the originally specified rm_21/rm_5 sit inside the skip-month where the same Robeco group documents residual REVERSAL.",
+              "build_steps": [
+                "Build the missing daily-bar infrastructure: a batched once-daily fetch + cache of ~300 trading days of daily bars for the ~96-name panel + SPY + sector ETFs (XLK/SMH/XLY/...). No live per-symbol daily cache exists today — only SPY daily in macro_indicators.py; live stock fetches are ~200 hourly bars (~28 days). Cache intraday; recompute residual features once daily.",
+                "stock_config.py: add a SYMBOL_SECTOR_ETF map (SECTOR_BUCKETS at line 113 is thematic, NOT ETF-mapped). Orthogonalize the sector regressor against SPY to stabilize betas; unmapped/judgment-call spec names degrade gracefully to SPY-only residuals. Add missing sector ETFs to the harvest list as regressors only, not tradables.",
+                "indicators.py: resid_mom() (numpy lstsq, trivial on Jetson): per symbol regress trailing 126-252 daily returns on [const, SPY, sectorETF], betas held fixed for the week; PRIMARY feature rm_252_21 = sum(e_{t-252..t-22})/std(e) — the 12-1 formation the cited Sharpe-2x evidence actually supports. rm_21/rm_5 may be included ONLY relabeled as residual-REVERSAL candidates (literature says opposite sign inside the skip-month) that must earn their place in ablation. HARD-ZERO rm for ETF/leveraged tickers (GLD, SLV, PALL, PPLT, COPX, TQQQ, SOXL, ARKK): residuals vs [SPY, sector] are near-zero-variance or leverage decay, and dividing by tiny std(e) produces explosive noise.",
+                "Emit raw + cs_rank versions into the panel (scripts/harvest_stock_data.py) and the live path via Tier-1 item 1's once-daily cross-sectional pre-pass.",
+                "Gate: hypersearch_v2 Sharpe-objective ablation + DSR holdout with/without rm_* (use NDCG@7 only if the Tier-1 ranker landed) -> shadow challenger with DM-HLN. Expect a small selection tilt; failure mode (useless feature) is cheap, bounded, detectable."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/indicators.py",
+                "/Users/kywwilson/Desktop/Projects/trader/stock_config.py",
+                "/Users/kywwilson/Desktop/Projects/trader/scripts/harvest_stock_data.py",
+                "/Users/kywwilson/Desktop/Projects/trader/market_data.py",
+                "/Users/kywwilson/Desktop/Projects/trader/macro_indicators.py",
+                "/Users/kywwilson/Desktop/Projects/trader/scripts/hypersearch_v2.py",
+                "/Users/kywwilson/Desktop/Projects/trader/stock_loop.py"
+              ],
+              "expected_impact": "A genuinely different momentum axis for the models: fewer post-rally beta-crash top-7 loads (complements the VIX ladder by de-betaing the SIGNAL, not the book) and residual-vol standardization naturally tempers the spec names. After long-leg-only x ~58% post-publication haircut x intraday-only capture (Lou-Polk-Skouras overnight concentration vs the 15:50 flatten), expect a small positive selection tilt — not the published 0.5-1%/mo.",
+              "risks": "Horizon trap if rm_21/rm_5 are treated as momentum (they are reversal candidates at those windows — Medhat-Schmeling puts high-turnover names in the 1-month reversal regime). Ehsani-Linnainmaa decomposition weakens the clean-underreaction story (what survives is factor momentum + BAB — which still functionally de-betas selection). Crash protection largely redundant with the existing five brakes (200d filter, VIX ladder, ATR stops, trailing, flatten). ~6-month beta warmup consumes early candidate-pool rows; SPY/sector collinearity makes individual betas unstable (residuals stay well-defined)."
+            },
+            {
+              "name": "Turnover-conditioned short-term momentum/reversal interaction features (Medhat-Schmeling 2022)",
+              "why": "The sign of short-horizon autocorrelation is a function of turnover (high-turnover moves continue at monthly horizon, +1.37%/mo t=4.74; low-turnover moves revert, -1.41%/mo t=7.13) and flips with horizon (weekly high-volume reverses, Conrad-Hameed-Niden 1994). MS 2022 survives costs net (+1.00%/mo) and is STRONGEST in the largest, most liquid, most-covered names — exactly this universe. The app's price-only features (Return_4h/12h, ROC, RSI) cannot represent the 2-D horizon-x-turnover surface; explicit interaction columns let the GBT learn it. Tier 2: short post-publication window (sample to 2018) and the free-data turnover proxy is imperfect.",
+              "build_steps": [
+                "indicators.py + scripts/harvest_stock_data.py: turnover proxies from existing OHLCV only — trailing 21d dollar-volume cross-sectional rank (reuse the _DV30 machinery stamped by _asof_tradability_mask:172), volume_surprise (hourly volume / trailing 20d same-hour average), and std_turn (turnover volatility, Chordia-Subrahmanyam-Anshuman; replicates '1_clear' in Chen-Zimmermann OSAP).",
+                "Emit EXPLICIT interaction columns rather than relying on GBT split discovery in a 500k-row noisy panel: ret_5d x turnover_rank and ret_21d x turnover_rank (the weekly-vs-monthly sign flip is the payload), plus the marginal turnover_rank and std_turn columns.",
+                "cs_rank versions ride Tier-1 item 1's per-hour pre-pass; train/live parity is automatic (own Alpaca bars, point-in-time by construction).",
+                "Gate: hypersearch_v2 ablation -> DSR holdout -> shadow DM-HLN. Explicitly NOT a standalone reversal strategy — standalone short-horizon reversal does not clear 11bps+spread (Avramov-Chordia-Goyal 2006); conditioning features only."
+              ],
+              "files": [
+                "/Users/kywwilson/Desktop/Projects/trader/indicators.py",
+                "/Users/kywwilson/Desktop/Projects/trader/scripts/harvest_stock_data.py",
+                "/Users/kywwilson/Desktop/Projects/trader/scripts/hypersearch_v2.py",
+                "/Users/kywwilson/Desktop/Projects/trader/stock_config.py"
+              ],
+              "expected_impact": "Realistic long-only top-7/top-15 tilt of ~10-30 bps/month at book level (upper bound anchored to MS's net +1.00%/mo L/S in liquid large caps), concentrated in better PM-window picks. Zero incremental trading cost — reshuffles trades the app already makes.",
+              "risks": "Free data lacks shares outstanding, so the dollar-volume-rank proxy is not true turnover (level differences across names; the rank form mitigates). IEX volume (~2-3% of tape) is noisy for thinner names. Short post-publication record for the monthly continuation leg; monthly-to-hourly transfer unproven. Watch feature dilution in the panel — the existing DSR/CV gates handle it."
+            }
+          ]
+        }
+      ],
+      "rejected": [
+        {
+          "name": "Cross-sectional calendar seasonality from the app's own panel (Heston-Sadka same-month + KLN same-weekday features)",
+          "reason": "No consumer for the signal: a ~0.2-0.3 bps/hour monthly-drift feature injected into a LightGBM trained on hourly TB labels with 100-200bps per-row noise gets ~zero split gain. The premium accrues close-to-close while the book is flat ~75% of calendar time (momentum-family premia accrue overnight per Lou-Polk-Skouras). Per-name same-month estimator SE ~4%/mo swamps true dispersion in a 50-96 name top-7 book, and the proposed yfinance history extension introduces a survivorship leak (feature missingness correlates with delisting). Central estimate ~0-0.3%/yr — below the DSR/DM-HLN gate's resolution; most likely outcome is a correctly rejected challenger and wasted build."
+        },
+        {
+          "name": "End-of-day reversal + volume-amplified market intraday momentum as HARD timing rules (PM winner demotion, 15:30 winner early-flatten, GHLZ overnight-sleeve scaling)",
+          "reason": "Magnitude misread by ~two orders of magnitude: the '24bps headwind' is the EW extreme-decile L-S spread; the winner quintile's absolute last-half-hour return is -0.22 bps/day (~zero over 27 years), so winner demotion swaps real model alpha for ~0.2bps of headwind avoidance. The documented effect is entirely on the LOSER side, which this app's q10/meta/sentiment vetoes mostly reject and whose bounce fully reverts by the next close (sleeve cannot monetize). GHLZ overnight scaling is unsupported horizon extrapolation and plausibly sign-wrong (day return NEGATIVELY predicts overnight). NOTE: the SOFT-feature expression of the same papers survived and is Tier-1 item 2, and the bounded SPY sizing gate survived separately as Tier-1 item 4 — only the hard rules, winner-side actions, volume amplification, and overnight extrapolation are rejected."
+        },
+        {
+          "name": "Hard-gate the overnight sleeve on deep VIX/VIX3M backwardation (>1.05)",
+          "reason": "Exact replication on the proposal's own spec shows the effect is one episode: ex-COVID the deep bucket is +8.6bps/night (Sharpe +0.91), and the deep bucket was POSITIVE in 2009-16 and 2022-26 subperiods. All 8 worst deep-bucket nights occurred with SPY<200d SMA and/or VIX>25 — nights the existing gates already prevented the sleeve from holding risk, so the claimed protection is double-counted. On the only nights the gate uniquely binds (16 nights in 16.7 years) it would have ONLY skipped profitable nights (+15.6bps avg, Sharpe +3.36). Timing also fails: backwardation crosses 1.05 only AFTER the first gap of every modern stress episode (2020-02-21, 2022-02-23, 2024-08-02, 2025-04-02 all gapped with ratio below trigger). Net expected effect is negative."
+        },
+        {
+          "name": "Variance risk premium (VIX^2 - RV) as post-spike re-risk accelerator and panel feature",
+          "reason": "Self-refuting evidence: the proposer's own replication shows the signal at t=0.09 post-2008 and SIGN-FLIPPED (t=-2.84) in 2016-2026 — the full-sample top-quintile stat is carried by the pre-decay era plus 2-3 clustered V-recoveries. Measurement contradicts the cited mechanism: trailing-RV VRP goes deeply negative immediately post-spike, so the promised earlier re-risk vs the live 15/25/35 VIX ladder materializes only in GFC/COVID-class episodes. The claimed 20-40bps/yr is close-to-close drift a 15:50-flat book structurally cannot capture (the app's own sleeve docstring cites Lou-Polk-Skouras on overnight accrual). VIX3M history starts ~2007, so the joint contango rule cannot even be backtested on the premium-carrying subsample, and the rule's stated safety precondition references an unbuilt sibling proposal."
+        },
+        {
+          "name": "52-week-high proximity (George-Hwang anchoring) as ranking feature + NH-NL aggregate",
+          "reason": "Dead at this app's horizon and universe: in the microcap-free Hou-Xue-Zhang replication the 1-month variant earns t=0.43 (the closest to <=6.5h holds, still ~100x longer) and the surviving 6-month variant's q-factor alpha is -0.01 — in liquid stocks the spread is factor exposure, not anchoring alpha. The slow-diffusion drift accrues ENTIRELY overnight (Lou-Polk-Skouras) while this book is flat 15:50->9:45, making the channel structurally inaccessible. The long leg's edge is ~+0.1-0.2%/mo gross in-sample (spread lives on the short/loser leg), which rounds to zero after the ~58% McLean-Pontiff post-publication haircut."
+        }
+      ]
+    },
+    "survivors_count": 14,
+    "killed": [
+      "Cross-sectional calendar seasonality from the app's own panel (Heston-Sadka same-month + KLN same-weekday relative-return features)",
+      "End-of-day cross-sectional reversal + volume-amplified market intraday momentum: timing logic for the 14:30-15:30 window and 15:50 flatten",
+      "Hard-gate the OVERNIGHT sleeve (not the day book) on deep backwardation — overnight gap risk bypasses the entire stop stack, and that is exactly where stress-regime losses live",
+      "Variance risk premium (VIX-squared minus realized variance) as an asymmetric POST-SPIKE RE-RISK accelerator and panel feature — explicitly not the dead BTZ linear mean-timing trade",
+      "52-week-high proximity (George-Hwang anchoring) as a per-name ranking feature, plus panel NH-NL aggregate",
+      "Absorption ratio (PCA factor-concentration of the app's own corr matrix) as a fragility de-risk overlay",
+      "MAX/lottery-spike penalty with the Stambaugh-Yu-Yuan sign caveat: avoid buying spec-tech names right after extreme daily pops"
+    ]
+  }
+}
