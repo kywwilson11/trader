@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from trading_utils import get_api
 from notify import halt_active, set_halt, clear_halt, request_flatten
+from hw_monitor import get_gpu_temp as hw_get_gpu_temp
 
 from PySide6.QtCore import (
     Qt, QTimer, QThread, Signal, Slot, QObject,
@@ -1112,14 +1113,16 @@ class DataFetcher(QObject):
                 })
                 return
 
-            # Resolution → API params
+            # Resolution → API params. Limits must cover the whole lookback
+            # window: bars come back ascending, so a too-small limit keeps
+            # the OLDEST bars and drops the most recent ones.
             res_config = {
-                'daily':  ('1Day',  365, 365),
-                'hourly': ('1Hour',  10, 168),   # 7 days of hourly = ~168 bars
-                '15min':  ('15Min',   5, 200),   # 5 days lookback covers weekends
-                '5min':   ('5Min',    3, 300),   # 3 days of 5-min bars
+                'daily':  ('1Day',  365, 370),
+                'hourly': ('1Hour',  10, 250),   # 10d * 24 = 240 crypto bars
+                '15min':  ('15Min',   5, 500),   # 5d * 96 = 480 crypto bars
+                '5min':   ('5Min',    3, 900),   # 3d * 288 = 864 crypto bars
             }
-            tf, lookback_days, limit = res_config.get(resolution, ('1Day', 365, 365))
+            tf, lookback_days, limit = res_config.get(resolution, ('1Day', 365, 370))
 
             start = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=lookback_days)
             if '/' in symbol:
@@ -1279,26 +1282,12 @@ class DataFetcher(QObject):
 
     @staticmethod
     def _read_gpu_temp():
-        """Read GPU temp from thermal zone (no torch, no tegrastats)."""
-        for zone in ("/sys/devices/virtual/thermal/thermal_zone1/temp",
-                     "/sys/devices/virtual/thermal/thermal_zone0/temp"):
-            try:
-                with open(zone) as f:
-                    return int(f.read().strip()) / 1000.0
-            except (FileNotFoundError, ValueError, OSError):
-                continue
-        try:
-            import subprocess
-            proc = subprocess.run(
-                ["tegrastats", "--interval", "100"],
-                capture_output=True, text=True, timeout=2,
-            )
-            m = re.search(r"GPU@(\d+(?:\.\d+)?)C", proc.stdout + proc.stderr, re.IGNORECASE)
-            if m:
-                return float(m.group(1))
-        except Exception:
-            pass
-        return None
+        """GPU temp via hw_monitor: zone-type scan, 20s cache, no subprocess.
+
+        (The old tegrastats fallback never exits, so subprocess.run always
+        burned its full 2s timeout before raising — fixed engine-side.)
+        """
+        return hw_get_gpu_temp()
 
     @staticmethod
     def _read_ram():
@@ -1617,6 +1606,7 @@ class TradingDashboard(QMainWindow):
 
         self._orders_cache = []
         self._hw_cache = {}
+        self._last_fng = None  # Fear & Greed, fetched off-thread by fetch_news
 
         # Restore last used theme
         settings = _load_gui_settings()
@@ -2517,6 +2507,7 @@ class TradingDashboard(QMainWindow):
         self._stock_symbol_combo.addItems(symbols)
         self._stock_symbol_combo.setCurrentText(text)
         self._stock_symbol_combo.blockSignals(False)
+        self._on_stock_symbol_changed(self._stock_symbol_combo.currentText())
         self._stock_universe_label.setText(f"Universe ({len(symbols)})")
         self._stock_add_input.clear()
 
@@ -2534,6 +2525,7 @@ class TradingDashboard(QMainWindow):
             self._stock_symbol_combo.clear()
             self._stock_symbol_combo.addItems(symbols)
             self._stock_symbol_combo.blockSignals(False)
+            self._on_stock_symbol_changed(self._stock_symbol_combo.currentText())
             self._stock_universe_label.setText(f"Universe ({len(symbols)})")
 
     def _on_stock_symbol_changed(self, sym):
@@ -2881,11 +2873,19 @@ class TradingDashboard(QMainWindow):
         cutoff = now_ts - zoom_days.get(self._stock_zoom, 30) * 86400
 
         # Find first index >= cutoff
-        start_idx = 0
+        start_idx = None
         for i, ts in enumerate(timestamps):
             if ts >= cutoff:
                 start_idx = i
                 break
+        if start_idx is None:
+            # Cached series ends before the zoom window — don't render
+            # stale bars under a current-window title
+            self._stock_chart_line.clear()
+            self._stock_chart.setTitle(
+                f"{self._stock_symbol_combo.currentText()} "
+                f"({self._stock_zoom}) — no data in window")
+            return
 
         vis_ts = timestamps[start_idx:]
         vis_closes = closes[start_idx:]
@@ -3729,10 +3729,10 @@ class TradingDashboard(QMainWindow):
         self._status_conn.setStyleSheet(f"color: {T['green'].name()};")
         self._error_count = 0
 
-        # Update sentiment indicator
+        # Update sentiment indicator from the last off-thread fetch
+        # (fetch_news refreshes it every 5 min — no HTTP on the UI thread)
         try:
-            from sentiment import get_fear_greed
-            fng = get_fear_greed()
+            fng = self._last_fng
             if fng is not None:
                 val = fng.get('value')
                 label = fng.get('label', '')
@@ -3966,6 +3966,9 @@ class TradingDashboard(QMainWindow):
         import datetime as _dt
         articles = data.get('articles', [])
         fng = data.get('fng')
+        self._last_fng = fng  # cached for UI-thread consumers (on_account)
+        if fng is not None:
+            self._last_fng = fng
         cnn_fng = data.get('cnn_fng')
         sent_24h = data.get('sent_24h')
         sent_7d = data.get('sent_7d')
