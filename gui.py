@@ -3650,17 +3650,19 @@ class TradingDashboard(QMainWindow):
 
         def probe():
             start = time.time()
+            ok, error = False, ""
             try:
                 from llm_client import call_llm
                 result = call_llm("Respond with just the word OK.",
                                   max_tokens=16)
+                ok = bool(result)
+            except Exception as e:
+                error = str(e)
+            try:
                 self._llm_test_done.emit(
-                    bool(result), (time.time() - start) * 1000, "")
+                    ok, (time.time() - start) * 1000, error)
             except RuntimeError:
                 pass  # window closed while the probe was in flight
-            except Exception as e:
-                self._llm_test_done.emit(
-                    False, (time.time() - start) * 1000, str(e))
 
         threading.Thread(target=probe, daemon=True, name="llm-test").start()
 
@@ -3966,8 +3968,9 @@ class TradingDashboard(QMainWindow):
         import datetime as _dt
         articles = data.get('articles', [])
         fng = data.get('fng')
-        self._last_fng = fng  # cached for UI-thread consumers (on_account)
         if fng is not None:
+            # cache for UI-thread consumers (on_account renders from this;
+            # a failed fetch must not wipe the last good value)
             self._last_fng = fng
         cnn_fng = data.get('cnn_fng')
         sent_24h = data.get('sent_24h')
