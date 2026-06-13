@@ -37,8 +37,15 @@ sys.path.insert(0, str(BASE_DIR))
 
 JOURNAL_DIR = BASE_DIR / 'journals'
 
-GATE_REASONS = ['sentiment_block', 'llm_veto', 'meta_veto',
-                'q10_tail_veto', 'edgar_event']
+# Gates whose vetoes carry a per-symbol counterfactual row worth pricing
+# (conviction/risk gates on real candidates). Mechanical skips
+# (already-held, cooldown, budget) are summarized in entry_window rows
+# but never priced per-symbol. Kept in sync with the loops' _journal_skip
+# call sites (base_loop.py / stock_loop.py, wave-5 Tier1-1).
+GATE_REASONS = ['sentiment_block', 'llm_veto', 'meta_veto', 'q10_tail_veto',
+                'edgar_event', 'below_threshold', 'cost_floor',
+                'winners_curse', 'correlation', 'bucket_cap', 'trend_filter',
+                'sizing_zero', 'earnings']
 MAX_HOLD_BARS = {'crypto': 24, 'stock': 24}   # vertical barrier for replays
 
 
@@ -188,7 +195,7 @@ def conviction_calibration(rows: list[dict], api) -> dict:
     if not buys:
         return {}
 
-    samples = []   # (pred, meta_prob_or_None, net)
+    samples = []   # (pred, meta_prob_or_None, net, rank_or_None)
     by_symbol: dict[str, list[dict]] = defaultdict(list)
     for r in buys:
         by_symbol[r['symbol']].append(r)
@@ -213,8 +220,10 @@ def conviction_calibration(rows: list[dict], api) -> dict:
             net = replay_entry(bars, ts, asset)
             if net is None:
                 continue
-            samples.append((float(r['pred_return']),
-                            r.get('meta_prob'), net))
+            # meta_p is the wave-5 field name; meta_prob the legacy one
+            mp = r.get('meta_p', r.get('meta_prob'))
+            samples.append((float(r['pred_return']), mp, net,
+                            r.get('entry_rank')))
 
     if len(samples) < 9:
         return {'n': len(samples),
@@ -235,6 +244,20 @@ def conviction_calibration(rows: list[dict], api) -> dict:
                          'mean_net_pct': round(float(nets[mask].mean()), 3),
                          'hit_rate': round(float((nets[mask] > 0).mean()), 3)}
 
+    # Entry-rank buckets — Stage-0 experiment 1: does rank 6-7 carry
+    # materially less edge than rank 1-3? (gates the concentration cap)
+    ranked = [(s[3], s[2]) for s in samples if s[3] is not None]
+    if len(ranked) >= 9:
+        rk = np.array([r[0] for r in ranked], dtype=float)
+        rn = np.array([r[1] for r in ranked], dtype=float)
+        for name, lo, hi in (('rank_1_3', 1, 3), ('rank_4_5', 4, 5),
+                             ('rank_6_7', 6, 7), ('rank_8_plus', 8, 9999)):
+            mask = (rk >= lo) & (rk <= hi)
+            if mask.sum():
+                out[name] = {'n': int(mask.sum()),
+                             'mean_net_pct': round(float(rn[mask].mean()), 3),
+                             'hit_rate': round(float((rn[mask] > 0).mean()), 3)}
+
     metas = [(s[1], s[2]) for s in samples if s[1] is not None]
     if len(metas) >= 9:
         mp = np.array([m[0] for m in metas])
@@ -247,6 +270,35 @@ def conviction_calibration(rows: list[dict], api) -> dict:
                 out[name] = {'n': int(mask.sum()),
                              'mean_net_pct': round(float(mn[mask].mean()), 3),
                              'hit_rate': round(float((mn[mask] > 0).mean()), 3)}
+    return out
+
+
+def admitted_k_distribution(rows: list[dict]) -> dict:
+    """Admitted-k distribution from entry_window summary rows — Stage-0
+    experiment 2 (does the gate stack already enforce concentration?).
+    No API/replay needed; reads the journals directly."""
+    out = {}
+    for asset in ('stock', 'crypto'):
+        wins = [r for r in rows if r.get('action') == 'entry_window'
+                and r.get('asset_type') == asset]
+        if not wins:
+            continue
+        ks = np.array([int(r.get('admitted_k', 0)) for r in wins])
+        veto_tot = defaultdict(int)
+        for r in wins:
+            for reason, c in (r.get('veto_counts') or {}).items():
+                veto_tot[reason] += int(c)
+        hist = {str(k): int((ks == k).sum()) for k in range(0, 8)}
+        hist['8+'] = int((ks >= 8).sum())
+        out[asset] = {
+            'windows': len(wins),
+            'mean_admitted_k': round(float(ks.mean()), 2),
+            'pct_windows_k_ge_6': round(float((ks >= 6).mean()), 3),
+            'pct_windows_zero': round(float((ks == 0).mean()), 3),
+            'admitted_k_hist': hist,
+            'total_vetoes_by_reason': dict(
+                sorted(veto_tot.items(), key=lambda kv: -kv[1])),
+        }
     return out
 
 
@@ -266,6 +318,17 @@ def run_report(days: int = 30) -> dict:
 
     gates = gate_attribution(rows, api)
     conviction = conviction_calibration(rows, api)
+    admitted_k = admitted_k_distribution(rows)
+
+    if admitted_k:
+        print(f"\n=== ADMITTED-K DISTRIBUTION (last {days}d) ===")
+        for asset, a in admitted_k.items():
+            print(f"{asset}: {a['windows']} windows, "
+                  f"mean k={a['mean_admitted_k']}, "
+                  f"P(k>=6)={a['pct_windows_k_ge_6']:.0%}, "
+                  f"P(k=0)={a['pct_windows_zero']:.0%}")
+        print("If P(k>=6) is tiny, the gate stack already concentrates "
+              "and a top-K cap adds little.")
 
     print(f"\n=== GATE ATTRIBUTION (last {days}d) ===")
     print(f"{'gate':<18}{'vetoes':>7}{'cf mean':>9}{'cf hit':>8}{'saved':>9}")
@@ -289,7 +352,8 @@ def run_report(days: int = 30) -> dict:
         print(f"(n={conviction['n']} priced entries)")
 
     report = {'generated': dt.datetime.now().isoformat(), 'days': days,
-              'gates': gates, 'conviction': conviction}
+              'gates': gates, 'conviction': conviction,
+              'admitted_k': admitted_k}
     out = BASE_DIR / 'decision_report.json'
     with open(out, 'w') as f:
         json.dump(report, f, indent=2)

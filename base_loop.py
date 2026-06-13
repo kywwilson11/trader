@@ -104,6 +104,10 @@ class BaseTradingLoop(ABC):
         self._daily_trades_date: str = datetime.date.today().isoformat()
         # Stop-breach confirmation state (2-consecutive-reading rule)
         self._pending_breach: dict[str, str] = {}
+        # Conviction instrumentation (wave-5 Tier1-1): last meta probability
+        # per symbol, stashed by _meta_gate so buy/skip rows can record it
+        # without recomputing. Measurement-only — never gates.
+        self._last_meta_p: dict[str, float] = {}
         # LLM veto strikes: liquidation needs 2 consecutive vetoing analyses
         self._veto_strikes: dict[str, int] = {}
         # Persistent prediction pool: rebuilding an executor every cycle
@@ -1057,10 +1061,14 @@ class BaseTradingLoop(ABC):
                 self.last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(1)
 
-    def _meta_gate(self, symbol: str, pred_return, snapshots: dict):
+    def _meta_gate(self, symbol: str, pred_return, snapshots: dict,
+                   rank=None):
         """Meta-labeling gate: calibrated P(this trade profits net of costs).
 
         Returns (allowed, meta_mult). No trained meta model -> neutral.
+        Stashes the computed probability in self._last_meta_p for the
+        conviction journaling (wave-5 Tier1-1), and tags the meta_veto
+        skip row with the entry rank when supplied.
         """
         try:
             from meta_label import (meta_probability_live, meta_size_mult,
@@ -1069,16 +1077,108 @@ class BaseTradingLoop(ABC):
                                       snapshots.get(symbol, {}) or {},
                                       pred_return)
             if p is None:
+                self._last_meta_p.pop(symbol, None)
                 return True, 1.0
+            self._last_meta_p[symbol] = float(p)
             if p < META_VETO_PROB:
-                log_decision({"symbol": symbol, "action": "skip",
-                              "skip_reason": "meta_veto",
-                              "pred_return": pred_return,
-                              "meta_prob": round(p, 4)})
+                rec = {"symbol": symbol, "action": "skip",
+                       "skip_reason": "meta_veto",
+                       "pred_return": pred_return,
+                       "meta_prob": round(p, 4)}
+                if rank is not None:
+                    rec["entry_rank"] = rank
+                log_decision(rec)
                 return False, 1.0
             return True, meta_size_mult(p)
         except Exception:
             return True, 1.0
+
+    # --- Conviction instrumentation (wave-5 Tier1-1, measurement-only) ---
+    # These NEVER affect control flow. They make every entry window's
+    # admitted-k and per-candidate veto attribution reconstructable from
+    # the journals, the substrate for the Stage-0 experiments that gate
+    # the conviction/concentration flagship. Disable via
+    # strategy_config.CONVICTION_JOURNAL_ENABLED.
+
+    @staticmethod
+    def _conviction_journal_on() -> bool:
+        try:
+            from strategy_config import CONVICTION_JOURNAL_ENABLED
+            return bool(CONVICTION_JOURNAL_ENABLED)
+        except Exception:
+            return True
+
+    def _conviction_tier(self, pred, meta_p) -> str:
+        """Provisional conviction tier. Tier1-1 only PLACES the field so
+        downstream code and analysis have it; the real tier definition and
+        its sizing land in Tier1-3 AFTER Stage-0 measures the rank-edge
+        gradient. A = strong signal AND strong meta; B = one of them;
+        C = neither (rare among fills since both clear their vetoes)."""
+        thr = self.trade_threshold or 0.0
+        strong_pred = thr > 0 and pred is not None and pred >= 1.5 * thr
+        strong_meta = meta_p is not None and meta_p >= 0.60
+        if strong_pred and strong_meta:
+            return 'A'
+        if strong_pred or strong_meta:
+            return 'B'
+        return 'C'
+
+    def _conv_fields(self, symbol, pred, snapshot, rank=None) -> dict:
+        """Conviction context shared by skip and buy journal rows."""
+        f = {}
+        if rank is not None:
+            f['entry_rank'] = rank
+        thr = self.trade_threshold or 0.0
+        if pred is not None and thr > 0:
+            f['pred_thresh_ratio'] = round(float(pred) / thr, 3)
+        snap = snapshot or {}
+        if snap.get('Q10') is not None:
+            f['q10'] = round(float(snap['Q10']), 4)
+        if snap.get('Q10_Floor') is not None:
+            f['q10_floor'] = round(float(snap['Q10_Floor']), 4)
+        mp = self._last_meta_p.get(symbol)
+        if mp is not None:
+            f['meta_p'] = round(float(mp), 4)
+            f['conviction_tier'] = self._conviction_tier(pred, mp)
+        return f
+
+    def _journal_skip(self, symbol, reason, rank=None, pred=None,
+                      snapshot=None, **extra):
+        """Journal a per-candidate veto row for counterfactual pricing.
+
+        Only for the conviction/risk gates worth replaying — mechanical
+        skips (already-held, cooldown, budget) are counted in the window
+        summary but not priced per-symbol."""
+        if not self._conviction_journal_on():
+            return
+        rec = {"symbol": symbol, "action": "skip", "skip_reason": reason}
+        if pred is not None:
+            rec["pred_return"] = round(float(pred), 4)
+        rec.update(self._conv_fields(symbol, pred, snapshot, rank=rank))
+        rec.update(extra)
+        try:
+            log_decision(rec)
+        except Exception:
+            pass
+
+    def _journal_entry_window(self, n_candidates, admitted, veto_counts):
+        """One summary row per entry-window cycle: admitted-k + the veto
+        breakdown across the candidate set. The cheap aggregate that
+        reconstructs the admitted-k distribution for Stage-0."""
+        if not self._conviction_journal_on() or n_candidates <= 0:
+            return
+        try:
+            log_decision({
+                "action": "entry_window",
+                "asset_type": self.get_asset_type(),
+                "n_candidates": int(n_candidates),
+                "admitted_k": len(admitted),
+                "admitted": list(admitted),
+                "veto_counts": dict(veto_counts),
+                "buys_allowed": bool(self._buys_allowed),
+            })
+        except Exception:
+            pass
 
     def _compute_position_size(self, symbol: str, pred_return: float | None,
                                quote: dict, sentiment_mult: float = 1.0,
@@ -1428,21 +1528,29 @@ class BaseTradingLoop(ABC):
         """Buy bullish symbols with all risk checks."""
         if not self._entries_allowed():
             return
+        from collections import Counter
+        vc = Counter()          # veto attribution for the window summary
+        admitted = []           # symbols that cleared every gate
+        n_candidates = 0        # symbols evaluated past the mechanical gates
         symbols = self.get_symbol_universe()
         for symbol in symbols:
             if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
+                vc['cooldown'] += 1
                 continue
 
             if self._is_hard_stop_locked(symbol):
+                vc['hard_stop_lockout'] += 1
                 continue
 
             if not self._trade_budget_ok(symbol):
+                vc['trade_budget'] += 1
                 continue
 
             # Position cap check
             if symbol in self.positions:
                 existing_value = self.positions[symbol].qty * self.positions[symbol].entry_price
                 if existing_value >= self.MAX_NOTIONAL_PER_SYMBOL:
+                    vc['position_cap'] += 1
                     continue
 
             # FAIL CLOSED: no prediction or no quote means we don't know
@@ -1451,10 +1559,14 @@ class BaseTradingLoop(ABC):
             # outage bought the whole universe ungated.)
             pred_return = preds.get(symbol)
             if pred_return is None:
+                vc['no_pred'] += 1
                 continue
             quote = self.get_quote(symbol)
             if quote is None:
+                vc['no_quote'] += 1
                 continue
+            n_candidates += 1   # a real, evaluatable candidate this window
+            snapshot = snapshots.get(symbol, {})
 
             # Prediction gate (higher bar if recently hard-stopped or mean-reverting)
             effective_threshold = self.trade_threshold
@@ -1467,12 +1579,17 @@ class BaseTradingLoop(ABC):
                                           self.trade_threshold * 1.3)
             if not should_trade(pred_return, quote['spread_pct'],
                                 asset_type=self.get_asset_type()):
+                vc['cost_floor'] += 1
+                self._journal_skip(symbol, 'cost_floor', pred=pred_return,
+                                   snapshot=snapshot)
                 continue
             if pred_return < effective_threshold:
+                vc['below_threshold'] += 1
+                self._journal_skip(symbol, 'below_threshold', pred=pred_return,
+                                   snapshot=snapshot)
                 continue
 
             # Winner's curse filter: if price > SMA20 + 2*ATR, require higher threshold
-            snapshot = snapshots.get(symbol, {})
             sma20 = snapshot.get('SMA_20')
             atr = snapshot.get('ATR')
             if sma20 and atr and quote['midpoint'] > sma20 + 2 * atr:
@@ -1480,6 +1597,9 @@ class BaseTradingLoop(ABC):
                 if pred_return is not None and pred_return < required:
                     logger.info("%s: Winner's curse filter (extended move), need %.2f got %.4f",
                                 symbol, required, pred_return)
+                    vc['winners_curse'] += 1
+                    self._journal_skip(symbol, 'winners_curse',
+                                       pred=pred_return, snapshot=snapshot)
                     continue
 
             # Correlation check
@@ -1487,11 +1607,15 @@ class BaseTradingLoop(ABC):
                 allowed, avg_corr = check_portfolio_correlation(
                     list(self.positions.keys()), symbol, self.corr_matrix)
                 if not allowed:
+                    vc['correlation'] += 1
+                    self._journal_skip(symbol, 'correlation', pred=pred_return,
+                                       snapshot=snapshot)
                     continue
 
             # Macro regime halt check
             if self.macro_regime and self.macro_regime.should_halt_stocks and self.get_asset_type() == 'stock':
                 logger.info("%s: Halted by VIX > 35", symbol)
+                vc['macro_halt'] += 1
                 continue
 
             # VIX > 25: block risky entries, allow safe-havens
@@ -1500,11 +1624,13 @@ class BaseTradingLoop(ABC):
                 from stock_config import SAFE_HAVEN_SYMBOLS
                 if symbol not in SAFE_HAVEN_SYMBOLS:
                     logger.info("%s: Blocked — VIX > 25 defensive (non-safe-haven)", symbol)
+                    vc['vix_block'] += 1
                     continue
 
             # Sentiment gate (veto first; multiplier folds into sizing tilt)
             gate, gate_reasons = sentiment_gate(symbol, self.get_asset_type())
             if gate <= 0:
+                vc['sentiment_block'] += 1
                 log_decision({"symbol": symbol, "action": "skip", "skip_reason": "sentiment_block",
                               "pred_return": pred_return,
                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons})
@@ -1515,6 +1641,7 @@ class BaseTradingLoop(ABC):
             llm_s = llm_info.get('s', 0.5)
             llm_reason = llm_info.get('r', '')
             if llm_s < LLM_VETO_THRESHOLD:
+                vc['llm_veto'] += 1
                 log_decision({"symbol": symbol, "action": "skip", "skip_reason": "llm_veto",
                               "pred_return": pred_return,
                               "llm_score": llm_s, "llm_reasoning": llm_reason})
@@ -1524,6 +1651,7 @@ class BaseTradingLoop(ABC):
             # Meta-labeling gate (veto + bounded sizing multiplier)
             meta_ok, meta_mult = self._meta_gate(symbol, pred_return, snapshots)
             if not meta_ok:
+                vc['meta_veto'] += 1
                 continue
 
             # q10 tail veto: a bullish mean prediction with a fat left
@@ -1532,6 +1660,7 @@ class BaseTradingLoop(ABC):
             q10 = snapshot.get('Q10')
             q10_floor = snapshot.get('Q10_Floor')
             if q10 is not None and q10_floor is not None and q10 < q10_floor:
+                vc['q10_tail_veto'] += 1
                 log_decision({"symbol": symbol, "action": "skip",
                               "skip_reason": "q10_tail_veto",
                               "pred_return": pred_return,
@@ -1544,6 +1673,9 @@ class BaseTradingLoop(ABC):
                 symbol, pred_return, quote,
                 sentiment_mult=gate, llm_mult=llm_mult, meta_mult=meta_mult)
             if sized_notional <= 0:
+                vc['sizing_zero'] += 1
+                self._journal_skip(symbol, 'sizing_zero', pred=pred_return,
+                                   snapshot=snapshot)
                 continue
 
             # Order timing jitter (prevent pattern detection)
@@ -1553,9 +1685,14 @@ class BaseTradingLoop(ABC):
             logger.info("%s: Sizing $%d (pred=%.4f)", symbol, sized_notional,
                         pred_return if pred_return else 0)
 
+            admitted.append(symbol)
+            conv = self._conv_fields(symbol, pred_return, snapshot)
             self._place_and_track_buy(symbol, sized_notional, pred_return, quote,
-                                      gate, gate_reasons, llm_s, llm_mult, llm_reason)
+                                      gate, gate_reasons, llm_s, llm_mult, llm_reason,
+                                      conv=conv)
             time.sleep(1)
+
+        self._journal_entry_window(n_candidates, admitted, vc)
 
     def _execute_entry_order(self, symbol, notional, quote):
         """Place and confirm the entry order. Returns (final_order, tactic).
@@ -1573,8 +1710,13 @@ class BaseTradingLoop(ABC):
         return result, 'marketable'
 
     def _place_and_track_buy(self, symbol, notional, pred_return, quote,
-                             gate, gate_reasons, llm_s, llm_mult, llm_reason):
-        """Place buy order and update position tracking. Override in subclasses for bracket orders."""
+                             gate, gate_reasons, llm_s, llm_mult, llm_reason,
+                             conv=None):
+        """Place buy order and update position tracking. Override in subclasses for bracket orders.
+
+        conv: optional conviction-context dict (wave-5 Tier1-1) merged
+        into the buy journal row.
+        """
         from market_data import get_live_atr
 
         result, entry_tactic = self._execute_entry_order(symbol, notional, quote)
@@ -1637,18 +1779,21 @@ class BaseTradingLoop(ABC):
                 decision_price = quote['midpoint']
                 slippage_bps = ((fill_price - decision_price) / decision_price * 1e4
                                 if decision_price > 0 else None)
-                log_decision({"symbol": symbol, "action": "buy",
-                              "pred_return": pred_return,
-                              "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
-                              "llm_multiplier": llm_mult, "llm_score": llm_s,
-                              "llm_reasoning": llm_reason,
-                              "final_notional": notional,
-                              "decision_price": decision_price,
-                              "fill_price": fill_price,
-                              "slippage_bps": round(slippage_bps, 2) if slippage_bps is not None else None,
-                              "entry_tactic": entry_tactic,
-                              "maker": entry_tactic.startswith('maker'),
-                              "skip_reason": None})
+                buy_rec = {"symbol": symbol, "action": "buy",
+                           "pred_return": pred_return,
+                           "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
+                           "llm_multiplier": llm_mult, "llm_score": llm_s,
+                           "llm_reasoning": llm_reason,
+                           "final_notional": notional,
+                           "decision_price": decision_price,
+                           "fill_price": fill_price,
+                           "slippage_bps": round(slippage_bps, 2) if slippage_bps is not None else None,
+                           "entry_tactic": entry_tactic,
+                           "maker": entry_tactic.startswith('maker'),
+                           "skip_reason": None}
+                if conv:
+                    buy_rec.update(conv)
+                log_decision(buy_rec)
                 self.last_trade_time[symbol] = datetime.datetime.now()
                 self._count_trade(symbol)
 

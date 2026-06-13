@@ -636,26 +636,39 @@ class StockLoop(BaseTradingLoop):
             logger.warning("[EXPOSURE] API error, skipping buys")
             return
 
-        for symbol in self.top_symbols:
+        from collections import Counter
+        vc = Counter()          # veto attribution for the window summary
+        admitted = []           # ranked names that cleared every gate
+        n_candidates = 0        # ranked candidates evaluated past mechanical gates
+        for rank, symbol in enumerate(self.top_symbols, 1):
             if symbol in self.positions:
+                vc['already_held'] += 1
                 continue
 
             if current_exposure >= self.MAX_EXPOSURE:
                 logger.info("Max exposure $%d reached, no more buys", self.MAX_EXPOSURE)
+                vc['max_exposure'] += 1
                 break
 
             # Sector-bucket cap: ranked entries cluster in one theme on
             # exactly the days that theme is running hot (factor crowding)
             if not self._bucket_room_ok(symbol):
+                vc['bucket_cap'] += 1
+                self._journal_skip(symbol, 'bucket_cap', rank=rank,
+                                   pred=preds.get(symbol),
+                                   snapshot=snapshots.get(symbol))
                 continue
 
             if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
+                vc['cooldown'] += 1
                 continue
 
             if self._is_hard_stop_locked(symbol):
+                vc['hard_stop_lockout'] += 1
                 continue
 
             if not self._trade_budget_ok(symbol):
+                vc['trade_budget'] += 1
                 continue
 
             # No new entries within a day of a known earnings print
@@ -664,6 +677,10 @@ class StockLoop(BaseTradingLoop):
                 from events_calendar import earnings_within_days
                 if earnings_within_days(symbol, days=1):
                     logger.info("%s: blocked — earnings within 1 day", symbol)
+                    vc['earnings'] += 1
+                    self._journal_skip(symbol, 'earnings', rank=rank,
+                                       pred=preds.get(symbol),
+                                       snapshot=snapshots.get(symbol))
                     continue
             except Exception:
                 pass
@@ -675,26 +692,39 @@ class StockLoop(BaseTradingLoop):
                 from edgar_events import entry_blocked
                 ev_blocked, ev_reason = entry_blocked(symbol)
                 if ev_blocked:
-                    log_decision({"symbol": symbol, "action": "skip",
-                                  "skip_reason": "edgar_event",
-                                  "detail": ev_reason})
+                    vc['edgar_event'] += 1
+                    rec = {"symbol": symbol, "action": "skip",
+                           "skip_reason": "edgar_event", "detail": ev_reason,
+                           "entry_rank": rank}
+                    log_decision(rec)
                     continue
             except Exception:
                 pass
 
             pred = preds.get(symbol)
-            if pred is None or pred < self.trade_threshold:
+            if pred is None:
+                vc['no_pred'] += 1
+                continue
+            n_candidates += 1
+            snapshot = snapshots.get(symbol, {})
+            if pred < self.trade_threshold:
+                vc['below_threshold'] += 1
+                self._journal_skip(symbol, 'below_threshold', rank=rank,
+                                   pred=pred, snapshot=snapshot)
                 continue
 
             quote = self.get_quote(symbol)
             if quote is None:
+                vc['no_quote'] += 1
                 continue
 
             if not should_trade(pred, quote['spread_pct'], asset_type='stock'):
+                vc['cost_floor'] += 1
+                self._journal_skip(symbol, 'cost_floor', rank=rank, pred=pred,
+                                   snapshot=snapshot)
                 continue
 
             # Winner's curse filter
-            snapshot = snapshots.get(symbol, {})
             sma20 = snapshot.get('SMA_20')
             atr = snapshot.get('ATR')
             if sma20 and atr and quote['midpoint'] > sma20 + 2 * atr:
@@ -702,6 +732,9 @@ class StockLoop(BaseTradingLoop):
                 if pred < required:
                     logger.info("%s: Winner's curse filter, need %.2f got %.4f",
                                 symbol, required, pred)
+                    vc['winners_curse'] += 1
+                    self._journal_skip(symbol, 'winners_curse', rank=rank,
+                                       pred=pred, snapshot=snapshot)
                     continue
 
             # Correlation check
@@ -709,29 +742,38 @@ class StockLoop(BaseTradingLoop):
                 allowed, avg_corr = check_portfolio_correlation(
                     list(self.positions.keys()), symbol, self.corr_matrix)
                 if not allowed:
+                    vc['correlation'] += 1
+                    self._journal_skip(symbol, 'correlation', rank=rank,
+                                       pred=pred, snapshot=snapshot)
                     continue
 
             # Macro regime halt
             if self.macro_regime and self.macro_regime.should_halt_stocks:
                 logger.info("%s: Halted by VIX > 35", symbol)
+                vc['macro_halt'] += 1
                 continue
 
             # VIX > 25: block risky entries, allow safe-havens
             if self.macro_regime and self.macro_regime.should_block_risky_entries:
                 if symbol not in SAFE_HAVEN_SYMBOLS:
                     logger.info("%s: Blocked — VIX > 25 defensive (non-safe-haven)", symbol)
+                    vc['vix_block'] += 1
                     continue
 
             # SPY below its 200d SMA: block non-safe-haven entries (Faber)
             if trend_ok is False and symbol not in SAFE_HAVEN_SYMBOLS:
                 logger.info("%s: Blocked — SPY below 200d SMA (trend filter)", symbol)
+                vc['trend_filter'] += 1
+                self._journal_skip(symbol, 'trend_filter', rank=rank,
+                                   pred=pred, snapshot=snapshot)
                 continue
 
             # Sentiment gate (veto first; multiplier folds into sizing tilt)
             gate, gate_reasons = sentiment_gate(symbol, 'stock')
             if gate <= 0:
+                vc['sentiment_block'] += 1
                 log_decision({"symbol": symbol, "action": "skip", "skip_reason": "sentiment_block",
-                              "pred_return": pred,
+                              "pred_return": pred, "entry_rank": rank,
                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons})
                 continue
 
@@ -740,25 +782,27 @@ class StockLoop(BaseTradingLoop):
             llm_s = llm_info.get('s', 0.5)
             llm_reason = llm_info.get('r', '')
             if llm_s < LLM_VETO_THRESHOLD:
+                vc['llm_veto'] += 1
                 log_decision({"symbol": symbol, "action": "skip", "skip_reason": "llm_veto",
-                              "pred_return": pred,
+                              "pred_return": pred, "entry_rank": rank,
                               "llm_score": llm_s, "llm_reasoning": llm_reason})
                 continue
             llm_mult = 0.5 + llm_s
 
             # Meta-labeling gate (veto + bounded sizing multiplier)
-            meta_ok, meta_mult = self._meta_gate(symbol, pred, snapshots)
+            meta_ok, meta_mult = self._meta_gate(symbol, pred, snapshots, rank=rank)
             if not meta_ok:
+                vc['meta_veto'] += 1
                 continue
 
             # q10 tail veto (fat left tail despite bullish mean)
-            _snap = snapshots.get(symbol, {}) or {}
-            q10 = _snap.get('Q10')
-            q10_floor = _snap.get('Q10_Floor')
+            q10 = snapshot.get('Q10')
+            q10_floor = snapshot.get('Q10_Floor')
             if q10 is not None and q10_floor is not None and q10 < q10_floor:
+                vc['q10_tail_veto'] += 1
                 log_decision({"symbol": symbol, "action": "skip",
                               "skip_reason": "q10_tail_veto",
-                              "pred_return": pred,
+                              "pred_return": pred, "entry_rank": rank,
                               "q10": round(q10, 4),
                               "q10_floor": round(q10_floor, 4)})
                 continue
@@ -768,6 +812,9 @@ class StockLoop(BaseTradingLoop):
                 symbol, pred, quote, sentiment_mult=gate, llm_mult=llm_mult,
                 meta_mult=meta_mult)
             if sized_notional <= 0:
+                vc['sizing_zero'] += 1
+                self._journal_skip(symbol, 'sizing_zero', rank=rank, pred=pred,
+                                   snapshot=snapshot)
                 continue
 
             # Calculate qty (whole shares)
@@ -801,6 +848,8 @@ class StockLoop(BaseTradingLoop):
             logger.info("%s: BUYING %d @ ~$%.2f (pred=%+.4f%%, stop=$%.2f, tp=$%.2f)",
                         symbol, qty, price, pred, stop_price, tp_price)
 
+            admitted.append(symbol)
+
             import random
             time.sleep(random.uniform(0, 5))
 
@@ -833,16 +882,26 @@ class StockLoop(BaseTradingLoop):
                     decision_price = quote['midpoint']
                     slippage_bps = ((fill_price - decision_price) / decision_price * 1e4
                                     if decision_price > 0 else None)
-                    log_decision({"symbol": symbol, "action": "buy",
-                                  "pred_return": pred,
-                                  "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
-                                  "llm_multiplier": llm_mult, "llm_score": llm_s,
-                                  "llm_reasoning": llm_reason,
-                                  "final_notional": sized_notional,
-                                  "decision_price": decision_price,
-                                  "fill_price": fill_price,
-                                  "slippage_bps": round(slippage_bps, 2) if slippage_bps is not None else None,
-                                  "skip_reason": None})
+                    # Conviction context + realized book stop-risk of this
+                    # fill (wave-5 Tier1-1): book_risk_pct lets Stage-0
+                    # measure how often the $5k notional cap binds before
+                    # the 0.5%-risk sizing does (notional-cap-bind audit).
+                    book_risk_pct = (round(qty * fill_price * stop_dist
+                                           / max(self._equity, 1) * 100, 4))
+                    buy_rec = {"symbol": symbol, "action": "buy",
+                               "pred_return": pred,
+                               "sentiment_gate": gate, "sentiment_reasons": gate_reasons,
+                               "llm_multiplier": llm_mult, "llm_score": llm_s,
+                               "llm_reasoning": llm_reason,
+                               "final_notional": sized_notional,
+                               "decision_price": decision_price,
+                               "fill_price": fill_price,
+                               "slippage_bps": round(slippage_bps, 2) if slippage_bps is not None else None,
+                               "book_risk_pct": book_risk_pct,
+                               "skip_reason": None}
+                    buy_rec.update(self._conv_fields(symbol, pred, snapshot,
+                                                     rank=rank))
+                    log_decision(buy_rec)
                     self.last_trade_time[symbol] = datetime.datetime.now()
                     self._count_trade(symbol)
                     estimated_exposure = current_exposure + qty * fill_price
@@ -854,8 +913,11 @@ class StockLoop(BaseTradingLoop):
                     if current_exposure > self.MAX_EXPOSURE:
                         logger.warning("[EXPOSURE] Exceeded cap after fill: $%.0f > $%.0f",
                                        current_exposure, self.MAX_EXPOSURE)
-                        break  # Stop placing more orders this cycle
+                        self._journal_entry_window(n_candidates, admitted, vc)
+                        return  # Stop placing more orders this cycle
             time.sleep(0.5)
+
+        self._journal_entry_window(n_candidates, admitted, vc)
 
     def _manage_stops(self):
         """Stock-specific: check server-side stop fills, upgrade to trailing stops."""

@@ -51,6 +51,9 @@ PORTFOLIO_VOL_TARGET = {         # annualized portfolio volatility targets
 TILT_MIN, TILT_MAX = 0.70, 1.30  # combined regime/sentiment/LLM tilt bounds
 HAR_VOL_ENABLED = True           # HAR-RV (realized range) sigma with GARCH
                                  # fallback — set False to force GARCH-only
+CONVICTION_JOURNAL_ENABLED = True  # wave-5 Tier1-1: per-candidate veto
+                                 # attribution + entry-window summaries in
+                                 # the decision journal (measurement-only)
 MIN_ORDER_NOTIONAL = 100         # skip dust orders that fees would eat
 
 # Per-symbol DAILY entry budget: signal jitter re-trading the same name all
