@@ -12,9 +12,12 @@ Promotion gates in this repo:
   - DSR > DSR_MIN on that holdout (default 0.60)
 
 Also provides a coarse CSCV-style probability-of-backtest-overfitting
-estimate from per-trial fold scores.
+estimate from per-trial fold scores, a proper Combinatorially-Symmetric
+Cross-Validation PBO when a finer per-subperiod performance matrix is
+available, and a Lo (2002) serial-correlation effective-sample correction.
 """
 
+import itertools
 import math
 
 import numpy as np
@@ -72,25 +75,38 @@ def expected_max_sharpe(n_trials: int, sr_std_across_trials: float,
 
 def deflated_sharpe_ratio(observed_sr: float, benchmark_sr: float,
                           n_obs: int, skew: float = 0.0,
-                          kurt: float = 3.0) -> float:
+                          kurt: float = 3.0,
+                          n_eff: float | None = None) -> float:
     """Probability that the TRUE Sharpe exceeds benchmark_sr.
 
     observed_sr / benchmark_sr are per-period (NOT annualized) Sharpe
     ratios over the same n_obs sample; skew/kurt are of the returns.
     Returns a probability in [0, 1]; > 0.95 is strong evidence of skill,
     < 0.5 means the result is indistinguishable from selection luck.
+
+    n_eff: effective (independent) sample size. The Sharpe estimator's
+        sampling variance is set by the number of INDEPENDENT observations,
+        not the raw row count. With overlapping forward-window labels the
+        effective count n_eff = sum(average-uniqueness) is < n_obs (see
+        sample_weights.py), so the z-statistic's sqrt(n-1) scaling must use
+        n_eff. Defaults to n_obs (IID assumption) for backward compatibility.
     """
     if n_obs < 10:
         return 0.0
+    ne = n_obs if n_eff is None else float(n_eff)
+    # Never let an effective count exceed the raw count or fall below the
+    # 10-sample floor the gate trusts.
+    ne = min(max(ne, 10.0), float(n_obs))
     denom = math.sqrt(max(
         1.0 - skew * observed_sr + ((kurt - 1.0) / 4.0) * observed_sr ** 2,
         1e-12))
-    z = (observed_sr - benchmark_sr) * math.sqrt(n_obs - 1) / denom
+    z = (observed_sr - benchmark_sr) * math.sqrt(ne - 1) / denom
     return _norm_cdf(z)
 
 
 def dsr_from_trade_returns(trade_returns, n_trials: int,
-                           sr_std_across_trials: float | None = None) -> dict:
+                           sr_std_across_trials: float | None = None,
+                           n_eff: float | None = None) -> dict:
     """End-to-end DSR for a sequence of per-trade returns.
 
     Args:
@@ -101,30 +117,38 @@ def dsr_from_trade_returns(trade_returns, n_trials: int,
         sr_std_across_trials: PER-TRADE-period std of trial Sharpe
             estimates. If None (the usual case — trial scores are
             annualized and not commensurate), uses the null sampling std
-            of a Sharpe estimator over n observations, 1/sqrt(n): under
-            H0 every config's true SR is 0 and its estimate scatters with
-            exactly that width (Lopez de Prado's "False Strategy" setup).
+            of a Sharpe estimator over n_eff observations, 1/sqrt(n_eff):
+            under H0 every config's true SR is 0 and its estimate scatters
+            with exactly that width (Lopez de Prado's "False Strategy"
+            setup). Using n_eff (not raw n) makes the expected-max null
+            WIDER when labels overlap, raising the bar the winner must clear.
+        n_eff: effective (independent) sample size from average-uniqueness
+            (sample_weights.effective_n). Defaults to the raw finite count
+            (IID assumption) — supply the measured value to de-bias the gate.
 
-    Returns dict: {sr, expected_max_sr, dsr, n}
+    Returns dict: {sr, expected_max_sr, dsr, n, n_eff}
     """
     r = np.asarray(trade_returns, dtype=np.float64)
     r = r[np.isfinite(r)]
     n = len(r)
     if n < 10 or r.std() < 1e-12:
-        return {'sr': 0.0, 'expected_max_sr': 0.0, 'dsr': 0.0, 'n': n}
+        return {'sr': 0.0, 'expected_max_sr': 0.0, 'dsr': 0.0, 'n': n,
+                'n_eff': float(n)}
+    ne = float(n) if n_eff is None else min(max(float(n_eff), 10.0), float(n))
     sr = float(r.mean() / r.std())
     centered = r - r.mean()
     m2 = float((centered ** 2).mean())
     skew = float((centered ** 3).mean() / (m2 ** 1.5 + 1e-18))
     kurt = float((centered ** 4).mean() / (m2 ** 2 + 1e-18))
     if sr_std_across_trials is None:
-        sr_std_across_trials = 1.0 / math.sqrt(n)
+        sr_std_across_trials = 1.0 / math.sqrt(ne)
     sr0 = expected_max_sharpe(n_trials, sr_std_across_trials)
     return {
         'sr': sr,
         'expected_max_sr': sr0,
-        'dsr': deflated_sharpe_ratio(sr, sr0, n, skew, kurt),
+        'dsr': deflated_sharpe_ratio(sr, sr0, n, skew, kurt, n_eff=ne),
         'n': n,
+        'n_eff': round(ne, 2),
     }
 
 
@@ -160,3 +184,134 @@ def pbo_from_fold_scores(fold_score_rows) -> float | None:
         if rank < 0.5:
             below_median += 1
     return below_median / combos if combos else None
+
+
+def _sharpe_cols(mat, cols):
+    """Per-trial Sharpe over a subset of period-columns (mean/std)."""
+    sub = mat[:, cols]
+    mu = sub.mean(axis=1)
+    sd = sub.std(axis=1)
+    out = np.zeros_like(mu)
+    nz = sd > 1e-12
+    out[nz] = mu[nz] / sd[nz]
+    return out
+
+
+def pbo_cscv(perf_matrix, n_groups: int = 8, perf_fn=None) -> dict | None:
+    """Probability of Backtest Overfitting via Combinatorially-Symmetric CV.
+
+    Bailey, Borwein, Lopez de Prado & Zhu (2017), "The Probability of Backtest
+    Overfitting" (J. Computational Finance). The honest upgrade over the coarse
+    3-fold screen in pbo_from_fold_scores.
+
+    Args:
+        perf_matrix: array shape [n_trials, T] — each row is one configuration's
+            per-subperiod performance series (e.g. per-bar net returns, or
+            per-block Sharpe contributions). Needs T >= n_groups and the
+            granularity to repartition; feed it from a hypersearch that records
+            per-subperiod scores (not just 3 fold means).
+        n_groups: S, the number of equal column groups (even). All C(S, S/2)
+            ways of choosing the IS half are evaluated; the OOS half is the
+            complement — symmetric, so every block serves as both IS and OOS.
+        perf_fn: optional (submatrix)->per-trial score; default in-sample and
+            out-of-sample Sharpe via mean/std.
+
+    Method: for each split, pick the IS-best trial, find its OOS performance
+    RANK omega in (0,1), take the logit lambda = ln(omega/(1-omega)). PBO is
+    the fraction of splits where the IS-winner lands at/below the OOS median
+    (lambda <= 0) — i.e. in-sample selection did not carry out of sample.
+
+    Returns {pbo, n_splits, median_logit, mean_oos_rank} or None if the matrix
+    is too small / degenerate.
+    """
+    m = np.asarray(perf_matrix, dtype=np.float64)
+    if m.ndim != 2:
+        return None
+    n_trials, t = m.shape
+    if n_trials < 2 or n_groups < 2 or n_groups % 2 != 0 or t < n_groups:
+        return None
+    if not np.all(np.isfinite(m)):
+        m = np.where(np.isfinite(m), m, 0.0)
+    score = perf_fn or _sharpe_cols
+
+    # Equal column groups (drop the remainder so groups are balanced).
+    gsz = t // n_groups
+    groups = [np.arange(g * gsz, (g + 1) * gsz) for g in range(n_groups)]
+    half = n_groups // 2
+
+    logits = []
+    oos_ranks = []
+    below = 0
+    n_splits = 0
+    for is_groups in itertools.combinations(range(n_groups), half):
+        is_set = set(is_groups)
+        is_cols = np.concatenate([groups[g] for g in is_groups])
+        oos_cols = np.concatenate([groups[g] for g in range(n_groups)
+                                   if g not in is_set])
+        is_perf = score(m, is_cols)
+        oos_perf = score(m, oos_cols)
+        winner = int(np.argmax(is_perf))
+        # relative OOS rank of the IS winner in (0,1): fraction of trials it
+        # beats OOS, smoothed by (n+1) so the extremes never hit 0 or 1.
+        beaten = int(np.sum(oos_perf < oos_perf[winner]))
+        omega = (beaten + 1) / (n_trials + 1)
+        omega = min(max(omega, 1e-6), 1 - 1e-6)
+        lam = math.log(omega / (1.0 - omega))
+        logits.append(lam)
+        oos_ranks.append(omega)
+        if lam <= 0.0:
+            below += 1
+        n_splits += 1
+
+    if n_splits == 0:
+        return None
+    return {
+        'pbo': below / n_splits,
+        'n_splits': n_splits,
+        'median_logit': float(np.median(logits)),
+        'mean_oos_rank': float(np.mean(oos_ranks)),
+    }
+
+
+def serial_correlation_factor(returns, max_lag: int | None = None) -> dict:
+    """Lo (2002) serial-correlation variance-inflation factor for a Sharpe.
+
+    Lo, "The Statistics of Sharpe Ratios" (FAJ 2002): when per-period returns
+    are autocorrelated, the IID Sharpe standard error is wrong. The variance
+    inflation factor is
+        f = 1 + 2 * sum_{k=1}^{q} (1 - k/n) * rho_k
+    (a Newey-West-style weighting of the sample autocorrelations rho_k). The
+    serial-correlation-adjusted effective sample size is n_eff = n / f, and the
+    annualized-Sharpe scaling shrinks by 1/sqrt(f) when f > 1 (positive
+    autocorrelation, the usual overlap case).
+
+    IMPORTANT: this is a SEPARATE effect from label-overlap uniqueness
+    (sample_weights.effective_n). Do NOT stack both n_eff reductions on the
+    same DSR — they double-count variance and the sign of rho_k matters. This
+    is provided OFF by default; opt in deliberately when serial correlation is
+    the dominant non-IID source (e.g. a single contiguous return stream).
+
+    Returns {factor, n_eff, n, max_lag, sharpe_scale} where sharpe_scale =
+    1/sqrt(max(factor, eps)) is the multiplier on an IID Sharpe.
+    """
+    r = np.asarray(returns, dtype=np.float64)
+    r = r[np.isfinite(r)]
+    n = len(r)
+    if n < 12 or r.std() < 1e-12:
+        return {'factor': 1.0, 'n_eff': float(n), 'n': n, 'max_lag': 0,
+                'sharpe_scale': 1.0}
+    q = max_lag if max_lag is not None else min(n // 4, int(round(n ** (1 / 3))) + 2)
+    q = max(1, min(q, n - 1))
+    x = r - r.mean()
+    denom = float(np.sum(x * x))
+    f = 1.0
+    for k in range(1, q + 1):
+        rho_k = float(np.sum(x[k:] * x[:-k]) / denom)
+        f += 2.0 * (1.0 - k / (q + 1.0)) * rho_k
+    # A negative factor (strong negative autocorrelation) would imply more
+    # independent info than n; floor at a small positive so n_eff stays finite
+    # and we never INFLATE n beyond the raw count.
+    f = max(f, 1e-6)
+    n_eff = min(float(n), n / f)
+    return {'factor': f, 'n_eff': n_eff, 'n': n, 'max_lag': q,
+            'sharpe_scale': 1.0 / math.sqrt(f)}

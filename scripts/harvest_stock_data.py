@@ -111,6 +111,18 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     # Recompute ALL features on full history (indicators need lookback windows)
     df = compute_stock_features(ohlcv, spy_close=spy_close, symbol=ticker)
 
+    # Per-name effective spread (Ardia-Guidotti-Kroencke EDGE), PERCENT of
+    # price, from a strictly TRAILING window — point-in-time like _DV30. This
+    # replaces the flat offline spread haircut so the meta-label / backtest /
+    # hypersearch cost matches the real-spread LIVE gate (wave 6). Never NaN
+    # (floored), so it survives the dropna below.
+    try:
+        from liquidity import edge_spread_series
+        df['Eff_Spread_Pct'] = edge_spread_series(df).values
+    except Exception as e:
+        print(f"  [SPREAD] {ticker}: EDGE stamp skipped ({e}) — "
+              f"flat fallback will be used downstream")
+
     # Multi-horizon targets: return over N bars as a percentage
     for fb in FORWARD_BARS:
         future_close = df['Close'].shift(-fb)

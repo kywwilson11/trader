@@ -1,0 +1,198 @@
+{
+  "wave": 6,
+  "date": "2026-06-13",
+  "title": "integrity-first: cost realism, non-IID overfitting, feature parsimony, capital allocation, model architecture",
+  "agents": 21,
+  "survivors": 11,
+  "killed_count": 4,
+  "logs": [
+    "11 findings survived red team, 4 refuted"
+  ],
+  "plan": {
+    "flagship": "Fix the Deflated-Sharpe / Sharpe null to use EFFECTIVE n (realized concurrency u-bar), in validation.py + hypersearch_v2.evaluate_on_holdout \u2014 because it re-grades EVERY model the gate has ever certified and is the single decisive promotion gate; nothing downstream (cost re-pricing, uniqueness weighting, feature pruning, shorts) can be honestly judged until the gate it is judged by is itself honest. It also requires persisting the realized u-bar from the concurrency Stage-0, so it co-builds with the highest-value de-biasing quantity the pipeline already harvests and throws away.",
+    "ordering_rationale": "Integrity-first and dependency-first are the same ordering here. (1) Measurement before any code (Stage 0) because the magnitude of every finding (effective-n shrinkage, spread gap, deployed-vs-total Sharpe) is unknown and the surviving caveats repeatedly warn that assumed multipliers like n/10 are unjustified; we measure on existing offline artifacts (journals are EMPTY \u2014 confirmed, so no live-fill experiment is runnable yet). (2) The VALIDATION model (DSR null + effective-n) must be corrected before anything else, because it is the final gate that grades all other work; if the gate is biased high, a cost fix or a pruned model can 'pass' on inflated DSR and we learn nothing. (3) The COST model (per-name EDGE spread) comes next because it re-prices the meta-label, q10 veto, backtest gate and hypersearch objective \u2014 i.e. it re-grades the trade set every alpha change is measured on; the live gate already sees real spread (confirmed: round_trip_cost_pct spread arg flows through), so this only removes train/deploy asymmetry, never adds edge. (4) Sample-uniqueness weighting is tier-1 alongside DSR because it PRODUCES the u-bar the corrected DSR consumes (shared dependency) and de-biases the training loss. (5) Only after gate+cost+weighting are honest do we touch alpha/structure: feature parsimony diagnostic, cross-book risk cap (a constraint, not a forecast \u2014 safe but its second validation gate needs a two-book simulator that does not exist). Everything that adds or changes signal is deferred to Tier 2 because re-grading must precede re-selecting.",
+    "stage0_experiments": [
+      {
+        "name": "Realized label-concurrency / effective-n measurement",
+        "test": "On the existing training parquet, for each forward_bars in {12,18,24,32,48}, compute per-ticker concurrency c_t from the already-harvested TB_Bars_{fb} (interval prefix-sum over [entry, entry+TB_Bars]) and average uniqueness u-bar; report u-bar distribution and N_eff/N PER BOOK (stock vs crypto) since stock TB windows are EOD-capped (~1-7 bars) while crypto runs to fb. Pure offline, no live data.",
+        "decision_criterion": "If crypto N_eff/N < ~0.3 (u-bar < 0.3), proceed with uniqueness weighting AND the effective-n DSR fix as Tier 1. If stock u-bar > ~0.6 (near-IID due to EOD cap), scope the DSR/weighting effect to crypto and treat stock as a near-no-op. Record the realized per-book u-bar as the ONLY justified n_eff input \u2014 do NOT use the hand-waved n/10."
+      },
+      {
+        "name": "Modeled-vs-realizable spread gap (per-name EDGE estimate)",
+        "test": "Install bidask (pure-Python, numpy+pandas \u2014 confirmed not installed; Jetson-trivial). Run edge_rolling over a trailing 5-10 trading-day window (35-70 hourly obs) per ticker on the harvested OHLC; produce a per-name Eff_Spread_Pct series. Compare each name's median trailing spread vs the flat backtest SPREAD_PCT['stock']=0.05 (and meta_label spread=0.05).",
+        "decision_criterion": "If the spread-aware estimate exceeds the flat 0.05 by >2x for the spec-tech names (ASTS/IONQ/QBTS/RKLB/POET/RDW/SERV, confirmed in stock_config) but is ~flat for the mega-caps, the train/deploy asymmetry is real and concentrated \u2014 proceed to thread per-bar cost. If EDGE is dominated by negative/halt-print noise on the spec-tech sleeve, fall back to Abdi-Ranaldo and apply a 2bps floor / 150bps cap before deciding."
+      },
+      {
+        "name": "DSR overstatement on currently-deployed champions",
+        "test": "Re-run hypersearch_v2.evaluate_on_holdout for the live crypto + stock champions (manifests do NOT persist holdout trade arrays \u2014 confirmed; save_artifacts saves only the summary dict \u2014 so this requires a re-inference pass, not in-memory arithmetic) and recompute DSR twice: with sr_std=1/sqrt(n) (current) and with sr_std=1/sqrt(n_eff) using the measured u-bar from experiment 1.",
+        "decision_criterion": "If a deployed champion's DSR drops below DSR_MIN=0.60 under n_eff, FLAG for shadow re-challenge (do NOT auto-pull \u2014 system never deploys/undeploys on a prior). If DSR stays >=0.60, the certified edge survives the honest bar. Either outcome is a finding."
+      },
+      {
+        "name": "LSTM-leg clustered-MDA feature diagnostic (read-only)",
+        "test": "On the souped champion (frozen, no retrain), form ~12-18 feature clusters by hierarchical linkage on sqrt(0.5*(1-rho)) computed on TRAIN-fold rows only (seed the 13 known base<->CS_Rank mirror pairs + MA_Dist/JKX ladders), then permute each cluster's columns across all seq_len lags and record net-of-cost Sharpe degradation over the 3 reused walk-forward folds. ~45 forward passes; minutes of CPU.",
+        "decision_criterion": "Rank clusters by mean delta_Sharpe across folds. Clusters with mean delta<=0 are pruning candidates. PASS to Tier-2 build ONLY as a diagnostic report; do NOT auto-prune, because importance is measured on the LSTM leg only while deployment is a fixed 0.6/0.4 LSTM+LGB ensemble (a column the LGB tree leg needs could look dead to the LSTM)."
+      }
+    ],
+    "tiers": [
+      {
+        "tier": 1,
+        "items": [
+          {
+            "name": "Effective-n correction to the Deflated-Sharpe null + observed-Sharpe z (validation.py, hypersearch_v2.evaluate_on_holdout)",
+            "why": "This is the single decisive promotion gate and it currently assumes IID (validation.py:121 sr_std=1/sqrt(n); :88 sqrt(n_obs-1)) on a holdout that pools 50-96 contemporaneously-correlated high-beta names with overlapping triple-barrier labels. Both legs bias DSR HIGH, so the gate can certify memorized/spread-erased edge. Correcting it re-grades everything downstream, so it MUST precede every alpha/cost change.",
+            "build_steps": [
+              "Add n_eff param to validation.dsr_from_trade_returns: use sr_std=1/sqrt(n_eff) for the expected_max_sharpe null AND substitute n_eff for n_obs in deflated_sharpe_ratio's sqrt(n_obs-1) z-term.",
+              "Compute n_eff at the hypersearch_v2.evaluate_on_holdout call site as sum of the holdout entries' u-bar (from the uniqueness module), NOT a fixed multiplier; report realized u-bar in the manifest.",
+              "Persist the raw holdout trade_returns array in save_artifacts so champions are re-checkable without a re-inference pass (closes the gap found in Stage-0 exp 3).",
+              "Keep DSR_MIN=0.60 but document it as now-honest; add a regression test asserting DSR(block-overlapping) < DSR(IID) for a synthetic series.",
+              "Keep the optional Lo (2002) serial-correlation factor SEPARATE and OFF by default \u2014 do not stack it on the same n_eff (double-counts variance; sign-dependent)."
+            ],
+            "files": [
+              "validation.py",
+              "scripts/hypersearch_v2.py"
+            ],
+            "expected_impact": "Gate statistic moves down (honest); some currently-saved champions may fail re-validation. No P&L change \u2014 this is pure integrity. Direction unambiguous (current DSR overstated).",
+            "validated_by": "Existing purged-WF + 12% calendar holdout + DSR gate, re-run weighted-vs-unweighted with same study seed; unit test on synthetic IID vs overlapping; flag (not pull) any champion that now fails.",
+            "risks": "n_eff has no source until the uniqueness module ships \u2014 co-build with it. Magnitude unknown until u-bar measured (Stage-0 exp 1); do not pre-commit to n/10. Re-running every weekly retrain creates a repeated multiple-comparisons surface vs the same holdout \u2014 log trial counts so DSR accounting stays honest.",
+            "jetson_note": "Pure numpy arithmetic on arrays already in memory at gate time (plus one concurrency prefix-sum). Sub-second; no GPU; no new dependency."
+          },
+          {
+            "name": "Concurrency-based sample weights (average uniqueness) for LSTM loss, LightGBM mean+q10, and meta-learner",
+            "why": "ZERO uniqueness weighting exists; the LSTM weights only by clamp(|y|+1,max=50) and LightGBM/meta/q10 are uniform. TB_Bars_{fb} (the exact per-sample label span) is harvested then dropped at hypersearch_v2 load (confirmed: exclude_cols drops all TB_). Overlapping labels are over-counted ~1/u-bar times, driving memorization. This module also PRODUCES the n_eff the DSR fix consumes \u2014 shared dependency, build together.",
+            "build_steps": [
+              "New module sample_weights.py: numba av_uniqueness(entry_idx, hold_bars, n_bars, ticker_boundaries) -> per-row u-bar via per-ticker interval prefix-sums (numba already a dep, indicators.py:12).",
+              "Combine w_i = u_bar_i * clamp(|r_i|+1,max=50); normalize mean->1 PER BOOK / per training run (not globally) so crypto-vs-stock balance is preserved.",
+              "hypersearch_v2.load_data: STOP dropping TB_Bars; carry an all_uniqueness array parallel to all_returns_by_fb (uniqueness is per-fb).",
+              "Replace the torch.clamp weight tensor at the LSTM loss (lines ~673/724) with the gathered w_i for the batch.",
+              "model_lgb.train_lgb: add sample_weight param -> lgb.Dataset(weight=...); thread through train_lgb_ensemble for mean AND q10; weight meta-replay trades by their realized-exit TB_Bars."
+            ],
+            "files": [
+              "sample_weights.py",
+              "scripts/hypersearch_v2.py",
+              "model_lgb.py",
+              "meta_label.py"
+            ],
+            "expected_impact": "In-search fold Sharpes drop ~10-30%; holdout-vs-search gap NARROWS; simpler Optuna configs (smaller hidden_dim, higher dropout) start winning. Integrity win, not a promised P&L lift. Effect is crypto-heavy (stock EOD-capped per Stage-0 exp 1).",
+            "validated_by": "Re-run purged-WF + holdout + corrected-DSR gate weighted vs unweighted; success = gap shrinks AND DSR>=0.60 under corrected null; then 14-28d DM-HLN challenger shadow (shadow.py) must show weighted champion not worse live.",
+            "risks": "w_i form is the author's hybrid, not canonical get_weights_by_return \u2014 defensible but document. Global mean-1 normalization would silently re-weight crypto vs stock \u2014 must normalize per-book. P&L improvement genuinely uncertain.",
+            "jetson_note": "O(N) per-ticker interval prefix-sum, sub-second for 300k rows, no new dep, no GPU. LightGBM sample_weight and the LSTM weight tensor are already on the hot path."
+          },
+          {
+            "name": "Per-name EDGE effective-spread replaces the flat SPREAD_PCT in TB-net cost (meta_label, backtest gate, hypersearch objective)",
+            "why": "The offline cost is FLAT (backtest.py:37 SPREAD_PCT stock 0.05; meta_label.py:210 spread=0.05; hypersearch TXN_COST_PCT 0.11) while the live gate sees REAL quote spread (confirmed: round_trip_cost_pct spread arg flows to the gate). So the meta-label is trained on net@0.05%-spread but deployed behind a real-spread gate \u2014 fake +net on wide-spread spec-tech names, and the DSR gate certifies it. This re-prices the trade set every alpha change is graded on, so it precedes alpha work.",
+            "build_steps": [
+              "New module liquidity.py: edge_spread_series(ohlc_df, window_days=5) wrapping bidask.edge_rolling on per-ticker hourly bars; clip negatives to ~2bps floor, cap ~150bps.",
+              "harvest_stock_data.prepare_stock_data: stamp Eff_Spread_Pct per bar from a TRAILING window only \u2014 mirror the existing _DV30 trailing per-ticker stamp (confirmed PIT-clean template at harvest_stock_data.py:212-219) to preserve point-in-time integrity.",
+              "Keep compute_tb_labels GROSS (correct). Make the single cost choke point per-bar: meta_label._gen_meta_rows net (line ~232) and backtest.simulate_ticker net (line ~217) subtract bar Eff_Spread_Pct + fees instead of round_trip_cost_pct(asset, FLAT).",
+              "hypersearch_v2.simulate_trades: change the scalar txn_cost arg to a per-bar cost array concatenated per-ticker into the same contiguous index space as all_returns_by_fb.",
+              "Leave fees.py fee constants and the live gate untouched \u2014 only the SPREAD component becomes per-name; offline now matches live."
+            ],
+            "files": [
+              "liquidity.py",
+              "scripts/harvest_stock_data.py",
+              "meta_label.py",
+              "backtest.py",
+              "scripts/hypersearch_v2.py",
+              "fees.py"
+            ],
+            "expected_impact": "Liquid mega-caps ~unchanged (0.05 was ~right); spec-tech sleeve shows LOWER, more honest net and fewer admitted marginal trades. One-sided: removes fake edge, never adds returns. Lowers live-vs-backtest slippage on the spec-tech sleeve.",
+            "validated_by": "NON-CIRCULAR ANCHOR: once journals accumulate fills, shadow-mode check that execution_report.py realized implementation shortfall converges toward the model's assumed per-name spread (the holdout-DSR comparison alone is mildly circular). Promotion hinges on shortfall convergence, not the DSR drop.",
+            "risks": "EDGE is RMS over the window, noisy on ~35-70 obs \u2014 use edge_rolling not edge(), Abdi-Ranaldo fallback. PIT holds ONLY with a strictly trailing window. Threads a per-bar cost array through 3 call sites incl. the hypersearch search core \u2014 regression-test the 451-test suite. bidask not installed (pip install needed)."
+          }
+        ]
+      },
+      {
+        "tier": 2,
+        "items": [
+          {
+            "name": "Cluster_robust feature preset as a shadow challenger (ensemble-aware importance)",
+            "why": "34% of the 76-feature stock vector is base<->CS_Rank mirror duplicates plus correlated MA_Dist/JKX/momentum ladders; no feature selector exists (confirmed). Clustered MDA is the only substitution-effect-robust selector valid on this set. Deferred to Tier 2 because it CHANGES the model and must be graded by the already-corrected gate (Tier 1) and cost model.",
+            "build_steps": [
+              "New feature_select.py: cluster_features(corr) via scipy linkage on sqrt(0.5*(1-rho)) on TRAIN-fold rows only; clustered_mda permuting each cluster across all lags, scored via the existing compute_sharpe.",
+              "Extend importance to permute a FROZEN LGB leg too (not LSTM-only) so a column the trees need is not pruned \u2014 the Stage-0 caveat.",
+              "Materialize survivors as an indicator_config.py 'cluster_robust' preset; do NOT auto-set as default.",
+              "Run hypersearch_v2 --preset cluster_robust as a --shadow challenger; log trial count for DSR multiple-comparisons accounting."
+            ],
+            "files": [
+              "feature_select.py",
+              "indicator_config.py",
+              "scripts/hypersearch_v2.py",
+              "shadow.py"
+            ],
+            "expected_impact": "DIAGNOSIS near-certain (which clusters carry joint OOS edge). Pruned-model Sharpe flat-to-modestly-up; real win is lower PBO / tighter fold-std + smaller artifacts + faster weekly retrain. No Sharpe jump promised.",
+            "validated_by": "Same 12% holdout + corrected DSR>=0.60, then backtest.py --gate, then live DM-HLN promotion (a feature-set swap is a MODEL change \u2014 permitted by the kill-list, which forbids only POLICY changes via shadow DM-HLN).",
+            "risks": "LSTM-only importance can drop an LGB-needed column unless ensemble-aware. Deployment artifact is a static preset chosen using val-fold evidence \u2014 re-gated on freshly trained model so acceptable, not fully fold-pure. Do NOT promise the inference-cost 'halving' (LGB inference is tree-traversal, independent of column count; per-bar feature compute unchanged unless harvest code is also edited).",
+            "jetson_note": "K~12-18 clusters x 3 reused folds on a frozen souped LSTM = ~45 forward passes, minutes of CPU, run once per weekly retrain as offline diagnostic."
+          },
+          {
+            "name": "Cross-book account risk cap (risk_budget.py) netting the two books' stop-risk",
+            "why": "Both loops set _equity from the SAME account.equity (base_loop.py:1224 risk_dollars=_equity*RISK_PCT_PER_TRADE) and the ENB cap (MAX_BOOK_RISK_PCT=0.025) is enforced PER BOOK (line 1362), so combined single-factor stop-risk reaches ~5%. Stock book holds COIN/MSTR/MARA (tagged crypto_proxy) while crypto holds spot BTC/ETH \u2014 same factor, books do NOT diversify. ADDS a constraint (low overfit risk), but deferred because its terminal-wealth validation gate needs a two-book simulator that does not exist.",
+            "build_steps": [
+              "risk_budget.py: lock-guarded process-shared AccountRiskState tracking total open stop-risk = sum over BOTH books of _book_stop_risks() and a measured cross-book rho.",
+              "In base_loop._compute_position_size after the per-book ENB block (~1348-1378), add an ACCOUNT gate: marginal contribution to diversified_book_risk over (all positions both books + candidate) at cross-book rho; shrink/block above ACCOUNT_RISK_CAP (~0.03).",
+              "Allocate the cap by inverse realized book-vol, clamped [0.25,0.75] each; recompute daily. FAIL-OPEN: any missing input -> today's per-book caps.",
+              "Reconcile crypto non-marginable settled-cash vs stock Reg-T buying power on the shared equity object."
+            ],
+            "files": [
+              "risk_budget.py",
+              "base_loop.py",
+              "run_bots.py",
+              "portfolio.py",
+              "strategy_config.py"
+            ],
+            "expected_impact": "Worst-case single-factor stop-risk drops ~5%->~3%. Day-to-day Sharpe effect small (cash drag keeps books under-deployed); value is left-tail/drawdown insurance on the 5-10 worst correlated-crash days/year.",
+            "validated_by": "GATE 1 (runnable now): journal per-cycle total account stop-risk + realized cross-book rho for 2-4 weeks; confirm 'combined >2.5%' events occur and rho is high in risk-off. GATE 2 (needs new build): two-book concurrent-equity simulator extending backtest.py; promote only if max-drawdown improves with DSR not degraded.",
+            "risks": "Circuit breaker is ALREADY account-level (order_utils:547) \u2014 claim mis-stated there; the real defect is sizing double-count only. Gate 2 simulator is the bulk of the work and easy to get wrong (crypto 24/7 vs stock RTH concurrency windows); built-to-pass is an overfit-the-validator risk. Use trailing-only PIT rho.",
+            "jetson_note": "One cached get_account, a 2x2-to-100x100 LedoitWolf corr the app already runs, one lock-guarded shared state object. Trivial."
+          },
+          {
+            "name": "Regime-conditional cost as a META FEATURE (option B only)",
+            "why": "Spreads on spec-tech names widen with VIX (commonality in liquidity); the meta-learner has no cost-regime feature (only Volatility_12h/ATR_Pct). Lowest-priority refinement, partly redundant with Tier-1 per-name EDGE (trailing window absorbs some widening) and with the live quoted spread (the live gate already widens in real time \u2014 the claim's live gap is overstated).",
+            "build_steps": [
+              "Build a FRED VIXCLS daily-CSV history merge (free, 1-day lagged) into harvest + a live VIX in the meta snapshot; add an Amihud ILLIQ column from OHLCV.",
+              "Add VIX bucket / panel-illiquidity as a meta_label feature; let the learner discover the cost-regime interaction.",
+              "Do NOT build option A (regressing realized shortfall on contemporaneous VIX into the gate) \u2014 look-ahead/feedback hazard."
+            ],
+            "files": [
+              "meta_label.py",
+              "macro_indicators.py",
+              "scripts/harvest_stock_data.py"
+            ],
+            "expected_impact": "Marginal. Directionally right (don't under-charge cost in stress) but magnitude small; stress regimes rare in the 12% holdout with intraday flatten.",
+            "validated_by": "Meta feature-importance + partial dependence on the VIX/illiquidity term; PBO/DSR must not degrade. High-VIX-tercile net-Sharpe check \u2014 but underpowered, so require a minimum trade count and treat a null as non-informative, not a pass.",
+            "risks": "PIT VIX history is net-new code (live-only today). Validation is the binding weakness (rare stress regimes). Build only after Tier-1 EDGE so the incremental signal is measurable.",
+            "jetson_note": "One scalar per bar; negligible CPU."
+          }
+        ]
+      }
+    ],
+    "rejected": [
+      {
+        "name": "Realized-shortfall feedback loop re-pricing offline label cost",
+        "reason": "Depends on a phantom EDGE term and on journal data that does not exist (journals/ is empty \u2014 confirmed; execution_report run_report returns {} on zero fills). Per-(symbol,reason) cells would shrink to the global prior for months. Cross-era look-ahead: relabeling years of historical panel with a live-era-only realized-cost series is impossible pre-journal. Superseded by Tier-1 per-name EDGE (offline, PIT, no live data needed)."
+      },
+      {
+        "name": "Sequential bootstrap for the LightGBM bagging legs",
+        "reason": "Substitute, not complement, for uniqueness weighting (same non-IID-overlap defect) and the proposal itself says do weighting first and that the P&L effect is 'probably within noise.' One-argument lgb.Dataset(weight=u_bar) captures most of the benefit; a numba sparse-bootstrap kernel is poor ROI at this scale."
+      },
+      {
+        "name": "Marchenko-Pastur denoising of the feature correlation matrix",
+        "reason": "Denoises a target that does not exist \u2014 no clustering, MDA, PCA-whitening, or correlation-matrix estimation in the codebase. Pure dependency of unbuilt selectors; zero standalone effect; the LSTM/LGB never consume the off-diagonal correlation structure."
+      },
+      {
+        "name": "Strategy-level (account) volatility targeting",
+        "reason": "backtest.py replays per-ticker bare net_pct with no shared-equity timeline, so a constant scalar is mathematically invisible to the metric (mean and std both scale by s) and a time-varying de-risk scalar has no engine to run on. De-risk-only clamp [0.5,1.0] captures only the left-tail half of the mechanism and pins at 1.0 on a mostly-cash sparse-position book \u2014 marginal. Building a bespoke simulator to pass the gate is overfit-the-validator risk. The cross-book risk cap (Tier 2) is the defensible version of the same drawdown-insurance intent."
+      },
+      {
+        "name": "Halve Jetson inference cost via the pruned feature core (as a standalone cost claim)",
+        "reason": "LGB INFERENCE cost is tree-traversal, independent of candidate column count (the '2x LGB reduction' conflates training/histogram cost with inference). Per-bar feature compute is unchanged because compute_stock_features and compute_live_panel_ranks build all columns regardless of preset. LSTM saving is only the input-projection slice. The parsimony GOAL survives folded into the Tier-2 cluster_robust preset (smaller artifacts, faster weekly retrain, LSTM denoising), but the 'halve inference cost' framing is dropped."
+      }
+    ]
+  },
+  "killed_findings": [
+    "Close the realized-shortfall feedback loop: trailing per-symbol/regime effective cost from journals re-prices the offline label cost (no look-ahead)",
+    "Sequential bootstrap for the LightGBM bagging legs (mean + q10) to draw near-IID in-bag samples instead of uniform bagging_fraction",
+    "Marchenko-Pastur denoising of the feature correlation matrix to make MDA trustworthy and to drop pure-noise eigen-directions before selection",
+    "Strategy-level (account) volatility targeting \u2014 defensible HERE because the signal is a cross-sectional momentum ranker (the one factor family where vol-management survives out-of-sample)"
+  ]
+}

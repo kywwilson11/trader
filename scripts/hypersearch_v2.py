@@ -156,6 +156,10 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
     exclude_cols = ['Ticker', 'Date', 'Datetime', 'NextClose']
     exclude_cols += [c for c in df.columns if c.startswith('Target_Return')]
     exclude_cols += [c for c in df.columns if c.startswith('TB_')]
+    # Eff_Spread_Pct is a per-bar COST annotation (wave 6), not a predictive
+    # feature, and is not computed on the live path — including it would both
+    # leak cost into the inputs and break train/live feature parity.
+    exclude_cols += ['Eff_Spread_Pct']
     feature_cols = [c for c in df.columns if c not in exclude_cols]
     feature_cols = [c for c in feature_cols if df[c].dtype in ['float64', 'float32', 'int64', 'int32']]
 
@@ -185,7 +189,13 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
     all_features_list = []
     all_returns_dict = {fb: [] for fb in FORWARD_BARS}
     all_tb_dict = {fb: [] for fb in FORWARD_BARS}
+    # Per-row label SPAN (bars held) — kept so the holdout gate and the
+    # training loss can weight by average uniqueness (sample_weights.py).
+    # Previously TB_Bars_* were dropped at load; that discarded the only
+    # signal that says how non-IID the overlapping labels are.
+    all_tb_bars_dict = {fb: [] for fb in FORWARD_BARS}
     has_tb = any(f'TB_Ret_{fb}' in df.columns for fb in FORWARD_BARS)
+    has_tb_bars = any(f'TB_Bars_{fb}' in df.columns for fb in FORWARD_BARS)
     all_times_list = []
     all_label_times_list = []
     ticker_boundaries = {}
@@ -216,6 +226,10 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
             tb_col = f'TB_Ret_{fb}'
             if has_tb and tb_col in tdf.columns:
                 all_tb_dict[fb].append(tdf[tb_col].values.astype(np.float32))
+            bars_col = f'TB_Bars_{fb}'
+            if has_tb_bars and bars_col in tdf.columns:
+                all_tb_bars_dict[fb].append(
+                    tdf[bars_col].values.astype(np.float32))
 
         ticker_boundaries[ticker] = (offset, offset + len(features))
         offset += len(features)
@@ -224,6 +238,7 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
     all_times = np.concatenate(all_times_list)
     all_label_times = np.concatenate(all_label_times_list)
     all_returns_by_fb = {}
+    all_tb_bars_by_fb = {}
     for fb in FORWARD_BARS:
         if all_returns_dict[fb]:
             all_returns_by_fb[fb] = np.concatenate(all_returns_dict[fb])
@@ -232,11 +247,20 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
         # search can choose target_kind per trial
         if has_tb and all_tb_dict[fb] and len(all_tb_dict[fb]) == len(all_returns_dict[fb]):
             all_returns_by_fb[('tb', fb)] = np.concatenate(all_tb_dict[fb])
+        # Per-row label spans (bars held), aligned to the same contiguous
+        # ticker-concatenated index as all_returns_by_fb[fb].
+        if has_tb_bars and all_tb_bars_dict[fb] and \
+                len(all_tb_bars_dict[fb]) == len(all_returns_dict[fb]):
+            all_tb_bars_by_fb[fb] = np.concatenate(all_tb_bars_dict[fb])
     if has_tb:
         print(f"Triple-barrier targets available: "
               f"{sorted(k[1] for k in all_returns_by_fb if isinstance(k, tuple))}")
+    if all_tb_bars_by_fb:
+        print(f"Label-span (TB_Bars) horizons for uniqueness weighting: "
+              f"{sorted(all_tb_bars_by_fb)}")
 
-    del all_features_list, all_returns_dict, all_tb_dict, all_times_list, all_label_times_list, df
+    del all_features_list, all_returns_dict, all_tb_dict, all_tb_bars_dict
+    del all_times_list, all_label_times_list, df
     gc.collect()
 
     print(f"Contiguous arrays: {all_features.shape}, {all_features.nbytes / 1e6:.1f} MB")
@@ -244,7 +268,8 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
 
     return (all_features, all_returns_by_fb, all_times, all_label_times,
             tickers, ticker_boundaries,
-            feature_cols, input_dim, preset_name, has_multi_horizon)
+            feature_cols, input_dim, preset_name, has_multi_horizon,
+            all_tb_bars_by_fb)
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +368,7 @@ BARS_PER_YEAR = {'crypto': 8760, 'stock': 1638}
 
 
 def simulate_trades(predictions, actual_returns, threshold, forward_bars,
-                    txn_cost_pct):
+                    txn_cost_pct, return_entries=False):
     """Non-overlapping hold simulation. Returns per-trade net returns.
 
     The model predicts the fb-bar forward return, so once a position is
@@ -351,24 +376,35 @@ def simulate_trades(predictions, actual_returns, threshold, forward_bars,
     The old simulator counted every signal bar as an independent trade
     earning the full overlapping fb-bar return — inflating scores by
     ~sqrt(fb) and mechanically favoring the longest horizon.
+
+    return_entries: also return an int array of the row index (into the
+        input arrays) each trade was entered at — lets the holdout gate map
+        a trade back to its label span for the effective-n / uniqueness
+        deflation (sample_weights.py).
     """
     n = len(predictions)
     trade_returns = []
+    entries = []
     i = 0
     while i < n:
         p = predictions[i]
         r = actual_returns[i]
         if p > threshold and np.isfinite(r):
             trade_returns.append(r - txn_cost_pct)
+            entries.append(i)
             i += forward_bars
         elif p < -threshold and np.isfinite(r):
             # Short side: realize the negated move (long-only live, but the
             # signal's bear accuracy still matters for exits)
             trade_returns.append(-r - txn_cost_pct)
+            entries.append(i)
             i += forward_bars
         else:
             i += 1
-    return np.asarray(trade_returns, dtype=np.float64)
+    ret = np.asarray(trade_returns, dtype=np.float64)
+    if return_entries:
+        return ret, np.asarray(entries, dtype=np.int64)
+    return ret
 
 
 def compute_sharpe(predictions, actual_returns, threshold, forward_bars=24,
@@ -990,7 +1026,8 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
 
 def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                         all_times, all_label_times, tickers, ticker_boundaries,
-                        input_dim, asset_type, n_trials, trial_values):
+                        input_dim, asset_type, n_trials, trial_values,
+                        all_tb_bars_by_fb=None):
     """Score the winning config ONCE on the untouched final time slice.
 
     Returns {'sharpe', 'dsr', 'dsr_min', 'n_trades', 'n_rows'} or None.
@@ -1035,19 +1072,61 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
 
         sharpe = compute_sharpe(preds, y, threshold, forward_bars=fb,
                                 asset_type=asset_type)
-        trade_returns = simulate_trades(preds, y, threshold, fb,
-                                        TXN_COST_PCT.get(asset_type, 0.6))
-        # Null-parameterized deflation: each of n_trials configs' SR
-        # estimate scatters ~1/sqrt(n_trades) under no-skill.
-        dsr = dsr_from_trade_returns(trade_returns, n_trials=n_trials)
+        trade_returns, entry_pos = simulate_trades(
+            preds, y, threshold, fb, TXN_COST_PCT.get(asset_type, 0.6),
+            return_entries=True)
+
+        # Effective-n deflation: the DSR null assumes n INDEPENDENT trade-SR
+        # draws. With overlapping forward-window labels the effective count
+        # is sum(average-uniqueness) < n, so the no-skill expected-max bar is
+        # actually higher. Measure n_eff from the realized trades' label
+        # spans (TB_Bars) instead of assuming IID. Falls back to IID (n_eff
+        # = n) when spans were not harvested — the gate is never loosened.
+        n_eff = None
+        u_bar_traded = None
+        if all_tb_bars_by_fb and fb in all_tb_bars_by_fb and len(entry_pos):
+            try:
+                from sample_weights import average_uniqueness, effective_n
+                # Concurrency is computed among the TRADED labels ONLY — a
+                # trade's independence is measured against the other trades
+                # the gate counts, not against every (non-traded) panel bar.
+                # Mask: only traded rows carry their span; all else is NaN
+                # (NaN rows neither hold nor count concurrency). Because
+                # simulate_trades skips fb bars after each entry and a label
+                # span is <= fb, holdout trades are near-non-overlapping, so
+                # n_eff ~ n_trades here by construction — the correction bites
+                # only if a model's realized entries crowd inside their holds.
+                tb = all_tb_bars_by_fb[fb]
+                global_rows = holdout_idx[entry_pos]
+                masked = np.full(len(tb), np.nan, dtype=np.float64)
+                masked[global_rows] = tb[global_rows]
+                u_all = average_uniqueness(masked, ticker_boundaries)
+                u_bar_traded = u_all[global_rows]
+                n_eff = effective_n(u_bar_traded)
+            except Exception as ue:
+                print(f"  [HOLDOUT] uniqueness n_eff unavailable ({ue}) — "
+                      f"falling back to IID null")
+                n_eff = None
+
+        dsr = dsr_from_trade_returns(trade_returns, n_trials=n_trials,
+                                     n_eff=n_eff)
         del mdl, scaled
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        u_bar_mean = (round(float(np.nanmean(u_bar_traded)), 4)
+                      if u_bar_traded is not None and len(u_bar_traded)
+                      else None)
         return {'sharpe': round(float(sharpe), 4),
                 'dsr': round(float(dsr['dsr']), 4),
                 'dsr_min': DSR_MIN,
                 'n_trades': int(dsr['n']),
+                'n_eff': dsr.get('n_eff'),
+                'u_bar_mean': u_bar_mean,
+                # Persist the realized holdout trade returns so a champion's
+                # DSR is re-checkable later without a full re-inference pass
+                # (closes the gap where save_artifacts kept only the summary).
+                'trade_returns': [round(float(x), 6) for x in trade_returns],
                 'n_rows': int(len(holdout_idx)),
                 # Net-of-cost hit rate — the CUSUM live monitor's baseline
                 'hit_rate': (round(float(np.mean(trade_returns > 0)), 4)
@@ -1167,8 +1246,8 @@ def main():
     (all_features, all_returns_by_fb, all_times, all_label_times,
      tickers, ticker_boundaries,
      feature_cols, input_dim, preset_name,
-     has_multi_horizon) = load_data(args.data, preset_override=args.preset,
-                                     max_rows=args.max_rows)
+     has_multi_horizon, all_tb_bars_by_fb) = load_data(
+         args.data, preset_override=args.preset, max_rows=args.max_rows)
 
     best_state_holder = {'state': None, 'scaler': None, 'score': 0.0, 'cfg': None}
     _state_cache = {}
@@ -1324,14 +1403,17 @@ def main():
             tickers, ticker_boundaries, input_dim, asset_type,
             n_trials=max(len(completed_trials), 2),
             trial_values=[t.value for t in completed_trials],
+            all_tb_bars_by_fb=all_tb_bars_by_fb,
         )
         gate_ok = (holdout_report is not None
                    and holdout_report['sharpe'] > 0
                    and holdout_report['dsr'] >= holdout_report['dsr_min'])
 
         if not gate_ok:
+            _hr = ({k: v for k, v in holdout_report.items()
+                    if k != 'trade_returns'} if holdout_report else None)
             print(f"\nModel NOT saved: failed holdout gate "
-                  f"({holdout_report})")
+                  f"({_hr})")
             print("A higher in-search score that cannot clear unseen data "
                   "is selection bias, not skill.")
         else:

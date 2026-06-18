@@ -181,6 +181,18 @@ def simulate_ticker(tdf, preds, asset_type: str, threshold: float,
 
     rt_cost = round_trip_cost_pct(asset_type, SPREAD_PCT[asset_type])
     edge_floor = required_edge_pct(asset_type, SPREAD_PCT[asset_type])
+    # Per-bar effective-spread cost when harvested (wave 6) — the net P&L is
+    # charged the real per-name spread, matching the live gate, instead of the
+    # flat SPREAD_PCT. The entry edge_floor stays on the (conservative) flat
+    # spread so admission is unchanged; only realized net cost is per-bar.
+    rt_cost_arr = None
+    if 'Eff_Spread_Pct' in tdf.columns:
+        try:
+            from liquidity import per_bar_round_trip_cost
+            rt_cost_arr = per_bar_round_trip_cost(
+                asset_type, tdf['Eff_Spread_Pct'].values)
+        except Exception:
+            rt_cost_arr = None
     cooldown_bars = max(1, int(math.ceil(policy['cooldown_min'] / 60)))
     lockout_bars = int(policy['lockout_hours'])
 
@@ -214,7 +226,8 @@ def simulate_ticker(tdf, preds, asset_type: str, threshold: float,
         exit_reason = REASON_NAMES.get(int(reason_code[i]), 'end_of_data')
 
         gross = (exit_price - entry_price) / entry_price * 100.0
-        net = gross - rt_cost
+        cost_i = rt_cost if rt_cost_arr is None else float(rt_cost_arr[i])
+        net = gross - cost_i
         trades.append({
             'entry_time': str(times[i]), 'exit_time': str(times[j]),
             'entry': float(entry_price), 'exit': exit_price,
@@ -238,7 +251,10 @@ def aggregate_metrics(all_trades: list[dict], asset_type: str,
                 'win_rate': 0.0, 'max_drawdown_pct': 0.0, 'avg_hold_bars': 0.0,
                 'fees_paid_pct': 0.0}
     rets = np.array([t['net_pct'] for t in all_trades])
-    rt_cost = round_trip_cost_pct(asset_type, SPREAD_PCT[asset_type])
+    # Exact realized cost = gross - net summed over trades (per-bar spread
+    # aware); replaces the flat rt_cost * n_trades estimate.
+    gross_total = float(sum(t['gross_pct'] for t in all_trades))
+    fees_paid = gross_total - float(rets.sum())
 
     ordered = sorted(all_trades, key=lambda t: t['exit_time'])
     equity = np.cumsum([t['net_pct'] for t in ordered])
@@ -256,11 +272,11 @@ def aggregate_metrics(all_trades: list[dict], asset_type: str,
         'sharpe': round(sharpe, 3),
         'dsr': round(dsr['dsr'], 4),
         'net_total_pct': round(float(rets.sum()), 2),
-        'gross_total_pct': round(float(sum(t['gross_pct'] for t in all_trades)), 2),
+        'gross_total_pct': round(gross_total, 2),
         'win_rate': round(float((rets > 0).mean()), 3),
         'max_drawdown_pct': round(max_dd, 2),
         'avg_hold_bars': round(float(np.mean([t['bars_held'] for t in all_trades])), 1),
-        'fees_paid_pct': round(rt_cost * len(rets), 2),
+        'fees_paid_pct': round(fees_paid, 2),
         'trades_per_year': round(trades_per_year, 1),
         'exit_reasons': {r: sum(1 for t in all_trades if t['reason'] == r)
                          for r in {t['reason'] for t in all_trades}},

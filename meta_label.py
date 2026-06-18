@@ -209,6 +209,17 @@ def _gen_meta_rows(tdf, preds, asset_type, threshold, policy):
 
     spread = 0.10 if asset_type == 'crypto' else 0.05
     rt_cost = round_trip_cost_pct(asset_type, spread)
+    # Per-bar effective-spread cost when the harvest stamped it (wave 6):
+    # removes the train/deploy asymmetry vs the real-spread live gate. Falls
+    # back to the flat rt_cost per bar when Eff_Spread_Pct is absent.
+    rt_cost_arr = None
+    if 'Eff_Spread_Pct' in tdf.columns:
+        try:
+            from liquidity import per_bar_round_trip_cost
+            rt_cost_arr = per_bar_round_trip_cost(
+                asset_type, tdf['Eff_Spread_Pct'].values)
+        except Exception:
+            rt_cost_arr = None
     cooldown_bars = max(1, int(math.ceil(policy['cooldown_min'] / 60)))
     entry_threshold = threshold * META_THRESHOLD_FRACTION
 
@@ -229,7 +240,8 @@ def _gen_meta_rows(tdf, preds, asset_type, threshold, policy):
             i += 1
             continue
         j = int(exit_idx[i])
-        net = (float(exit_px[i]) - closes[i]) / closes[i] * 100.0 - rt_cost
+        cost_i = rt_cost if rt_cost_arr is None else float(rt_cost_arr[i])
+        net = (float(exit_px[i]) - closes[i]) / closes[i] * 100.0 - cost_i
         rows.append(feats_all[i])
         labels.append(1 if net > 0 else 0)
         nets.append(net)
