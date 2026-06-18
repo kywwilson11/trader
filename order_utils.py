@@ -123,6 +123,60 @@ def compute_limit_price(side, quote_info, offset_bps=5):
         return round(mid - effective_offset, 4)
 
 
+def _round_price_band(px, asset_type='stock'):
+    """Per-price-band tick rounding (wave-7): equities round to 2dp at/above
+    $1 and 4dp below $1 — sub-penny limits on >=$1 names are rejected and
+    become silent non-fills. Crypto keeps finer resolution."""
+    px = float(px)
+    if asset_type == 'crypto':
+        return round(px, 6 if px < 1 else 2)
+    return round(px, 2 if px >= 1.0 else 4)
+
+
+def _bid_ask(quote_info):
+    """Best bid/ask from a quote dict, deriving from midpoint+spread_pct when
+    explicit bid/ask are absent (spread_pct is the FULL spread, % of price)."""
+    bid = quote_info.get('bid')
+    ask = quote_info.get('ask')
+    if bid and ask:
+        return float(bid), float(ask)
+    mid = float(quote_info['midpoint'])
+    half = mid * (float(quote_info.get('spread_pct', 0.0)) / 100.0) / 2.0
+    return mid - half, mid + half
+
+
+def ioc_limit_price(side, quote_info, cap_bps, asset_type='stock'):
+    """Marketable-limit price for an IOC: cross the touch but cap how far past
+    it we will pay. Buys lift the ask up to ask*(1+cap); sells hit the bid down
+    to bid*(1-cap). Band-rounded so the limit is never sub-penny-rejected."""
+    bid, ask = _bid_ask(quote_info)
+    if side == 'buy':
+        return _round_price_band(ask * (1.0 + cap_bps / 1e4), asset_type)
+    return _round_price_band(bid * (1.0 - cap_bps / 1e4), asset_type)
+
+
+def place_marketable_ioc(api, symbol, side, qty, quote_info, cap_bps,
+                         asset_type='stock'):
+    """Submit a slippage-capped marketable IOC (limit + time_in_force='ioc').
+
+    Replaces uncapped type='market' fallbacks: a market order in a thin
+    spec-tech book can fill tens-to-hundreds of bps through the quote on the
+    exact bad days slippage concentrates. The IOC takes liquidity up to
+    cap_bps past the touch, then auto-cancels any unfilled remainder (the
+    caller re-chases for entries, or escalates to a true-market backstop for
+    exits/flatten so a stop can never silently fail). Returns the order or
+    None on submit failure.
+    """
+    limit = ioc_limit_price(side, quote_info, cap_bps, asset_type)
+    try:
+        return api.submit_order(
+            symbol=symbol, qty=qty, side=side, type='limit',
+            limit_price=limit, time_in_force='ioc')
+    except Exception as e:
+        print(f"[IOC] {side} {symbol} submit failed ({e})")
+        return None
+
+
 # --- ORDER PLACEMENT ---
 
 def place_maker_buy(api, symbol, notional, quote_fn, stage_timeout=25,

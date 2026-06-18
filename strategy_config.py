@@ -68,6 +68,22 @@ MAX_TRADES_PER_SYMBOL_PER_DAY = {
 MAKER_ENTRIES_ENABLED = True
 MAKER_STAGE_TIMEOUT = 25         # seconds per bid-join rung (2 rungs max)
 
+# --- Entry-tactic table (wave-7: replaces compute_limit_price's buried magic
+# constants with explicit, calibrated thresholds the backtester reads too).
+# Thresholds are from microstructure priors + the offline Eff_Spread_Pct
+# ranking — NEVER tuned on realized P&L. Spreads are PERCENT of price.
+EXEC_TAKER_FLOOR_PCT = 0.05      # spread <= this -> just cross (passive saves ~nothing, risks non-fill)
+EXEC_WIDE_SPREAD_PCT = 0.15      # spread >= this -> candidate to POST inside the quote
+EXEC_POST_INSIDE_FRAC = 0.40     # post this fraction of the half-spread inside from our side
+EXEC_EDGE_HEADROOM_MULT = 1.5    # need pred >= this * edge_floor to risk a passive non-fill
+
+# Marketable-IOC slippage caps (bps past the touch a taker order may pay before
+# it cancels). ENTRY caps are tight (re-chase next loop); EXIT/flatten caps are
+# WIDE with a true-market backstop so a stop can never silently fail to fill.
+# Per name_class from the offline Eff_Spread_Pct ranking.
+IOC_CAP_BPS = {'mega': 8, 'mid': 20, 'spec': 40}
+IOC_EXIT_CAP_BPS = {'mega': 15, 'mid': 35, 'spec': 50}
+
 # --- Stock entry windows (Gao-Han-Li-Zhou 2018: intraday predictability
 # concentrates in the first/last half-hours; midday is noise+costs).
 # Start at 9:45, not 9:30: the first 15 minutes are dominated by the
