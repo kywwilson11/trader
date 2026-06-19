@@ -175,3 +175,72 @@ def brier(p, y):
     p = np.asarray(p, float)
     y = np.asarray(y, float)
     return float(np.mean((p - y) ** 2))
+
+
+def reliability_curve(p, y, n_bins=10):
+    """Binned reliability: per equal-width probability bin, the mean predicted
+    probability vs the observed win frequency. A well-calibrated forecast has
+    obs_freq ~= pred_mean in every populated bin (the diagonal)."""
+    p = np.asarray(p, float)
+    y = np.asarray(y, float)
+    m = np.isfinite(p) & np.isfinite(y)
+    p, y = p[m], y[m]
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.clip(np.digitize(p, edges[1:-1]), 0, n_bins - 1)
+    out = []
+    for b in range(n_bins):
+        sel = idx == b
+        n = int(sel.sum())
+        out.append({'bin': b, 'n': n,
+                    'pred_mean': round(float(p[sel].mean()), 4) if n else None,
+                    'obs_freq': round(float(y[sel].mean()), 4) if n else None})
+    return out
+
+
+def expected_calibration_error(p, y, n_bins=10):
+    """ECE = sum_b (n_b/N) * |pred_mean_b - obs_freq_b| — the n-weighted average
+    gap from the diagonal. 0 = perfectly calibrated; bigger = more mis-calibrated."""
+    p = np.asarray(p, float)
+    y = np.asarray(y, float)
+    m = np.isfinite(p) & np.isfinite(y)
+    p, y = p[m], y[m]
+    if len(p) == 0:
+        return None
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.clip(np.digitize(p, edges[1:-1]), 0, n_bins - 1)
+    ece, N = 0.0, len(p)
+    for b in range(n_bins):
+        sel = idx == b
+        n = int(sel.sum())
+        if n:
+            ece += (n / N) * abs(float(p[sel].mean()) - float(y[sel].mean()))
+    return float(ece)
+
+
+def compare_calibrations(p_legacy, p_purged, y, n_bins=10):
+    """Before/after gate for META_CALIBRATION_MODE='purged_oof' (wave-9 #1).
+
+    Compares the leaked same-slice calibration (p_legacy) against the purged
+    out-of-fold one (p_purged) on the SAME held-out outcomes y, by Brier and ECE.
+    Flip the flag only when the purged calibrator is at least as well-calibrated
+    (lower/equal Brier AND ECE) on the holdout — never on a same-slice score, and
+    never if the win-rate floor is threatened (that is decision_report's job).
+    """
+    y = np.asarray(y, float)
+    bl, bp = brier(p_legacy, y), brier(p_purged, y)
+    el = expected_calibration_error(p_legacy, y, n_bins)
+    ep = expected_calibration_error(p_purged, y, n_bins)
+    better = (bp <= bl) and (ep is not None and el is not None and ep <= el)
+    return {
+        'n': int(np.isfinite(y).sum()),
+        'brier_legacy': round(bl, 5), 'brier_purged': round(bp, 5),
+        'ece_legacy': round(el, 5) if el is not None else None,
+        'ece_purged': round(ep, 5) if ep is not None else None,
+        'brier_improved': bool(bp < bl),
+        'ece_improved': bool(ep is not None and el is not None and ep < el),
+        'verdict': ('purged_oof is better-calibrated on the holdout — safe to flip '
+                    'META_CALIBRATION_MODE (then re-certify in shadow)' if better else
+                    'no calibration improvement on this holdout — keep legacy / collect more'),
+        'reliability_legacy': reliability_curve(p_legacy, y, n_bins),
+        'reliability_purged': reliability_curve(p_purged, y, n_bins),
+    }

@@ -18,6 +18,9 @@ from calibration import (
     purged_kfold_indices,
     crossfit_oof_predict,
     brier,
+    reliability_curve,
+    expected_calibration_error,
+    compare_calibrations,
     ISOTONIC_MIN_N,
 )
 
@@ -133,3 +136,34 @@ def test_leak_detection_oof_beats_same_slice_on_fresh_data():
     # slice makes the map OVER-CONFIDENT — it pushes fresh predictions toward the
     # extremes (higher dispersion) relative to the honest OOF calibrator.
     assert p_leaked.std() > p_oof.std()
+
+
+def test_reliability_and_ece_reward_calibration():
+    rng = np.random.default_rng(11)
+    n = 8000
+    p_true = rng.uniform(0, 1, n)
+    y = (rng.uniform(size=n) < p_true).astype(float)
+    # Perfectly-calibrated forecast: obs_freq ~ pred_mean per bin, tiny ECE.
+    for b in reliability_curve(p_true, y, n_bins=10):
+        if b['n'] > 50:
+            assert abs(b['pred_mean'] - b['obs_freq']) < 0.06
+    assert expected_calibration_error(p_true, y) < 0.03
+    # An OVER-confident forecast (pushed toward 0/1) is worse-calibrated.
+    p_over = np.clip((p_true - 0.5) * 2.0 + 0.5, 0, 1)
+    assert expected_calibration_error(p_over, y) > expected_calibration_error(p_true, y)
+
+
+def test_compare_calibrations_flips_only_on_holdout_improvement():
+    rng = np.random.default_rng(12)
+    n = 8000
+    p_true = rng.uniform(0.1, 0.9, n)
+    y = (rng.uniform(size=n) < p_true).astype(float)
+    p_purged = np.clip(p_true + rng.normal(0, 0.05, n), 0, 1)        # honest
+    p_legacy = np.clip((p_true - 0.5) * 1.8 + 0.5, 0, 1)            # over-confident (the leak)
+    rep = compare_calibrations(p_legacy, p_purged, y)
+    assert rep['brier_purged'] < rep['brier_legacy']
+    assert rep['ece_purged'] < rep['ece_legacy']
+    assert 'safe to flip' in rep['verdict']
+    # When the candidate map is NOT better, the gate refuses to flip.
+    rep2 = compare_calibrations(p_true, p_legacy, y)                # arg2 worse than arg1
+    assert 'keep legacy' in rep2['verdict']
