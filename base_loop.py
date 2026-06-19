@@ -231,6 +231,7 @@ class BaseTradingLoop(ABC):
             self._update_macro_regime()
             self._update_equity()
             self._update_correlations()
+            self._record_account_risk()
 
         # Log GPU temp periodically
         if self.cycle % TEMP_LOG_EVERY_N_CYCLES == 0:
@@ -307,6 +308,11 @@ class BaseTradingLoop(ABC):
                 'last_trade': {s: t.timestamp() for s, t in self.last_trade_time.items()},
                 'daily_trades': {'date': self._daily_trades_date,
                                  'counts': self._daily_trades},
+                # Persist the account high-water mark so the drawdown
+                # de-leveraging ladder survives restarts (wave-8 #4). Without it
+                # a restart mid-drawdown reset the peak to ~current equity and
+                # silently disabled the ladder while underwater.
+                'peak_equity': self._peak_equity,
             }
             tmp = self._position_state_file() + '.tmp'
             with open(tmp, 'w') as f:
@@ -331,6 +337,14 @@ class BaseTradingLoop(ABC):
         symbols = self.get_symbol_universe()
         raw_positions = reconstruct_positions(self.api, symbols, asset_type=self.get_asset_type())
         saved = self._load_position_state()
+        # Restore the account high-water mark BEFORE any equity ratchet so the
+        # drawdown ladder stays armed across a restart-mid-drawdown (wave-8 #4).
+        # restore_peak_equity never drops below current equity, and the later
+        # _update_equity ratchet only moves UP, so a higher prior peak survives.
+        if 'peak_equity' in saved:
+            from drawdown import restore_peak_equity
+            self._peak_equity = restore_peak_equity(
+                saved.get('peak_equity'), getattr(self, '_equity', 0.0))
         saved_hwm = saved.get('hwm', {})
         saved_trailing = saved.get('trailing', {})
         for sym, info in raw_positions.items():
@@ -532,8 +546,8 @@ class BaseTradingLoop(ABC):
         try:
             acct = self.api.get_account()
             self._equity = float(acct.equity)
-            if self._equity > self._peak_equity:
-                self._peak_equity = self._equity
+            from drawdown import update_peak_equity
+            self._peak_equity = update_peak_equity(self._peak_equity, self._equity)
         except Exception:
             pass
 
@@ -589,6 +603,33 @@ class BaseTradingLoop(ABC):
         if trailing_active:
             desired_stop = max(desired_stop, hwm * (1 - trail_dist))
         return desired_stop, stop_dist, trail_dist, trailing_active
+
+    def _record_account_risk(self):
+        """GATE-1 measurement (wave-8 #7): journal the COMBINED cross-book
+        stop-risk.
+
+        The per-book ENB cap runs independently in each loop process, so the
+        stock book (crypto-proxies) and crypto book (spot) can stack toward the
+        same factor. This writes THIS book's diversified stop-risk to a shared
+        registry, reads the other book's, and journals the combined account
+        risk vs the cap. MEASUREMENT ONLY — it takes no trading action; the live
+        clamp is gated to the Jetson once the journals show the books do stack.
+        """
+        try:
+            from risk_budget import record_book_risk_and_report
+            from portfolio import avg_book_correlation
+            from strategy_config import CROSS_BOOK_RHO
+            names = list(self.positions.keys())
+            rho_b = (avg_book_correlation(names, self.corr_matrix)
+                     if (self.corr_matrix and names) else 0.5)
+            rep = record_book_risk_and_report(
+                self.get_asset_type(), self._book_stop_risks(), rho_b,
+                rho_cross=CROSS_BOOK_RHO)
+            if rep is not None:
+                log_decision({'action': 'account_risk',
+                              'book': self.get_asset_type(), **rep})
+        except Exception as e:
+            logger.debug("[ACCT-RISK] gate-1 measurement skipped: %s", e)
 
     def _book_stop_risks(self) -> list[float]:
         """Open stop-risk per position as a fraction of equity.
@@ -1266,15 +1307,10 @@ class BaseTradingLoop(ABC):
         vix = self.macro_regime.vix if self.macro_regime else None
         if vix is not None:
             tilt *= 0.3 if vix > 35 else 0.5 if vix > 25 else 0.7 if vix > 15 else 1.0
-        # Drawdown de-leveraging ladder
-        if self._peak_equity > 0:
-            dd = (self._peak_equity - self._equity) / self._peak_equity
-            if dd >= 0.20:
-                tilt *= 0.25
-            elif dd >= 0.15:
-                tilt *= 0.50
-            elif dd >= 0.10:
-                tilt *= 0.75
+        # Drawdown de-leveraging ladder (peak persisted across restarts, wave-8 #4)
+        from drawdown import drawdown_fraction, drawdown_size_multiplier
+        tilt *= drawdown_size_multiplier(
+            drawdown_fraction(self._peak_equity, self._equity))
         # Macro regime
         if self.macro_regime:
             tilt *= self.macro_regime.sizing_mult

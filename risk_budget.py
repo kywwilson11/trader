@@ -30,6 +30,10 @@ two-book simulator below supplies it. Everything here is pure-numpy and
 PIT-clean (uses trailing realized correlations only).
 """
 
+import json
+import os
+import time
+
 import numpy as np
 
 from portfolio import diversified_book_risk
@@ -201,3 +205,91 @@ def simulate_two_books(stock_trades, crypto_trades, periods=None):
                                 if s_pnl.std() > 1e-9 and c_pnl.std() > 1e-9
                                 else None),
     }
+
+
+# ---------------------------------------------------------------------------
+# GATE-1: cross-book stop-risk registry + measurement (wave-8 #7)
+# ---------------------------------------------------------------------------
+# The live clamp needs both books' current risk, but the loops run as separate
+# processes. Each writes its own diversified stop-risk to a shared registry and
+# reads the other's; the report below is JOURNALED ONLY (no trading decision),
+# so we can measure whether the per-book ENB caps actually let the two books
+# stack toward the account cap before wiring the clamp (the model-facing step).
+
+ACCOUNT_RISK_REGISTRY = 'account_risk_registry.json'
+
+
+def read_registry(path=ACCOUNT_RISK_REGISTRY):
+    """Load the shared per-book stop-risk registry; {} if absent/corrupt."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_book_risk(book, book_risk, rho_book, path=ACCOUNT_RISK_REGISTRY, now=None):
+    """Atomically upsert one book's diversified stop-risk into the registry.
+
+    Returns the updated registry. Fail-open: a write error is swallowed (the
+    measurement must never break the trading loop).
+    """
+    now = time.time() if now is None else float(now)
+    reg = read_registry(path)
+    reg[str(book)] = {'risk': float(book_risk), 'rho': float(rho_book), 'ts': now}
+    try:
+        tmp = f'{path}.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(reg, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return reg
+
+
+def account_risk_gate1_report(registry, rho_cross=1.0, cap=ACCOUNT_RISK_CAP,
+                              stale_after_s=900.0, now=None):
+    """Combined cross-book stop-risk from the registry — measurement only.
+
+    Each book stored its already-diversified risk R_b; combine via the two-
+    super-position formula at rho_cross. Entries older than stale_after_s are
+    dropped (book treated as down). Returns the combined risk, the naive per-book
+    sum, the cap, and the over-cap flag — the evidence that justifies (or kills)
+    the live clamp. Takes NO trading action.
+    """
+    now = time.time() if now is None else float(now)
+    fresh = {}
+    for b, e in (registry or {}).items():
+        if not isinstance(e, dict):
+            continue
+        risk = e.get('risk')
+        if risk is None or not np.isfinite(risk):
+            continue
+        if (now - float(e.get('ts', 0.0))) <= stale_after_s:
+            fresh[b] = float(risk)
+    r_s = fresh.get('stock', 0.0)
+    r_c = fresh.get('crypto', 0.0)
+    account = account_stop_risk([r_s], [r_c], 0.0, 0.0, rho_cross)
+    book_sum = r_s + r_c
+    return {
+        'account_stop_risk': round(account, 5),
+        'book_sum': round(book_sum, 5),
+        'stock_risk': round(r_s, 5),
+        'crypto_risk': round(r_c, 5),
+        'cap': float(cap),
+        'over_cap': bool(account > cap),
+        'headroom': round(cap - account, 5),
+        'concentration': round(account / book_sum, 4) if book_sum > 1e-9 else None,
+        'stale_books': sorted(set((registry or {})) - set(fresh)),
+        'rho_cross': float(min(max(rho_cross, -1.0), 1.0)),
+    }
+
+
+def record_book_risk_and_report(book, book_risks, rho_book, rho_cross=1.0,
+                                cap=ACCOUNT_RISK_CAP, path=ACCOUNT_RISK_REGISTRY,
+                                now=None):
+    """Write this book's diversified stop-risk to the registry, return the
+    combined GATE-1 report. One call for the per-cycle measurement hook."""
+    r_b = diversified_book_risk(list(book_risks), rho_book) if len(book_risks) else 0.0
+    reg = write_book_risk(book, r_b, rho_book, path=path, now=now)
+    return account_risk_gate1_report(reg, rho_cross=rho_cross, cap=cap, now=now)
