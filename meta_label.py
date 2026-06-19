@@ -215,9 +215,13 @@ def _gen_meta_rows(tdf, preds, asset_type, threshold, policy):
     rt_cost_arr = None
     if 'Eff_Spread_Pct' in tdf.columns:
         try:
-            from liquidity import per_bar_round_trip_cost
+            from liquidity import per_bar_round_trip_cost, impact_inputs_from_df
+            # Optional sqrt market-impact haircut (wave-8 #6), off by default so
+            # the meta labels are unchanged unless explicitly enabled + DV30 present.
+            adv_arr, impact_notional, impact_k = impact_inputs_from_df(tdf)
             rt_cost_arr = per_bar_round_trip_cost(
-                asset_type, tdf['Eff_Spread_Pct'].values)
+                asset_type, tdf['Eff_Spread_Pct'].values,
+                adv_dollar=adv_arr, notional=impact_notional, impact_k=impact_k)
         except Exception:
             rt_cost_arr = None
     cooldown_bars = max(1, int(math.ceil(policy['cooldown_min'] / 60)))
@@ -229,7 +233,7 @@ def _gen_meta_rows(tdf, preds, asset_type, threshold, policy):
         max_hold=0, use_signal_exit=True)
 
     feats_all = build_feature_matrix(tdf, preds)
-    rows, labels, nets, times = [], [], [], []
+    rows, labels, nets, times, exit_times = [], [], [], [], []
     n = len(closes)
     i = 0
     next_entry = 0
@@ -246,9 +250,10 @@ def _gen_meta_rows(tdf, preds, asset_type, threshold, policy):
         labels.append(1 if net > 0 else 0)
         nets.append(net)
         times.append(tdf.index[i])
+        exit_times.append(tdf.index[j])   # label span end, for the purged calibration
         next_entry = j + cooldown_bars
         i = j + 1
-    return rows, labels, nets, times
+    return rows, labels, nets, times, exit_times
 
 
 def train_meta(prefix: str = '') -> bool:
@@ -283,7 +288,7 @@ def train_meta(prefix: str = '') -> bool:
     times_ns = df.index.view('int64')
     cutoff = np.quantile(times_ns, 1.0 - HOLDOUT_FRACTION)
 
-    X, y, nets, ts = [], [], [], []
+    X, y, nets, ts, exit_ts = [], [], [], [], []
     for ticker in df['Ticker'].unique():
         tdf = df[df['Ticker'] == ticker].sort_index()
         tdf = tdf[tdf.index.view('int64') <= cutoff]
@@ -293,8 +298,8 @@ def train_meta(prefix: str = '') -> bool:
             continue
         preds = _predict_ticker(model, scaler, config, feature_cols, tdf,
                                 lgb_model=lgb_primary)
-        r, l, nr, t = _gen_meta_rows(tdf, preds, asset_type, threshold, policy)
-        X.extend(r); y.extend(l); nets.extend(nr); ts.extend(t)
+        r, l, nr, t, et = _gen_meta_rows(tdf, preds, asset_type, threshold, policy)
+        X.extend(r); y.extend(l); nets.extend(nr); ts.extend(t); exit_ts.extend(et)
         print(f"  [META] {ticker}: {len(r)} replayed trades")
 
     if len(X) < 200:
@@ -318,8 +323,37 @@ def train_meta(prefix: str = '') -> bool:
                         valid_sets=[val_set],
                         callbacks=[lgb.early_stopping(30, verbose=False)])
 
-    raw_val = booster.predict(X[split:])
-    calib = IsotonicRegression(out_of_bounds='clip').fit(raw_val, y[split:])
+    # Probability calibration. Default 'legacy' = the original same-slice isotonic
+    # (the leak: it fits on the exact X[split:] slice the booster early-stopped on).
+    # 'purged_oof' (wave-9 #1) calibrates on PURGED out-of-fold predictions so the
+    # calibrator never sees a slice the model peeked at, removing the upward p-bias
+    # that drives the live veto + size multiplier. Fail-open to legacy.
+    from strategy_config import META_CALIBRATION_MODE
+    calib = None
+    if META_CALIBRATION_MODE == 'purged_oof':
+        try:
+            from calibration import crossfit_oof_predict, fit_calibrator
+            entry_e = np.array([t.timestamp() for t in np.asarray(ts)[order]], float)
+            exit_e = np.array([t.timestamp() for t in np.asarray(exit_ts)[order]], float)
+            n_iter = int(booster.best_iteration or 200)
+
+            def _fold_fit_predict(Xtr, ytr, Xte):
+                ds = lgb.Dataset(Xtr, label=ytr, feature_name=META_FEATURES)
+                b = lgb.train(params, ds, num_boost_round=n_iter)
+                return b.predict(Xte)
+
+            oof = crossfit_oof_predict(_fold_fit_predict, X, y, entry_e, exit_e,
+                                       k=5, embargo=0.0)
+            calib = fit_calibrator(oof, y)
+            if calib is not None:
+                print(f"[META] purged out-of-fold calibration "
+                      f"({type(calib).__name__}, {int(np.isfinite(oof).sum())} OOF rows)")
+        except Exception as e:
+            print(f"[META] purged calibration failed ({e}) — falling back to legacy")
+            calib = None
+    if calib is None:
+        raw_val = booster.predict(X[split:])
+        calib = IsotonicRegression(out_of_bounds='clip').fit(raw_val, y[split:])
 
     # .prev backups so the policy gate can roll the meta layer back
     import shutil
