@@ -67,7 +67,7 @@ def _sorted_desc(period):
 
 
 def run_policy(panel, policy, cost_pct=0.0,
-               periods_per_year=DEFAULT_PERIODS_PER_YEAR):
+               periods_per_year=DEFAULT_PERIODS_PER_YEAR, with_series=False):
     """Replay one admission policy over the panel. Returns a metrics dict.
 
     Per period: admit = policy(sorted candidates); gross = equal-weight mean of
@@ -103,7 +103,7 @@ def run_policy(panel, policy, cost_pct=0.0,
     sharpe = 0.0
     if n > 1 and nets.std() > 1e-12:
         sharpe = float(nets.mean() / nets.std() * np.sqrt(periods_per_year))
-    return {
+    result = {
         'n_periods': n,
         'mean_admitted_k': round(float(np.mean(ks)), 3) if n else 0.0,
         'pct_periods_cash': round(float(np.mean(np.asarray(ks) == 0)), 4) if n else 0.0,
@@ -115,6 +115,9 @@ def run_policy(panel, policy, cost_pct=0.0,
         'exits': n_exits_total,
         'hit_rate': round(float(np.mean(nets > 0)), 4) if n else 0.0,
     }
+    if with_series:
+        result['_nets'] = nets
+    return result
 
 
 def compare(panel, policies, cost_pct=0.0,
@@ -139,3 +142,111 @@ def compare(panel, policies, cost_pct=0.0,
             'k_delta': round(r['mean_admitted_k'] - b['mean_admitted_k'], 3),
         }
     return {'results': results, 'deltas': deltas, 'baseline': base}
+
+
+def compare_deflated(panel, policies, cost_pct=0.0,
+                     periods_per_year=DEFAULT_PERIODS_PER_YEAR, baseline=None):
+    """compare() + a DEFLATED Sharpe and turnover per policy (wave-9 #4).
+
+    The plain compare() ranks policies by RAW Sharpe with NO correction for how
+    many policies were tried — a multiple-testing leak: the best of N noise
+    policies looks good. dsr_from_trade_returns deflates by n_trials=len(policies),
+    so the winner must beat the expected MAX Sharpe of that many tries. Turnover
+    is promoted to first-class (a higher-Sharpe-but-higher-turnover policy is not
+    free on a cost-bound book). THIS is the difference between certifying a real
+    conviction edge and shipping a mined one.
+    """
+    from validation import dsr_from_trade_returns
+    names = list(policies)
+    base = baseline if baseline in policies else names[0]
+    results = {}
+    for name in names:
+        m = run_policy(panel, policies[name], cost_pct, periods_per_year,
+                       with_series=True)
+        nets = m.pop('_nets')
+        d = dsr_from_trade_returns(nets, n_trials=len(names))
+        m['dsr'] = round(d['dsr'], 4)
+        m['expected_max_sr'] = round(d['expected_max_sr'], 4)
+        m['turnover'] = round((m['entries'] + m['exits']) / max(m['n_periods'], 1), 4)
+        results[name] = m
+    b = results[base]
+    deltas = {name: {
+        'sharpe_delta': round(results[name]['sharpe'] - b['sharpe'], 4),
+        'net_delta': round(results[name]['net_total'] - b['net_total'], 4),
+        'dsr': results[name]['dsr'],
+        'turnover_delta': round(results[name]['turnover'] - b['turnover'], 4),
+    } for name in names}
+    return {'results': results, 'deltas': deltas, 'baseline': base}
+
+
+def panel_from_frame(df, signal_col, fwd_return_col, ticker_col='Ticker',
+                     extra_cols=None, signal_lag=0):
+    """Build an A/B panel from a tidy frame (index=timestamp, one row per
+    symbol-bar). Each timestamp becomes one period of candidate dicts.
+
+    signal_lag>0 takes the signal from `signal_lag` bars earlier PER TICKER
+    (strict PIT: the admission decides on info known before fwd_return realizes).
+    Rows with a missing signal/fwd_return after lagging are dropped.
+    """
+    extra_cols = list(extra_cols or [])
+    cols = [ticker_col, signal_col, fwd_return_col] + extra_cols
+    work = df[cols].copy()
+    if signal_lag:
+        work[signal_col] = work.groupby(ticker_col)[signal_col].shift(signal_lag)
+    work = work.dropna(subset=[signal_col, fwd_return_col])
+    panel = []
+    for _ts, g in work.groupby(level=0):
+        period = []
+        for _, row in g.iterrows():
+            c = {'symbol': row[ticker_col], 'signal': float(row[signal_col]),
+                 'fwd_return': float(row[fwd_return_col])}
+            for col in extra_cols:
+                c[col] = row[col]
+            period.append(c)
+        if period:
+            panel.append(period)
+    return panel
+
+
+# ---------------------------------------------------------------------------
+# Tier sizing (edge-proportional vs equal-weight)
+# ---------------------------------------------------------------------------
+
+def edge_proportional_weights(signals, floor=0.0):
+    """Weights proportional to (signal - floor)+, summing to 1. Falls back to
+    equal-weight when no admitted name clears the floor. The growth-optimal book
+    tracks edge (Kelly) rather than equal-weighting every admitted name."""
+    s = np.asarray(signals, dtype=float)
+    s = np.clip(np.where(np.isfinite(s), s, 0.0) - floor, 0.0, None)
+    if len(s) == 0:
+        return s
+    if s.sum() <= 1e-12:
+        return np.full(len(s), 1.0 / len(s))
+    return s / s.sum()
+
+
+def run_policy_weighted(panel, policy, weight_fn, cost_pct=0.0,
+                        periods_per_year=DEFAULT_PERIODS_PER_YEAR):
+    """run_policy but the admitted book is weighted by weight_fn([signals])
+    instead of equal-weight — to test edge-proportional concentration. Cost is
+    charged on the turnover of the WEIGHT vector (sum of positive weight changes)."""
+    prev_w = {}
+    nets = []
+    for period in panel:
+        admitted = policy(_sorted_desc(period))
+        if not admitted:
+            nets.append(0.0)
+            prev_w = {}
+            continue
+        w = np.asarray(weight_fn([c.get('signal', 0.0) for c in admitted]), float)
+        gross = float(np.sum(w * np.array([c['fwd_return'] for c in admitted])))
+        cur_w = {c['symbol']: float(wi) for c, wi in zip(admitted, w)}
+        syms = set(cur_w) | set(prev_w)
+        turnover = sum(max(cur_w.get(s, 0.0) - prev_w.get(s, 0.0), 0.0) for s in syms)
+        nets.append(gross - cost_pct * turnover)
+        prev_w = cur_w
+    nets = np.asarray(nets, float)
+    sharpe = (float(nets.mean() / nets.std() * np.sqrt(periods_per_year))
+              if len(nets) > 1 and nets.std() > 1e-12 else 0.0)
+    return {'n_periods': len(nets), 'net_total': round(float(nets.sum()), 4),
+            'sharpe': round(sharpe, 4)}

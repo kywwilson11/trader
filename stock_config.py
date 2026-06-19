@@ -62,8 +62,12 @@ LEVERAGED_ETFS = {
     'SOXL': 3,
 }
 
-# Safe-haven symbols allowed to trade during VIX > 25 defensive regimes
-SAFE_HAVEN_SYMBOLS = {'GLD', 'SLV', 'PALL', 'PPLT', 'OXY', 'COPX'}
+# Safe-haven symbols allowed to trade during VIX > 25 defensive regimes.
+# Wave-9 #3: added consumer-staples + healthcare defensives so the book can
+# rotate into low-beta names (not just metals) on risk-off days — the de-
+# clustering that breadth promotion is meant to capture.
+SAFE_HAVEN_SYMBOLS = {'GLD', 'SLV', 'PALL', 'PPLT', 'OXY', 'COPX',
+                      'PG', 'KO', 'PEP', 'WMT', 'JNJ', 'MRK', 'T', 'VZ'}
 
 # ETFs in the universe/panel — residual momentum is hard-zeroed for these
 # (an index product's residual vs the index is degenerate noise)
@@ -131,6 +135,30 @@ SECTOR_BUCKETS = {
     # Metals / hard assets
     'GLD': 'metals', 'SLV': 'metals', 'PALL': 'metals', 'PPLT': 'metals',
     'COPX': 'metals',
+    # --- wave-9 #3: map the previously-UNMAPPED (= uncapped) names so the
+    # factor-crowding cap actually diversifies the top-K (a cap only truncates,
+    # never enlarges, so this is strictly more conservative). ---
+    'JPM': 'financials', 'BAC': 'financials', 'WFC': 'financials',
+    'GS': 'financials', 'MS': 'financials', 'V': 'financials',
+    'MA': 'financials', 'AXP': 'financials',
+    'XOM': 'energy', 'CVX': 'energy', 'COP': 'energy', 'SLB': 'energy',
+    'OXY': 'energy',
+    'JNJ': 'healthcare', 'PFE': 'healthcare', 'MRK': 'healthcare',
+    'LLY': 'healthcare', 'UNH': 'healthcare', 'ABBV': 'healthcare',
+    'PG': 'staples', 'KO': 'staples', 'PEP': 'staples', 'WMT': 'staples',
+    'MCD': 'staples', 'HD': 'staples', 'LOW': 'staples',
+    'CAT': 'industrials', 'DE': 'industrials', 'BA': 'industrials',
+    'GE': 'industrials', 'HON': 'industrials', 'UPS': 'industrials',
+    'T': 'telecom', 'VZ': 'telecom',
+    'AAPL': 'megacap_tech', 'MSFT': 'megacap_tech', 'GOOGL': 'megacap_tech',
+    'AMZN': 'megacap_tech', 'INTC': 'megacap_tech', 'CSCO': 'megacap_tech',
+    'ORCL': 'megacap_tech', 'IBM': 'megacap_tech', 'TXN': 'megacap_tech',
+    'QCOM': 'megacap_tech', 'META': 'megacap_tech',
+    'SPY': 'index', 'QQQ': 'index', 'IWM': 'index', 'TQQQ': 'index',
+    'ABNB': 'growth_tech', 'DASH': 'growth_tech', 'UBER': 'growth_tech',
+    'SHOP': 'growth_tech', 'NET': 'growth_tech', 'CRWD': 'growth_tech',
+    'PLTR': 'growth_tech', 'RBLX': 'growth_tech', 'ROKU': 'growth_tech',
+    'SNAP': 'growth_tech', 'TSLA': 'growth_tech',
 }
 
 # Bucket notional caps as a fraction of MAX_EXPOSURE
@@ -139,8 +167,26 @@ BUCKET_CAP_FRACTION = {
     'default': 0.35,
 }
 
+# --- Live tradable universe promotion (wave-9 #3) ---
+# The model scores universe + TRAINING_CANDIDATE_POOL every hour, but the loop
+# trades only the hand-list. OFF by default: promoting the as-of top-K of the
+# full panel into the SELECTABLE set is MODEL-FACING (the model must actually
+# predict the pool names live) and must clear the IC-by-name diagnostic on the
+# Jetson first (promote only names whose individual OOS rank-IC is positive).
+# K_HOLD > K_ENTER is the hysteresis band; held names are always included.
+TRADABLE_POOL_ENABLED = False
+AS_OF_TRADABLE_TOP_K = 20
+TRADABLE_K_ENTER = 20
+TRADABLE_K_HOLD = 28
 
-# Top cryptos by market cap (USD pairs on Alpaca)
+
+# Top cryptos by market cap (USD pairs on Alpaca).
+# Wave-9 #6: AVAX/BCH/DOT/LTC are in stock_universe.json but were dropped here —
+# restoring them (6 -> 10) gives the crypto cross-sectional ranks + dispersion
+# 67% more breadth. This is MODEL-FACING: the crypto model was trained on the
+# 6-coin panel, so the 4 must be added HERE only together with a crypto
+# harvest+retrain (train/serve parity), on the Jetson. Listed in CRYPTO_POOL
+# below so the harvest can include them without the live loop trading them yet.
 CRYPTO_SYMBOLS = [
     'BTC/USD',
     'ETH/USD',
@@ -149,3 +195,7 @@ CRYPTO_SYMBOLS = [
     'DOGE/USD',
     'LINK/USD',
 ]
+
+# The intended full coin set (Jetson: harvest+retrain on this, then promote into
+# CRYPTO_SYMBOLS for live trading — see wave-9 #6).
+CRYPTO_POOL = CRYPTO_SYMBOLS + ['AVAX/USD', 'BCH/USD', 'DOT/USD', 'LTC/USD']

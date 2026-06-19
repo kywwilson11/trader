@@ -204,3 +204,102 @@ def compute_live_panel_ranks(api, spy_close=None,
                 disp, breadth)
     _live_cache = (now, out)
     return out
+
+
+def live_tradable_members(dvs, top_k, k_enter=None, k_hold=None, held=None):
+    """Names tradable THIS hour: top-K by dollar volume, with hysteresis (wave-9 #3).
+
+    The model already scores the full ~96-name panel but the loop only trades a
+    hand-list. This promotes the as-of top-K of the panel into the SELECTABLE set
+    so the top-K buys the genuinely-highest-predicted names cross-sectionally —
+    and the breadth de-correlates the high-beta book on risk-off hours.
+
+    A name becomes selectable when it ranks in the top k_enter by dv, and STAYS
+    selectable while within the wider k_hold band IF currently held, so positions
+    don't churn in/out on dv noise at the boundary. Currently-held names are
+    ALWAYS returned (never orphan a live position — the exit blind-spot guard).
+    Ties break on symbol for determinism. Returns names ordered by dv rank.
+    """
+    dvs = {s: float(v) for s, v in dvs.items()
+           if v is not None and np.isfinite(v) and float(v) > 0}
+    held = set(held or [])
+    k_enter = int(top_k if k_enter is None else k_enter)
+    k_hold = max(int(k_hold), k_enter) if k_hold is not None else k_enter
+    ordered = sorted(dvs, key=lambda s: (-dvs[s], s))
+    rank = {s: i for i, s in enumerate(ordered)}
+    members = set()
+    for s in ordered:
+        r = rank[s]
+        if r < k_enter:
+            members.add(s)
+        elif r < k_hold and s in held:
+            members.add(s)          # hysteresis keeps a held name in the band
+    members |= held                 # always manageable, even past k_hold
+    return sorted(members, key=lambda s: (rank.get(s, len(ordered)), s))
+
+
+# --- Crypto cross-sectional rank (wave-9 #6) ---
+# The crypto book selects each coin independently (no notion of which coin is
+# strongest now). Liu-Tsyvinski 2021 / Grobys-Sapkota 2021: large liquid coins
+# show MOMENTUM (the reversal trap is a small-coin illiquidity effect, absent
+# here). This is a SOFT, cost-NEUTRAL size tilt only — never an exclusion: every
+# laggard already cleared the 2x-cost should_trade floor, so dropping it would be
+# negative-EV. NOT the wave-7-KILLED funding-carry rank (that needed shorts).
+CRYPTO_CS_BASE_COLS = ['Return_4h', 'Return_12h', 'ROC', 'Volume_Ratio',
+                       'ATR_Pct', 'RSI']
+
+
+def add_crypto_panel_ranks(df: pd.DataFrame) -> pd.DataFrame:
+    """Harvest-side per-timestamp cross-sectional ranks for the crypto panel.
+
+    Like add_panel_ranks but with the crypto base columns and NO dollar-volume
+    as-of mask (coins trade 24/7 — every coin is always a member). Adds
+    CS_Rank_<col> in [-1,1] + CS_Dispersion. PIT-clean (ranks within a bar only).
+    """
+    if 'Ticker' not in df.columns or df.empty:
+        return df
+    ts = df.index
+    for col in CRYPTO_CS_BASE_COLS:
+        if col not in df.columns:
+            continue
+        r = df.groupby(ts)[col].rank(method='average')
+        n = df.groupby(ts)[col].transform('count')
+        df[f'CS_Rank_{col}'] = _signed_rank(r, n).where(n > 1, 0.0)
+    if 'Return_4h' in df.columns:
+        df['CS_Dispersion'] = df.groupby(ts)['Return_4h'].transform('std').fillna(0.0)
+    return df
+
+
+def compute_live_crypto_ranks(values_by_symbol) -> dict:
+    """Signed cross-sectional rank in [-1,1] per coin from a relative-strength
+    value (e.g. trailing momentum). Missing/degenerate -> 0.0 (neutral)."""
+    syms = [s for s, v in values_by_symbol.items()
+            if v is not None and np.isfinite(v)]
+    out = {s: 0.0 for s in values_by_symbol}
+    n = len(syms)
+    if n < 2:
+        return out
+    vals = np.array([float(values_by_symbol[s]) for s in syms])
+    order = np.argsort(np.argsort(vals)).astype(float) + 1.0   # average-ish ranks 1..n
+    signed = 2.0 * (order - 1.0) / (n - 1.0) - 1.0
+    for i, s in enumerate(syms):
+        out[s] = float(signed[i])
+    return out
+
+
+def cs_size_tilt(cs_rank, dispersion=None, dispersion_floor=0.0,
+                 lo=0.90, hi=1.10):
+    """Bounded, cost-NEUTRAL size multiplier from a coin's signed CS rank.
+
+    Maps cs_rank in [-1,1] linearly to [lo,hi] (rank +1 -> hi, -1 -> lo, 0 -> 1.0).
+    Returns 1.0 (no-op) when the rank is missing OR cross-sectional dispersion is
+    below dispersion_floor (a pure-BTC-beta hour where 'relative strength' is just
+    common-beta noise). It only RE-WEIGHTS the same budget, so turnover is
+    unchanged — never a forgone trade or an extra round trip.
+    """
+    if cs_rank is None or not np.isfinite(cs_rank):
+        return 1.0
+    if dispersion is not None and np.isfinite(dispersion) and dispersion < dispersion_floor:
+        return 1.0
+    r = float(np.clip(cs_rank, -1.0, 1.0))
+    return float(np.clip(1.0 + r * (hi - lo) / 2.0, lo, hi))   # bounded by contract
