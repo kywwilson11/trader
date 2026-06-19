@@ -63,6 +63,7 @@ logos/old/
 llm_cost.json
 position_state.json
 *_position_state.json
+account_risk_registry.json
 hard_stop_lockout.json
 llm_eval_report.json
 backtest_*report.json

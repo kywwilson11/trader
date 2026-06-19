@@ -102,6 +102,99 @@ OVERNIGHT_SLEEVE_MAX_POSITIONS = 2
 OVERNIGHT_SLEEVE_MAX_PCT_EQUITY = 0.05   # per kept position
 OVERNIGHT_SLEEVE_MIN_PRED = 0.0          # only keep names still predicted up
 
+# --- Square-root market-impact cost (wave-8 #6) ---
+# A $100 and a $50k order into a thin spec name cost the same bps in the offline
+# cost model today; real impact grows ~ sqrt(notional/ADV). OFF by default —
+# enabling it ADDS a per-name impact haircut to the OFFLINE backtest/meta net
+# P&L (strictly higher cost, never live behavior), de-certifying edge that only
+# survives because size is under-priced on illiquid names. Flip on only after
+# stamping DV30 into the harvested data and calibrating k / typical notional on
+# the Jetson (see liquidity.market_impact_pct).
+IMPACT_COST_ENABLED = False
+IMPACT_K = 1.0                   # sqrt-impact coefficient (Almgren/Kyle)
+IMPACT_TYPICAL_NOTIONAL = 25_000 # representative $ order size for the %-return replay
+
+# --- Average-uniqueness training weights (wave-8 #1) ---
+# The DSR gate already deflates by effective-n, but the trainers still over-count
+# overlapping hourly labels ~k times. OFF by default — flip on the Jetson AFTER
+# scripts/wave6_stage0.py measures u_bar per book (crypto u_bar<0.30 -> ship;
+# stock EOD-capped near-IID -> near no-op). Use PURE uniqueness (never blend
+# uniqueness x |return|), and delete v2_study.db before the first weighted retrain
+# (the loss change makes old Optuna scores incomparable — CLAUDE.md gotcha #2).
+UNIQUENESS_WEIGHTS_ENABLED = False
+
+# --- Meta-label probability calibration (wave-9 #1) ---
+# 'legacy'     = original isotonic fit on the same val slice the booster early-
+#                stopped on (a leak -> upward-biased p that gates cost + sizes bets).
+# 'purged_oof' = calibrate on PURGED out-of-fold predictions (leak-free; picks
+#                sigmoid on thin books). Flip on the Jetson after a reliability /
+#                Brier-before-after check, and re-certify in shadow BEFORE enabling
+#                any p-consuming sizing lever (edge-Kelly, conviction tiers).
+META_CALIBRATION_MODE = 'legacy'
+
+# --- Edge/probability bet sizing (wave-9 #5) ---
+# OFF by default and HARD-GATED on META_CALIBRATION_MODE='purged_oof' being live
+# and certified: edge-Kelly over-bets on an optimistic p (Chopra-Ziemba). When
+# enabled (Jetson, after Stage-0 shows a real rank gradient) it replaces the
+# flat-topped clip(2p,0.6,1.3) with bet_sizing.afml_bet_size / kelly_edge_odds,
+# kept inside KELLY_CAP + the ENB book cap, and must move OUTSIDE the TILT_MAX
+# clamp or it is dead on arrival.
+EDGE_KELLY_ENABLED = False
+
+# --- Crypto cross-sectional rank tilt (wave-9 #6) ---
+# OFF by default. A SOFT [0.90,1.10] size tilt toward the relative-strength
+# leader (never an exclusion — every laggard already cleared the 2x cost floor).
+# Gate by dispersion so pure-BTC-beta hours are no-ops. Model-facing (the crypto
+# panel changes); enable on the Jetson after a retrain on the full coin set + a
+# Stage-0 measurement that the laggard actually realizes lower net P&L.
+CRYPTO_CS_RANK_ENABLED = False
+CRYPTO_CS_DISPERSION_FLOOR = 0.01
+
+# --- BTC trend / TSMOM risk-off gate (wave-9 #7) ---
+# OFF by default. Graded BTC-200h-SMA de-risk scalar via CryptoLoop._extra_tilt,
+# debounced (Schmitt + persistence). Wiring MUST floor the COMBINED macro x HMM x
+# book-vol x trend product (4 de-risk terms can stack-collapse size) and run the
+# co-fire counterfactual (if it fires with the shipped vol-scaler >70% of the
+# time the marginal edge is ~0 -> kill it). Needs 220-bar BTC history on the Jetson.
+CRYPTO_TREND_GATE_ENABLED = False
+CRYPTO_TREND_SMA_WINDOW = 200
+CRYPTO_TREND_FLOOR = 0.5
+
+# --- Conviction-gated dynamic top-K + tier sizing flagship (wave-9 #4) ---
+# OFF by default. Admit fewer/higher-conviction names and concentrate the top
+# tier by edge. STRICTLY Stage-0-gated on the Jetson: certify via
+# portfolio_backtest.compare_deflated (DSR after deflation by #policy-configs)
+# AND decision_report rank-1-3 net >= ~2x rank-6-7 in BOTH live journals and the
+# holdout, else it is regime-mining. When CONCENTRATION_ENABLED=False the
+# conviction walk reduces EXACTLY to the incumbent flat top-K (no-op kill switch).
+# Tier-A concentration is also inert until the $5k notional cap is raised (which
+# must clear the wave-8 market-impact model). Sequence AFTER the calibration fix.
+CONCENTRATION_ENABLED = False
+CONVICTION_K_MAX = 7
+CONVICTION_K_MIN = 3            # Statman diversification floor
+CONVICTION_SIGNAL_FLOOR = None  # None = floor not applied
+CONVICTION_META_FLOOR = None
+CONVICTION_RATIO_FLOOR = None
+TIER_SIZING_ENABLED = False
+TIER_A_K = 3                   # top-K names that get edge-proportional concentration
+
+# --- Bar-keyed prediction cache (wave-8 #5) ---
+# Hourly bars + 30s loop => ~119/120 inference cycles recompute a bit-identical
+# feature+LSTM+LGB result. Memoizing on the latest closed-bar timestamp skips
+# them — the biggest idle-CPU win on the 8GB Jetson. OFF by default; enable on
+# the Jetson after confirming bit-identical predicted_return on real symbols and
+# a clean cache-clear on model hot-reload (see prediction_cache.py).
+PREDICTION_CACHE_ENABLED = False
+
+# --- Cross-book account stop-risk (wave-8 #7) ---
+# The per-book ENB cap (MAX_BOOK_RISK_PCT) runs independently, so the stock book
+# (COIN/MSTR/MARA) and crypto book (spot BTC/ETH) can each run to 2.5% behind the
+# SAME factor — ~5% combined vs the intended ~3%. CROSS_BOOK_RHO is the assumed
+# cross-book correlation for the GATE-1 measurement journal; 1.0 = the risk-off
+# lockstep worst case. The measurement only LOGS; the live clamp (Jetson) will
+# replace this with the realized cross-book correlation it accumulates.
+CROSS_BOOK_RHO = 1.0
+
 
 def policy_for(asset_type: str) -> dict:
     return CRYPTO_POLICY if asset_type == 'crypto' else STOCK_POLICY

@@ -1,0 +1,320 @@
+{
+  "summary": "Wave-8 discovery: find, ROI-rank, deep-research and adversarially verify the 5 highest-ROI improvements to the trader quant system",
+  "agentCount": 35,
+  "logs": [
+    "Scan complete: 45 candidate improvements from 9/9 finders",
+    "Rank complete: 41 unique candidates ranked; deep-researching top 8",
+    "Research+Verify complete: 6/8 candidates survived BOTH adversarial lenses"
+  ],
+  "result": {
+    "top5": [
+      {
+        "rank": 1,
+        "title": "Wire avg-uniqueness sample weights into the LGB-mean / LGB-q10 / LSTM trainers (producer built+green, consumed only by the DSR gate today)",
+        "priority_axis": "financial_soundness (#2)",
+        "gap": "The de-biasing kernel is DONE and green-on-Mac (sample_weights.uniqueness_weights/average_uniqueness/effective_n, 18/18 tests pass with numba absent), its own docstring (sample_weights.py:11-14) names LSTM/LGB-mean+q10/meta as the consumers, and research/wave6_research.json lists this as a SURVIVING Tier-1 item — yet NO trainer uses it. VERIFIED this wave: model_lgb.train_lgb (model_lgb.py:43-77) has no weight param and builds lgb.Dataset(X_flat, label=y) with no weight=; the LSTM loss weights only by torch.clamp(abs(yb)+1, max=50) (hypersearch_v2.py:709-710, 760-761); meta_label trains lgb.Dataset(X[:split], label=y[:split]) unweighted (meta_label.py:308); average_uniqueness/effective_n are consumed ONLY at hypersearch_v2.py:1089 (the DSR gate). The plumbing artery is genuinely missing: train_lgb_ensemble's signature (hypersearch_v2.py:946-947) omits all_tb_bars_by_fb and its call site (:1466) does not forward it, even though load_data already carries it and the gate (evaluate_on_holdout, :1406) already receives it. So on a panel where every hourly bar is an overlapping triple-barrier label, the loss over-counts a row overlapping k others ~k times — the wave-6 honesty is half-closed: the gate deflates by n_eff but certifies a model trained on the over-counted rows.",
+        "roi_case": "Highest-ROI remaining integrity fix and the codebase's OWN named #1 unfinished item: ~80% of the work (the de-biasing kernel + tests) already exists and is PIT-clean, so the marginal build is one backward-compatible weight param + a numpy fold-weight helper + synthetic tests. Closes the train/gate asymmetry on exactly the non-IID structure the repo acknowledges: with hourly bars and 12-48-bar windows, measured crypto u_bar is typically 0.1-0.3, i.e. a 3-10x over-count. Literature-quantified (MQL5/AFML ch.4 replication): pure-uniqueness weighting lifted out-of-sample F1 +6.7% / accuracy +7.5% on overlapping-label strategies; the trader's analog is a NARROWER holdout-vs-search Sharpe gap (the integrity win), not a promised P&L lift. Beat the others on ROI-per-LOC because the kernel is pre-built/tested and it is the repo's self-identified top gap; beat the scaler-slice and peak_equity on magnitude (a structural train/gate correctness fix vs a micro-perf cleanup / a transient-window risk-control nit).",
+        "implementation": "MAC_NOW (measurement_safe edits, buildable+testable now): (A) add backward-compatible sample_weight/sample_weight_val params to model_lgb.train_lgb that flow to lgb.Dataset(weight=...) (None preserves current behavior; py_compile-checkable since lgb body never RUNS here); (B) add a pure-numpy fold_train_weights(hold_bars_panel, row_indices, ticker_boundaries, returns=None) helper in sample_weights.py that calls average_uniqueness over the full panel, slices to the fold's row_indices, and re-normalizes to mean-1 over finite>0 rows; (C) tests/test_uniqueness_wiring.py (pure numpy): per-book mean-1, 1/k down-weighting of fully-overlapping blocks, q10==mean vector PARITY via np.array_equal, NaN-span->0, row-subset ALIGNMENT (#1 bug risk), and an A/B guard asserting pure-uniqueness (returns=None) != magnitude-blend so the default path is provably the safe one; plus a regression guard reproducing the documented cross-book imbalance (joint-pool A 0.38 vs B 1.62) so nobody 'simplifies' to one pooled normalization. py_compile-check the signature/body edits to train_lgb_ensemble (add all_tb_bars_by_fb + forward at :1466) and the LSTM loss. JETSON_LATER (model_facing_gated, challenger->shadow->DM-HLN): (1) run scripts/wave6_stage0.py FIRST and SCOPE BY MEASURED u_bar (wave-6 rule: crypto u_bar<0.30 ship; stock EOD-capped >0.6 near-IID -> near-no-op, likely crypto-only); (2) pass the SAME mean-1 fold vector to BOTH mean and q10 train_lgb calls; replace the LSTM clamp(|y|+1) with PURE mean-1 uniqueness (magnitude-blend only as a SHADOW challenger — never silently multiply uniqueness x |return|, the return-attribution scheme that collapsed F1->0 in the MQL5 replication); wire meta with realized-exit span (j-i+1) but rank LOWEST as an admitted near-no-op; (3) delete v2_study.db + stock_v2_study.db before the first weighted retrain (loss change makes old Optuna scores incomparable, CLAUDE.md gotcha #2); (4) do NOT also enable validation Lo-2002 serial_correlation_factor (double-deflation, gotcha #4); (5) validate via backtest.py --gate policy replay + weighted holdout DSR. Success signature = holdout-minus-search gap NARROWS, explicitly NOT a P&L lift.",
+        "deploy_class": "model_facing_gated",
+        "literature": "Lopez de Prado, Advances in Financial Machine Learning (Wiley 2018) ch.4 (average uniqueness u_i=mean_t(1/c_t), sample weighting w_i=u_i) + ch.3 (meta-labeling). MQL5 'Machine Learning Blueprint Part 4: Label Concurrency' (mql5.com/en/articles/19850, AFML ch.4 replication): uniqueness-only weighting +6.7% F1 / +7.5% accuracy, BUT return-attribution weighting COLLAPSED both (F1->0) — the direct warning against blending uniqueness x |return|. LightGBM docs: Dataset(weight=w) scales per-row gradient AND hessian for every objective, so the SAME vector keeps the quantile (q10) leg calibrated; min_sum_hessian_in_leaf is in hessian-weight units so mean-1 (total mass ~N) preserves the tuned leaf regularizer (raw u_i would over-fragment trees). Sequential bootstrap was KILLED in wave-6 (substitute not complement) so weighting is the sanctioned path.",
+        "risk": "model_facing: changes fitted weights -> must go challenger->shadow->DM-HLN with Jetson sign-off. Two regression traps the design must respect: (1) silently keeping the LSTM |y|+1 multiply reproduces the toxic return-attribution scheme — default to pure uniqueness; (2) per-fold-train mean-1 alignment when subsetting rows is the top bug risk (covered by the alignment test). Stock book likely near-IID so the live effect is probably crypto-only; meta leg is a near-no-op. Mac cannot RUN torch/lgb, but every pure function above is importable and tested standalone, and the lgb/torch edits are py_compile-clean. Fail-direction is safe: weighting can only DROP in-search Sharpe; a holdout collapse would be a DIAGNOSTIC that the prior edge was memorization, not a loss."
+      },
+      {
+        "rank": 2,
+        "title": "Wire the already-implemented honest CSCV-PBO into the promotion gate (pbo_cscv + Lo-2002 are coded, unit-tested, and DEAD; the gate is single-12%-holdout DSR with no overfitting probability)",
+        "priority_axis": "financial_soundness (#2)",
+        "gap": "validation.pbo_cscv() (Bailey-Borwein-LopezdePrado-Zhu 2017, the 'honest upgrade' per its own docstring, validation.py:200-273) and serial_correlation_factor() (Lo-2002, :276-317) are fully implemented and unit-tested but called in NO gate — VERIFIED this wave the only callers are validation.py defs + tests/test_validation_hardening.py (grep empty elsewhere). The actual promotion gate is solely holdout sharpe>0 AND dsr>=dsr_min (VERIFIED hypersearch_v2.py:1408-1410). The only PBO computed anywhere is the coarse 3-fold pbo_from_fold_scores (:1514-1519), and it is PRINT-ONLY ('WARNING: >0.25 suggests overfitting') — it never blocks a save. So a config with PBO=0.5 prints a warning and still deploys if its lucky ~12% holdout slice clears DSR. validation.py imports cleanly on the Mac (confirmed), so the offline estimator is genuinely buildable+testable here now.",
+        "roi_case": "Activates ~80 lines of already-written, already-unit-tested honest-validation code that is currently dead, adding the SECOND independent overfit check the gate structurally lacks. Per the source paper, a single 12% holdout 'cannot correctly assess representativeness' once you search hundreds of configs (Sec 2.2), and Arian-Seco 2024 shows holdout/walk-forward are the WORST overfit detectors vs combinatorial CV (CSCV/CPCV have lowest PBO, highest DSR). The 3 free companion stats (perf-degradation slope, prob-of-loss, stochastic dominance) are byproducts of the same matrix at zero extra compute. Split-ship maximizes ROI: the validation wrapper + offline audit + tests are measurement_safe and land on the Mac NOW; only the one-line gate clause is model_facing_gated. Beat the LLM and peak_equity items on this axis by being a second ORTHOGONAL integrity check (complements, doesn't overlap, the uniqueness fix at rank 1 — that fixes training honesty, this fixes SELECTION honesty); beat the scaler-slice on magnitude.",
+        "implementation": "MAC_NOW (measurement_safe, ships directly, pure numpy + synthetic tests): (A) validation.pbo_from_oos_blocks(block_rows, n_groups=8) — ~15-line wrapper that filters None/wrong-length/non-finite/all-equal rows, np.stacks into M, returns pbo_cscv(M, n_groups); fail-open (None on <2 valid rows or B<n_groups). (B) build_oos_blocks(trade_returns, n_blocks) pure helper binning a 1-D net-return array into n_blocks equal-count contiguous Sharpe/mean contributions, padded to exactly n_blocks (keeps the testable logic out of the torch path). (C) tests/test_cscv_gate.py extending the green test_validation_hardening.py: KNOWN-OVERFIT rank-reversal row (IS-best on first S/2 blocks, below-median after) -> high PBO AND a PBO_MAX predicate REJECTS it, while a persistent-skill row passes; FAIL-OPEN None=>pass; build_oos_blocks length/equal-partition/mean-preservation invariants; LO-vs-UNIQUENESS NON-STACKING guard (assert the DSR n_eff arg is the uniqueness value, NOT the Lo factor — gotcha #4). Ship scripts/cscv_audit.py ONLY as a forward-looking harness for a FUTURE Jetson user_attrs dump — do NOT advertise 're-audit past runs now' (no saved run carries the per-subperiod matrix; fold_sharpes is 3 scalars < n_groups=8). JETSON_LATER (model_facing_gated): (1) add trial.set_user_attr('oos_block_perf', build_oos_blocks(...)) inside the objective fold loop (needs torch final_preds_np / per-trial trade_returns — note today trade_returns is persisted only for the single champion, so this is net-new per-trial); (2) add a PBO_MAX clause to gate_ok at hypersearch_v2.py:1408-1410 so an IS-best/below-OOS-median config is REJECTED even when its lucky 12% holdout clears DSR; (3) calibrate PBO_MAX on real historical retrains (AFML 0.5 floor vs strict 0.05); (4) keep serial_correlation_factor OFF by default; (5) no study reset unless PBO_MAX couples into best_score (gotcha #2). Verify-no-regression: pytest then git-stash A/B against the 616/34/14 baseline.",
+        "deploy_class": "model_facing_gated",
+        "literature": "Bailey, Borwein, Lopez de Prado, Zhu (2017) 'The Probability of Backtest Overfitting', J. Computational Finance — pbo_cscv is a faithful Algorithm 2.3 implementation (form M of [N trials x T obs]; even S disjoint blocks; enumerate C(S,S/2) symmetric splits; per split pick IS-best, compute OOS rank omega, logit lambda; PBO = fraction with lambda<=0). Sec 2.2 lists 5 reasons single holdout is unsatisfactory (incl. 'does not take into account the number of trials'); Sec 3.1 gives the PBO>0.05 reject rule; davidhbailey.com/dhbpapers/backtest-prob.pdf. Arian, Norouzi M., Seco (2024) 'Backtest overfitting in the ML era', Knowledge-Based Systems / SSRN-4686376 — CSCV/CPCV have lowest PBO & highest DSR vs walk-forward/K-fold. Lo (2002) 'The Statistics of Sharpe Ratios', FAJ — serial-correlation variance-inflation f=1+2*sum(1-k/q)rho_k (the off-by-default diagnostic).",
+        "risk": "Bounded by the fail-open contract (None => DSR still governs), so it can never block honest models on small/early runs and the gate gets strictly-tighter-never-looser. Honest-scope caveats (folded in from refutes): the immediate Mac value is ~15 lines + tests around already-tested code; the real ROI (per-trial OOS-matrix persistence + the blocking PBO_MAX clause) is Jetson-gated and model-facing; marginal value over the existing coarse 3-fold PBO is finer granularity (8-block) + actually BLOCKING vs warning. Do NOT couple PBO_MAX into best_score comparisons or a study reset is forced (gotcha #2)."
+      },
+      {
+        "rank": 3,
+        "title": "Make llm_eval answer the only question that justifies the LLM spend: incremental-over-pred (partial-Spearman controlling for ML pred), not raw Spearman",
+        "priority_axis": "llm_utilization (#3)",
+        "gap": "llm_eval journals the ML pred alongside each conviction score s and carries it into the sample tuples, but the keep/kill verdict is computed on RAW correlation of s vs realized only — pred is DEAD. VERIFIED: pred captured at llm_eval.py:139 and appended at :151 (samples.append((s, realized, pred))), but the entire compute block uses only s_vals/realized: rho = _spearman(s_vals, realized) at :178 drives report['spearman_s_vs_return'] and the printed keep/kill verdict at :193-198. The 3rd tuple element is never read. CRITICALLY the prompt SHOWS the LLM the ML pred (llm_analyst.py:456-457), so a high Spearman can be the LLM merely ECHOING the ML signal (redundant) and a low one can hide real orthogonal alpha. The verdict that gates a real decision is confounded by the very signal the LLM is meant to complement: s drives llm_mult=0.5+s sizing (base_loop.py:1649, applied :1313, 0.65-1.5x) AND forced liquidation on consecutive s<0.15 vetoes, at ~$7/mo. llm_eval imports cleanly on the Mac (confirmed) so the estimator is genuinely mac_now-testable; no tests/test_llm_eval.py exists today.",
+        "roi_case": "The ONLY candidate on priority axis #3, which the user explicitly wants ('make the LLM EARN its place with a measurable lift'), and it is the single highest-leverage fix to the LLM-value question: it converts llm_eval from a metric that CANNOT distinguish complementarity from redundancy into one that answers the binary $7/mo keep/kill AND is the PREREQUISITE measurement for the deferred model-facing LLM sizing items (conf-field fix, llm_mult attribution) — those can only be validated once incremental lift is measurable. measurement_safe (offline, zero live-signal change) so it ships directly; ~1 file of pure numpy + 1 new test file, fully Mac-buildable (scipy.stats + statsmodels both import here). Beat a 4th financial-soundness pick for the #5 slot on PORTFOLIO grounds: it is the only item covering priority axis #3, and skipping it would leave the LLM's value formally unanswerable while three #2 items pile up.",
+        "implementation": "MAC_NOW (measurement_safe, ships directly): refactor run_eval to SPLIT API-bound sample collection from a pure compute_incremental_report(samples) over (s, realized, pred) triples so the statistics are unit-testable WITHOUT Alpaca. Report THREE things side-by-side: (1) PRIMARY = partial Spearman rho(s,realized|pred) via rank-residualization (rank-transform all three, closed-form 2-var OLS residualize rank(s) and rank(realized) on rank(pred), Spearman the residuals) — the gap between RAW and PARTIAL IS the echo diagnostic; (2) the 2x2 agree/disagree grid {LLM-bull s>=0.5, LLM-bear} x {ML-bull pred>0, ML-bear} with explicit per-cell n (off-diagonal disagreement cells are where the LLM can ONLY be adding orthogonal value); (3) OPTIONAL/SECONDARY encompassing regression realized = a + b1*pred + b2*z_s with Newey-West variance at lag=forward_bars-1 and an HLN n-1 t-dist p-value — this self-reports significance and is the honest verdict driver. tests/test_llm_eval.py (pure numpy, fixed seed, N~2000): redundancy (s=sigmoid(pred) -> raw HIGH, partial ~0, b2 NOT significant — catches the echo the current metric can't); orthogonal-alpha (realized=a*pred+b*g+noise, s=sigmoid(g), g _|_ pred -> partial recovers positive b even when raw ~0 — proves the flip case); null; 2x2 disagreement-cell edge; degeneracy (constant pred -> pred_degenerate flag, no crash); statsmodels ORACLE cross-check (b2 / partial-rho to 1e-6); plus a SMALL-n power caveat assertion (at N=40 the verdict ABSTAINS). JETSON_LATER (measurement_safe, no promotion gate): run python llm_eval.py --days 30 (and --asset crypto/stock) on real journals carrying the pred field; one-time statsmodels correctness audit on the full stack.",
+        "deploy_class": "measurement_safe",
+        "literature": "Harvey, Leybourne & Newbold (1998, JBES 16(2):254-259) 'Tests for forecast encompassing' — regression e^A_t=lambda(f^B_t-f^A_t)+u_t, H0:lambda=0 (A encompasses B => B adds nothing), small-sample t(n-1) correction + HAC/Newey-West for overlapping h-step horizons (exactly our forward_bars=24 case). PResiduals::partial_Spearman (CRAN) — partial Spearman = Spearman of residuals after regressing rank(X) and rank(Y) on control rank(Z); the RankIC-with-control analogue of the standard quant Information Coefficient, scale-free and robust to the LLM's monotone-nonlinear 0-1 mapping and fat-tailed returns. Chen, Kelly & Xiu, 'Expected Returns and Large Language Models' (SSRN 4416687) — finds LLM news signals contain information INCREMENTAL beyond traditional technical predictors and firm characteristics: the field measures LLM value as incremental-over-baseline, precisely the metric llm_eval is missing.",
+        "risk": "Refinement of an existing offline tool, not a live defect — zero live-signal change. The honest hazard (folded in from refutes): at realistic journal volume (often n~30-80, thinned by forward-horizon-elapsed and per-asset splits) a partial-rho of 0.03-0.15 is statistically indistinguishable from zero (null std ~0.15-0.19 at n=30-50), so the verdict must gate on the SIGNIFICANCE of b2 with CIs, NOT a bright-line rho_partial>0.03; raise the n guard to >=60-100 and emit 'insufficient_power'/'pred_degenerate' flags rather than a confident flip. The 2x2 disagreement cells are the LEAST populated (the LLM is shown the pred and rarely disagrees) — report n and don't lean on thin cells. Frame the payoff as diagnosing echo-vs-orthogonal + a significance-tested incremental coefficient, NOT a promised clean keep/kill flip. Real numbers need Jetson journals carrying pred (only recently started being written) — expect thin n initially."
+      },
+      {
+        "rank": 4,
+        "title": "Persist account-level _peak_equity so the drawdown de-leveraging ladder survives restarts (today it silently disables on every restart-mid-drawdown)",
+        "priority_axis": "financial_soundness (#2) + jetson_memory_perf (#1, restart resilience)",
+        "gap": "self._peak_equity initializes to a HARDCODED 100_000 (VERIFIED base_loop.py:98) and is only updated IN-MEMORY from acct.equity (VERIFIED :535-536). _save_position_state persists hwm/trailing/last_trade/daily_trades but NOT _peak_equity (VERIFIED the data dict at :304-310 has exactly those four keys; grep confirms peak_equity appears ONLY at 98/535/536/1270/1271). The drawdown ladder computes dd=(_peak_equity-_equity)/_peak_equity and cuts size 25/50/75% at 10/15/20% DD (VERIFIED :1270-1277). So after ANY restart mid-drawdown from a peak>100k, _peak_equity resets to max(100k, current)~current, dd snaps to ~0, and the entire de-leveraging ladder turns OFF precisely when the account is underwater. On an 8GB Jetson Orin Nano, restarts on retrain/OOM/power events are ROUTINE, not rare, so the window is hit in normal operation.",
+        "roi_case": "Serves BOTH the #1 (Jetson restart resilience) and #2 (financial soundness) priority axes — the only candidate touching the top axis with real ROI (the rank-1 scaler-slice that nominally hits #1 is a microsecond no-op). Surgical, ~6 LOC + 1 test, no deps/perf/memory cost, fail-direction safe. Without it a bot restarted at a 15% drawdown sizes at 1.0x instead of 0.50x (2x the intended risk; 4x at 20% DD), exactly when de-risking matters most. Beat the scaler-slice decisively (a real risk-control fidelity gap on the single most consequential downside-control mechanism vs a microsecond cleanup) and earned the slot over a 4th #2 item by ALSO covering priority axis #1, giving the portfolio breadth.",
+        "implementation": "MAC_NOW (buildable+testable now, but NOT via importing base_loop — VERIFIED `import base_loop` fails with ModuleNotFoundError: joblib via predict_now, so the naive 'instantiate the loop' test does NOT run here): extract the persistence round-trip and the dd-ladder arithmetic (the math at base_loop.py:1270-1277) into pure free functions and unit-test THOSE with numpy/json + a synthetic state file. Edits: add 'peak_equity': self._peak_equity to the _save_position_state dict (:304-310) and restore in _reconstruct_positions as self._peak_equity = max(self._peak_equity, float(saved.get('peak_equity', 0.0))) BEFORE the first _update_equity ratchet; keep _update_equity a monotone UP-ratchet so a restored higher peak is never clobbered by lower current equity (the bug-reintroduction trap). tests/test_peak_equity_persistence.py: restart-mid-drawdown (write peak=200k, simulate restart with equity=170k, assert restored peak==200k and dd==0.15 and the ladder applies 0.50x); cold-start; legacy state file missing 'peak_equity' (backward-compat -> falls back, no crash); corrupt value. JETSON_LATER (model_facing_gated, sizing activation): live restart-resilience drill, end-to-end ladder check post-restart, atomic-write durability under OOM/power restarts; ships via challenger->shadow->DM-HLN with Jetson sign-off. Verify-no-regression: pytest --continue-on-collection-errors -q, git-stash A/B against the 616/34/14 baseline.",
+        "deploy_class": "model_facing_gated",
+        "literature": "Grossman & Zhou (1993, Mathematical Finance 3(3):241-276) 'Optimal Investment Strategies for Controlling Drawdowns' — cushion-proportional sizing relative to the running high-water mark; the HWM MUST persist for the rule to be well-defined across sessions. Cvitanic & Karatzas (1995) drawdown-constrained optimization; Boyd et al. 'Multi-Period Portfolio Selection with Drawdown Control'; Klass & Nowicki (2005); Rob Carver (qoppac) practitioner drawdown-scaled capital sizing.",
+        "risk": "model_facing (sizing) -> Jetson sign-off via challenger->shadow->DM-HLN. Scope corrections folded in from refutes: DROP the incorrect 'permanent 0.25x throttle / 2x over-risk for sub-100k accounts' justification — the 100k seed errs CONSERVATIVE (fail-safe phantom-dd) for small accounts; the ONLY genuine risk hole is the >100k-peak restart-mid-drawdown case where dd resets to ~0 and the ladder disables. This is a PAPER system (no real capital at risk), so frame ROI as risk-control FIDELITY, not money-loss avoidance. The realized-harm window requires (a) a restart AND (b) being underwater from a prior higher peak — plausible and routine on the Jetson but not constant. The restore-then-ratchet ordering is mandatory or the fix reintroduces the bug; the synthetic free-function test covers it. Honest mac_now caveat: needs a free-function extraction (or a sys.modules-stub harness with no precedent in the suite) because base_loop can't import on the Mac — slightly more than the '~6 LOC' headline."
+      },
+      {
+        "rank": 5,
+        "title": "Slice the seq_len window BEFORE scaler.transform in get_live_prediction (bit-identical partially-dead-code elimination)",
+        "priority_axis": "jetson_memory_perf (#1)",
+        "gap": "In get_live_prediction(), current_features = df[feature_cols].values is the ENTIRE post-dropna fetched window (predict_now.py:312), scaler_X.transform(current_features) transforms ALL of them (:318), and then only the last seq_len rows are used: sequence = current_features_scaled[-seq_len:] (:319). VERIFIED: current_features_scaled has exactly two occurrences (318 define, 319 sole consumer), so it is dead beyond the slice; scaler_X is a joblib-loaded RobustScaler whose transform is strictly elementwise per-column ((X-center)/scale), so transform(current_features[-seq_len:]) is bit-identical to transform(current_features)[-seq_len:]; the upstream len(df)>=seq_len guard makes the slice always valid. Transforming the discarded leading rows is pure waste, repeated per symbol per ~30s cycle across both 24/7 crypto and stock books. Batch paths (backtest.py:97, hypersearch:508) build sliding windows over ALL rows and legitimately need the full transform — left untouched.",
+        "roi_case": "Hits priority axis #1 (Jetson perf) and is the rare ZERO-functional-risk item (row-independent transform => bit-identical output), so it ships directly measurement_safe with no gate, and it is fully provable on the Mac NOW with a synthetic numpy RobustScaler equivalence test. Cuts the live-path transform input by ~2-4x fewer rows (effective post-dropna window ~74-100 -> seq_len 8-40) and drops the oversized intermediate, per symbol per cycle. It earns the #5 slot over a 4th financial-soundness pick to keep the portfolio honest about priority axis #1 being the user's #1 stated priority AND because it is the highest-confidence lowest-effort item on the board (a verified one-line change + one test). It is explicitly ranked LAST because, post-verification, the absolute saving is small (single-digit microseconds/cycle on a sub-microsecond-scale operand) and it does NOT touch the real perf lever.",
+        "implementation": "MAC_NOW (measurement_safe, ships directly): replace predict_now.py:318-319 with a single line `sequence = scaler_X.transform(current_features[-seq_len:])` (drop the dead current_features_scaled intermediate). tests/test_scaler_slice_equiv.py (pure numpy synthetic RobustScaler): assert np.array_equal(transform(window)[-seq_len:], transform(window[-seq_len:])) across shapes; assert the reshape/tensor-input path is identical; an ast guard that current_features_scaled is gone (dead-intermediate eliminated). Leave backtest.py:97 and hypersearch_v2.py:508 untouched (batch paths need all rows). JETSON_LATER (measurement_safe): one-time bit-identical regression of predicted_return/lstm/lgb/q10 on real symbols + a transform/cycle microbenchmark (RSS+CPU) under TORCH_NUM_THREADS=2 to confirm no behavior change.",
+        "deploy_class": "measurement_safe",
+        "literature": "RobustScaler row-independent transform arithmetic (scikit-learn preprocessing docs: each row is (x-center)/scale elementwise). Partially-dead-code elimination / loop-invariant code motion (compiler optimization: hoist/eliminate computation whose result is discarded). Sliding-window preprocessing latency scaling (edge-AI narrowing of the preprocessing window) — cited honestly as the analogy, NOT as a literal multiplier, since here preprocessing does not dominate the cycle.",
+        "risk": "Effectively zero functional risk (bit-identical output, verified). The honest hazard is OVERSELLING the ROI (both refute critiques flagged this): the real saving is single-digit microseconds/cycle and a ~36KB transient freed at function return regardless — it does NOT relieve 8GB Jetson MEMORY pressure and moves the perf needle ~0% because the cycle is dominated by network fetch, the full-window feature computation (indicators.py rolling(252)/(231) recomputed over the WHOLE window every 30s cycle — the ACTUAL perf lever this does NOT touch), the torch LSTM forward, and two LightGBM boosters. Ship it as a correct zero-risk cleanup, claim NO measurable latency/RSS win, and flag the full-window rolling-recompute as the real perf item for a future wave."
+      }
+    ],
+    "portfolio_note": "Spans 3 of the 4 priority axes and is weighted by the strict order. Three financial-soundness items (#2) anchor the wave because that axis has the highest-confidence, best-evidenced, lowest-overfit-risk gaps right now — and crucially they are ORTHOGONAL, not redundant: rank 1 fixes TRAINING honesty (the loss over-counts non-IID overlapping labels), rank 2 fixes SELECTION honesty (the gate is a single 12% holdout with no overfit-probability), and rank 4 fixes RISK-CONTROL honesty (the drawdown ladder silently disables on restart). Rank 4 doubles as the only real win on priority axis #1 (Jetson restart resilience), and rank 5 is the pure-#1 perf item kept for axis coverage but ranked last and explicitly de-hyped after verification proved it a microsecond no-op (its refutes were decisive on magnitude). Rank 3 is the sole priority-axis-#3 item and earns its slot on portfolio grounds — the user explicitly wants the LLM to EARN its place, and it is the prerequisite measurement that unblocks every deferred model-facing LLM change; dropping it for a 4th #2 item would leave axis #3 unrepresented and the $7/mo LLM value formally unanswerable. Feasibility-weighted: 4 of 5 are mac_now-buildable now (verified — risk_budget/validation/llm_eval all import on the Mac; only base_loop hits the joblib wall, which is why rank 4's mac_now is a free-function extraction not a loop-instantiation). Deploy mix is healthy: ranks 2/3/5 ship a measurement_safe slice DIRECTLY this wave (audit/estimator/cleanup), while the model-facing activations (rank 1 weighting, rank 2 PBO_MAX clause, rank 4 sizing) are correctly gated to Jetson + challenger->shadow->DM-HLN. Every refute critique was folded in to TIGHTEN scope (strip inflated ROI on 1/4/5, gate the LLM verdict on significance not a bright line, scope uniqueness to crypto via Stage-0, honor the Lo-2002/uniqueness double-count and study-reset gotchas) rather than to kill — all 5 gaps are confirmed real against HEAD and none re-propose shipped or KILLED work. I deliberately did NOT pad to a 6th lower-evidence idea: these 5 dominate their niches and the honest-mention list below captures the adjacent items that pair with them.",
+    "honorable_mentions": [],
+    "full_ranked": [
+      {
+        "title": "Cache live predictions on the closed-bar timestamp (hourly bars, but full feature+inference re-runs every 30s)",
+        "roi_score": 96,
+        "priority_axis": "jetson_memory_perf",
+        "one_line": "~119/120 inference cycles/hour are bit-identical recomputes of feature-compute+LSTM+LGB+q10 for ~66 symbols; no bar-keyed prediction cache exists (verified: only LOOP_INTERVAL=30 base_loop.py:57 + 20s BAR_CACHE_TTL that expires before the next cycle, bars are '1Hour' market_data.py:149,212). Memoize (pred,snapshot) on the closed-bar ts — the single largest source of wasted edge-device CPU; #1 priority, hybrid build (Mac-testable with mocked timestamps)."
+      },
+      {
+        "title": "Slice the seq_len window BEFORE scaler.transform (currently transforms full ~120-200 bar history, keeps only last seq_len)",
+        "roi_score": 90,
+        "priority_axis": "jetson_memory_perf",
+        "one_line": "predict_now.py:312-319 does scaler_X.transform on the entire fetched window then discards all but [-seq_len:]; RobustScaler is row-independent so transforming only current_features[-seq_len:] is bit-identical. Zero-risk, pure-numpy, fully Mac-unit-testable NOW, ~5-10x fewer scaled rows x66 symbols x up to 120 cycles/hr — the cheapest provably-correct Jetson win."
+      },
+      {
+        "title": "INT8 dynamic quantization for the CPU LSTM inference path (zero quantization exists today)",
+        "roi_score": 84,
+        "priority_axis": "jetson_memory_perf",
+        "one_line": "Verified no quantiz/qint8/.half()/torch.quantization anywhere; model is nn.LSTM+nn.Linear (model_v2.py) traced fp32 (predict_now.py:95-98) on CPU-only inference (trading_utils.py:88-96) — the textbook quantize_dynamic target for ~2-4x CPU LSTM speedup + ~4x smaller weights. #1 priority, low LOC; jetson_later (needs torch + qnnpack/fbgemm validation + return parity before promotion)."
+      },
+      {
+        "title": "Wire avg-uniqueness sample weights into LSTM/LGB-mean/LGB-q10/meta training losses (built+tested producer, consumed only by the DSR gate)",
+        "roi_score": 83,
+        "priority_axis": "financial_soundness",
+        "one_line": "MERGED (3 candidates). uniqueness_weights/effective_n are consumed ONLY at the offline DSR gate (verified hypersearch_v2.py:1089-1105, wave6_stage0.py); LSTM loss weights by clamp(|ret|+1) only (hypersearch_v2.py:707-760), model_lgb.Dataset has no weight= (model_lgb.py:74), meta trains unweighted (meta_label.py:308) — so the gate is honest but the FIT over-counts overlapping hourly labels 3-10x. AFML ch.4; the kernel exists and is the #1 wave-6 NEXT item. model_facing_gated (jetson retrain), pure-numpy wiring is Mac-testable."
+      },
+      {
+        "title": "Add a square-root market-impact / size term to the backtest+meta cost model (DV30 already harvested; cost is fee+EDGE-half-spread only)",
+        "roi_score": 80,
+        "priority_axis": "financial_soundness",
+        "one_line": "MERGED (3 candidates). Verified: backtest charges rt_cost=fees+per-bar EDGE only (backtest.py:182-229), meta uses identical cost (meta_label.py:243-244), fees/liquidity have no qty/notional arg — a $100 and $5k order into a thin spec name cost the same bps. DV30 is stamped (harvest_stock_data.py:224-231) then dropped. A k*spread*sqrt(notional/ADV) haircut de-certifies impact-driven 'edge' the marginal trades sit on; measurement_safe (offline gate+labels), pure-pandas MAC_NOW."
+      },
+      {
+        "title": "Honest CSCV-PBO (pbo_cscv) + Lo-2002 serial factor are implemented, unit-tested, and dead — the promotion gate is single-holdout DSR with no overfit probability",
+        "roi_score": 78,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified pbo_cscv + serial_correlation_factor (validation.py:200-317) have ZERO callers; the gate is sharpe>0 AND dsr>=0.60 (hypersearch_v2.py:1408-1410) and the only PBO is coarse 3-fold pbo_from_fold_scores that is print-only ('WARNING >0.25', hypersearch_v2.py:1514-1519) and never blocks a save. Recording per-subperiod trial scores turns ~80 lines of tested honest-validation code into the 2nd independent overfit gate; measurement_safe, MAC_NOW."
+      },
+      {
+        "title": "Persist account-level _peak_equity — the drawdown de-leveraging ladder silently disables on every restart",
+        "roi_score": 77,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified _peak_equity inits to hardcoded 100_000 (base_loop.py:98), updates in-memory only (:535-536), and is OMITTED from _save_position_state (:304-314 persists hwm/trailing/last_trade/daily_trades only). After a restart mid-DD it snaps to current equity, dd~=0, so the 25/50/75% ladder (:1270-1277) turns OFF exactly when underwater — a restarted bot at 15% DD sizes 1.0x instead of 0.50x (2x intended risk). Jetson restarts on retrain/OOM/power are routine. Tiny surgical fix, persistence logic is MAC-testable; serves #1 (restart resilience) + #2."
+      },
+      {
+        "title": "llm_eval can't answer the only question that matters: does the LLM add signal BEYOND the ML model (incremental-over-pred)?",
+        "roi_score": 75,
+        "priority_axis": "llm_utilization",
+        "one_line": "Verified llm_eval captures the ML pred (llm_eval.py:139,151) but the keep/kill verdict uses rho=_spearman(s_vals, realized) only (:178) — pred is collected and never used. The prompt SHOWS the LLM the ML pred (llm_analyst.py:456-457), so a high rho could be pure echo and a low one could hide orthogonal alpha. Partial-Spearman(s | pred) is the single highest-leverage fix to the 'does the ~$7/mo LLM earn its place' question; pure-numpy, measurement-only, MAC-testable on synthetic triples (numbers need Jetson journals)."
+      },
+      {
+        "title": "Wire risk_budget account-level cross-book stop cap into live sizing (built+tested flagship, but base_loop nets risk WITHIN a book only)",
+        "roi_score": 73,
+        "priority_axis": "financial_soundness",
+        "one_line": "MERGED (2 candidates). Verified the account-cap module (account_stop_risk/account_risk_budget/scale_for_account_cap) has NO live importer — base_loop only uses portfolio.book_risk_budget per-book (base_loop.py:1355-1362; the earlier grep 'hit' was the substring in book_risk_budget). So crypto book to 0.025 + stock book to 0.025 can stack to ~5% combined vs the intended ~3% cap the module was written to enforce. scale_for_account_cap only ever reduces size (fail-safe). GATE-1 journal measurement ships safe; live clamp is model_facing_gated and needs a shared cross-book registry (the real plumbing) — hybrid."
+      },
+      {
+        "title": "Calibration leak in the meta-label: isotonic fit on the SAME slice used for early-stopping, no purge, feeding a hard live veto (p<0.30)",
+        "roi_score": 71,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified meta_label.py:307-322 — 80/20 chronological split, X[split:] is the val_set for LightGBM early-stopping AND the rows isotonic is fit on (raw_val=booster.predict(X[split:]); calib.fit(raw_val,y[split:])). No purge/embargo, no uniqueness weight. Calibrated P(profit) is optimistic and drives a hard veto + clip(2p,0.6,1.3) sizing. A held-out/CV calibration fold removes the bias; <200-trade bail (meta_label.py:300) means it must reuse CV folds not a naive 70/15/15. model_facing_gated, jetson_later (needs lgb+replay)."
+      },
+      {
+        "title": "Add the q10 left-tail veto to the crypto loop (trained+served for crypto, consumed only by stocks)",
+        "roi_score": 70,
+        "priority_axis": "trading_strategy",
+        "one_line": "Verified predict_now stamps Q10/Q10_Floor for the crypto prefix (predict_now.py:414-416), hypersearch trains a crypto q10 (hypersearch_v2.py:1001), but crypto_loop.py has ZERO Q10 refs (grep -c = 0) while stock_loop.py:798-807 implements q10_tail_veto. The 24/7, fattest-left-tail book pays full training+serving cost and never acts on it. ~5-line port of a tested branch, self-calibrating floor; asymmetric DD protection on the riskier book. model_facing_gated (new veto), hybrid."
+      },
+      {
+        "title": "The DOMINANT LLM effect — the (0.5+s) size multiplier on EVERY entry — is completely unmeasured; only the rare s<0.15 veto is priced",
+        "roi_score": 69,
+        "priority_axis": "llm_utilization",
+        "one_line": "Verified llm_mult=0.5+llm_s spans 0.65-1.5x and is applied to every entry (stock_loop.py:790, base_loop.py:1649, folded at base_loop.py:1313 'tilt *= llm_mult'); decision_report GATE_REASONS prices only the binary 'llm_veto' (decision_report.py:45) and llm_eval reports bucket means but never size-weighted-vs-flat P&L. A counterfactual (0.5+s)-weighted vs equal-weight book over the same entries answers whether the always-on multiplier adds or destroys return — the body of the distribution vs the tail veto. Reuses replay_entry; measurement-only, MAC core."
+      },
+      {
+        "title": "Add top-K-portfolio DSR + turnover scoring to portfolio_backtest.py (the evaluator that gates BOTH the conviction flagship and LambdaMART)",
+        "roi_score": 67,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified portfolio_backtest.py:105 scores a real top-K book with a PLAIN annualized Sharpe and compare() returns only sharpe/net/k deltas (:120-137) — no DSR over admission-policy count, no n_eff, turnover not a first-class gate metric. validation.dsr_from_trade_returns (validation.py:107) is pure and uncalled here. wave-3 memo names this as a hard prerequisite ('do NOT build the ranker before its evaluator') and the wave-5 conviction go/no-go routes through this A/B engine. One ~M MAC_NOW change unblocks two deferred items; measurement_safe."
+      },
+      {
+        "title": "Wire built+tested cost_regime.py (Amihud illiquidity per-name rank + PIT VIX regime) into the stock harvest + cross-section + meta-labeler",
+        "roi_score": 64,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified amihud_illiq + vix_features_for_index have ZERO consumers (orphaned like basis/squeeze); its own docstring says the meta-learner 'has no cost-regime feature — only Volatility_12h/ATR_Pct', and CS_RANK_BASE_COLS (panel_ranks.py:42-52) has DV30 dollar-volume but NO illiquidity/price-impact rank. Adds a free PIT Amihud cross-sectional predictor + VIX stress-conditioning to the meta layer. Pure functions are unit-tested; ~one harvest-merge of wiring. model_facing_gated (next retrain), MAC-provable."
+      },
+      {
+        "title": "Wire the already-built basis + squeeze-interaction crypto features into the crypto harvest (orphaned, zero consumers)",
+        "roi_score": 62,
+        "priority_axis": "trading_strategy",
+        "one_line": "Verified basis_features_for_index + squeeze_interaction have ZERO non-self/test callers; crypto harvest ARCHIVE_FEATURES omits Basis_*/Funding_x_OI/Squeeze_Setup, presets have no entries. Per wave-7 the novel signal is Basis_minus_Funding (funding lead/lag residual) + the Funding_x_OI interaction (extreme funding only dangerous when OI high — a product a tree must otherwise rediscover from a starved 10-name panel). ~20-line harvest merge + preset/ARCHIVE_FEATURES edit turns sunk PIT-clean code into usable alpha; MAC-provable, model_facing_gated on retrain."
+      },
+      {
+        "title": "Crypto book has NO cross-sectional rank substrate — the relative-strength info the stock top-K relies on is structurally absent",
+        "roi_score": 61,
+        "priority_axis": "trading_strategy",
+        "one_line": "Verified stock harvest gets add_panel_ranks (harvest_stock_data.py:309-310) but crypto harvest + crypto_loop have ZERO panel/CS_Rank refs (grep -c = 0); compute_features is single-name. The crypto loop makes a relative top-K-of-10 selection blind to within-hour standing. NOT the wave-7-KILLED 'crypto CARRY rank' (that was the funding trade Alpaca can't do) — this is the directional rank substrate. panel_ranks helpers are reusable; small 10-name panel inflates overfit so it MUST ride the effective-n DSR + parsimony. model_facing_gated, MAC-provable."
+      },
+      {
+        "title": "Make the LSTM/LGB ensemble blend weight a tuned+validated parameter instead of a hardcoded 0.6",
+        "roi_score": 60,
+        "priority_axis": "trading_strategy",
+        "one_line": "Verified ensemble_predict defaults lstm_weight=0.6 (model_lgb.py:138) and predict_now.py:346 calls it with NO weight, so the live blend is permanently 0.6/0.4 — never tuned, validated, or in config, and the two legs aren't guaranteed on a common scale. Selecting the weight (or a tiny stacker) once on the holdout and freezing into config typically recovers 5-15% ensemble Sharpe at zero live cost. A magic constant gates the entire live signal. model_facing_gated, hybrid (Mac builds the selector, Jetson fits)."
+      },
+      {
+        "title": "DSR deflation pool counts only LSTM Optuna trials — undercounts true multiple-testing breadth + assumes independent trial Sharpes",
+        "roi_score": 59,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified n_trials=max(len(completed_trials),2) (hypersearch_v2.py:1404) ignores the target_kind raw-vs-tb DoF, the self-calibrated q10 floor (15th pctile, :1006), the meta veto, and the two independent crypto/stock searches; expected_max_sharpe~sqrt(2 ln N) (validation.py:62-73) so understating N lowers the bar, and sr_std defaults to 1/sqrt(n_eff) assuming independence (validation.py:143-144) while TPE trials concentrate near the optimum on a shared panel. A defensible accounting of discrete extra DoF tightens the gate. One-file pure-math, measurement_safe, MAC-testable."
+      },
+      {
+        "title": "Bar-freshness guard in the predict/trade path — model can trade on silently stale OHLCV during data outages",
+        "roi_score": 58,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified predict_now.py:174-187 only checks df None/empty and len>=seq_len, never bar AGE; the 20s cache bounds re-fetch not recency; base_loop GARCH/HMM use the same returns with no freshness gate. Staleness logic exists for LLM scores (base_loop.py:871-911) but nothing analogous for the OHLCV that drives signals AND stops. An asset-aware guard (skip+notify when newest bar > 1.5x interval, session-aware for stock) closes a silent bad-fill/bad-stop class. Must fail-CLOSED; the skip is model_facing_gated, the measurement is safe; MAC-testable."
+      },
+      {
+        "title": "Joint cap on the kelly_mult * vol_mult * tilt BOOST side — sizing can procyclically stack to 2.25x off correlated calm-regime inputs",
+        "roi_score": 56,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified sized = base * kelly_mult * vol_mult * tilt (base_loop.py:1346) with kelly_mult and vol_mult each [0.5,1.5]; TILT_MAX clamps only `tilt`, leaving kelly*vol uncapped at 2.25x. kelly is min(kelly_mult,1.0) ONLY in bear/stress (verified), so boosts stack precisely in calm/winning regimes (procyclical). A single explicit BOOST ceiling cuts only the over-sizing tail (de-risking to 0.1x untouched); MacLean-Thorp-Ziemba fractional-Kelly the code already cites. Pure-arithmetic, MAC-testable, model_facing_gated."
+      },
+      {
+        "title": "Add a Deflated-Sharpe / effective-n promotion gate to the meta-learner (selected today on a single val_auc number)",
+        "roi_score": 55,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified the meta layer ships on val_auc alone (meta_label.py:336-348) with no DSR/n_eff/overfit penalty, even though the repo applies exactly those to the primary holdout (hypersearch_v2.py:1111). _gen_meta_rows already produces per-trade 'nets' + entry_times (meta_label.py:247) so a policy-Sharpe+DSR gate on the meta's replayed trades is directly buildable. An overfit secondary classifier currently distorts sizing + hard-vetoes live trades on AUC alone. measurement_safe gate logic; reuses existing kernels; hybrid (real replay needs Jetson)."
+      },
+      {
+        "title": "Calibrate the primary 'pred' magnitude per-asset before it feeds the meta gate, single threshold, and conviction tiers",
+        "roi_score": 53,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified meta ingests raw 'pred' as feature #1 with no per-asset standardization (meta_label.py:43-50,77), the live signal hits a single trade_threshold (predict_now.py:381), and conviction tiers hardcode pred>=1.5*thr / pred/thr (base_loop.py:1118,1133) — yet crypto vs stock predicted-return magnitudes live on different vol/horizon/cost scales (TXN 0.60 vs 0.11). Nothing maps the raw % to a calibrated edge; isotonic/Platt exist only on the meta OUTPUT. Ships FIRST as a measurement_safe meta feature + journal field, A/B before touching the live gate; pure-numpy MAC core."
+      },
+      {
+        "title": "Single conflated LLM score s can't separate 'confident neutral' from 'no information' — gate down-sizes uninformed names as if bearish",
+        "roi_score": 51,
+        "priority_axis": "llm_utilization",
+        "one_line": "Verified the schema returns one s (llm_analyst.py:108-116), the rubric FORBIDS neutral and forces a directional view (:71-76), and the same s drives both veto (base_loop.py:852) and sizing magnitude 0.5+s. A no-news name and a mildly-bearish name both land ~0.42 and both get down-sized to ~0.92x — absence of signal mispriced as weak-negative on every quiet name. Add a `conf` field and shrink the multiplier toward 1.0x when conf is low. model_facing_gated (changes live sizing) -> challenger/shadow; small prompt+schema change, validated via the conf-bucketed llm_eval above."
+      },
+      {
+        "title": "PSI drift + CUSUM + shadow eval never run in --no-retrain mode (the common 'train once, run forever' deployment)",
+        "roi_score": 50,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified the --no-retrain branch (run_pipeline.py:1103-1177) polls only _check_pipeline_command/_check_retrain_trigger and OMITS _maybe_run_drift_check + _check_telegram_commands, which appear only in the Phase-C weekly-retrain loop (:1214-1215); monitor_drift's docstring assumes a daily cron that CLAUDE.md gotcha #5 confirms does not exist. So in forever-mode, PSI/CUSUM/shadow safety instrumentation silently never fires. Cheap wiring activates already-built+tested monitors; measurement_safe (only writes a retrain flag); jetson_later to confirm end-to-end."
+      },
+      {
+        "title": "Realized slippage is journaled but never feeds the cost model — execution_report.py asks a HUMAN to hand-edit the constant",
+        "roi_score": 49,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified the loops journal slippage_bps on entries+exits (stock_loop.py:883-899, base_loop.py:966-975) but execution_report.py:105-108 literally prints 'raise SPREAD_PCT in backtest.py' — backtest.SPREAD_PCT and STOCK_SLIPPAGE_BPS_PER_SIDE are static priors no fill corrects, and monitor_drift.py:231 discards pre-slippage estimates. A per-(asset,exit_reason) reconciliation emits the exact calibration delta ('stock hard_stop +12bps realized vs 3bps modeled'), surfacing whether stop-out slippage is under-modeled. Ships directly (report only); aggregation is MAC-testable, numbers need Jetson journals."
+      },
+      {
+        "title": "Backtest fills every passive/maker entry at the bar close with no non-fill/queue model — live crypto is ALWAYS post and can miss",
+        "roi_score": 47,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified backtest enters at closes[i] unconditionally (backtest.py:223) with no fill-probability term, while execution_policy makes crypto ALWAYS 'post' (:51-54) and the maker ladder returns 'unfilled'/'maker_partial'/'taker_fallback' (order_utils.py:204-247). So a non-trivial fraction of signaled crypto entries never fill, yet the gate assumes 100% fill at close — inflating trade count + biasing the maker/taker cost mix the DSR sees. A conservative 'fill only if next bar trades through the post' rule corrects population+cost; pure-numpy MAC_NOW, model_facing_gated."
+      },
+      {
+        "title": "Per-asset-class correlation matrices make the loops blind to crypto-proxy factor overlap (COIN/MSTR/MARA vs spot BTC)",
+        "roi_score": 46,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified get_correlation_matrix_cached keys by asset_type and fetches within one class only (portfolio.py:15,80-107), so the corr sizing haircut + ENB book-risk rho (base_loop.py:1283-1284,1360) treat a stock-book COIN/MSTR/MARA long and a crypto-book BTC long as UNCORRELATED; risk_budget.py:4-9 names this exact overlap and no COIN/MSTR/MARA ref exists in the loops. A static proxy->BTC map injected as a high cross-book rho is MAC-codeable; the data-driven cross-class realized-corr needs Jetson. Pairs with the account-cap registry. model_facing_gated, hybrid."
+      },
+      {
+        "title": "LLM post-trade critique loop — bull/bear/r reasoning is generated, saved, and thrown away; no outcome ever feeds back",
+        "roi_score": 44,
+        "priority_axis": "llm_utilization",
+        "one_line": "Verified structured bull/bear/r reasoning is produced (llm_analyst.py:105-116) and persisted (:208-215), trade_memory stores reasoning+outcome (trade_memory.py:64-75), but get_lesson_summary emits only a mechanical W/L/avg-PnL string (:92-112) and grep finds no 'critique' consumer. An offline pass prompting the LLM with (its thesis, what happened) -> tagged failure-mode JSON aggregated into get_lesson_summary turns one-way spend into a feedback loop. Land GENERATION measurement-only first; prompt-injection is model_facing_gated. Most plumbing exists; jetson_later."
+      },
+      {
+        "title": "Analyst hard-pinned to flash-lite for ALL inputs with no model-tier-vs-decision-quality measurement",
+        "roi_score": 41,
+        "priority_axis": "llm_utilization",
+        "one_line": "Verified routing pins the analyst to gemini-2.5-flash-lite in every cost bracket (llm_client.py:115-122), justified by a cost/latency comment (:112-114) — never a decision-quality argument; no second-model scoring path exists. An offline shadow-scoring replay (flash-lite vs flash/pro) fed into the incremental-over-pred metric yields a $/incremental-alpha curve so the user chooses the tier deliberately. Either confirms the frugal default (free peace of mind) or unlocks lift. measurement_safe (offline, bounded by the $1 daily cap); needs real API calls + journals -> jetson_later."
+      },
+      {
+        "title": "Crypto cross-asset features are a thin 3-column BTC stub — no ETH driver, no BTC vol/regime, no BTC-residualized momentum",
+        "roi_score": 40,
+        "priority_axis": "trading_strategy",
+        "one_line": "Verified crypto cross-asset = 3 btc_close-gated columns (indicators.py:566-572) and harvest hardcodes BENCHMARK='BTC-USD' (harvest_crypto_data.py:35), while residual momentum/reversal (Blitz-Huij-Martens, Nagel) exist ONLY for stocks via spy_close (indicators.py:680-720). Adds BTC-residualized momentum/reversal + ETH co-driver + BTC-vol regime, importing market-stripping machinery already proven on the stock book. Needs ETH-close plumbing in harvest; mirrors existing rolling-beta/clip/residual code; MAC-provable with synthetic two-asset frames. model_facing_gated."
+      },
+      {
+        "title": "HMM regime smoothing (_smooth_regime) does not debounce flips — a single-bar flip is honored if the prior regime was stable",
+        "roi_score": 38,
+        "priority_axis": "trading_strategy",
+        "one_line": "Verified the bug exactly: on a label change _smooth_regime sets (new,1) then `if count >= _REGIME_PERSISTENCE: pass` (a no-op) and falls through to `return regime` (regime_detector.py:182-195), so the NEW regime's sizing_mult (bull 1.2x/bear 0.3x/high_vol 0.5x) applies on its FIRST bar whenever the prior regime persisted >=3 bars — whipsaw is not damped as the docstring claims. Correct hysteresis (accumulate N bars in the candidate before switching) is a pure-python fix, fully MAC-unit-testable; bounded by TILT clamp so small blast radius. model_facing_gated."
+      },
+      {
+        "title": "Crypto resting stop_limit's 2% gap can leave a naked unfilled stop in a fast gap-down — backtest assumes it always fills",
+        "roi_score": 37,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified the crypto protective stop is a GTC stop_limit with the limit 2% below trigger (crypto_loop.py:168) while the shared kernel fills unconditionally at min(stop,open) (policy_exits.py:101) — so on the -31%/-11% gap events the comment itself cites (crypto_loop.py:160-165) the limit can be skipped past and the position is unprotected until the 30s loop notices, yet labels/backtest score a clean stop fill. A measurement_safe offline study quantifies how often a one-bar gap clears stop*(1-2%) on the no-EOD-backstop 24/7 book; the kernel non-fill option is model-facing. MAC_NOW measurement half."
+      },
+      {
+        "title": "Stop-out exit slippage on stocks is mis-benchmarked / None-dropped, biasing realized cost low",
+        "roi_score": 35,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified _record_confirmed_exit benchmarks exit slippage to the current midpoint and sets slippage_bps=None when the fill is estimated (base_loop.py:954-969), and execution_report filters None out (execution_report.py:46) — so a server-side stop that gaps through fills far below a mid that already collapsed is understated, and the gappiest stop-outs (most likely quote-less/estimated) are dropped, biasing the report toward clean fills. Benchmark stop exits to the STOP TRIGGER price + tag it. Measurement-only; benchmark logic is MAC-testable; numbers need Jetson journals."
+      },
+      {
+        "title": "Reuse prediction-path bars for GARCH sizing instead of re-fetching + recomputing returns per buy candidate",
+        "roi_score": 34,
+        "priority_axis": "jetson_memory_perf",
+        "one_line": "Verified _compute_position_size independently re-fetches bars + recomputes returns=pct_change for GARCH (base_loop.py:1240-1252) plus a separate get_live_atr (:1216) for a symbol whose bars were feature-engineered microseconds earlier in the prediction pass; the 20s cache returns .copy() (market_data.py:35) so the copy+pct_change+ATR recompute repeats per buy candidate. Threading the already-fetched bars/ATR/returns via the snapshot removes redundant transient allocations on the hot buy path. Sizing is model_facing_gated (keep numerically identical); medium cost (sizing signature); pairs with the bar-keyed cache."
+      },
+      {
+        "title": "Bound peak training RSS: scaler.transform materializes the full fp32 scaled matrix per fold/refit on the 8GB Jetson",
+        "roi_score": 33,
+        "priority_axis": "jetson_memory_perf",
+        "one_line": "Verified each fold + LGB/refit path materializes the FULL fp32 scaled matrix (all_scaled at hypersearch_v2.py:508,892,985,1055; rg_scaled:892); at --max-rows=500000 (:118) x N features x 4B that is multi-hundred-MB allocated repeatedly while a CUDA context (~0.6-1.2GB) + the 0.40 allocator cap (~3GB) are already live. Sequence-array bloat was already fixed; these resident full-matrix copies are the next-largest training allocation. Scale lazily inside gather_windows (mirroring the lazy sequence build) so all_scaled is never resident. jetson_later (needs real parquet+lgb), RobustScaler row-independence makes it bit-identical."
+      },
+      {
+        "title": "RSI_Divergence subtracts incommensurable units (RSI-points/bar minus percent/bar), corrupting the feature",
+        "roi_score": 30,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified RSI_Divergence = rsi_slope - (price_slope/Close*100) (indicators.py:543-546): rsi_slope is RSI-points/bar (O(1)) and the second term is %/bar (O(0.1-1)), so the difference is dominated by raw magnitude not genuine divergence and is scale-arbitrary noise occupying a 'full'-preset slot. Z-scoring/ranking both slope legs over a trailing window before differencing makes it measure divergence (or justifies dropping it, shrinking overfit surface). Single-function change, fully MAC-unit-testable for sign + scale-invariance. model_facing_gated (alters a served feature)."
+      },
+      {
+        "title": "Bad-print cleaning applied to LIVE bars only, never to the training harvest (train/serve asymmetry)",
+        "roi_score": 29,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified _filter_bad_prints (Brownlees-Gallo 6-MAD) is called ONLY on the two live paths (market_data.py:168,231); fetch_historical_bars (:295-377) and fetch_with_fallback (data_sources.py:107-196) build the harvest with no outlier filter, so an erroneous wick flows into ATR-based triple-barrier labels + features while the same print is scrubbed live. One bad hourly wick can mis-fire a stop label and inflate ATR for days, biasing the gate. The function exists+is trusted; a CAUSAL (center=False) harvest variant is pure-pandas MAC-testable. model_facing data-prep, validate via retrain gate."
+      },
+      {
+        "title": "Training-data validation report is computed but never gates the harvest or alerts (silent corrupt-harvest poisons the weekly retrain)",
+        "roi_score": 28,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified validate_training_data builds a report with report['issues'] (data_utils.py:159-258) but both call sites drop the return value (harvest_stock_data.py:350, harvest_crypto_data.py:280), save_training_data writes unconditionally first, and no notify is imported — so a 30%-NaN / inf / gappy harvest saves and trains silently on a headless edge device. Turn the existing report into a gate+notify (column >X% NaN / any inf / gaps beyond N -> warn + suspect.flag). Pure-logic on an existing dict; warn-not-block initially; measurement_safe, MAC-testable."
+      },
+      {
+        "title": "Archive sync failures (funding/OI/basis) degrade to frozen-ffill features with no staleness alert",
+        "roi_score": 26,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified funding_archive swallows per-month errors and prints 'up to date' even when every fetch failed (funding_archive.py:131-149) and funding_features_for_index reindex(ffill) with NO recency cap on s.index.max() (:187-194); oi_archive documents the same pattern, no notify imported. A silently-stopped sync freezes the parquet and ffills a months-old funding rate as current into live crypto tilt — a subtle train/serve skew current code can't detect. A max-archive-age guard (stale -> neutral 0.0 + notify once) fixes it; the alert is measurement_safe, the stale->neutral served-value change is model_facing_gated. Hybrid (spans offline writer + live reader)."
+      },
+      {
+        "title": "Thread a per-bar EDGE cost array through hypersearch simulate_trades so the SEARCH objective is priced like the gates",
+        "roi_score": 24,
+        "priority_axis": "financial_soundness",
+        "one_line": "Verified the Optuna SEARCH objective still charges a scalar TXN_COST_PCT={'crypto':0.60,'stock':0.11} (hypersearch_v2.py:366) applied flat in simulate_trades (:419) + holdout (:1076), even though meta/backtest/holdout gates are now per-name spread-honest — so every trial optimizes against a cost that under-prices wide-spread spec names, biasing which hypers/features win before the honest gates see them. load_data already carries/excludes the spread column (half-built). The wave-6 memo flags this as 'the riskiest sub-item, deferred to Jetson' (needs the 451-test suite + torch/lgb to regression-test the hot core); downstream gates catch the worst mispricing. jetson_later."
+      },
+      {
+        "title": "meta_short + q90 tail head — thread `side` through meta_label and add a q90 LGB quantile leg for the offline short sleeve",
+        "roi_score": 22,
+        "priority_axis": "trading_strategy",
+        "one_line": "Verified meta_label._gen_meta_rows has no `side` param (meta_label.py:193) and train_meta trains a single long classifier (:254) with no q90/quantile/short anywhere; per the wave-5 KILL list, sign-flipping the long meta for shorts is mis-calibrated BY CONSTRUCTION, so a short sleeve can't be certified without a separately-trained meta_short + q90 coverage check (AUC>=0.55, coverage 8-15%). The kernel, borrow cost, and squeeze vetoes are all already shipped — this is the keystone that converts that sunk infra into either a live ETB-short edge or a clean kill. Lowest priority axis + most expensive (L); hard-blocked on Mac (needs lightgbm + real panel); correctly jetson_later, sequenced after the integrity items."
+      }
+    ],
+    "survivor_count": 6,
+    "studied_count": 8
+  }
+}
