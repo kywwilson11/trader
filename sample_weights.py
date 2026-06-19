@@ -165,3 +165,47 @@ def uniqueness_weights(hold_bars, returns=None, ret_cap=50.0,
     if finite.size and finite.mean() > 0:
         w = w / finite.mean()
     return w
+
+
+def fold_train_weights(hold_bars_panel, row_indices, ticker_boundaries=None,
+                       returns=None, ret_cap=50.0):
+    """Mean-1 training weights for ONE fold's rows, de-biased for label overlap.
+
+    The wiring artery the LSTM / LightGBM-mean / q10 trainers were missing: the
+    producer below is consumed only by the DSR gate today, so the loss still
+    over-counts a row overlapping k others ~k times.
+
+    Correctness hinges on two things:
+      1. Average uniqueness is computed over the FULL panel (with per-ticker
+         boundaries) — a fold's rows still overlap labels OUTSIDE the fold, so
+         slicing first then computing concurrency would be wrong.
+      2. row_indices index into the PANEL (not a pre-sliced copy). This is the
+         #1 alignment hazard; mismatching it silently mis-weights every row.
+
+    Args:
+        hold_bars_panel: 1-D label spans (TB_Bars_{fb}) for the ENTIRE panel.
+        row_indices: integer positions of this fold's rows into the panel.
+        ticker_boundaries: per-ticker (start, end) blocks into the panel so
+            concurrency never crosses tickers (see average_uniqueness).
+        returns: None = PURE uniqueness (the safe default). Supplying returns
+            blends a |return| magnitude emphasis — do NOT enable silently: the
+            return-attribution variant collapsed out-of-sample F1 in the AFML
+            replication; use it only as an explicit shadow challenger.
+
+    Returns a float64 array aligned to row_indices, mean 1 over its finite>0
+    entries (NaN-span rows -> weight 0). Train each book separately so the mean-1
+    scaling never re-balances crypto against stock.
+    """
+    u = average_uniqueness(hold_bars_panel, ticker_boundaries)   # FULL panel
+    idx = np.asarray(row_indices, dtype=np.int64)
+    u_fold = u[idx]
+    w = np.where(np.isfinite(u_fold), u_fold, 0.0)
+    if returns is not None:
+        r = np.abs(np.asarray(returns, dtype=np.float64)) + 1.0
+        np.clip(r, None, ret_cap, out=r)
+        r = np.where(np.isfinite(r), r, 0.0)
+        w = w * r
+    finite = w[np.isfinite(w) & (w > 0)]
+    if finite.size and finite.mean() > 0:
+        w = w / finite.mean()
+    return w

@@ -944,7 +944,8 @@ LGB_MAX_ROWS = 120_000  # cap flattened-feature memory (~250MB at 24x23 cols)
 
 
 def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
-                       all_times, all_label_times, tickers, ticker_boundaries):
+                       all_times, all_label_times, tickers, ticker_boundaries,
+                       all_tb_bars_by_fb=None):
     """Train the LightGBM leg of the ensemble on the winning config.
 
     Tree ensembles are the stronger learner at this data size (Grinsztajn
@@ -988,9 +989,30 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
         X_val = gather_windows(all_scaled, val_idx, offsets).reshape(len(val_idx), -1)
         y_train, y_val = returns[train_idx], returns[val_idx]
 
+        # Average-uniqueness training weights (wave-8 #1): the DSR gate already
+        # deflates by effective-n, but the loss still over-counts overlapping
+        # hourly labels ~k times. Weights are aligned to the FINAL train_idx/
+        # val_idx (after the NaN filter + most-recent truncation above). OFF by
+        # default; the SAME mean-1 vector feeds the mean and q10 legs so the
+        # quantile leg stays calibrated. NEVER blend uniqueness x |return| here.
+        w_train = w_val = None
+        try:
+            from strategy_config import UNIQUENESS_WEIGHTS_ENABLED
+        except Exception:
+            UNIQUENESS_WEIGHTS_ENABLED = False
+        if UNIQUENESS_WEIGHTS_ENABLED and all_tb_bars_by_fb:
+            tb_spans = all_tb_bars_by_fb.get(fb)
+            if tb_spans is not None:
+                from sample_weights import fold_train_weights
+                w_train = fold_train_weights(tb_spans, train_idx, ticker_boundaries)
+                w_val = fold_train_weights(tb_spans, val_idx, ticker_boundaries)
+                print(f"[LGB] uniqueness weighting ON "
+                      f"(train mean-1 over {int(np.isfinite(w_train).sum())} rows)")
+
         print(f"[LGB] Training on {X_train.shape[0]} rows x {X_train.shape[1]} "
               f"flattened features (fb={fb})")
-        booster = train_lgb(X_train, y_train, X_val, y_val)
+        booster = train_lgb(X_train, y_train, X_val, y_val,
+                            sample_weight=w_train, sample_weight_val=w_val)
         save_lgb_model(booster, prefix=prefix.rstrip('_'))
 
         # Left-tail (q10) quantile model for the entry tail veto: a
@@ -1001,7 +1023,8 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
         try:
             q10 = train_lgb(X_train, y_train, X_val, y_val,
                             params={'objective': 'quantile', 'alpha': 0.10,
-                                    'metric': 'quantile'})
+                                    'metric': 'quantile'},
+                            sample_weight=w_train, sample_weight_val=w_val)
             q10_val = q10.predict(X_val)
             floor = float(np.percentile(q10_val, 15))
             q10.save_model(f'{prefix}lgb_q10.txt')
@@ -1466,7 +1489,8 @@ def main():
             train_lgb_ensemble(save_prefix, best_scaler, best_cfg,
                                all_features, all_returns_by_fb,
                                all_times, all_label_times,
-                               tickers, ticker_boundaries)
+                               tickers, ticker_boundaries,
+                               all_tb_bars_by_fb=all_tb_bars_by_fb)
     elif best_state_holder['state'] is not None:
         print(f"\nModel NOT saved: new best {new_score:.3f} <= existing {existing_score:.3f}")
         print("Existing model preserved (higher score).")

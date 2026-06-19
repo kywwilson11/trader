@@ -21,6 +21,8 @@ Point-in-time discipline: the rolling estimate at bar t uses only bars in
 the harvest introduces no look-ahead — exactly like the _DV30 stamp.
 """
 
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -98,18 +100,78 @@ def _abdi_ranaldo_rolling(df, window):
     return out
 
 
+# --- Square-root market impact (wave-8 #6) -------------------------------- #
+# A $100 and a $50k order into a thin name pay the same fee+spread today; real
+# impact grows with participation. Almgren et al. (2005) / Kyle lambda:
+# temporary impact ~ k * spread * sqrt(notional / ADV). Used to DE-CERTIFY edge
+# that only exists because the cost model under-prices size on illiquid names.
+# OFF by default (strategy_config.IMPACT_COST_ENABLED); DV30 must be stamped in
+# the harvested data and k/notional calibrated on the Jetson before enabling.
+IMPACT_CAP_PCT = 2.0   # per-side impact ceiling so a near-zero ADV can't blow up
+
+
+def market_impact_pct(notional, adv_dollar, spread_pct, k=1.0, sides=2,
+                      cap_pct=IMPACT_CAP_PCT):
+    """Square-root market-impact haircut, PERCENT of notional (round trip).
+
+    impact_one_side = min(k * spread_pct * sqrt(notional / ADV), cap_pct); the
+    round trip is `sides` of that (entry + exit = 2). Fail-open: returns 0.0 when
+    ADV/notional/spread is unknown, non-finite, or <= 0, so a missing DV30 leaves
+    the spread-only cost untouched.
+    """
+    n, adv, sp = float(notional), float(adv_dollar), float(spread_pct)
+    if not all(np.isfinite([n, adv, sp])) or adv <= 0 or n <= 0 or sp <= 0:
+        return 0.0
+    one_side = min(k * sp * math.sqrt(n / adv), float(cap_pct))
+    return one_side * sides
+
+
+def impact_inputs_from_df(df):
+    """(adv_array, notional, k) for per_bar_round_trip_cost's impact term.
+
+    Returns (None, None, 1.0) — i.e. impact OFF — unless strategy_config enables
+    it AND the frame carries a DV30 (30d $ volume) column. Single source so the
+    backtest and the meta-labeler stay in lockstep.
+    """
+    try:
+        from strategy_config import (IMPACT_COST_ENABLED, IMPACT_K,
+                                      IMPACT_TYPICAL_NOTIONAL)
+    except Exception:
+        return None, None, 1.0
+    if not IMPACT_COST_ENABLED:
+        return None, None, 1.0
+    for col in ('DV30', '_DV30'):
+        if col in df.columns:
+            return df[col].values, float(IMPACT_TYPICAL_NOTIONAL), float(IMPACT_K)
+    return None, None, 1.0
+
+
 def per_bar_round_trip_cost(asset_type, spread_pct_array,
-                            maker=False, live=False):
-    """Vectorized round-trip cost (PERCENT) = fee constant + per-bar spread.
+                            maker=False, live=False,
+                            adv_dollar=None, notional=None, impact_k=1.0):
+    """Vectorized round-trip cost (PERCENT) = fee constant + per-bar spread
+    [+ optional sqrt market impact].
 
     round_trip_cost_pct(asset, s) is linear in s: fee_const + max(s, 0). So we
     compute fee_const once at spread=0 and add the per-bar spread array — same
     result, no Python-level per-bar fee call. NaN spreads fall back to the
     asset's flat default so a missing stamp never zeroes the cost.
+
+    When adv_dollar (per-bar ADV $, e.g. DV30) and notional are supplied, a
+    square-root market-impact haircut k*spread*sqrt(notional/ADV) (round trip,
+    per-side capped) is ADDED per bar — larger for thinner names. adv_dollar=None
+    (the default) preserves the exact prior spread-only behavior.
     """
     from fees import round_trip_cost_pct
     fee_const = round_trip_cost_pct(asset_type, 0.0, maker, live)
     flat = 0.10 if asset_type == 'crypto' else 0.05
     s = np.asarray(spread_pct_array, dtype=float)
     s = np.where(np.isfinite(s) & (s >= 0.0), s, flat)
-    return fee_const + s
+    cost = fee_const + s
+    if adv_dollar is not None and notional is not None:
+        adv = np.asarray(adv_dollar, dtype=float)
+        part = np.where(np.isfinite(adv) & (adv > 0.0), float(notional) / adv, 0.0)
+        impact_one_side = np.clip(impact_k * s * np.sqrt(np.clip(part, 0.0, None)),
+                                  0.0, IMPACT_CAP_PCT)
+        cost = cost + 2.0 * impact_one_side
+    return cost

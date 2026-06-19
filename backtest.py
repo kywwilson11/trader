@@ -112,7 +112,9 @@ def _predict_ticker(model, scaler, config, feature_cols, tdf, lgb_model=None,
                 flat = windows.reshape(len(chunk), -1)
                 if lgb_model is not None:
                     lgb_out = lgb_model.predict(flat)
-                    out = 0.6 * out + 0.4 * np.asarray(lgb_out, dtype=np.float64)
+                    # Blend weight tunable (wave-9 #2); matches predict_now's live path.
+                    _w = config.get('lstm_weight', 0.6)
+                    out = _w * out + (1.0 - _w) * np.asarray(lgb_out, dtype=np.float64)
                 if q10_model is not None:
                     q10[chunk] = np.asarray(q10_model.predict(flat),
                                             dtype=np.float64)
@@ -188,9 +190,14 @@ def simulate_ticker(tdf, preds, asset_type: str, threshold: float,
     rt_cost_arr = None
     if 'Eff_Spread_Pct' in tdf.columns:
         try:
-            from liquidity import per_bar_round_trip_cost
+            from liquidity import per_bar_round_trip_cost, impact_inputs_from_df
+            # Optional sqrt market-impact haircut (wave-8 #6) — off unless
+            # IMPACT_COST_ENABLED and a DV30 column is present, so net P&L is
+            # unchanged by default.
+            adv_arr, impact_notional, impact_k = impact_inputs_from_df(tdf)
             rt_cost_arr = per_bar_round_trip_cost(
-                asset_type, tdf['Eff_Spread_Pct'].values)
+                asset_type, tdf['Eff_Spread_Pct'].values,
+                adv_dollar=adv_arr, notional=impact_notional, impact_k=impact_k)
         except Exception:
             rt_cost_arr = None
     cooldown_bars = max(1, int(math.ceil(policy['cooldown_min'] / 60)))

@@ -315,3 +315,45 @@ def serial_correlation_factor(returns, max_lag: int | None = None) -> dict:
     n_eff = min(float(n), n / f)
     return {'factor': f, 'n_eff': n_eff, 'n': n, 'max_lag': q,
             'sharpe_scale': 1.0 / math.sqrt(f)}
+
+
+def build_oos_blocks(trade_returns, n_blocks: int = 8):
+    """Bin a 1-D net-return stream into n_blocks contiguous equal-count block means.
+
+    pbo_cscv needs a rectangular [n_trials, T] matrix, but different
+    configurations produce different numbers of trades. This normalizes one
+    configuration's variable-length per-trade (or per-bar) return series into a
+    FIXED-length vector — each element is the mean net return of a contiguous
+    equal-count block — so heterogeneous trials stack into one matrix.
+
+    Returns None when there are fewer finite returns than blocks (a block would
+    be empty) — the caller treats None as "cannot judge" and falls back to DSR.
+    """
+    r = np.asarray(trade_returns, dtype=np.float64)
+    r = r[np.isfinite(r)]
+    if n_blocks < 2 or r.size < n_blocks:
+        return None
+    return np.array([chunk.mean() for chunk in np.array_split(r, n_blocks)])
+
+
+def pbo_from_oos_blocks(block_rows, n_groups: int = 8) -> dict | None:
+    """Fail-open CSCV-PBO over per-trial block vectors (from build_oos_blocks).
+
+    Filters None / wrong-length / non-finite / zero-variance rows, stacks the
+    rest into a [n_valid_trials, n_blocks] matrix and runs pbo_cscv. Returns None
+    — leaving the promotion decision governed by the DSR gate — whenever there is
+    too little to judge honestly: fewer than 2 valid trials, or fewer
+    block-columns than n_groups. The gate it feeds can only ever get STRICTER,
+    never looser, so this never blocks an honest model on a thin/early run.
+    """
+    from collections import Counter
+    rows = [np.asarray(r, dtype=np.float64) for r in block_rows if r is not None]
+    rows = [r for r in rows
+            if r.ndim == 1 and r.size >= 2 and np.all(np.isfinite(r)) and r.std() > 1e-12]
+    if len(rows) < 2:
+        return None
+    width = Counter(r.size for r in rows).most_common(1)[0][0]  # modal length
+    rows = [r for r in rows if r.size == width]
+    if len(rows) < 2 or width < n_groups:
+        return None
+    return pbo_cscv(np.stack(rows), n_groups=n_groups)

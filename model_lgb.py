@@ -42,7 +42,9 @@ def flatten_sequence(sequence: np.ndarray, feature_names: list[str]) -> tuple[np
 
 def train_lgb(X_flat: np.ndarray, y: np.ndarray,
               X_val_flat: np.ndarray = None, y_val: np.ndarray = None,
-              params: dict = None) -> object:
+              params: dict = None,
+              sample_weight: np.ndarray = None,
+              sample_weight_val: np.ndarray = None) -> object:
     """Train a LightGBM model on flattened features.
 
     Args:
@@ -51,6 +53,13 @@ def train_lgb(X_flat: np.ndarray, y: np.ndarray,
         X_val_flat: Validation features (optional)
         y_val: Validation targets (optional)
         params: LightGBM parameters (optional override)
+        sample_weight: per-row training weights (optional). LightGBM scales each
+            row's gradient AND hessian by its weight, so a mean-1 average-
+            uniqueness vector (sample_weights.fold_train_weights) de-biases
+            overlapping-label over-counting while keeping the tuned leaf
+            regularizer calibrated (total mass ~N). None == uniform (unchanged).
+        sample_weight_val: per-row weights for the validation set (optional);
+            pass the SAME mean-1 vector kind so early-stopping sees weighted loss.
 
     Returns:
         Trained lightgbm.Booster
@@ -71,10 +80,11 @@ def train_lgb(X_flat: np.ndarray, y: np.ndarray,
     if params:
         default_params.update(params)
 
-    train_data = lgb.Dataset(X_flat, label=y)
+    train_data = lgb.Dataset(X_flat, label=y, weight=sample_weight)
     valid_sets = [train_data]
     if X_val_flat is not None and y_val is not None:
-        val_data = lgb.Dataset(X_val_flat, label=y_val, reference=train_data)
+        val_data = lgb.Dataset(X_val_flat, label=y_val, reference=train_data,
+                               weight=sample_weight_val)
         valid_sets.append(val_data)
 
     callbacks = [lgb.log_evaluation(period=50)]
