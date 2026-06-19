@@ -127,6 +127,12 @@ def load_models(inference_device=None, prefix=''):
 
 # --- LIVE PREDICTION ---
 
+from prediction_cache import PredictionCache, bar_key as _bar_key, MISS as _CACHE_MISS
+
+# Bar-keyed inference memo (wave-8 #5); inert unless PREDICTION_CACHE_ENABLED.
+_PRED_CACHE = PredictionCache()
+
+
 def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
                         api=None, inference_device=None,
                         asset_type='crypto', spy_close=None, btc_close=None,
@@ -185,6 +191,21 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
     if len(df) < seq_len:
         print(f"  Not enough data for sequence (need {seq_len}, have {len(df)})")
         return _none_ret
+
+    # Bar-keyed memo (wave-8 #5): within a bar the closed inputs are identical,
+    # so skip the feature+LSTM+LGB recompute. Keyed on the latest closed-bar
+    # timestamp + the model object (a hot-reload swaps the object, auto-
+    # invalidating). Inert unless PREDICTION_CACHE_ENABLED.
+    try:
+        from strategy_config import PREDICTION_CACHE_ENABLED
+    except Exception:
+        PREDICTION_CACHE_ENABLED = False
+    _cache_subkey = (symbol, id(model), return_snapshot)
+    _cache_key = _bar_key(df.index[-1]) if PREDICTION_CACHE_ENABLED else None
+    if _cache_key is not None:
+        _cached = _PRED_CACHE.get(_cache_subkey, _cache_key)
+        if _cached is not _CACHE_MISS:
+            return _cached
 
     # Inject live sentiment if the model was trained with it
     if 'Daily_Sentiment' in feature_cols and 'Daily_Sentiment' not in df.columns:
@@ -315,8 +336,13 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         return _none_ret
 
     # --- Scale and build input tensor ---
-    current_features_scaled = scaler_X.transform(current_features)
-    sequence = current_features_scaled[-seq_len:]
+    # Slice to seq_len BEFORE transforming. scaler_X (RobustScaler) is
+    # row-independent ((x-center)/scale per column), so transforming only the
+    # last seq_len rows is bit-identical to transform(all)[-seq_len:] while
+    # avoiding scaling the discarded leading rows every ~30s cycle per symbol
+    # (a Jetson hot-path waste). Batch paths (backtest/hypersearch) still need
+    # the full transform and are left untouched.
+    sequence = scaler_X.transform(current_features[-seq_len:])
     sequence = sequence.reshape(1, seq_len, -1)
     tensor_input = torch.tensor(sequence, dtype=torch.float32).to(dev)
 
@@ -343,7 +369,9 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             from model_lgb import flatten_sequence, predict_lgb, ensemble_predict
             flat, _ = flatten_sequence(sequence.reshape(seq_len, -1), feature_cols)
             lgb_pred = predict_lgb(lgb_model, flat)
-            predicted_return = ensemble_predict(lstm_pred, lgb_pred)
+            # Blend weight is tunable (wave-9 #2); defaults to the historical 0.6.
+            predicted_return = ensemble_predict(
+                lstm_pred, lgb_pred, lstm_weight=config.get('lstm_weight', 0.6))
         except Exception:
             pass  # Fall back to LSTM-only
 
@@ -421,8 +449,10 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
             val = prev_row['Volume_Ratio']
             if val is not None and val == val:
                 snapshot['Volume_Ratio'] = float(val)
+        _PRED_CACHE.put(_cache_subkey, _cache_key, (predicted_return, snapshot))
         return predicted_return, snapshot
 
+    _PRED_CACHE.put(_cache_subkey, _cache_key, predicted_return)
     return predicted_return
 
 
