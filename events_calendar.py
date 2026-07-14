@@ -43,6 +43,12 @@ def _load_cache() -> dict:
                 _mem = json.load(f)
         except (OSError, json.JSONDecodeError):
             _mem = {}
+        if not isinstance(_mem, dict):
+            # Corrupt-but-parseable file (e.g. a JSON list): reset — the
+            # sleeve then fails closed via calendar_available()==False
+            # instead of AttributeError-crashing the unguarded
+            # _select_overnight_keepers call path. Same guard as novelty._load.
+            _mem = {}
     return _mem
 
 
@@ -86,7 +92,7 @@ def refresh_if_stale() -> bool:
                 age = (datetime.datetime.now()
                        - datetime.datetime.fromisoformat(fetched)).total_seconds()
                 fresh = age < _REFRESH_SEC
-            except ValueError:
+            except (TypeError, ValueError):
                 pass
         if fresh:
             return True
@@ -100,7 +106,9 @@ def refresh_if_stale() -> bool:
         if new is not None:
             _mem = new
             try:
-                tmp = _CACHE_FILE + '.tmp'
+                # pid-unique tmp: a fixed '.tmp' let a live bot and a manual
+                # CLI run interleave one tmp file — mirrors edgar_events.
+                tmp = f"{_CACHE_FILE}.{os.getpid()}.tmp"
                 with open(tmp, 'w') as f:
                     json.dump(new, f)
                 os.replace(tmp, _CACHE_FILE)

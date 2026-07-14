@@ -179,12 +179,16 @@ BUCKET_CAP_FRACTION = {
 }
 
 # --- Live tradable universe promotion (wave-9 #3) ---
-# The model scores universe + TRAINING_CANDIDATE_POOL every hour, but the loop
-# trades only the hand-list. OFF by default: promoting the as-of top-K of the
-# full panel into the SELECTABLE set is MODEL-FACING (the model must actually
-# predict the pool names live) and must clear the IC-by-name diagnostic on the
-# Jetson first (promote only names whose individual OOS rank-IC is positive).
-# K_HOLD > K_ENTER is the hysteresis band; held names are always included.
+# NOT YET WIRED — flipping TRADABLE_POOL_ENABLED currently has NO effect: no
+# production code reads these four constants (panel_ranks.live_tradable_members,
+# the intended consumer, is called only by tests). Kept pre-configured for the
+# wave-9 #3 activation. The cross-sectional rank PRE-PASS scores the full panel
+# (universe + TRAINING_CANDIDATE_POOL); the LSTM only predicts the traded hand-
+# list, so promoting pool names into the SELECTABLE set is MODEL-FACING (the
+# model must actually predict them live) and must clear the IC-by-name
+# diagnostic on the Jetson first (promote only names whose individual OOS
+# rank-IC is positive). K_HOLD > K_ENTER is the hysteresis band; held names are
+# always included.
 TRADABLE_POOL_ENABLED = False
 AS_OF_TRADABLE_TOP_K = 20
 TRADABLE_K_ENTER = 20

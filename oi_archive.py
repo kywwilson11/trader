@@ -20,6 +20,12 @@ both training and serving measure relative OI dynamics, not absolute
 levels). Features are 0.0 until enough local history accumulates
 (~1 day for the 24h change, ~7 days for the z-score).
 
+NOTE: a real UNIT mismatch remains — live serves OKX oiCcy (coin units)
+while the training archive uses Binance sum_open_interest_value (USD
+notional = coin x price); these are different quantities. A unit-parity
+fix is model-facing and pending (module-review decision queue); this
+note is documentation only.
+
 Exposed features (stationary): OI_Chg_24h (% change), OI_Z (z vs
 trailing 30 days). The parquet also stores top-trader and taker
 long/short ratios so future features need no re-download.
@@ -479,6 +485,17 @@ def live_ls_features(symbol: str) -> dict | None:
         _fail_cache[('ls', symbol)] = now
         logger.debug('[OI] %s: OKX long/short fetch failed: %s', symbol, e)
         return None
+    # Observability only: the begin-only query truncates the newest ~24h, so
+    # stamp the freshest row's age (this makes the deferred staleness visible).
+    try:
+        _rows = data.get('data') or []
+        if _rows:
+            _age_h = (time.time() * 1000 - float(_rows[0][0])) / 3.6e6
+            logger.debug('[OI] %s: newest L/S row is %.1fh old '
+                         '(begin-only query truncates the last ~24h)',
+                         base, _age_h)
+    except Exception:
+        pass
     if len(vals) < 168:
         return None
     import statistics

@@ -107,12 +107,17 @@ def choose_calibration_method(n, min_n=ISOTONIC_MIN_N):
 
 def fit_calibrator(scores, y, min_n=ISOTONIC_MIN_N):
     """Pick + fit a calibrator on (scores, y), ignoring NaN scores. Returns the
-    fitted calibrator, or None when there is nothing usable."""
+    fitted calibrator, or None when there is nothing usable (thin data,
+    one-class labels, or constant scores)."""
     scores = np.asarray(scores, float)
     y = np.asarray(y, float)
     mask = np.isfinite(scores) & np.isfinite(y)
     scores, y = scores[mask], y[mask]
-    if scores.size < 10 or np.unique(y).size < 2:
+    # Degenerate guards: thin data, one-class labels, or CONSTANT scores —
+    # a constant-score model has no ranking to calibrate; isotonic collapses
+    # to a single p (verified pathological p==1.0 in the 2026-07 review).
+    if (scores.size < 10 or np.unique(y).size < 2
+            or np.unique(scores).size < 2):
         return None
     method = choose_calibration_method(scores.size, min_n)
     cal = IsotonicCalibrator() if method == 'isotonic' else SigmoidCalibrator()

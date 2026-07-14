@@ -105,10 +105,16 @@ def train_lgb(X_flat: np.ndarray, y: np.ndarray,
 
 
 def save_lgb_model(model, prefix: str = ''):
-    """Save LightGBM model to disk."""
+    """Save LightGBM model to disk atomically (tmp + os.replace).
+
+    A bot's lazy load_lgb_model — triggered by a manifest hot-reload —
+    must never read a half-written booster file (2026-07 review P1).
+    """
     pfx = f'{prefix}_' if prefix else ''
     path = os.path.join(_MODEL_DIR, f'{pfx}lgb_model.txt')
-    model.save_model(path)
+    tmp = path + '.tmp'
+    model.save_model(tmp)
+    os.replace(tmp, path)
     logger.info("[LGB] Saved to %s", path)
 
 

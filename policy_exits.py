@@ -313,7 +313,16 @@ def exit_walk(close, high, low, open_, atr, is_eod, policy,
 
 
 def eod_mask_from_index(index, asset_type: str) -> np.ndarray:
-    """True on each day's last bar (stocks); all-False for crypto."""
+    """True on each day's last bar (stocks); all-False for crypto.
+
+    'Day' = calendar date of the raw index timestamps (UTC in every real
+    caller), NOT the exchange session. Correct while stock frames are
+    RTH-only (the current data paths). If extended-hours bars ever enter
+    the harvest/backtest frames, the flatten bar shifts after-hours and
+    (winter, SIP feed) one session can straddle two UTC dates — verify
+    the Jetson parquet's ET hour distribution before changing feeds;
+    session-aware masking is a deferred, label-semantics change.
+    """
     n = len(index)
     if asset_type != 'stock':
         return np.zeros(n, dtype=np.bool_)

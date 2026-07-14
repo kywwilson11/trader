@@ -1,6 +1,8 @@
 """Backup data sources and fallback chain for historical bar fetching.
 
-Provides CryptoCompare as a third data source (free, no key needed) and
+Provides CryptoCompare as a third historical source (keyless min-api access
+now returns HTTP 401 — CoinDesk sunset it ~2026-07, so this leg is inert in
+production until revived with a key; see fetch_cryptocompare_hourly) and
 a unified fetch_with_fallback() that tries Alpaca -> yfinance -> CryptoCompare.
 """
 
@@ -25,7 +27,11 @@ def _cc_symbol(ticker: str) -> str:
 
 def fetch_cryptocompare_hourly(symbol: str, start_date: str,
                                 end_date: str | None = None) -> pd.DataFrame | None:
-    """Fetch hourly bars from CryptoCompare (free, no API key needed).
+    """Fetch hourly bars from CryptoCompare.
+
+    NOTE: the keyless min-api endpoint now returns HTTP 401 (CoinDesk sunset
+    keyless access ~2026-07); this fetch catches it, logs, and returns None,
+    so the leg is currently a no-op. Revive with a key or remove (owner call).
 
     Args:
         symbol: Ticker in any format (BTC-USD, BTC/USD, BTC)
@@ -157,6 +163,15 @@ def fetch_with_fallback(ticker: str, start_date: str, api=None,
     # meant different wall-clock spans across the dataset. For stocks,
     # yfinance is used ONLY when Alpaca returned nothing.
     # Crypto: yfinance 1h bars are :00-aligned 24/7, so a true merge is safe.
+    # KNOWN HAZARD (deferred, model-facing — do NOT fix here):
+    #  (a) yf.download(period='max') IGNORES start_date and returns ~730d of
+    #      bars; in incremental harvests (fetch_start = latest-48h) the in-call
+    #      keep='first' merge protects only the 48h Alpaca covered, so the
+    #      store-level append_ticker_data(keep='last') then overwrites Alpaca
+    #      rows with yfinance prices/volume for the trailing 730d.
+    #  (b) the stock :30/:00 grid guard below holds only WITHIN one call — a
+    #      full-Alpaca-outage harvest still interleaves grids across runs.
+    #  Fixing either changes training-data composition -> owner + reharvest.
     if asset_type != 'stock' or not alpaca_ok:
         try:
             print(f"  [YF] Fetching {ticker}...")

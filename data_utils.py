@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
 _BASE_DIR = Path(__file__).resolve().parent
 
@@ -212,7 +213,6 @@ def _stock_gap_spans_trading_days(gap_end: pd.Timestamp, gap_dur: pd.Timedelta) 
     single-day holidays are calendar closures, not data loss — flagging them
     buried real gaps under thousands of spurious report entries.
     """
-    import numpy as np
     gap_start = gap_end - gap_dur
     first_full_day = (gap_start + pd.Timedelta(days=1)).date()
     return np.busday_count(first_full_day, gap_end.date()) >= 2
@@ -279,7 +279,6 @@ def validate_training_data(df: pd.DataFrame, asset_type: str) -> dict:
 
     # Inf check
     numeric = df.select_dtypes(include=['float64', 'float32', 'int64', 'int32'])
-    import numpy as np
     inf_mask = np.isinf(numeric)
     inf_counts = inf_mask.sum()
     inf_cols = inf_counts[inf_counts > 0]

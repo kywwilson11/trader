@@ -105,7 +105,8 @@ def _abdi_ranaldo_rolling(df, window):
         m = mid[sl]
         if len(cc) < 3:   # only reachable when window < 3 (slice len == window)
             continue
-        # E[(c_t - eta_t)(c_t - eta_{t+1})] form, simplified single-window var
+        # SAME-bar squared dispersion E[(c_t - eta_t)^2] (NOT the AR cross-
+        # product E[(c_t-eta_t)(c_t-eta_{t+1})] — see docstring); upward-biased
         d = cc - m
         val = np.mean(d * d)
         out[t] = 2.0 * np.sqrt(val) if val > 0 else 0.0

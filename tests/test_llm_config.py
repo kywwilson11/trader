@@ -13,7 +13,10 @@ class TestLoadLLMConfig:
         fake_path = tmp_path / "nonexistent.json"
         with patch("llm_config.LLM_CONFIG_FILE", fake_path):
             config = load_llm_config()
-        assert config["provider"] == "gemini"
+        # 'auto' = the multi-provider selection engine default (2026-07);
+        # saved configs with a legacy provider value are preserved on load
+        assert config["provider"] == "auto"
+        assert config["selection_mode"] == "auto"
         assert config["enabled"] is True
         assert "gemini" in config["models"]
         assert "claude" in config["models"]

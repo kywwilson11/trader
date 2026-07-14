@@ -61,6 +61,12 @@ def main() -> int:
     args = ap.parse_args()
 
     rows = _load(args.inp)
+    if not isinstance(rows, list):
+        # ic_by_name expects a list of per-(name,bar) row objects; a JSON object
+        # or scalar would iterate its keys/chars and raise a cryptic TypeError
+        # deep inside the library (r[name_key] on a str). Fail loud, up front.
+        sys.exit(f"{args.inp}: expected a JSON array of row objects, got "
+                 f"{type(rows).__name__}")
     keys = [args.name_key, args.pred_key, args.fwd_key]
     if args.time_key is not None:
         keys.append(args.time_key)

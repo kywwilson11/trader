@@ -62,6 +62,14 @@ def main() -> int:
               f"p_legacy={len(p_legacy)}  p_purged={len(p_purged)}  y={len(y)}",
               file=sys.stderr)
         return 2
+    if len(y) == 0:
+        # Empty arrays pass allclose() as "identical", which would print a full
+        # n=0 report (Brier nan labelled 'worse', empty reliability table) and a
+        # falsely reassuring 'tied — do NOT flip' verdict. There is nothing to
+        # calibrate; refuse instead of emitting a vacuous comparison.
+        print(f"ERROR: {args.inp} has empty arrays — no holdout rows to compare",
+              file=sys.stderr)
+        return 2
 
     identical = bool(np.allclose(np.asarray(p_legacy, float),
                                  np.asarray(p_purged, float), equal_nan=True))

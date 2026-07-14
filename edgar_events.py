@@ -133,15 +133,35 @@ def _evaluate(filings: list[tuple[str, str, str]],
     return False, None
 
 
+_cache_memo: tuple[int, int, dict] | None = None  # (mtime_ns, size, parsed)
+
+
 def _load_cache() -> dict:
+    """Day-cache read, memoized on (mtime_ns, size): entry_blocked runs
+    for every ranked candidate every ~30s cycle and re-parsing the JSON
+    from disk each call is pure waste. Returns a shallow COPY (callers
+    replace whole keys) so mutations never leak into the memo."""
+    global _cache_memo
     try:
+        st = _CACHE_FILE.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if _cache_memo is not None and _cache_memo[:2] == key:
+            return dict(_cache_memo[2])
         with open(_CACHE_FILE) as f:
-            return json.load(f)
+            parsed = json.load(f)
+        if not isinstance(parsed, dict):
+            # Corrupt-but-parseable: treat as empty so the refetch path
+            # rebuilds and _save_cache overwrites it (self-heal, same
+            # class as the ticker-map ValueError guard above)
+            return {}
+        _cache_memo = (st.st_mtime_ns, st.st_size, parsed)
+        return dict(parsed)
     except (OSError, json.JSONDecodeError):
         return {}
 
 
 def _save_cache(cache: dict) -> None:
+    global _cache_memo
     try:
         # pid-unique tmp: a fixed '.tmp' let a live bot and a manual CLI
         # run interleave writes before os.replace published the file
@@ -149,6 +169,11 @@ def _save_cache(cache: dict) -> None:
         with open(tmp, 'w') as f:
             json.dump(cache, f)
         os.replace(tmp, _CACHE_FILE)
+        try:
+            st = _CACHE_FILE.stat()
+            _cache_memo = (st.st_mtime_ns, st.st_size, dict(cache))
+        except OSError:
+            _cache_memo = None
     except OSError:
         pass
 

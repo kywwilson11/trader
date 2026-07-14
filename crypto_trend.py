@@ -16,6 +16,12 @@ Sharpe/survival hygiene item, not a P&L driver. The whole point of the
 hysteresis is that bare TSMOM is often OOS-negative (whipsaw tax). Validate the
 co-fire counterfactual before flipping it on. Pure numpy — Mac-testable.
 
+STATUS: NOT YET WIRED — no live caller. CRYPTO_TREND_GATE_ENABLED /
+CRYPTO_TREND_SMA_WINDOW / CRYPTO_TREND_FLOOR in strategy_config.py are consumed
+by NOTHING yet; flipping the flag on the Jetson is currently a silent no-op.
+Wiring (CryptoLoop._extra_tilt composing funding_tilt x trend_scalar, bar-fetch
+limit >= 220) is the Jetson-gated wave-9 #7 phase 2 — see the review queue.
+
 References: Moskowitz-Ooi-Pedersen 2012 (TSMOM); Detzel et al. 2021 (MAs predict
 BTC; rational-learning equilibrium); Faber 2007 (200d SMA cut max-drawdown).
 """

@@ -259,7 +259,8 @@ def load_holdout_hit_rate(prefix: str) -> float | None:
         with open(path) as f:
             hr = (json.load(f).get('holdout') or {}).get('hit_rate')
         return float(hr) if hr is not None else None
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError,
+            ValueError):
         return None
 
 

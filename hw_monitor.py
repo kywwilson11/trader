@@ -119,7 +119,7 @@ def get_ram_usage():
         available = int(re.search(r'MemAvailable:\s+(\d+)', info).group(1)) / 1024.0
         used = total - available
         return round(used, 1), round(total, 1)
-    except (FileNotFoundError, AttributeError, ValueError):
+    except (OSError, AttributeError, ValueError):
         return None, None
 
 

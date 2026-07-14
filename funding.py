@@ -46,6 +46,8 @@ _lock = threading.Lock()
 _cache: dict[str, tuple[float, float]] = {}   # symbol -> (ts, 8h rate)
 _history: dict[str, list[float]] | None = None
 _save_warned = False
+_stale_warned: set[str] = set()   # symbols warned once about a stale archive baseline
+_ARCHIVE_STALE_H = 48.0           # warn if archive tail older than ~2 funding cycles
 
 
 def _load_history() -> dict:
@@ -131,6 +133,22 @@ def live_funding_features(symbol: str) -> dict | None:
     samples = None
     if s is not None and len(s) >= 33:
         samples = list(s.values[-90:])
+        # Observability only (returned values are unchanged): the archive is
+        # synced at weekly harvests and holds complete months, so its tail can
+        # be up to ~5 weeks stale — a lagged baseline shifts z/chg semantics
+        # vs training. Stamp the tail age; warn once per symbol when stale.
+        try:
+            age_h = (time.time() - s.index[-1].timestamp()) / 3600.0
+            if age_h > _ARCHIVE_STALE_H and symbol not in _stale_warned:
+                _stale_warned.add(symbol)
+                logger.warning('[FUNDING] %s: archive baseline tail is %.0fh '
+                               'stale (z/chg computed vs a lagged window)',
+                               symbol, age_h)
+            else:
+                logger.debug('[FUNDING] %s: archive tail age %.1fh',
+                             symbol, age_h)
+        except Exception:
+            pass
     else:
         hist = _load_history().get(symbol, [])
         if len(hist) >= 33:

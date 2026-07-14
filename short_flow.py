@@ -44,6 +44,8 @@ MAX_FILES_PER_SYNC = 150        # back-fills across a few harvests
 SVR_WINDOW = 21
 Z_WINDOW = 252
 Z_MIN = 60
+SVR_STALE_DAYS = 7              # warn if the newest print is older than this (weekly sync)
+_svr_stale_warned: set[str] = set()
 
 
 def _panel_symbols() -> set[str]:
@@ -190,6 +192,18 @@ def live_svr_features(symbol: str) -> dict | None:
     if out is None:
         return None
     svr, z = out
+    # Observability only (returned values unchanged): sync runs at the weekly
+    # stock harvest, so the newest print can be ~a week old while training uses
+    # a strict 1-day lag. Stamp the age; warn once per symbol beyond the guard.
+    try:
+        age_days = (dt.date.today() - svr.index[-1].date()).days
+        key = symbol.upper()
+        if age_days > SVR_STALE_DAYS and key not in _svr_stale_warned:
+            _svr_stale_warned.add(key)
+            logger.warning('[SHORT-FLOW] %s: SVR print is %dd old '
+                           '(train uses a 1-day lag)', key, age_days)
+    except Exception:
+        pass
     return {'SVR_21': float(svr.iloc[-1]), 'SVR_Z': float(z.iloc[-1])}
 
 

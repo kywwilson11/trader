@@ -29,6 +29,10 @@ def afml_bet_size(p, base_rate=0.5, step=0.0):
     """
     from scipy.stats import norm
     p = np.asarray(p, float)
+    # Fail closed (matches kelly_edge_odds / breakeven_p): a non-finite p
+    # maps to base_rate -> z=0 -> size exactly 0.0, instead of propagating
+    # NaN through Phi into the returned size.
+    p = np.where(np.isfinite(p), p, float(base_rate))
     p = np.clip(p, 1e-6, 1 - 1e-6)
     z = (p - float(base_rate)) / np.sqrt(p * (1 - p))
     m = 2.0 * norm.cdf(z) - 1.0

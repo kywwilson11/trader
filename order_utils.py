@@ -32,6 +32,17 @@ def _symbol_variants(symbol: str) -> set[str]:
     return variants
 
 
+_NOT_FOUND_SIGS = ('position does not exist', 'not found', '404', 'no position')
+
+
+def _is_not_found(exc) -> bool:
+    """True when an exception reads like Alpaca's 'no such position' (both
+    SDKs), as opposed to a transient API failure (429/timeout/5xx).
+    Mirrors the classifier stock_loop's flatten path already uses."""
+    msg = str(exc).lower()
+    return any(s in msg for s in _NOT_FOUND_SIGS)
+
+
 # --- SPREAD / QUOTE HELPERS ---
 
 def get_quote(api, symbol, asset_type='crypto'):
@@ -429,7 +440,10 @@ def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2,
             try:
                 return api.get_order(order_id)
             except Exception:
-                return None
+                # We may already hold the post-cancel state (final_order from the
+                # fetch above) — a failed redundant re-fetch must not discard it;
+                # None only when the state could never be fetched (docstring).
+                return final_order
         logger.info("[LIFECYCLE] Falling back to market order (%s remaining)...",
                     remaining or saved_qty)
         try:
@@ -480,7 +494,13 @@ def verify_position(api, symbol):
             qty = float(pos.qty)
             if qty > 0:
                 return pos
-        except Exception:
+        except Exception as e:
+            if not _is_not_found(e):
+                # Still returns None (callers treat that as 'really gone' —
+                # see ledger P1), but a transient blip that is about to drop
+                # tracking must at least be visible in the log.
+                logger.warning("[VERIFY] %s: get_position failed (%s) — "
+                               "treated as no position", sym, e)
             continue
     return None
 
@@ -634,14 +654,22 @@ def reconstruct_positions(api, symbols, asset_type='crypto'):
                 qty = float(pos.qty)
                 if qty > 0:
                     entry_price = float(pos.avg_entry_price)
-                    current_price = float(pos.current_price)
+                    # current_price can be None under the alpaca-py adapter
+                    # (the shim passes it through) — float(None) raised and
+                    # silently dropped a LIVE position from startup tracking.
+                    # Fall back to entry for the HWM; base_loop ratchets it up.
+                    cp = getattr(pos, 'current_price', None)
+                    current_price = float(cp) if cp is not None else entry_price
                     positions[sym] = {
                         'qty': qty,
                         'entry_price': entry_price,
                         'high_water_mark': max(entry_price, current_price),
                     }
                     break
-            except Exception:
+            except Exception as e:
+                if not _is_not_found(e):
+                    logger.warning("[RECONSTRUCT] %s: get_position failed (%s)"
+                                   " — a live position may be untracked", candidate, e)
                 continue
     return positions
 
@@ -723,7 +751,7 @@ def emergency_flatten(api, symbols=None, tif_for_symbol=None):
             if tif_for_symbol is not None:
                 tif = tif_for_symbol(sym)
             else:
-                tif = 'gtc' if ('/' in sym or sym.endswith('USD') and len(sym) > 5) else 'day'
+                tif = 'gtc' if ('/' in sym or (sym.endswith('USD') and len(sym) > 5)) else 'day'
             order = api.submit_order(
                 symbol=sym,
                 qty=abs(qty),

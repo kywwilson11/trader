@@ -74,7 +74,9 @@ def build_feature_matrix(tdf, preds) -> np.ndarray:
     n = len(tdf)
     # Single hour pass feeding both trig columns — vectorized twin of
     # _hour_encode (the live scalar path); keep the two in sync.
-    hours = np.array([t.hour for t in tdf.index], dtype=np.float64)
+    hours = (tdf.index.hour.to_numpy(dtype=np.float64)
+             if hasattr(tdf.index, 'hour')
+             else np.array([t.hour for t in tdf.index], dtype=np.float64))
     hour_ang = 2 * np.pi * hours / 24.0
     cols = {}
     for name in META_FEATURES:
@@ -123,24 +125,58 @@ def features_from_snapshot(snapshot: dict, pred: float,
 # Live / backtest scoring
 # ---------------------------------------------------------------------------
 
-_loaded: dict[str, tuple | None] = {}
+_loaded: dict[str, tuple] = {}   # prefix -> (artifact stat key, result)
+
+
+def _stat_key(paths: dict) -> tuple:
+    """(model_mtime_ns, calib_mtime_ns); None for a missing file.
+
+    The key changes when artifacts are retrained, deleted (shadow
+    promotion), or first appear — so _load self-heals without a restart.
+    """
+    key = []
+    for k in ('model', 'calib'):
+        try:
+            key.append(os.stat(paths[k]).st_mtime_ns)
+        except OSError:
+            key.append(None)
+    return tuple(key)
+
+
+def _read_artifacts(paths: dict) -> tuple:
+    """Load (booster, calibrator) from disk. Split out so tests can stub it."""
+    import joblib
+    import lightgbm as lgb
+    booster = lgb.Booster(model_file=str(paths['model']))
+    calib = joblib.load(paths['calib'])
+    return booster, calib
 
 
 def _load(prefix: str):
-    if prefix in _loaded:
-        return _loaded[prefix]
+    """(booster, calib) for `prefix`, or None when the meta layer is absent.
+
+    Cache contract (2026-07 review P1): keyed on the artifact files'
+    mtimes, re-stat'd on every call (two os.stat per candidate — cheap).
+    A weekly meta retrain, a shadow promotion that DELETES the champion
+    meta files (the gate then fails open to neutral, per shadow.py), or
+    the first meta train landing in an already-running bot all take
+    effect without a process restart. A load failure is cached as None
+    under the same key (no per-bar retry storm) and retried as soon as
+    the files change.
+    """
     paths = _paths(prefix)
+    key = _stat_key(paths)
+    cached = _loaded.get(prefix)
+    if cached is not None and cached[0] == key:
+        return cached[1]
     result = None
-    try:
-        if paths['model'].exists() and paths['calib'].exists():
-            import joblib
-            import lightgbm as lgb
-            booster = lgb.Booster(model_file=str(paths['model']))
-            calib = joblib.load(paths['calib'])
-            result = (booster, calib)
-    except Exception as e:
-        print(f"[META] load failed ({e}) — meta layer disabled")
-    _loaded[prefix] = result
+    if None not in key:
+        try:
+            result = _read_artifacts(paths)
+        except Exception as e:
+            print(f"[META] load failed ({e}) — meta layer disabled")
+            result = None
+    _loaded[prefix] = (key, result)
     return result
 
 
@@ -375,10 +411,20 @@ def train_meta(prefix: str = '') -> bool:
             except OSError:
                 pass
 
-    booster.save_model(str(paths['model']))
-    joblib.dump(calib, paths['calib'])
+    # Atomic publish (tmp + os.replace): a bot's mtime-keyed _load can never
+    # read a half-written file. Calib is replaced FIRST, model LAST, so a
+    # reader waking on the model swap sees the paired calibrator already in
+    # place. (Strict cross-file pairing atomicity would need a manifest —
+    # deferred; the remaining window is two adjacent os.replace calls.)
+    tmp_model = str(paths['model']) + '.tmp'
+    tmp_calib = str(paths['calib']) + '.tmp'
+    booster.save_model(tmp_model)
+    joblib.dump(calib, tmp_calib)
+    os.replace(tmp_calib, paths['calib'])
+    os.replace(tmp_model, paths['model'])
     base_rate = float(np.mean(y))
-    with open(paths['meta'], 'w') as f:
+    tmp_meta = str(paths['meta']) + '.tmp'
+    with open(tmp_meta, 'w') as f:
         json.dump({
             'features': META_FEATURES,
             'n_trades': int(len(X)),
@@ -386,6 +432,7 @@ def train_meta(prefix: str = '') -> bool:
             'val_auc': round(float(booster.best_score['valid_0']['auc']), 4),
             'threshold_fraction': META_THRESHOLD_FRACTION,
         }, f, indent=2)
+    os.replace(tmp_meta, paths['meta'])
     invalidate_cache()
     print(f"[META] saved {paths['model'].name}: {len(X)} trades, "
           f"base win-rate {base_rate:.3f}, "
@@ -397,4 +444,5 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='Train the meta-labeling layer')
     ap.add_argument('--prefix', default='', help="'' crypto, 'stock' stocks")
     args = ap.parse_args()
-    sys.exit(0 if train_meta(args.prefix) else 0)  # non-fatal in pipeline
+    train_meta(args.prefix)  # graceful False is non-fatal in the pipeline
+    sys.exit(0)  # NOTE: an uncaught crash still exits 1 — crash-tolerance is decision-queued

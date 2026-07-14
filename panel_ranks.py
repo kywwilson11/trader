@@ -91,16 +91,18 @@ def add_panel_ranks(df: pd.DataFrame) -> pd.DataFrame:
     if 'Ticker' not in df.columns or df.empty:
         return df
     ts = df.index
+    gb = df.groupby(ts)  # one grouping reused for every column — group
+    #                      codes are computed once and cached on the GroupBy
     for col in CS_RANK_BASE_COLS:
         if col not in df.columns:
             continue
-        r = df.groupby(ts)[col].rank(method='average')
-        n = df.groupby(ts)[col].transform('count')
+        r = gb[col].rank(method='average')
+        n = gb[col].transform('count')
         signed = _signed_rank(r, n)
         # A 1-member cross-section has no relative information
         df[f'CS_Rank_{col}'] = signed.where(n > 1, 0.0)
     if 'Return_4h' in df.columns:
-        disp = df.groupby(ts)['Return_4h'].transform('std')
+        disp = gb['Return_4h'].transform('std')
         df['CS_Dispersion'] = disp.fillna(0.0)
     if 'Price_SMA20_Ratio' in df.columns:
         above = (df['Price_SMA20_Ratio'] > 1.0).astype(float)
@@ -274,14 +276,15 @@ def add_crypto_panel_ranks(df: pd.DataFrame) -> pd.DataFrame:
     if 'Ticker' not in df.columns or df.empty:
         return df
     ts = df.index
+    gb = df.groupby(ts)  # one grouping reused (see add_panel_ranks)
     for col in CRYPTO_CS_BASE_COLS:
         if col not in df.columns:
             continue
-        r = df.groupby(ts)[col].rank(method='average')
-        n = df.groupby(ts)[col].transform('count')
+        r = gb[col].rank(method='average')
+        n = gb[col].transform('count')
         df[f'CS_Rank_{col}'] = _signed_rank(r, n).where(n > 1, 0.0)
     if 'Return_4h' in df.columns:
-        df['CS_Dispersion'] = df.groupby(ts)['Return_4h'].transform('std').fillna(0.0)
+        df['CS_Dispersion'] = gb['Return_4h'].transform('std').fillna(0.0)
     return df
 
 

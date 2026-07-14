@@ -109,11 +109,13 @@ def run_report(days: int = 14) -> dict:
     print(f"\nOverall mean shortfall: {overall:+.1f} bps per fill")
 
     # Maker share of crypto entries (the maker ladder journals
-    # entry_tactic per buy). Realized fee/RT = 50 - 10*maker_share bps
-    # (entry 25 - 10*share, exit always taker 25) vs the 50 bps
-    # taker-taker baseline — feeds the fees.py review. Same '/'-only
-    # symbol predicate as fees.realized_crypto_maker_share, so the share
-    # printed here is the one the live fee gate actually computes.
+    # entry_tactic per buy). Realized fee/RT = 2*taker - (taker-maker)*share
+    # bps (entry taker-(taker-maker)*share, exit always taker) vs the 2*taker
+    # taker-taker baseline, with taker/maker = fees.CRYPTO_TAKER_BPS /
+    # CRYPTO_MAKER_BPS (today 25/15, i.e. RT = 50 - 10*maker_share bps) —
+    # feeds the fees.py review. Same '/'-only symbol predicate as
+    # fees.realized_crypto_maker_share, so the share printed here is the one
+    # the live fee gate actually computes.
     tactics = []
     for e in rows:
         sym = e.get('symbol', '')
@@ -124,11 +126,15 @@ def run_report(days: int = 14) -> dict:
         maker_n = sum(1 for t in tactics if t.startswith('maker'))
         share = maker_n / len(tactics)
         report['crypto_maker_share'] = round(share, 3)
+        taker = fees.CRYPTO_TAKER_BPS       # taker leg (also the exit leg)
+        entry_fee_bps = taker - (taker - fees.CRYPTO_MAKER_BPS) * share
         caveat = ('' if len(tactics) >= fees.MAKER_SHARE_MIN_ENTRIES else
                   f' (below live-gate min n={fees.MAKER_SHARE_MIN_ENTRIES})')
-        # Entry-leg fee: 15 bps maker vs 25 bps taker
+        # Entry-leg fee: maker (fees.CRYPTO_MAKER_BPS) vs taker
+        # (fees.CRYPTO_TAKER_BPS); exit is always taker.
         print(f"Crypto maker share (entries): {share:.0%} of {len(tactics)} "
-              f"— entry fee ≈ {25 - 10 * share:.1f} bps vs 25 taker{caveat}")
+              f"— entry fee ≈ {entry_fee_bps:.1f} bps vs {taker:.0f} "
+              f"taker{caveat}")
     print("Compare against the backtest's assumptions (fees.py spread "
           "haircuts: crypto 10 bps, stock 5 bps round trip). If realized "
           "shortfall is persistently higher, the backtest is optimistic — "

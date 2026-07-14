@@ -19,9 +19,11 @@ import sqlite3
 import time
 import threading
 
-from dotenv import load_dotenv
-
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:  # dev Mac: python-dotenv absent; env comes from the shell
+    pass
 
 # ---------------------------------------------------------------------------
 # Database setup
@@ -98,7 +100,14 @@ def _get_db():
 # ---------------------------------------------------------------------------
 
 def _keyword_score(headline, summary=''):
-    """Score text using keyword-based sentiment. Returns float in (-1, 1)."""
+    """Score text using keyword-based sentiment. Returns float in (-1, 1).
+
+    NOT the same combine as sentiment._kw_score_article: when only ONE field
+    is scorable this returns that field's score at FULL weight, while
+    _kw_score_article always applies fixed 0.6/0.4 (zeroing the missing
+    part). Stored keyword_score rows are training features — do NOT unify
+    the two without a retrain/promotion decision.
+    """
     from sentiment import _score_text, _validate_text
     parts = []
     h = _validate_text(headline)
@@ -278,7 +287,10 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
     """Fetch historical news for stock tickers via Finnhub and keyword-score.
 
     Fetches in 30-day windows, rate-limited at 25 calls/min. Caches all articles
-    in SQLite — subsequent runs only fetch new/uncached date ranges.
+    in SQLite. NOTE: a ticker is re-fetched only when it has ZERO cached articles
+    in [start_date, end_date] — there is NO incremental refresh of an
+    already-fetched ticker (known P1; the fix is model-facing and deferred to
+    the promotion path).
 
     Args:
         tickers: List of stock ticker symbols (crypto symbols with '/' are skipped)
@@ -622,8 +634,8 @@ def _gemini_batch_http(method, url_path, body=None, api_key=''):
     req = urllib.request.Request(
         url, data=data, method=method,
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key})
-    resp = urllib.request.urlopen(req, timeout=60)
-    return _json.loads(resp.read())
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return _json.loads(resp.read())
 
 
 def submit_sentiment_batch(db, model=None) -> bool:

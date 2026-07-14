@@ -18,6 +18,7 @@ import os
 import json
 import time
 import datetime
+import random
 import zoneinfo
 from pathlib import Path
 
@@ -650,10 +651,9 @@ class StockLoop(BaseTradingLoop):
 
     def _execute_buys(self, preds: dict, snapshots: dict):
         """Stock-specific: bracket orders with server-side stops, exposure tracking."""
-        from trading_utils import cooldown_ok
+        from trading_utils import cooldown_ok, LLM_VETO_THRESHOLD
         from order_utils import should_trade
         from trade_journal import log_decision
-        from trading_utils import LLM_VETO_THRESHOLD
         from portfolio import check_portfolio_correlation
 
         if self.flattened_today:
@@ -866,6 +866,7 @@ class StockLoop(BaseTradingLoop):
             # Calculate qty (whole shares)
             price = quote['midpoint']
             if price <= 0:
+                vc['bad_price'] += 1   # degenerate quote — keep window attribution complete
                 continue
             qty = int(sized_notional / price)
             if qty <= 0:
@@ -902,7 +903,6 @@ class StockLoop(BaseTradingLoop):
 
             admitted.append(symbol)
 
-            import random
             time.sleep(random.uniform(0, 5))
 
             order = self.place_buy_order(symbol, qty, quote, stop_price, tp_price)
@@ -999,6 +999,11 @@ class StockLoop(BaseTradingLoop):
                                                     reasoning=llm_info.get('r', ''))
                         del self.positions[symbol]
                         self.last_trade_time[symbol] = datetime.datetime.now()
+                        # KNOWN (2026-07 review P2, deferred): after the
+                        # trailing upgrade this order can be the TRAILING
+                        # stop — the lockout + exit_reason='server_stop'
+                        # then misclassify a profitable trailing exit as a
+                        # hard stop.
                         self.hard_stop_lockout[symbol] = datetime.datetime.now()
                         self._save_hard_stop_lockout()
                         continue

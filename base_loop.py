@@ -12,20 +12,20 @@ import json
 import os
 import time
 import datetime
-import gc
+import random
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from log_config import get_logger
 from types_mod import Position, MacroRegime
 from order_utils import (
-    manage_order_lifecycle, get_all_positions, should_trade,
+    manage_order_lifecycle, should_trade,
     cancel_all_open_orders, reconstruct_positions,
     check_circuit_breaker, emergency_flatten,
 )
 from predict_now import load_models
 from trading_utils import (
-    get_api, get_model_mtime, choose_inference_device, cooldown_ok,
+    get_api, choose_inference_device, cooldown_ok,
     predict_symbol, compute_kelly_fraction,
     LLM_VETO_THRESHOLD, THERMAL_THROTTLE_TEMP, TEMP_LOG_EVERY_N_CYCLES,
 )
@@ -37,9 +37,8 @@ from fundamentals import get_fundamentals, format_fundamentals_for_llm
 from trade_journal import log_decision
 from trade_memory import record_trade
 from macro_indicators import get_macro_regime
-from volatility import get_cached_sigma, compute_vol_adjusted_size, get_garch_stop
+from volatility import compute_vol_adjusted_size
 from portfolio import (
-    get_returns_for_symbols, compute_correlation_matrix,
     check_portfolio_correlation, get_correlation_sizing_factor,
 )
 from regime_detector import get_cached_regime
@@ -83,6 +82,10 @@ class BaseTradingLoop(ABC):
         self.positions: dict[str, Position] = {}
         self.last_trade_time: dict[str, datetime.datetime] = {}
         self.hard_stop_lockout: dict[str, datetime.datetime] = {}
+        # KNOWN (2026-07 review P2, deferred): this file is SHARED by both
+        # books (unlike _position_state_file) and _save_hard_stop_lockout
+        # rewrites it wholesale, so each book's save clobbers the other's
+        # persisted lockouts. Per-book prefix fix queued for owner review.
         self._lockout_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                           'hard_stop_lockout.json')
         self._load_hard_stop_lockout()
@@ -94,8 +97,9 @@ class BaseTradingLoop(ABC):
         self.cycle = 0
         self.macro_regime: MacroRegime | None = None
         self.corr_matrix: dict = {}
-        self._equity: float = 100_000
-        self._peak_equity: float = 100_000
+        from drawdown import PEAK_SEED
+        self._equity: float = PEAK_SEED
+        self._peak_equity: float = PEAK_SEED
         self._buys_allowed: bool = True
         self._halted_until: datetime.datetime | None = None
         # Per-symbol daily trade budget: caps fee bleed from signal jitter
@@ -335,7 +339,7 @@ class BaseTradingLoop(ABC):
         """Rebuild positions from API (survive restarts)."""
         from market_data import get_live_atr
         symbols = self.get_symbol_universe()
-        raw_positions = reconstruct_positions(self.api, symbols, asset_type=self.get_asset_type())
+        raw_positions = reconstruct_positions(self.api, symbols)
         saved = self._load_position_state()
         # Restore the account high-water mark BEFORE any equity ratchet so the
         # drawdown ladder stays armed across a restart-mid-drawdown (wave-8 #4).
@@ -344,7 +348,7 @@ class BaseTradingLoop(ABC):
         if 'peak_equity' in saved:
             from drawdown import restore_peak_equity
             self._peak_equity = restore_peak_equity(
-                saved.get('peak_equity'), getattr(self, '_equity', 0.0))
+                saved.get('peak_equity'), self._equity)
         saved_hwm = saved.get('hwm', {})
         saved_trailing = saved.get('trailing', {})
         for sym, info in raw_positions.items():
@@ -549,7 +553,19 @@ class BaseTradingLoop(ABC):
                 if self.macro_regime.sizing_mult == 0:
                     logger.warning("[CONTAGION] Stablecoin emergency! Flattening crypto...")
                     failures = emergency_flatten(self.api, symbols=self.get_symbol_universe())
-                    self.positions = {s: p for s, p in self.positions.items() if s in failures}
+                    # Same failure-tracking contract as the circuit-breaker
+                    # branch (2026-07 review P1): failures come back
+                    # BROKER-format ('BTCUSD'), positions are keyed
+                    # universe-format ('BTC/USD'), and the list-positions
+                    # sentinel means broker state is UNKNOWN — keep all.
+                    if '<list_positions failed>' in failures:
+                        pass  # unknown broker state — keep all positions tracked
+                    elif failures:
+                        failed_norm = {f.replace('/', '') for f in failures}
+                        self.positions = {s: p for s, p in self.positions.items()
+                                          if s.replace('/', '') in failed_norm}
+                    else:
+                        self.positions.clear()
         except Exception as e:
             logger.debug("[MACRO] Regime update failed: %s", e)
 
@@ -589,6 +605,16 @@ class BaseTradingLoop(ABC):
         Returns (desired_stop, stop_dist, trail_dist, trailing_active).
         Used by stop management AND book-risk accounting so the cap can
         never disagree with the stops actually being enforced.
+
+        STOP-MATH SYNC CONTRACT (2026-07 review): the entry-anchored
+        stop-distance arithmetic (entry_ATR * ATR_STOP_MULTIPLIER / price,
+        clamped [ATR_STOP_FLOOR_PCT, ATR_STOP_CEIL_PCT], fallback
+        STOP_LOSS_PCT) is duplicated at base_loop._reconstruct_positions,
+        base_loop._compute_position_size, base_loop._place_and_track_buy,
+        crypto_loop._stop_distance_for, stock_loop._execute_buys (bracket),
+        stock_loop._prepare_overnight_keepers and
+        stock_loop._replace_protective_stops. Change one -> change ALL
+        (helper consolidation queued for owner review).
         """
         entry_price = pos.entry_price
         hwm = pos.high_water_mark
@@ -684,13 +710,22 @@ class BaseTradingLoop(ABC):
                                                     reasoning=llm_info.get('r', ''))
                         del self.positions[symbol]
                         self.last_trade_time[symbol] = datetime.datetime.now()
+                        # KNOWN (2026-07 review P2, deferred): the resting
+                        # stop may sit at the TRAILING level (ratcheted by
+                        # _maybe_update_resting_stop), so this lockout also
+                        # fires on profitable trailing exits and the journal
+                        # conflates them with hard stops.
                         self.hard_stop_lockout[symbol] = datetime.datetime.now()
                         self._save_hard_stop_lockout()
                         continue
                     if status in ('canceled', 'expired', 'rejected'):
                         pos.stop_order_id = None
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Keep the id and retry next cycle (stock_loop logs the
+                    # same case); a transient get_order failure must not
+                    # blind server-fill detection silently.
+                    logger.debug("[STOP-CHECK] %s: resting-stop status check "
+                                 "failed (%s) — retry next cycle", symbol, e)
 
             quote = self.get_quote(symbol)
             if quote is None:
@@ -1560,6 +1595,12 @@ class BaseTradingLoop(ABC):
 
         The flag is cleared BEFORE flattening so a partial failure can't
         re-trigger liquidation every 30s; failures are notified instead.
+
+        KNOWN LIMITATION (2026-07 review P1, deferred): the flag file is
+        SHARED across books and cleared by the first consumer, so in a
+        two-book deployment only one book flattens — and the stock loop
+        never sees an off-hours request (market-closed returns before this
+        check). Per-book flags queued for owner review.
         """
         try:
             from notify import (flatten_requested, clear_flatten_request,
@@ -1605,8 +1646,10 @@ class BaseTradingLoop(ABC):
                     logger.warning("[HALT] trading_halt.flag active — "
                                    "entries blocked (/resume to clear)")
                 return False
-        except Exception:
-            pass
+        except Exception as e:
+            if self.cycle % 10 == 1:
+                logger.warning("[HALT] halt-flag check failed (%s) — "
+                               "failing open, entries allowed", e)
         try:
             from macro_calendar import macro_standdown, calendar_exhausted
             blocked, reason = macro_standdown()
@@ -1617,8 +1660,10 @@ class BaseTradingLoop(ABC):
             if calendar_exhausted() and self.cycle % 2000 == 1:
                 logger.warning("[MACRO] static FOMC/CPI table has no future "
                                "events — refresh macro_calendar.py")
-        except Exception:
-            pass
+        except Exception as e:
+            if self.cycle % 10 == 1:
+                logger.warning("[MACRO] stand-down check failed (%s) — "
+                               "failing open, entries allowed", e)
         return True
 
     def _execute_buys(self, preds: dict, snapshots: dict):
@@ -1781,7 +1826,6 @@ class BaseTradingLoop(ABC):
                 continue
 
             # Order timing jitter (prevent pattern detection)
-            import random
             time.sleep(random.uniform(0, 5))
 
             logger.info("%s: Sizing $%d (pred=%.4f)", symbol, sized_notional,
@@ -1905,6 +1949,24 @@ class BaseTradingLoop(ABC):
                 log_decision(buy_rec)
                 self.last_trade_time[symbol] = datetime.datetime.now()
                 self._count_trade(symbol)
+            else:
+                # Coins were ACQUIRED but the position endpoint can't see
+                # them (lag or transient error): the position is UNTRACKED —
+                # no stop management, no journal row, no cooldown/budget
+                # stamp — until a restart reconstructs it. Tracking-retry is
+                # deferred (2026-07 review P2); surface it loudly.
+                logger.error("[BUY] %s: acquired qty=%s but verify_position "
+                             "returned None — position UNTRACKED until "
+                             "restart (order status=%s)", symbol, partial_qty,
+                             getattr(result, 'status', None))
+                try:
+                    from notify import notify
+                    notify(f"BUY {symbol}: fill acquired but position "
+                           f"unverified — UNTRACKED until restart",
+                           level='warning',
+                           dedupe_key=f'untracked-buy-{symbol}')
+                except Exception:
+                    pass
 
     def _sleep(self):
         """Sleep with thermal throttling."""
@@ -1921,7 +1983,6 @@ class BaseTradingLoop(ABC):
                         temp, THERMAL_THROTTLE_TEMP, sleep_interval)
 
         # Add small random jitter (±5s) to prevent pattern detection
-        import random
         jitter = random.uniform(-5, 5)
         sleep_interval = max(10, sleep_interval + jitter)
 

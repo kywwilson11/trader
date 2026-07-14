@@ -16,8 +16,11 @@ LIVE side: feed decision_report's rank buckets directly:
 
 PASS on BOTH the holdout panel AND >=20-30d of live journals before shipping the
 conviction flagship (CONCENTRATION_ENABLED) or edge-Kelly (EDGE_KELLY_ENABLED).
-Exit status: 0 only when the verdict CONFIRMS the gradient, 1 otherwise, so
-scripted use cannot mistake a no-go verdict for success.
+Exit status: 0 only when the verdict CONFIRMS the gradient, 1 on a ran-but-no-go
+verdict, and 2 when the --buckets input cannot be gated at all (a STALE
+decision_report placeholder, or a payload that is not a JSON object) — so
+scripted use can tell "gate ran and said no" apart from both "gate confirmed"
+and "input unusable / not trustworthy".
 """
 import argparse
 import json
@@ -57,6 +60,27 @@ def main() -> int:
         buckets = rank_gradient_from_panel(panel, cost_pct=args.cost_pct)
     else:
         buckets = json.loads(Path(args.buckets).read_text())
+        if not isinstance(buckets, dict):
+            # A list/scalar payload would AttributeError on .get() below; name
+            # the shape mismatch instead of dumping a traceback.
+            print(f"ERROR: {args.buckets} must be a JSON object (a decision_report "
+                  f"or a bare rank-bucket dict); got {type(buckets).__name__}",
+                  file=sys.stderr)
+            return 2
+        # decision_report.py writes a placeholder marked 'stale': True whenever it
+        # could not price counterfactuals (no reachable API, or an empty journal),
+        # and its docstring names THIS script as the consumer meant to "refuse to
+        # trust it". Do so explicitly: a stale report has no rank buckets, so the
+        # generic path would misreport it as merely 'insufficient rank coverage'
+        # and exit 1 — indistinguishable from a real ran-but-no-gradient verdict.
+        if buckets.get('stale'):
+            print(f"REFUSED: {args.buckets} is a STALE decision_report "
+                  f"(stale=true, api_available={buckets.get('api_available')!r}) — "
+                  f"it carries no live rank buckets and cannot gate the "
+                  f"conviction / edge-Kelly levers. Re-run decision_report.py on "
+                  f"the Jetson with a reachable API and >=20-30d of journals, then "
+                  f"gate on the fresh report.", file=sys.stderr)
+            return 2
         # Same unwrap as rank_gradient_verdict: a full decision_report.json
         # nests the rank buckets under 'conviction' — without this, the
         # per-bucket evidence lines below silently print nothing.

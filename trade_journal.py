@@ -1,7 +1,34 @@
 """Structured trade journal — append-only JSONL logging of every decision.
 
 One file per day in journals/ directory: journals/2026-02-08.jsonl
-Each line is a self-contained JSON object with all inputs and reasoning.
+Each line is a self-contained JSON object. log_decision() guarantees only the
+`ts` key (offset-aware ISO-8601); every other key is set by the PRODUCER
+(base_loop.py / stock_loop.py). The schema below is the producer contract the
+Stage-0 consumers read — keep it in sync when adding a row type or key.
+
+Row schema (tagged union on `action`; `ts` on every row):
+  "buy"           symbol, pred_return, sentiment_gate, sentiment_reasons,
+                  llm_multiplier, llm_score, llm_reasoning, final_notional,
+                  decision_price, fill_price, slippage_bps, entry_tactic, maker,
+                  skip_reason(=None); optional conviction fields + nested `sizing`.
+  "sell"          symbol, exit_reason, pnl_pct, decision_price, fill_price,
+                  slippage_bps, estimated.
+  "skip"          symbol, skip_reason (sentiment_block | llm_veto | meta_veto |
+                  cost/qty_zero/…); optional pred_return, meta_prob, entry_rank,
+                  + conviction fields (spread_pct, _fetch_failed, …).
+  "llm_analysis"  asset_type, forward_bars, scores={sym:{s,pred}}.
+  "entry_window"  asset_type, n_candidates, admitted_k, admitted, veto_counts,
+                  buys_allowed.
+  "account_risk"  book, plus the record_book_risk_and_report payload.
+
+Consumers (read-only; break on a rename):
+  decision_report.py  action, skip_reason, symbol, spread_pct, exit_reason,
+                      pnl_pct, pred_return, meta_p/meta_prob, entry_rank,
+                      asset_type, admitted_k, veto_counts, _fetch_failed.
+  llm_eval.py         action=="llm_analysis": asset_type, forward_bars,
+                      scores{s,pred}, ts.
+  fees.py             action=="buy": symbol, entry_tactic (maker-share feedback).
+  execution_report.py action, symbol, entry_tactic, exit_reason, slippage_bps.
 """
 
 import datetime

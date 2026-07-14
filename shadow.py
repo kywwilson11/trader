@@ -22,6 +22,17 @@ Mechanics:
     promote early after >=14d at p<0.05; at >=28d promote at p<0.10 if
     the mean loss diff favors the challenger, else discard.
     Status-quo bias is intentional — promotion churn has real costs.
+  - KNOWN anti-conservative approximations (documented, not corrected —
+    correcting them changes promotion behavior, owner decision): (1) the
+    records pool K symbols per hour (crypto ~6, stocks ~56) but dm_hln
+    truncates the Newey-West LRV at h-1 in RECORD units, so same-hour
+    cross-sectional correlation and the ~K*(h-1)-record overlap
+    dependence are under-covered (for stocks lag 23 spans <1 hour of
+    records) — the LRV is underestimated and the DM stat inflated;
+    (2) the daily eval re-tests an unadjusted p<0.05 from day 14
+    (~14 sequential looks); (3) MIN_OBS counts pooled records, not
+    independent hours. Fix sketch on file: collapse d to per-timestamp
+    means, lag h-1 in hours, per-book MIN_OBS, spaced peeks.
   - Promotion copies the full artifact stack (LSTM, scaler, config,
     feature cols, LGB, q10) with .prev backups, manifest LAST; the
     champion's meta-label artifacts are deleted (stale pairing — the
@@ -220,6 +231,10 @@ def dm_hln(d: np.ndarray, h: int) -> tuple[float, float]:
     MA(h-1)); HLN small-sample correction; p-value against t_{n-1}
     (normal fallback when scipy is unavailable).
     Returns (dm_stat, p_value_challenger_better).
+
+    NOTE: the MA(h-1) truncation assumes ONE loss-diff per time step;
+    evaluate_shadow feeds a POOLED cross-section (K records per hour),
+    which under-covers the true dependence — see the module docstring.
     """
     d = np.asarray(d, dtype=float)
     d = d[np.isfinite(d)]

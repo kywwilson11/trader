@@ -81,8 +81,9 @@ def load_archive():
     if ARCHIVE_FILE.exists():
         try:
             return pd.read_parquet(ARCHIVE_FILE)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[BASIS-ARCHIVE] corrupt archive {ARCHIVE_FILE}: {e} "
+                  f"— treating as empty")
     return pd.DataFrame(columns=['symbol', 'ts', 'premium'])
 
 
@@ -127,7 +128,14 @@ def sync(symbols=None, start: str = '2020-01') -> bool:
             except Exception as e:
                 print(f"[BASIS-ARCHIVE] {bsym} {month}: {e}")
                 continue
-            parsed = _parse_zip(data)
+            # A parse failure must not abort the sync: that would discard
+            # every month already fetched this run, and the bad month would
+            # re-download and re-crash every future run (never in 'have').
+            try:
+                parsed = _parse_zip(data)
+            except Exception as e:
+                print(f"[BASIS-ARCHIVE] {bsym} {month}: parse failed: {e}")
+                continue
             if parsed is not None and not parsed.empty:
                 parsed['symbol'] = alp
                 new_frames.append(parsed)

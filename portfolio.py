@@ -59,6 +59,12 @@ def compute_correlation_matrix(returns_dict: dict[str, np.ndarray],
                                window: int = 30) -> dict[tuple[str, str], float]:
     """Compute pairwise correlation from recent returns.
 
+    Uses LedoitWolf-shrunk covariance when sklearn is importable, else falls
+    back to np.corrcoef. Only OFF-DIAGONAL pairs are written (both (s1,s2) and
+    (s2,s1)); the diagonal (sym,sym) is intentionally absent, so a self-pair
+    lookup falls to the caller's 0.0 default — which under-counts a symbol's
+    correlation with itself on add-on entries (see the deferred self-pair item).
+
     Args:
         returns_dict: {symbol: array_of_returns}
         window: Number of recent bars to use

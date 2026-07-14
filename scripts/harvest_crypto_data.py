@@ -6,7 +6,10 @@ saves as Parquet + CSV. Falls back through multiple data sources.
 Data sources (in priority order):
   - Alpaca: Jan 2021 – present (via get_crypto_bars auto-pagination)
   - yfinance: Most recent 730 days (max for hourly)
-  - CryptoCompare: Free, no key needed, up to 2000 bars/call
+  - CryptoCompare: DEAD in production since the CoinDesk migration —
+    keyless requests return HTTP 401 (verified 2026-07-02); the leg is
+    kept in data_sources pending an API key or removal, so effective
+    redundancy is Alpaca (2021+) + yfinance (last 730d)
 """
 import sys; from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -243,6 +246,11 @@ def main():
         if crypto_df is not None:
             crypto_df['Ticker'] = t
             all_data.append(crypto_df)
+
+    # Free the previous full feature panel before pd.concat allocates the
+    # new one — peak-RSS matters on the 8GB Jetson (harvest can run beside
+    # the bots). `existing` is not referenced past this point.
+    del existing
 
     # Combine and save — sort chronologically for time-series split in training
     if not all_data:

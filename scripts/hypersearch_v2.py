@@ -1,20 +1,25 @@
 """
 Regression-based Optuna hyperparameter search with walk-forward cross-validation.
 
-Replaces the dual bear/bull classification approach with a single regression model
-that predicts continuous returns, optimized via Sharpe ratio.
+Trains a single RegressionLSTM (no separate bear/bull models) per book that
+predicts continuous returns, plus a LightGBM ensemble leg, searched via
+Optuna TPE over a walk-forward cross-validated objective.
 
-Key improvements over hypersearch_dual.py:
+Key properties:
   - Single model (no separate bear/bull)
   - Huber loss with return-weighted emphasis
   - Walk-forward CV with expanding windows (3 folds)
-  - Sharpe ratio as optimization objective
+  - Risk-adjusted objective: mean fold Sharpe − 0.5·std, cost-aware, holdout
+    Deflated-Sharpe gate before any save
   - FP16 mixed precision for ~2x speedup on Jetson tensor cores
   - Stationary features only (no raw price/volume drift)
 
 Usage:
     python scripts/hypersearch_v2.py --trials 200 --data training_data.csv --preset stationary
     python scripts/hypersearch_v2.py --trials 50 --prefix stock --data stock_training_data.csv
+
+Note: data loads parquet-first via data_utils by --prefix stem; --data is
+only a direct-CSV fallback.
 """
 import sys; from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -152,6 +157,17 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
         print(f"Multi-horizon targets: {sorted(csv_target_cols)}")
     else:
         print("Legacy single-horizon dataset (Target_Return only, treated as forward_bars=4)")
+
+    if has_multi_horizon:
+        _missing = [fb for fb in FORWARD_BARS
+                    if f'Target_Return_{fb}' not in df.columns]
+        if _missing:
+            print(f"[WARN] Target_Return columns missing for fb={_missing}: "
+                  f"trials at those horizons will train AND holdout-gate on "
+                  f"the legacy shortest-horizon 'Target_Return' substitute "
+                  f"(silently mis-specified objective) — re-harvest before "
+                  f"trusting this search (adaptive forward_bars likely "
+                  f"expanded after the last harvest)")
 
     exclude_cols = ['Ticker', 'Date', 'Datetime', 'NextClose']
     exclude_cols += [c for c in df.columns if c.startswith('Target_Return')]
@@ -487,7 +503,7 @@ def compute_regime_sharpes(predictions, actual_returns, threshold,
 
 
 # ---------------------------------------------------------------------------
-# Sequence cache (reused from hypersearch_dual pattern)
+# Sequence cache
 # ---------------------------------------------------------------------------
 
 class ScaledCache:
@@ -1082,8 +1098,8 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
 # ---------------------------------------------------------------------------
 
 def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
-                        all_times, all_label_times, tickers, ticker_boundaries,
-                        input_dim, asset_type, n_trials, trial_values,
+                        all_times, tickers, ticker_boundaries,
+                        input_dim, asset_type, n_trials,
                         all_tb_bars_by_fb=None):
     """Score the winning config ONCE on the untouched final time slice.
 
@@ -1492,10 +1508,9 @@ def main():
                             and t.value is not None]
         holdout_report = evaluate_on_holdout(
             best_state_holder['state'], best_scaler, best_cfg,
-            all_features, all_returns_by_fb, all_times, all_label_times,
+            all_features, all_returns_by_fb, all_times,
             tickers, ticker_boundaries, input_dim, asset_type,
             n_trials=max(len(completed_trials), 2),
-            trial_values=[t.value for t in completed_trials],
             all_tb_bars_by_fb=all_tb_bars_by_fb,
         )
         gate_ok = (holdout_report is not None
@@ -1567,30 +1582,6 @@ def main():
     else:
         print(f"\nNo new best found (prior best score={best_state_holder['score']:.3f})")
 
-    # Update adaptive state with results. When the holdout gate REJECTED the
-    # winner, do NOT ratchet best_score — otherwise future (honest) models
-    # would have to beat a score that belongs to an unsaved, overfit config.
-    final_score = best_state_holder['score']
-    if not model_saved:
-        final_score = min(final_score, existing_score)
-    final_params = best_state_holder.get('cfg', {})
-    if final_score > 0 and final_params:
-        adaptive_state = update_after_search(adaptive_state, final_score, final_params,
-                                                   study_db_path=db_path)
-        print(f"\n[ADAPTIVE] Updated state: mode={adaptive_state['mode']}, "
-              f"cycles_without_improvement={adaptive_state['cycles_without_improvement']}")
-        if adaptive_state.get('expansion_history'):
-            latest = adaptive_state['expansion_history'][-1]
-            if latest.get('expansions'):
-                print(f"[ADAPTIVE] Expansions: {latest['expansions']}")
-    elif final_params:
-        # No improvement but still save params if this is initial run
-        if not adaptive_state.get('best_params'):
-            adaptive_state['best_params'] = final_params
-            adaptive_state['best_score'] = final_score
-            from adaptive_config import save_adaptive_state
-            save_adaptive_state(adaptive_state)
-
     # Param importance
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if len(completed) >= 10:
@@ -1636,6 +1627,34 @@ def main():
                     print("  WARNING: 5th percentile <= 0 — model may be overfit")
         except Exception as e:
             print(f"  Monte Carlo failed: {e}")
+
+    # Deliberately AFTER the study reads above (importance/PBO/Monte-Carlo):
+    # update_after_search may DELETE {prefix}v2_study.db on categorical
+    # expansion, and a fresh pooled sqlite connection would otherwise
+    # recreate an empty DB and silently blank those diagnostics.
+    # Update adaptive state with results. When the holdout gate REJECTED the
+    # winner, do NOT ratchet best_score — otherwise future (honest) models
+    # would have to beat a score that belongs to an unsaved, overfit config.
+    final_score = best_state_holder['score']
+    if not model_saved:
+        final_score = min(final_score, existing_score)
+    final_params = best_state_holder.get('cfg', {})
+    if final_score > 0 and final_params:
+        adaptive_state = update_after_search(adaptive_state, final_score, final_params,
+                                                   study_db_path=db_path)
+        print(f"\n[ADAPTIVE] Updated state: mode={adaptive_state['mode']}, "
+              f"cycles_without_improvement={adaptive_state['cycles_without_improvement']}")
+        if adaptive_state.get('expansion_history'):
+            latest = adaptive_state['expansion_history'][-1]
+            if latest.get('expansions'):
+                print(f"[ADAPTIVE] Expansions: {latest['expansions']}")
+    elif final_params:
+        # No improvement but still save params if this is initial run
+        if not adaptive_state.get('best_params'):
+            adaptive_state['best_params'] = final_params
+            adaptive_state['best_score'] = final_score
+            from adaptive_config import save_adaptive_state
+            save_adaptive_state(adaptive_state)
 
     # Final pipeline status
     _pipeline_status['phase'] = 'complete'

@@ -12,9 +12,12 @@ import os
 import time
 import datetime
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:  # dev Mac: python-dotenv absent; env comes from the shell
+    pass
 
 # --- Finnhub client (lazy init) ---
 _finnhub_client = None
@@ -185,9 +188,9 @@ _NEG_PREFIX = _re.compile(
 )
 
 # Pre-compiled phrase patterns with word boundaries (avoids substring matches)
-_POS_PHRASE_RES = [(_re.compile(r'\b' + _re.escape(p) + r'\b', _re.IGNORECASE), w)
+_POS_PHRASE_RES = [(p, _re.compile(r'\b' + _re.escape(p) + r'\b', _re.IGNORECASE), w)
                    for p, w in _POSITIVE_PHRASES]
-_NEG_PHRASE_RES = [(_re.compile(r'\b' + _re.escape(p) + r'\b', _re.IGNORECASE), w)
+_NEG_PHRASE_RES = [(p, _re.compile(r'\b' + _re.escape(p) + r'\b', _re.IGNORECASE), w)
                    for p, w in _NEGATIVE_PHRASES]
 
 
@@ -201,7 +204,13 @@ def _score_text(text):
     raw_score = 0.0
 
     # Phase 1: Phrase matching (higher weight, word-boundary, negation-aware)
-    for pat, weight in _POS_PHRASE_RES:
+    # containment is a NECESSARY condition for a \b+re.escape(literal) match
+    # on lowercased text because every table phrase is lowercase (invariant
+    # pinned in tests); skipping the regex on containment-miss cannot change
+    # the score.
+    for phrase, pat, weight in _POS_PHRASE_RES:
+        if phrase not in text_lower:
+            continue
         m = pat.search(text_lower)
         if m:
             prefix = text_lower[max(0, m.start() - 15):m.start()]
@@ -209,7 +218,9 @@ def _score_text(text):
                 raw_score -= weight * 0.7  # negated positive → negative
             else:
                 raw_score += weight
-    for pat, weight in _NEG_PHRASE_RES:
+    for phrase, pat, weight in _NEG_PHRASE_RES:
+        if phrase not in text_lower:
+            continue
         m = pat.search(text_lower)
         if m:
             prefix = text_lower[max(0, m.start() - 15):m.start()]
@@ -672,7 +683,9 @@ def _llm_score_batch(articles):
     """Batch-score articles using tiered Gemini models.
 
     Newest articles get the best model (pro), middle get flash, rest get lite.
-    Falls back to cheaper models when daily quota is exhausted.
+    A tier whose model has no remaining budget (or a mid-batch 429 cooldown)
+    is SKIPPED — its articles are NOT reassigned to the next tier; they fall
+    through to the keyword gap-fill below.
     Sets _scored_by_model on each article.
     Returns list[float] or None if all models fail.
     """
@@ -1239,9 +1252,8 @@ def get_recent_headlines(symbol, asset_type='crypto', max_headlines=5):
             if len(relevant) < 2:
                 relevant = articles[:10]
         else:
-            import datetime as dt
-            today = dt.date.today()
-            week_ago = today - dt.timedelta(days=7)
+            today = datetime.date.today()
+            week_ago = today - datetime.timedelta(days=7)
             clean_sym = symbol.replace('/', '')
             articles = client.company_news(
                 clean_sym,

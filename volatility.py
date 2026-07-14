@@ -57,7 +57,7 @@ def fit_garch(returns: np.ndarray, p: int = 1, q: int = 1):
         if np.abs(returns).mean() < 0.01:
             returns = returns * 100
 
-        # Try EGARCH first (captures asymmetry: crashes increase vol more than rallies)
+        # Try EGARCH first (log-variance spec; symmetric here — o=0, no leverage/asymmetry term fit)
         try:
             am = arch_model(returns, vol='EGARCH', p=p, q=q, mean='Zero',
                             rescale=False)
@@ -164,6 +164,7 @@ BARS_PER_DAY = {'crypto': 24.0, 'stock': 6.5}
 _HAR_MIN_DAYS = 60
 _HAR_WINDOW = 250
 _har_cache: dict[str, tuple[object, float]] = {}   # symbol -> (day, sigma)
+_har_gap_logged: set = set()   # symbols already warned about thin HAR history
 
 
 def daily_realized_range(bars) -> 'pd.Series':
@@ -234,6 +235,10 @@ def get_sigma(symbol: str, returns: np.ndarray, bars=None,
             _har_cache[symbol] = (day, sigma)
             logger.debug("HAR %s: sigma=%.4f", symbol, sigma)
             return sigma
+        if symbol not in _har_gap_logged:
+            _har_gap_logged.add(symbol)
+            logger.info("[VOL] %s: HAR-RV unavailable (need >=%d daily obs) — "
+                        "falling back to GARCH/cached sigma", symbol, _HAR_MIN_DAYS)
     return get_cached_sigma(symbol, returns)
 
 

@@ -126,7 +126,7 @@ def fetch_financial_stress() -> float | None:
 def fetch_cape() -> float | None:
     """Fetch Shiller CAPE ratio estimate.
 
-    Uses a simple approximation: SPY P/E * 1.5 adjustment factor
+    Uses a simple approximation: SPY P/E * 1.6 adjustment factor
     since real-time Shiller CAPE APIs are unreliable.
     """
     cached = _get_cached('cape', _CAPE_CACHE_TTL)
