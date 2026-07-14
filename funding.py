@@ -45,6 +45,7 @@ EXTREME_Z = 3.0
 _lock = threading.Lock()
 _cache: dict[str, tuple[float, float]] = {}   # symbol -> (ts, 8h rate)
 _history: dict[str, list[float]] | None = None
+_save_warned = False
 
 
 def _load_history() -> dict:
@@ -59,13 +60,18 @@ def _load_history() -> dict:
 
 
 def _save_history():
+    global _save_warned
     try:
         tmp = _HISTORY_FILE + '.tmp'
         with open(tmp, 'w') as f:
             json.dump(_history, f)
         os.replace(tmp, _HISTORY_FILE)
-    except OSError:
-        pass
+    except OSError as e:
+        # Full/read-only disk: the z baseline restarts cold on every bot
+        # restart if this never persists — say so once, don't spam
+        if not _save_warned:
+            _save_warned = True
+            logger.warning('[FUNDING] history persist failed: %s', e)
 
 
 def get_funding_rate(symbol: str) -> float | None:
@@ -81,8 +87,8 @@ def get_funding_rate(symbol: str) -> float | None:
     try:
         url = f"https://www.okx.com/api/v5/public/funding-rate?instId={inst}"
         req = urllib.request.Request(url, headers={'User-Agent': 'trader/1.0'})
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
         rate = float(data['data'][0]['fundingRate'])
     except Exception as e:
         logger.debug('[FUNDING] %s: fetch failed: %s', symbol, e)
@@ -114,7 +120,9 @@ def live_funding_features(symbol: str) -> dict | None:
     try:
         from funding_archive import get_funding_series
         s = get_funding_series(symbol)
-    except Exception:
+    except Exception as e:
+        logger.debug('[FUNDING] %s: archive unavailable, using local '
+                     'history: %s', symbol, e)
         s = None
 
     ann = rate * 3 * 365
@@ -169,7 +177,10 @@ def funding_tilt(symbol: str) -> float:
                     f'{z:.1f}' if z is not None else 'n/a')
         return 0.25
     if crowded:
-        logger.info('[FUNDING] %s: crowded longs (%.1f%%/yr) -> 0.6x entries',
-                    symbol, annualized * 100)
+        # Include z: this branch fires on z > 2.0 alone, where the
+        # annualized rate can sit well under the 30%/yr threshold
+        logger.info('[FUNDING] %s: crowded longs (%.1f%%/yr, z=%s) '
+                    '-> 0.6x entries', symbol, annualized * 100,
+                    f'{z:.1f}' if z is not None else 'n/a')
         return 0.6
     return 1.0

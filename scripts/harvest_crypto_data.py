@@ -12,7 +12,6 @@ import sys; from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import os
-import time
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -221,6 +220,10 @@ def main():
         available_ohlcv = []
 
     btc_close = fetch_btc_close(api=api)
+    if btc_close is None:
+        print("WARNING: benchmark fetch failed — BTC cross-asset features "
+              "(BTC_Return_1h/BTC_SMA_Ratio/BTC_RSI) will be OMITTED from "
+              "this dataset")
 
     all_data = []
     for t in CRYPTO_TICKERS:
@@ -244,7 +247,7 @@ def main():
     # Combine and save — sort chronologically for time-series split in training
     if not all_data:
         print("ERROR: No data fetched for any ticker. Check API credentials and network.")
-        return
+        sys.exit(1)  # nonzero so run_pipeline's retry/notify machinery fires
     final_df = pd.concat(all_data)
     final_df = final_df.sort_index()
 
@@ -264,16 +267,22 @@ def main():
         final_df['Daily_Sentiment'] = 0.0
 
     # Save as Parquet + CSV
-    save_training_data(final_df, 'crypto')
+    if not save_training_data(final_df, 'crypto'):
+        print("ERROR: Could not save training data (both Parquet and CSV "
+              "writes failed) — data on disk is STALE")
+        sys.exit(1)
 
     # Summary
     print(f"\nDone! Saved {len(final_df)} rows of training data")
     print(f"Cryptos harvested: {len(all_data)}/{len(CRYPTO_TICKERS)}")
+    # Mirror training's exclude list (hypersearch_v2): TB_* are labels, not
+    # features; OHLCV stay counted because training keeps them as features.
     target_cols = [c for c in final_df.columns if c.startswith('Target_Return')]
-    exclude = set(target_cols) | {'Ticker', 'Date', 'Datetime'}
+    tb_cols = [c for c in final_df.columns if c.startswith('TB_')]
+    exclude = set(target_cols) | set(tb_cols) | {'Ticker', 'Date', 'Datetime'}
     feature_count = len([c for c in final_df.columns if c not in exclude])
     print(f"Feature columns: {feature_count}")
-    print(f"Target columns: {target_cols}")
+    print(f"Target columns: {target_cols + tb_cols}")
     print(f"Date range: {final_df.index.min()} to {final_df.index.max()}")
 
     # Validation report

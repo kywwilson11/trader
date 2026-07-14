@@ -1,25 +1,28 @@
 """24/7 crypto trading loop — subclass of BaseTradingLoop.
 
-Runs continuously (crypto markets never close):
-  1. Fetch predictions for all symbols in parallel
+Runs continuously (crypto markets never close). Each cycle
+(base_loop._run_one_cycle):
+  1. Handle remote flatten requests + circuit-breaker check
   2. Check stop-loss / trailing stop / take-profit on open positions
-  3. Sell positions where the model signals weakness
-  4. Buy symbols where the model signals strength (sentiment-gated)
-  5. Sleep and repeat
+  3. Fetch predictions for all symbols in parallel
+  4. Sell positions where the model signals weakness (+ LLM veto sells)
+  5. Buy symbols where the model signals strength (sentiment-gated)
+  6. Sleep and repeat
 
 Enhanced with GARCH volatility, macro regime, correlation-aware sizing,
 Kelly criterion, HMM regime detection, and stablecoin contagion detection.
 """
 
+import os
 import json
 import datetime
 from pathlib import Path
 
 from base_loop import BaseTradingLoop
 from order_utils import (
-    get_crypto_quote, place_limit_order, manage_order_lifecycle,
+    get_crypto_quote, manage_order_lifecycle,
 )
-from market_data import fetch_bars_alpaca, fetch_crypto_volume
+from market_data import fetch_bars_alpaca
 from sentiment import get_fear_greed, get_recent_headlines
 from stock_config import CRYPTO_SYMBOLS
 from log_config import get_logger
@@ -30,15 +33,11 @@ _PRED_CACHE_FILE = Path(__file__).resolve().parent / "crypto_predictions.json"
 
 
 class CryptoLoop(BaseTradingLoop):
-    """24/7 crypto trading loop."""
+    """24/7 crypto trading loop.
 
-    NOTIONAL_PER_SYMBOL = 1000
-    MAX_NOTIONAL_PER_SYMBOL = 3000
-    ORDER_TIMEOUT = 30
-    LOOP_INTERVAL = 30
-    MAX_PREDICTION_WORKERS = 5
-    LLM_INTERVAL_SEC = 600
-    CIRCUIT_BREAKER_PCT = 0.05
+    Notional/timeout/interval/worker/LLM/breaker settings inherit the
+    BaseTradingLoop defaults.
+    """
 
     # ATR stops — values come from strategy_config so the backtester
     # validates the SAME policy the bot trades
@@ -58,7 +57,6 @@ class CryptoLoop(BaseTradingLoop):
 
     def __init__(self):
         super().__init__()
-        self._volume_ratios: dict = {}
         self._resting_stop_px: dict[str, float] = {}
 
     def _extra_tilt(self, symbol: str) -> float:
@@ -71,7 +69,11 @@ class CryptoLoop(BaseTradingLoop):
         try:
             from funding import funding_tilt
             return funding_tilt(symbol)
-        except Exception:
+        except Exception as e:
+            # Fail-open by design (advisory input), but never SILENTLY:
+            # funding_tilt only logs when it tilts, so without this line a
+            # broken feed disables the de-risk with zero log evidence.
+            logger.debug("[FUNDING] tilt unavailable for %s: %s", symbol, e)
             return 1.0
 
     def get_symbol_universe(self) -> list[str]:
@@ -87,12 +89,10 @@ class CryptoLoop(BaseTradingLoop):
         return get_crypto_quote(self.api, symbol)
 
     def place_buy_order(self, symbol, notional, quote, stop_price=None, tp_price=None):
-        order = place_limit_order(self.api, symbol, 'buy', notional, quote)
-        if order is None:
-            return None
-        result = manage_order_lifecycle(self.api, order.id, timeout=self.ORDER_TIMEOUT,
-                                        fallback_to_market=True)
-        return result
+        # Satisfies the base abstractmethod only — no crypto code path calls
+        # it (stock_loop is the sole caller of its own override). Crypto
+        # entries flow exclusively through _execute_entry_order.
+        return self._execute_entry_order(symbol, notional, quote)[0]
 
     def _execute_entry_order(self, symbol, notional, quote):
         """Crypto entries try the maker ladder first (15bps maker vs
@@ -233,6 +233,16 @@ class CryptoLoop(BaseTradingLoop):
         self._resting_stop_px.pop(symbol, None)
         self._place_resting_stop(symbol, pos, desired_stop_price)
 
+    def _manage_stops(self):
+        # Exits (signal sells, LLM vetoes, server fills, flattens) drop
+        # positions in base_loop without touching this bookkeeping — prune
+        # stale levels so a re-entry whose stop placement failed doesn't
+        # take the cancel-and-replace branch on a leftover price.
+        for symbol in list(self._resting_stop_px):
+            if symbol not in self.positions:
+                self._resting_stop_px.pop(symbol, None)
+        super()._manage_stops()
+
     def write_prediction_cache(self, preds, **kwargs):
         try:
             data = {}
@@ -250,31 +260,21 @@ class CryptoLoop(BaseTradingLoop):
                     "signal": signal,
                     "updated": datetime.datetime.now().isoformat(),
                 }
-            with open(_PRED_CACHE_FILE, 'w') as f:
+            # Atomic write (tmp + rename): the GUI polls this file, and an
+            # in-place write can hand it a torn read
+            tmp = _PRED_CACHE_FILE.with_suffix('.tmp')
+            with open(tmp, 'w') as f:
                 json.dump(data, f, indent=2)
+            os.replace(tmp, _PRED_CACHE_FILE)
         except Exception as e:
             logger.error("[CACHE] Error writing crypto prediction cache: %s", e)
 
     def _get_predictions(self, benchmark_close):
-        """Override to add crypto volume injection and cache writing."""
+        """Override to add cache writing and periodic sentiment logging."""
         preds, snapshots = super()._get_predictions(benchmark_close)
 
         # Write prediction cache for GUI
         self.write_prediction_cache(preds)
-
-        # Fetch real crypto volume (Alpaca reports zero). Hourly bars only
-        # change once an hour — 6 serial HTTP calls every 30s cycle bought
-        # nothing, so refresh every 10th cycle and reuse in between.
-        if self.cycle % 10 == 1 or not self._volume_ratios:
-            try:
-                self._volume_ratios = fetch_crypto_volume(self.get_symbol_universe())
-            except Exception as e:
-                logger.debug("[VOLUME] CryptoCompare error: %s", e)
-        for sym, ratio in self._volume_ratios.items():
-            if sym in snapshots:
-                snapshots[sym]['Volume_Ratio'] = ratio
-            else:
-                snapshots[sym] = {'Volume_Ratio': ratio}
 
         # Log Fear & Greed periodically
         if self.cycle % 10 == 1:

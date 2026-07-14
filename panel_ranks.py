@@ -152,7 +152,8 @@ def compute_live_panel_ranks(api, spy_close=None,
 
     rows = {}
     dvs = {}
-    for sym in _panel_symbols():
+    panel_syms = _panel_symbols()
+    for sym in panel_syms:
         try:
             bars = fetch_stock_bars_alpaca(api, sym)
             if bars is None or len(bars) < 60:
@@ -174,30 +175,44 @@ def compute_live_panel_ranks(api, spy_close=None,
                        "cross-sectional ranks neutral this hour", len(rows))
         _live_cache = (now, {})
         return {}
+    if len(rows) < top_k:
+        logger.warning("[PANEL] coverage %d/%d below top_k=%d — ranking "
+                       "over a reduced population", len(rows),
+                       len(panel_syms), top_k)
 
-    members = sorted(dvs, key=dvs.get, reverse=True)[:top_k]
-    frame = pd.DataFrame({s: rows[s] for s in members}).T
+    try:
+        members = sorted(dvs, key=dvs.get, reverse=True)[:top_k]
+        frame = pd.DataFrame({s: rows[s] for s in members}).T
 
-    out: dict[str, dict] = {s: {} for s in members}
-    for col in CS_RANK_BASE_COLS:
-        if col not in frame.columns:
-            continue
-        r = frame[col].rank(method='average')
-        n = int(r.notna().sum())
-        signed = _signed_rank(r, n) if n > 1 else r * 0.0
+        out: dict[str, dict] = {s: {} for s in members}
+        for col in CS_RANK_BASE_COLS:
+            if col not in frame.columns:
+                continue
+            r = frame[col].rank(method='average')
+            n = int(r.notna().sum())
+            signed = _signed_rank(r, n) if n > 1 else r * 0.0
+            for s in members:
+                v = signed.get(s)
+                out[s][f'CS_Rank_{col}'] = float(v) if pd.notna(v) else 0.0
+        disp = float(np.nanstd(frame['Return_4h'].values, ddof=1)) \
+            if 'Return_4h' in frame.columns else 0.0  # ddof=1 = harvest's std
+        breadth = (float(np.nanmean((frame['Price_SMA20_Ratio'] > 1.0)
+                                    .astype(float))) - 0.5) * 2.0 \
+            if 'Price_SMA20_Ratio' in frame.columns else 0.0
         for s in members:
-            v = signed.get(s)
-            out[s][f'CS_Rank_{col}'] = float(v) if pd.notna(v) else 0.0
-    disp = float(np.nanstd(frame['Return_4h'].values, ddof=1)) \
-        if 'Return_4h' in frame.columns else 0.0  # ddof=1 = harvest's std
-    breadth = (float(np.nanmean((frame['Price_SMA20_Ratio'] > 1.0)
-                                .astype(float))) - 0.5) * 2.0 \
-        if 'Price_SMA20_Ratio' in frame.columns else 0.0
-    for s in members:
-        out[s]['CS_Dispersion'] = disp if np.isfinite(disp) else 0.0
-        out[s]['CS_Breadth'] = breadth if np.isfinite(breadth) else 0.0
-        out[s]['MS_Interact'] = (out[s].get('CS_Rank_Ret_21d', 0.0)
-                                 * out[s].get('CS_Rank_DV30', 0.0))
+            out[s]['CS_Dispersion'] = disp if np.isfinite(disp) else 0.0
+            out[s]['CS_Breadth'] = breadth if np.isfinite(breadth) else 0.0
+            out[s]['MS_Interact'] = (out[s].get('CS_Rank_Ret_21d', 0.0)
+                                     * out[s].get('CS_Rank_DV30', 0.0))
+    except Exception as e:
+        # The documented contract is "{} on failure" (predict_now then
+        # neutral-fills 0.0, matching training). Caching the {} also
+        # matters: without it the ~96-name sequential refetch would
+        # repeat every 30s loop cycle until the hour's TTL.
+        logger.warning("[PANEL] ranking failed (%s) — cross-sectional "
+                       "ranks neutral this hour", e)
+        _live_cache = (now, {})
+        return {}
 
     logger.info("[PANEL] live cross-section: %d members ranked "
                 "(dispersion=%.2f, breadth=%+.2f)", len(members),
@@ -291,10 +306,14 @@ def cs_size_tilt(cs_rank, dispersion=None, dispersion_floor=0.0,
                  lo=0.90, hi=1.10):
     """Bounded, cost-NEUTRAL size multiplier from a coin's signed CS rank.
 
-    Maps cs_rank in [-1,1] linearly to [lo,hi] (rank +1 -> hi, -1 -> lo, 0 -> 1.0).
-    Returns 1.0 (no-op) when the rank is missing OR cross-sectional dispersion is
-    below dispersion_floor (a pure-BTC-beta hour where 'relative strength' is just
-    common-beta noise). It only RE-WEIGHTS the same budget, so turnover is
+    Linear map CENTERED AT 1.0: 1.0 + cs_rank*(hi-lo)/2, clipped to [lo,hi].
+    Exact for bounds symmetric about 1.0 (the defaults: +1 -> hi, -1 -> lo,
+    0 -> 1.0); ASYMMETRIC bounds clip at the nearer bound and never reach the
+    farther one (e.g. lo=0.8, hi=1.1: rank -1 -> 0.85). Returns 1.0 (no-op)
+    when the rank is missing, or when dispersion is FINITE and below
+    dispersion_floor (a pure-BTC-beta hour where 'relative strength' is just
+    common-beta noise); a None/non-finite dispersion SKIPS that gate and the
+    tilt still applies. It only RE-WEIGHTS the same budget, so turnover is
     unchanged — never a forgone trade or an extra round trip.
     """
     if cs_rank is None or not np.isfinite(cs_rank):

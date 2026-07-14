@@ -1,10 +1,10 @@
 """Structured data types for the trading system.
 
-Replaces raw dicts with typed dataclasses for positions, quotes, LLM results,
-and macro regime data. Provides both type safety and self-documenting code.
+Replaces raw dicts with typed dataclasses for positions, quotes, and macro
+regime data. Provides both type safety and self-documenting code.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
 
 
 @dataclass(slots=True)
@@ -19,16 +19,7 @@ class Position:
     garch_sigma: float | None = None
 
     def to_dict(self) -> dict:
-        return {
-            'qty': self.qty,
-            'entry_price': self.entry_price,
-            'high_water_mark': self.high_water_mark,
-            'stop_order_id': self.stop_order_id,
-            'trailing_activated': self.trailing_activated,
-            'entry_atr': self.entry_atr,
-            'take_profit_price': self.take_profit_price,
-            'garch_sigma': self.garch_sigma,
-        }
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -40,22 +31,7 @@ class Quote:
     spread_pct: float
 
     def to_dict(self) -> dict:
-        return {
-            'bid': self.bid,
-            'ask': self.ask,
-            'spread': self.spread,
-            'midpoint': self.midpoint,
-            'spread_pct': self.spread_pct,
-        }
-
-
-@dataclass(slots=True)
-class LLMResult:
-    s: float
-    m: float
-    r: str
-    bull: str = ""
-    bear: str = ""
+        return asdict(self)
 
 
 @dataclass(slots=True)

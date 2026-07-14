@@ -30,13 +30,17 @@ two-book simulator below supplies it. Everything here is pure-numpy and
 PIT-clean (uses trailing realized correlations only).
 """
 
+import fcntl
 import json
 import os
 import time
 
 import numpy as np
 
+from log_config import get_logger
 from portfolio import diversified_book_risk
+
+logger = get_logger(__name__)
 
 # Combined single-factor stop-risk ceiling across BOTH books (fraction of
 # equity). Below the per-book sum (2*0.025) on purpose — that headroom was the
@@ -64,10 +68,17 @@ def account_risk_budget(candidate_book, stock_risks, crypto_risks,
     """Max stop-risk (fraction of equity) a NEW position may add to
     `candidate_book` ('stock'|'crypto') before the ACCOUNT cap binds.
 
-    account_stop_risk is strictly increasing in the candidate's risk, so we
-    bisect for the r_c where it equals `cap`. Returns 0.0 when the cap is
-    already exhausted. `max_risk` bounds the search (default: the per-trade
-    risk budget headroom, capped at the account cap itself).
+    account_stop_risk is strictly increasing in the candidate's risk for
+    rho_cross >= 0 but U-shaped for rho_cross < 0 (added hedge risk first NETS
+    the account down before re-raising it). Bisection stays valid either way:
+    when acct(0) < cap < acct(hi) the U-shape has exactly one rising
+    cap-crossing, and the return-hi branch is safe because a U-shape's max sits
+    at an endpoint. The acct(0) >= cap early-exit deliberately returns 0 even
+    when a hedging candidate would REDUCE account risk below the cap — it only
+    ever blocks, never enlarges; do not hand out hedge budgets without the
+    promotion path. Returns 0.0 when the cap is already exhausted. `max_risk`
+    bounds the search (default: the per-trade risk budget headroom, capped at
+    the account cap itself).
     """
     hi = float(max_risk) if max_risk is not None else float(cap)
     if hi <= 0:
@@ -153,8 +164,13 @@ def simulate_two_books(stock_trades, crypto_trades, periods=None):
     which is exactly the cross-book concentration the per-book caps miss.
 
     Returns a dict with the combined and per-book equity curves (cumulative
-    return %), max drawdown %, and a period-return Sharpe. `periods` overrides
-    the grid length (default = max exit_period + 1).
+    return %), max drawdown %, and 'combined_sharpe' — mean/std * sqrt(n)
+    over the period grid, i.e. a sqrt(N)-scaled t-statistic rather than a
+    per-period Sharpe: comparable only across SAME-length windows (fine for
+    the capped-vs-uncapped A/B this exists for, where it is monotone-
+    equivalent). `periods` overrides the grid length (default =
+    max exit_period + 1); trades whose exit_period falls outside the grid are
+    excluded from the P&L and counted in 'n_dropped_trades'.
     """
     def _bucket(trades, n):
         pnl = np.zeros(n, dtype=float)
@@ -165,11 +181,14 @@ def simulate_two_books(stock_trades, crypto_trades, periods=None):
         return pnl
 
     all_trades = list(stock_trades) + list(crypto_trades)
-    if not all_trades:
+    n = int(periods) if periods is not None else (
+        max(int(t['exit_period']) for t in all_trades) + 1 if all_trades else 0)
+    if not all_trades or n <= 0:
         return {'n_periods': 0, 'combined_max_drawdown_pct': 0.0,
-                'combined_sharpe': 0.0, 'combined_total_pct': 0.0}
-    n = periods if periods is not None else \
-        max(int(t['exit_period']) for t in all_trades) + 1
+                'combined_sharpe': 0.0, 'combined_total_pct': 0.0,
+                'n_dropped_trades': len(all_trades)}
+    n_dropped = sum(1 for t in all_trades
+                    if not (0 <= int(t['exit_period']) < n))
 
     s_pnl = _bucket(stock_trades, n)
     c_pnl = _bucket(crypto_trades, n)
@@ -191,6 +210,7 @@ def simulate_two_books(stock_trades, crypto_trades, periods=None):
 
     return {
         'n_periods': int(n),
+        'n_dropped_trades': int(n_dropped),
         'combined_total_pct': round(float(comb_eq[-1]), 4),
         'combined_max_drawdown_pct': round(comb_dd, 4),
         'combined_sharpe': round(comb_sharpe, 4),
@@ -223,27 +243,57 @@ def read_registry(path=ACCOUNT_RISK_REGISTRY):
     """Load the shared per-book stop-risk registry; {} if absent/corrupt."""
     try:
         with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+            reg = json.load(f)
+    except (ValueError, OSError):
+        # ValueError covers json.JSONDecodeError AND the UnicodeDecodeError a
+        # binary-garbage file raises (power loss mid-write); OSError covers
+        # FileNotFoundError et al.
         return {}
+    # Valid-but-non-dict JSON ('[]', 'null') would crash write_book_risk's
+    # upsert — and, being parseable, would never self-heal. Treat as corrupt.
+    return reg if isinstance(reg, dict) else {}
+
+
+_write_warned = False  # once-per-process: registry writes are per-cycle noise
 
 
 def write_book_risk(book, book_risk, rho_book, path=ACCOUNT_RISK_REGISTRY, now=None):
     """Atomically upsert one book's diversified stop-risk into the registry.
 
-    Returns the updated registry. Fail-open: a write error is swallowed (the
-    measurement must never break the trading loop).
+    Both books write this file (two processes, or two threads under
+    --combined-bots), so the read-modify-write is serialized with an flock on
+    a sidecar lockfile ('{path}.lock' — never replaced, so the lock target is
+    stable across os.replace) and staged through a per-writer tmp name, else
+    interleavings could drop the other book's entry, rename each other's tmp
+    away, or expose torn JSON to a concurrent reader.
+
+    Returns the updated registry. Fail-open: a write error is swallowed
+    (the measurement must never break the trading loop) but logged once per
+    process so a stale GATE-1 journal is diagnosable.
     """
+    global _write_warned
     now = time.time() if now is None else float(now)
+    entry = {'risk': float(book_risk), 'rho': float(rho_book), 'ts': now}
     reg = read_registry(path)
-    reg[str(book)] = {'risk': float(book_risk), 'rho': float(rho_book), 'ts': now}
+    reg[str(book)] = entry
+    tmp = f'{path}.{os.getpid()}.tmp'
     try:
-        tmp = f'{path}.tmp'
-        with open(tmp, 'w') as f:
-            json.dump(reg, f)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+        with open(f'{path}.lock', 'w') as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            reg = read_registry(path)  # re-read under the lock: pick up the
+            reg[str(book)] = entry     # other book's concurrent write
+            with open(tmp, 'w') as f:
+                json.dump(reg, f)
+            os.replace(tmp, path)
+    except OSError as e:
+        if not _write_warned:
+            _write_warned = True
+            logger.warning("[ACCT-RISK] registry write failed (%s) — GATE-1 "
+                           "measurement goes stale until writes recover", e)
+        try:
+            os.unlink(tmp)             # don't leave partial tmp on disk-full
+        except OSError:
+            pass
     return reg
 
 
@@ -262,11 +312,17 @@ def account_risk_gate1_report(registry, rho_cross=1.0, cap=ACCOUNT_RISK_CAP,
     for b, e in (registry or {}).items():
         if not isinstance(e, dict):
             continue
-        risk = e.get('risk')
-        if risk is None or not np.isfinite(risk):
+        try:
+            # Coerce defensively: a hand-edited/corrupt registry can hold
+            # string or None values; treat the entry as missing (-> stale).
+            risk = float(e.get('risk'))
+            ts = float(e.get('ts', 0.0))
+        except (TypeError, ValueError):
             continue
-        if (now - float(e.get('ts', 0.0))) <= stale_after_s:
-            fresh[b] = float(risk)
+        if not np.isfinite(risk):
+            continue
+        if (now - ts) <= stale_after_s:
+            fresh[b] = risk
     r_s = fresh.get('stock', 0.0)
     r_c = fresh.get('crypto', 0.0)
     account = account_stop_risk([r_s], [r_c], 0.0, 0.0, rho_cross)

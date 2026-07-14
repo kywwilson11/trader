@@ -30,7 +30,9 @@ import io
 import json
 import os
 import sys
+import threading
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -42,21 +44,20 @@ ARCHIVE_FILE = BASE_DIR / 'oi_archive.parquet'
 _LIVE_HISTORY_FILE = BASE_DIR / 'oi_history.json'
 
 OI_START = '2023-01-01'
-MAX_FILES_PER_SYNC = 2000       # bound one sync run (~10-15 min worst case)
+MAX_FILES_PER_SYNC = 2000       # attempt cap per sync run (~10-15 min on a
+                                # responsive network; a dead/hanging network
+                                # exits via the consecutive-failure abort)
+_MAX_CONSEC_FAILURES = 10       # non-404 failures in a row -> abort the run
 _LIVE_CACHE_TTL = 900
+_NEG_TTL = 300                  # failed live fetch: no retry sooner than this
 _LIVE_THIN_SEC = 3300           # keep ~hourly samples in the local history
 _LIVE_MAX_SAMPLES = 24 * 35     # ~35 days
 
+from funding import OKX_INSTRUMENTS  # Alpaca->OKX perp map (single source)
 from funding_archive import BINANCE_SYMBOLS  # same Alpaca->Binance map
+from log_config import get_logger
 
-# OKX perp instruments (same map funding.py uses)
-OKX_INSTRUMENTS = {
-    'BTC/USD': 'BTC-USDT-SWAP', 'ETH/USD': 'ETH-USDT-SWAP',
-    'XRP/USD': 'XRP-USDT-SWAP', 'SOL/USD': 'SOL-USDT-SWAP',
-    'DOGE/USD': 'DOGE-USDT-SWAP', 'LINK/USD': 'LINK-USDT-SWAP',
-    'AVAX/USD': 'AVAX-USDT-SWAP', 'DOT/USD': 'DOT-USDT-SWAP',
-    'LTC/USD': 'LTC-USDT-SWAP', 'BCH/USD': 'BCH-USDT-SWAP',
-}
+logger = get_logger(__name__)
 
 _URL = ("https://data.binance.vision/data/futures/um/daily/metrics/"
         "{sym}/{sym}-metrics-{day}.zip")
@@ -115,7 +116,6 @@ def _parse_zip(data: bytes):
             frames.append(hourly.dropna(how='all'))
     if not frames:
         return None
-    import pandas as pd
     return pd.concat(frames).reset_index()
 
 
@@ -124,8 +124,18 @@ def load_archive():
     if ARCHIVE_FILE.exists():
         try:
             return pd.read_parquet(ARCHIVE_FILE)
-        except Exception:
-            pass
+        except Exception as e:
+            # Preserve the evidence: treating this silently as "no archive"
+            # would let the next capped sync() rebuild from scratch and
+            # OVERWRITE years of accumulated back-fill with ~200 days
+            corrupt = str(ARCHIVE_FILE) + '.corrupt'
+            print(f"[OI-ARCHIVE] corrupt archive {ARCHIVE_FILE}: {e} "
+                  f"— preserving as {corrupt}")
+            try:
+                os.replace(ARCHIVE_FILE, corrupt)
+            except OSError as mv_err:
+                print(f"[OI-ARCHIVE] could not preserve corrupt archive: "
+                      f"{mv_err}")
     return pd.DataFrame(columns=['symbol', 'ts', 'oi', 'oi_value',
                                  'tt_ls_ratio', 'taker_ratio', 'taker_mean',
                                  'src_day'])
@@ -151,11 +161,12 @@ def sync(symbols=None, start: str = OI_START,
     days_newest_first = list(reversed(_days(start)))
     new_frames = []
     fetched = 0
+    consec_failures = 0
     for day in days_newest_first:
-        if fetched >= max_files:
+        if fetched >= max_files or consec_failures >= _MAX_CONSEC_FAILURES:
             break
         for alp in symbols:
-            if fetched >= max_files:
+            if fetched >= max_files or consec_failures >= _MAX_CONSEC_FAILURES:
                 break
             bsym = BINANCE_SYMBOLS.get(alp)
             if not bsym or (alp, day) in have:
@@ -170,16 +181,35 @@ def sync(symbols=None, start: str = OI_START,
                 fetched += 1
                 if e.code != 404:
                     print(f"[OI-ARCHIVE] {bsym} {day}: HTTP {e.code}")
+                    consec_failures += 1
+                else:
+                    consec_failures = 0  # server responsive, day just absent
                 continue
             except Exception as e:
                 print(f"[OI-ARCHIVE] {bsym} {day}: {e}")
                 fetched += 1
+                consec_failures += 1
                 continue
-            parsed = _parse_zip(data)
+            # One corrupt zip must not raise out of sync() and discard
+            # every frame already fetched this run
+            try:
+                parsed = _parse_zip(data)
+            except Exception as e:
+                print(f"[OI-ARCHIVE] {bsym} {day}: parse failed ({e})")
+                consec_failures += 1
+                continue
+            consec_failures = 0
             if parsed is not None and not parsed.empty:
                 parsed['symbol'] = alp
                 parsed['src_day'] = day
                 new_frames.append(parsed)
+
+    if consec_failures >= _MAX_CONSEC_FAILURES:
+        # A hanging network would otherwise pay up to max_files x 30s
+        # timeouts (~16h); flush whatever landed and let the next
+        # harvest retry
+        print(f"[OI-ARCHIVE] aborting sync after {_MAX_CONSEC_FAILURES} "
+              f"consecutive fetch failures (network down?)")
 
     if not new_frames:
         print(f"[OI-ARCHIVE] up to date ({len(arc)} rows)")
@@ -305,7 +335,19 @@ def taker_features_for_index(alpaca_symbol: str, index):
 
 # --- Live serving (OKX; venue-consistent local history) ---
 
+_live_lock = threading.Lock()   # oi_history.json read-modify-write guard
 _live_cache: dict[str, tuple[float, float]] = {}
+_fail_cache: dict[tuple[str, str], float] = {}  # (endpoint, symbol) -> mono ts
+_hist_read_warned = False
+_hist_write_warned = False
+
+
+def _neg_cached(endpoint: str, symbol: str, now: float) -> bool:
+    """True while a recent failure should suppress a retry (an OKX outage
+    would otherwise re-pay a 10s timeout per symbol per endpoint per
+    prediction cycle)."""
+    ts = _fail_cache.get((endpoint, symbol))
+    return ts is not None and (now - ts) < _NEG_TTL
 
 
 def _fetch_okx_oi(symbol: str) -> float | None:
@@ -316,22 +358,35 @@ def _fetch_okx_oi(symbol: str) -> float | None:
     hit = _live_cache.get(symbol)
     if hit and (now - hit[0]) < _LIVE_CACHE_TTL:
         return hit[1]
+    if _neg_cached('oi', symbol, now):
+        return None
     try:
         url = f"https://www.okx.com/api/v5/public/open-interest?instId={inst}"
         req = urllib.request.Request(url, headers={'User-Agent': 'trader/1.0'})
         data = json.loads(urllib.request.urlopen(req, timeout=10).read())
         oi = float(data['data'][0]['oiCcy'])  # coin units (venue-local)
-    except Exception:
+    except Exception as e:
+        _fail_cache[('oi', symbol)] = now
+        logger.debug('[OI] %s: OKX OI fetch failed: %s', symbol, e)
         return None
     _live_cache[symbol] = (now, oi)
     return oi
 
 
 def _load_live_history() -> dict:
+    global _hist_read_warned
     try:
         with open(_LIVE_HISTORY_FILE) as f:
             return json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return {}  # cold start — expected
+    except (OSError, json.JSONDecodeError) as e:
+        # Corrupt/unreadable history silently restarts a week-long z
+        # warm-up — say so once
+        if not _hist_read_warned:
+            _hist_read_warned = True
+            logger.warning('[OI] live history unreadable (%s) — '
+                           'z warm-up restarts from empty', e)
         return {}
 
 
@@ -342,44 +397,53 @@ def live_oi_features(symbol: str) -> dict | None:
     trailing window (same relative-dynamics semantics the model trained
     on). Features read 0.0 until local history accumulates.
     """
+    global _hist_write_warned
     oi = _fetch_okx_oi(symbol)
     if oi is None:
         return None
     now = time.time()
-    hist_all = _load_live_history()
-    hist = hist_all.get(symbol, [])
+    # Serialize the whole read-modify-write (funding.py's _lock pattern):
+    # base_loop fans symbols across a 5-worker pool, and unlocked
+    # concurrent rewrites of the shared file drop other symbols' freshly
+    # appended samples (last writer wins)
+    with _live_lock:
+        hist_all = _load_live_history()
+        hist = hist_all.get(symbol, [])
 
-    chg = 0.0
-    target = now - 86400
-    candidates = [(abs(ts - target), v) for ts, v in hist
-                  if abs(ts - target) <= 3 * 3600]
-    if candidates:
-        _, ref = min(candidates)
-        if ref > 0:
-            chg = (oi - ref) / ref * 100
+        chg = 0.0
+        target = now - 86400
+        candidates = [(abs(ts - target), v) for ts, v in hist
+                      if abs(ts - target) <= 3 * 3600]
+        if candidates:
+            _, ref = min(candidates)
+            if ref > 0:
+                chg = (oi - ref) / ref * 100
 
-    z = 0.0
-    vals = [v for _, v in hist]
-    if len(vals) >= 168:
-        import statistics
-        mu = statistics.fmean(vals)
-        sd = statistics.pstdev(vals)
-        if sd > 1e-12:
-            z = (oi - mu) / sd
+        z = 0.0
+        vals = [v for _, v in hist]
+        if len(vals) >= 168:
+            import statistics
+            mu = statistics.fmean(vals)
+            sd = statistics.pstdev(vals)
+            if sd > 1e-12:
+                z = (oi - mu) / sd
 
-    # Thin to ~hourly samples; persist
-    if not hist or (now - hist[-1][0]) >= _LIVE_THIN_SEC:
-        hist.append([now, oi])
-        if len(hist) > _LIVE_MAX_SAMPLES:
-            del hist[:len(hist) - _LIVE_MAX_SAMPLES]
-        hist_all[symbol] = hist
-        try:
-            tmp = str(_LIVE_HISTORY_FILE) + '.tmp'
-            with open(tmp, 'w') as f:
-                json.dump(hist_all, f)
-            os.replace(tmp, _LIVE_HISTORY_FILE)
-        except OSError:
-            pass
+        # Thin to ~hourly samples; persist
+        if not hist or (now - hist[-1][0]) >= _LIVE_THIN_SEC:
+            hist.append([now, oi])
+            if len(hist) > _LIVE_MAX_SAMPLES:
+                del hist[:len(hist) - _LIVE_MAX_SAMPLES]
+            hist_all[symbol] = hist
+            try:
+                tmp = str(_LIVE_HISTORY_FILE) + '.tmp'
+                with open(tmp, 'w') as f:
+                    json.dump(hist_all, f)
+                os.replace(tmp, _LIVE_HISTORY_FILE)
+            except OSError as e:
+                # Disk full/read-only silently freezes accumulation
+                if not _hist_write_warned:
+                    _hist_write_warned = True
+                    logger.warning('[OI] live history persist failed: %s', e)
     return {'OI_Chg_24h': chg, 'OI_Z': z}
 
 
@@ -401,6 +465,8 @@ def live_ls_features(symbol: str) -> dict | None:
     hit = _ls_cache.get(symbol)
     if hit and (now - hit[0]) < _LIVE_CACHE_TTL:
         return hit[1]
+    if _neg_cached('ls', symbol, now):
+        return None
     try:
         begin_ms = int((time.time() - 31 * 86400) * 1000)
         url = ("https://www.okx.com/api/v5/rubik/stat/contracts/"
@@ -409,7 +475,9 @@ def live_ls_features(symbol: str) -> dict | None:
         req = urllib.request.Request(url, headers={'User-Agent': 'trader/1.0'})
         data = json.loads(urllib.request.urlopen(req, timeout=10).read())
         vals = [float(r[1]) for r in data.get('data', [])]  # newest first
-    except Exception:
+    except Exception as e:
+        _fail_cache[('ls', symbol)] = now
+        logger.debug('[OI] %s: OKX long/short fetch failed: %s', symbol, e)
         return None
     if len(vals) < 168:
         return None
@@ -437,6 +505,8 @@ def live_taker_features(symbol: str) -> dict | None:
     hit = _taker_cache.get(symbol)
     if hit and (now - hit[0]) < _LIVE_CACHE_TTL:
         return hit[1]
+    if _neg_cached('taker', symbol, now):
+        return None
     try:
         url = ("https://www.okx.com/api/v5/rubik/stat/taker-volume"
                f"?ccy={base}&instType=CONTRACTS&period=1H")
@@ -448,7 +518,9 @@ def live_taker_features(symbol: str) -> dict | None:
             sell, buy = float(r[1]), float(r[2])
             if sell > 0 and buy > 0:
                 ratios.append(buy / sell)
-    except Exception:
+    except Exception as e:
+        _fail_cache[('taker', symbol)] = now
+        logger.debug('[OI] %s: OKX taker-volume fetch failed: %s', symbol, e)
         return None
     if len(ratios) < 12:
         return None

@@ -13,7 +13,6 @@ from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
 
-from hw_monitor import is_gpu_available
 # NOTE: predict_now (and through it torch, ~300MB RSS) is imported lazily
 # inside predict_symbol() — harvest scripts and the GUI construct API
 # clients through this module and must NOT pay the torch import.
@@ -22,7 +21,11 @@ load_dotenv()
 
 
 # --- SHARED CONSTANTS ---
-# These were hardcoded in multiple places; centralizing here prevents drift.
+# Single source of truth for LLM_VETO_THRESHOLD, THERMAL_THROTTLE_TEMP and
+# TEMP_LOG_EVERY_N_CYCLES (imported by base_loop/stock_loop). ORDER_TIMEOUT
+# is NOT centralized here: the live loops use their own class attributes
+# (base_loop.BaseTradingLoop.ORDER_TIMEOUT, overridden in stock_loop) —
+# keep those in sync by hand.
 
 LLM_VETO_THRESHOLD = 0.15      # LLM score below this = catastrophic veto
 THERMAL_THROTTLE_TEMP = 75     # GPU temp threshold for throttling (Celsius)
@@ -46,6 +49,17 @@ def get_api():
     key = os.getenv('ALPACA_API_KEY')
     secret = os.getenv('ALPACA_API_SECRET')
     base_url = os.getenv('ALPACA_BASE_URL')
+
+    # Fail loud on misconfiguration: None credentials otherwise surface as
+    # confusing 401s deep in the SDKs, and an unset base_url makes BOTH SDKs
+    # default to the LIVE trading endpoint (this system is paper-only).
+    for name, val in (('ALPACA_API_KEY', key), ('ALPACA_API_SECRET', secret)):
+        if not val:
+            print(f"[API] ERROR: {name} is not set — requests will fail "
+                  f"with 401 (check .env)")
+    if not base_url:
+        print("[API] WARNING: ALPACA_BASE_URL is not set — the SDKs "
+              "default to the LIVE trading endpoint, not paper")
 
     if os.environ.get('TRADER_USE_ALPACA_PY') != '1':
         try:
@@ -77,10 +91,10 @@ def model_reload_key(model_prefix=''):
     saved before manifests existed.
     """
     p = f'{model_prefix}_' if model_prefix else ''
-    manifest = f'{p}model_v2.manifest.json'
-    if os.path.exists(manifest):
-        return os.path.getmtime(manifest)
-    return get_model_mtime(f'{p}model_v2.pth')
+    # get_model_mtime (not exists+getmtime) so a manifest vanishing between
+    # the two calls degrades to the .pth fallback instead of raising.
+    m = get_model_mtime(f'{p}model_v2.manifest.json')
+    return m if m else get_model_mtime(f'{p}model_v2.pth')
 
 
 # --- INFERENCE DEVICE ---
@@ -154,7 +168,8 @@ def compute_kelly_fraction(min_trades: int = 50,
 
     Uses trade_memory.json to calculate:
         Kelly f = (win_rate * avg_win/avg_loss - (1 - win_rate)) / (avg_win/avg_loss)
-        Half-Kelly = f / 2
+    with win_rate and payoff ratio first SHRUNK toward a skeptical prior
+    (50 pseudo-trades at breakeven: win rate 0.5, payoff 1.0), then halved.
 
     Args:
         min_trades: Minimum trades required before Kelly activates
@@ -164,7 +179,11 @@ def compute_kelly_fraction(min_trades: int = 50,
             sizing (or vice versa). None pools everything.
 
     Returns:
-        Half-Kelly fraction (0.0 to 1.0), or None if insufficient history.
+        Half-Kelly fraction clamped to [0.05, 0.25], or None if history is
+        insufficient/degenerate. The 0.05 floor applies even when the raw
+        Kelly is negative — a losing edge surfaces as the floor, never 0.
+        Consumer contract: base_loop maps 0.125 (the clamp midpoint) to a
+        1.0x sizing multiplier, bounded to [0.5x, 1.5x].
     """
     try:
         if not _TRADE_MEMORY_FILE.exists():

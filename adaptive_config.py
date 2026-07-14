@@ -74,7 +74,6 @@ TRIAL_COUNTS = {
     'initial': 200,
     'refine': 70,
     'explore': 120,
-    'post_explore': 80,
 }
 
 # Stagnation threshold: cycles without >5% improvement before exploring
@@ -115,11 +114,21 @@ def _migrate_search_space(space: dict) -> dict:
 
 
 def load_adaptive_state(asset_type: str) -> dict:
-    """Load adaptive state from disk, or create defaults if not found."""
+    """Load adaptive state from disk, or create defaults if not found.
+
+    A corrupt state file raises (fail closed): silently resetting to
+    defaults would wipe the best_score ratchet.
+    """
     path = _state_path(asset_type)
     if path.exists():
-        with open(path) as f:
-            state = json.load(f)
+        try:
+            with open(path) as f:
+                state = json.load(f)
+        except ValueError as e:
+            raise ValueError(
+                f"Corrupt adaptive state file {path}: {e} — "
+                f"fix or delete it (deleting resets the best_score ratchet)"
+            ) from e
         # Ensure all expected keys exist (forward compat)
         defaults = _default_state(asset_type)
         for key in defaults:
@@ -136,7 +145,10 @@ def save_adaptive_state(state: dict) -> None:
     """Atomically save adaptive state to disk."""
     state['last_updated'] = datetime.now().isoformat()
     path = _state_path(state['asset_type'])
-    tmp = str(path) + '.tmp'
+    # PID-unique tmp name: two same-asset writers (e.g. a manual hypersearch
+    # during run_pipeline's retrain) must not interleave writes to one tmp
+    # file and os.replace corrupt JSON into place.
+    tmp = f'{path}.tmp.{os.getpid()}'
     with open(tmp, 'w') as f:
         json.dump(state, f, indent=2)
     os.replace(tmp, str(path))
@@ -237,6 +249,10 @@ def expand_search_space(search_space: dict, edges: list) -> tuple:
 def decide_mode(state: dict, new_best_score: float) -> str:
     """Decide whether to explore or refine.
 
+    `new_best_score` is UNUSED — kept only for call-site compatibility
+    (run_pipeline passes it positionally); improvement tracking lives in
+    update_after_search(), which folds it into state before calling here.
+
     Returns "explore" if:
       - Any edge detected in best params
       - Stagnation: N+ cycles without meaningful improvement
@@ -317,8 +333,17 @@ def update_after_search(state: dict, new_best_score: float,
 
         # Optuna doesn't allow changing categorical distributions in an
         # existing study.  Delete the study DB so the next run starts fresh.
+        # NOTE: the caller (hypersearch) may still hold an open connection —
+        # on POSIX the unlinked inode stays alive for it; only future
+        # connections see the deletion.
         if categoricals_changed and study_db_path and os.path.exists(study_db_path):
             os.remove(study_db_path)
+            # Remove sqlite sidecars too: a stale -wal/-journal left behind
+            # could be replayed into a future DB recreated at the same path.
+            for suffix in ('-wal', '-shm', '-journal'):
+                sidecar = study_db_path + suffix
+                if os.path.exists(sidecar):
+                    os.remove(sidecar)
             print(f"[ADAPTIVE] Deleted {study_db_path} "
                   f"(categorical search space expanded — incompatible with old study)")
 

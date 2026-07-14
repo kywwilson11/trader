@@ -125,13 +125,17 @@ def fetch_crypto_volume(symbols: list[str], limit: int = 24) -> dict[str, float]
 
 # --- ALPACA BAR FETCHING ---
 
-def fetch_bars_alpaca(api, symbol, limit=120):
+def fetch_bars_alpaca(api, symbol, limit=250):
     """Fetch hourly bars from Alpaca's crypto data API.
 
     Args:
         api: Alpaca REST API object
         symbol: Alpaca format e.g. 'BTC/USD'
-        limit: Max number of bars to fetch
+        limit: Max number of bars to fetch. Default 250: the 100-bar
+            indicator warmups (SMA_100 / Hurst / ATR_Percentile) eat the
+            head of the frame, and the old 120-bar fetch left only ~20
+            usable rows — one seq_len hyperparameter away from zero
+            (the search space allows seq_len up to 40).
 
     Returns:
         DataFrame with OHLCV columns and DatetimeIndex, or None on error.
@@ -182,13 +186,15 @@ def fetch_bars_yfinance(symbol):
     Returns:
         DataFrame with OHLCV columns, or None if empty.
     """
-    df = yf.download(symbol, period="5d", interval="1h", progress=False)
+    # 60d (not 5d): the 100-bar hourly warmups plus the daily-window stock
+    # features need real history or every row dies in the feature dropna.
+    df = yf.download(symbol, period="60d", interval="1h", progress=False)
     if df.empty:
         return None
     return flatten_yfinance_columns(df)
 
 
-def fetch_stock_bars_alpaca(api, symbol, limit=200):
+def fetch_stock_bars_alpaca(api, symbol, limit=320):
     """Fetch hourly bars from Alpaca's stock data API.
 
     Args:
@@ -205,11 +211,23 @@ def fetch_stock_bars_alpaca(api, symbol, limit=200):
     if cached is not None:
         return cached
     try:
-        # 30 days gives ~150 market-hours bars — enough for SMA_100, Hurst, etc.
+        # 45 days ≈ 220 market-hours bars: the 100-bar hourly warmups
+        # (SMA_100 / Hurst / ATR_Percentile) consume the head, and ~30 days
+        # left almost no post-warmup rows. The LONG-window daily features
+        # (MA_Dist_200d, RM_252_21, ...) can never warm up on a live frame —
+        # they are neutral-filled via indicators.fill_warmup_features, the
+        # exact fill the harvest applies, so train/serve stays consistent.
         # Do NOT pass limit= to the API: bars come back ascending, so the API
         # would truncate to the OLDEST bars and serve days-stale data.
-        start = datetime.now(timezone.utc) - timedelta(days=30)
-        bars = api.get_bars(symbol, '1Hour', start=start.isoformat())
+        start = datetime.now(timezone.utc) - timedelta(days=45)
+        # adjustment='all', matching the harvest (_fetch_chunk below): the SDK
+        # default is RAW bars, so any split/dividend ex-date inside the live
+        # window made every price-derived feature (returns, SMA, RSI, ATR,
+        # GARCH inputs) disagree with the adjusted distribution the model
+        # trained on — a dividend drifts large caps every quarter; a split
+        # makes the symbol's features garbage for weeks (2026-07 review P1).
+        bars = api.get_bars(symbol, '1Hour', start=start.isoformat(),
+                            adjustment='all')
         rows = []
         timestamps = []
         for bar in bars:
@@ -236,9 +254,41 @@ def fetch_stock_bars_alpaca(api, symbol, limit=200):
         return None
 
 
-def fetch_spy_bars_alpaca(api, limit=200):
-    """Fetch SPY hourly bars for relative strength calculation."""
+def fetch_spy_bars_alpaca(api, limit=320):
+    """Fetch SPY hourly bars for relative strength calculation.
+
+    Default matches fetch_stock_bars_alpaca so the benchmark series covers
+    the full stock frame (a shorter SPY series would leave NaN heads in
+    RS_vs_SPY after reindex).
+    """
     return fetch_stock_bars_alpaca(api, 'SPY', limit)
+
+
+def drop_forming_bar(df, bar_seconds=3600):
+    """Drop the trailing IN-PROGRESS bar from a fetched hourly frame.
+
+    Alpaca labels an hourly bar with its OPEN time and serves it while it is
+    still forming (partial volume, minutes-old close). Training windows hold
+    CLOSED bars only (window offsets -seq_len..-1 exclude the entry bar) and
+    the backtest enters at the signal bar's close — so live inference must see
+    closed bars only, or the final sequence row is drawn from a distribution
+    the model never trained on. Bars older than one bar-length are closed by
+    definition (stock frames after hours / weekends lose nothing).
+    """
+    if df is None or len(df) == 0:
+        return df
+    from datetime import datetime, timedelta, timezone
+    last = df.index[-1]
+    try:
+        last_py = last.to_pydatetime()
+    except AttributeError:
+        last_py = last
+    if last_py.tzinfo is None:
+        last_py = last_py.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if now < last_py + timedelta(seconds=bar_seconds):
+        return df.iloc[:-1]
+    return df
 
 
 # --- HISTORICAL BAR FETCHING (for training data harvest) ---

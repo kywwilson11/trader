@@ -25,6 +25,7 @@ import datetime as dt
 import io
 import os
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -80,8 +81,9 @@ def load_archive():
     if ARCHIVE_FILE.exists():
         try:
             return pd.read_parquet(ARCHIVE_FILE)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[SHORT-FLOW] archive read failed (%s) — serving "
+                           "no SVR features until the next sync rebuilds it", e)
     return pd.DataFrame(columns=['date', 'symbol', 'short_vol', 'total_vol'])
 
 
@@ -97,10 +99,11 @@ def sync(days_back: int = START_DAYS_BACK,
         have = set(arc['date'].dt.strftime('%Y%m%d'))
 
     today = dt.date.today()
-    fetched = 0
+    attempts = 0    # request budget: counts 404s/errors too (max_files cap)
+    fetched = 0     # files actually downloaded (HTTP 200)
     frames = []
     for back in range(1, days_back + 1):
-        if fetched >= max_files:
+        if attempts >= max_files:
             break
         day = today - dt.timedelta(days=back)
         if day.weekday() >= 5:
@@ -111,16 +114,18 @@ def sync(days_back: int = START_DAYS_BACK,
         try:
             req = urllib.request.Request(_URL.format(d=ds),
                                          headers={'User-Agent': 'trader/1.0'})
-            text = urllib.request.urlopen(req, timeout=20).read().decode()
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                text = resp.read().decode()
+            attempts += 1
             fetched += 1
         except urllib.error.HTTPError as e:
             if e.code != 404:           # 404 = holiday, expected
                 print(f"[SHORT-FLOW] {ds}: HTTP {e.code}")
-            fetched += 1
+            attempts += 1
             continue
         except Exception as e:
             print(f"[SHORT-FLOW] {ds}: {e}")
-            fetched += 1
+            attempts += 1
             continue
         parsed = _parse_file(text, keep)
         if parsed is not None:
@@ -135,7 +140,8 @@ def sync(days_back: int = START_DAYS_BACK,
     tmp = str(ARCHIVE_FILE) + '.tmp'
     combined.to_parquet(tmp)
     os.replace(tmp, ARCHIVE_FILE)
-    print(f"[SHORT-FLOW] synced {fetched} day-files ({len(combined)} rows)")
+    print(f"[SHORT-FLOW] fetched {fetched} day-files, ingested {len(frames)} "
+          f"({len(combined)} rows)")
     return True
 
 

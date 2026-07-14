@@ -275,6 +275,19 @@ _URL_PATTERN = _re.compile(r'^https?://')
 # --- Full article fetching ---
 _article_cache = {}  # url -> (timestamp, text or None)
 _ARTICLE_CACHE_TTL = 1800  # 30 min — articles don't change
+_ARTICLE_CACHE_MAX = 500   # evict expired entries once the dict grows past this
+
+
+def _article_cache_put(url, ts, text):
+    """Insert into the article cache, evicting expired entries once it is
+    large — TTL is only checked on read, so a 24/7 process would otherwise
+    accumulate every article URL ever fetched (slow leak on the Jetson)."""
+    if len(_article_cache) >= _ARTICLE_CACHE_MAX:
+        cutoff = ts - _ARTICLE_CACHE_TTL
+        for k, (t, _) in list(_article_cache.items()):
+            if t < cutoff:
+                _article_cache.pop(k, None)
+    _article_cache[url] = (ts, text)
 
 _USER_AGENT = (
     'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
@@ -307,7 +320,7 @@ def _fetch_article_text(url, timeout=5):
             allow_redirects=True,
         )
         if resp.status_code != 200:
-            _article_cache[url] = (now, None)
+            _article_cache_put(url, now, None)
             return None
 
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -355,18 +368,18 @@ def _fetch_article_text(url, timeout=5):
 
         # Validate: need at least a sentence worth of content
         if len(text) < 50:
-            _article_cache[url] = (now, None)
+            _article_cache_put(url, now, None)
             return None
 
         # Cap at ~2000 chars to keep scoring fast
         if len(text) > 2000:
             text = text[:2000]
 
-        _article_cache[url] = (now, text)
+        _article_cache_put(url, now, text)
         return text
 
     except Exception:
-        _article_cache[url] = (now, None)
+        _article_cache_put(url, now, None)
         return None
 
 
@@ -405,7 +418,25 @@ def _deduplicate_articles(articles):
     return unique
 
 
-_LLM_CHUNK_SIZE = 80  # score all articles in one API call to minimize RPM usage
+def _kw_score_article(article, fetch_full=False):
+    """Keyword-score one article: headline 0.6 / summary 0.4, or
+    0.25 / 0.25 / 0.50 when fetch_full finds a body. Returns None when
+    neither field is scorable — callers decide skip vs 0.0.
+
+    The single implementation for all three KW fallbacks (LLM gap-fill,
+    score_article_batch, _score_articles) so the weights can't drift.
+    """
+    headline = _validate_text(article.get('headline', ''))
+    summary = _validate_text(article.get('summary', ''))
+    if headline is None and summary is None:
+        return None
+    h = _score_text(headline) if headline else 0.0
+    s = _score_text(summary) if summary else 0.0
+    if fetch_full:
+        full_text = _fetch_article_text(article.get('url', ''))
+        if full_text:
+            return h * 0.25 + s * 0.25 + _score_text(full_text) * 0.50
+    return h * 0.6 + s * 0.4
 
 
 def _parse_llm_json(raw_text):
@@ -526,8 +557,10 @@ def _build_score_prompt(chunk_articles, full_texts):
     n = len(chunk_articles)
     lines = []
     for i, a in enumerate(chunk_articles):
-        h = ' '.join(a.get('headline', '').split())
-        s = ' '.join(a.get('summary', '').split())
+        # `or ''`, not a .get default: Finnhub can send the key with a None
+        # value, and dedup keeps None-summary articles (same guard as there)
+        h = ' '.join((a.get('headline') or '').split())
+        s = ' '.join((a.get('summary') or '').split())
         body = full_texts[i] if i < len(full_texts) else None
 
         parts = [f"{i + 1}. {h}"]
@@ -589,9 +622,13 @@ def _llm_score_chunk(chunk_articles, full_texts, model=None):
     max_tokens = max(512, n * 40)  # thinking models need more headroom
 
     if model:
-        from llm_client import call_gemini
-        result = call_gemini(prompt, system=system, model=model, max_tokens=max_tokens)
+        # call_model, not call_gemini: get_recommended_model('sentiment') can
+        # return a Claude model when the provider switch is on
+        from llm_client import call_model
+        result = call_model(prompt, system=system, model=model, max_tokens=max_tokens)
     else:
+        # Test-only path: every production caller passes an explicit tier
+        # model (tests/test_parse_scores.py exercises the call_llm chain).
         from llm_client import call_llm
         result = call_llm(prompt, system=system, max_tokens=max_tokens)
 
@@ -604,7 +641,12 @@ def _fetch_full_texts(articles):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     urls = [a.get('url', '') for a in articles]
     full_texts = [None] * len(articles)
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    # NOT a `with` block: __exit__ calls shutdown(wait=True), which blocks
+    # on every submitted fetch and turns the 15s deadline below into a soft
+    # limit — slow-drip servers could stall the live entry loop for minutes
+    # (requests' timeout=5 is per-socket-op, not per-request).
+    pool = ThreadPoolExecutor(max_workers=10)
+    try:
         futures = {pool.submit(_fetch_article_text, u): i
                    for i, u in enumerate(urls) if u}
         try:
@@ -618,6 +660,11 @@ def _fetch_full_texts(articles):
             # subclass of builtins TimeoutError — catching only the builtin
             # let a slow article fetch kill the whole backfill worker.
             pass
+    finally:
+        # Drop queued-but-unstarted fetches; in-flight ones finish in their
+        # worker threads and are discarded. Un-fetched bodies stay None,
+        # exactly as in the timeout path. (cancel_futures needs Python 3.9+.)
+        pool.shutdown(wait=False, cancel_futures=True)
     return full_texts
 
 
@@ -630,7 +677,7 @@ def _llm_score_batch(articles):
     Returns list[float] or None if all models fail.
     """
     try:
-        from llm_client import call_gemini, get_budget, _429_cooled_down  # noqa: F401
+        from llm_client import get_budget, _429_cooled_down
     except ImportError:
         return None
 
@@ -648,8 +695,6 @@ def _llm_score_batch(articles):
 
     all_scores = [None] * n
     all_models = [None] * n
-
-    from llm_client import _trigger_429_cooldown
 
     prev_end = 0
     for tier_model, cum_frac in _get_scoring_tiers():
@@ -690,14 +735,8 @@ def _llm_score_batch(articles):
     for i in range(n):
         if all_scores[i] is None:
             gap_count += 1
-            headline = _validate_text(articles[i].get('headline', ''))
-            summary = _validate_text(articles[i].get('summary', ''))
-            if headline or summary:
-                h = _score_text(headline) if headline else 0.0
-                s = _score_text(summary) if summary else 0.0
-                all_scores[i] = h * 0.6 + s * 0.4
-            else:
-                all_scores[i] = 0.0
+            kw = _kw_score_article(articles[i])  # no body fetch: gap-fill stays fast
+            all_scores[i] = kw if kw is not None else 0.0
             all_models[i] = 'KW'
     if gap_count > 0:
         print(f"[SENTIMENT] {gap_count} articles fell back to KW scoring (LLM tier gaps)")
@@ -737,19 +776,8 @@ def score_article_batch(articles):
     print(f"[SENTIMENT] Keyword scoring {len(articles)} articles (LLM unavailable)")
     scores = []
     for a in articles:
-        headline = _validate_text(a.get('headline', ''))
-        summary = _validate_text(a.get('summary', ''))
-        if headline is None and summary is None:
-            scores.append(0.0)
-            continue
-        h = _score_text(headline) if headline else 0.0
-        s = _score_text(summary) if summary else 0.0
-        full_text = _fetch_article_text(a.get('url', ''))
-        if full_text:
-            f = _score_text(full_text)
-            scores.append(h * 0.25 + s * 0.25 + f * 0.50)
-        else:
-            scores.append(h * 0.6 + s * 0.4)
+        kw = _kw_score_article(a, fetch_full=True)
+        scores.append(kw if kw is not None else 0.0)  # display: keep list aligned
     return scores, "KW"
 
 
@@ -808,12 +836,16 @@ def try_llm_upgrade(articles):
     scores = _llm_score_chunk(arts, full_texts, model=best_model)
 
     if scores is not None:
-        # Build full scores list (None for non-upgraded articles)
+        # Build full scores list (None for non-upgraded articles).
+        # A None score is a gap the model skipped — keep that article's old
+        # score AND old model tag so a later upgrade pass can retry it.
         result = [None] * len(articles)
+        n_upgraded = 0
         for idx, score in zip(indices, scores):
-            result[idx] = score
-            articles[idx]['_scored_by_model'] = best_model
-        n_upgraded = len(scores)
+            if score is not None:
+                result[idx] = score
+                articles[idx]['_scored_by_model'] = best_model
+                n_upgraded += 1
         print(f"[SENTIMENT] Upgraded {n_upgraded} articles to {best_model.split('-')[-1]}")
         return result
 
@@ -868,23 +900,9 @@ def _score_articles(articles):
         # Fallback: keyword scoring with full-text fetch for accuracy
         scores = []
         for article in articles:
-            headline = _validate_text(article.get('headline', ''))
-            summary = _validate_text(article.get('summary', ''))
-
-            if headline is None and summary is None:
-                continue
-
-            h_score = _score_text(headline) if headline else 0.0
-            s_score = _score_text(summary) if summary else 0.0
-
-            full_text = _fetch_article_text(article.get('url', ''))
-            if full_text:
-                f_score = _score_text(full_text)
-                combined = h_score * 0.25 + s_score * 0.25 + f_score * 0.50
-            else:
-                combined = h_score * 0.6 + s_score * 0.4
-
-            scores.append(combined)
+            kw = _kw_score_article(article, fetch_full=True)
+            if kw is not None:  # unscorable articles are skipped, not zeroed
+                scores.append(kw)
 
     return _aggregate_scores(scores), used_llm
 
@@ -916,6 +934,12 @@ def _try_llm_retry():
     if scores is None:
         # LLM still unavailable — push back to front for next attempt
         _llm_retry_queue.appendleft((cache_key, articles, queued_at))
+        return
+
+    # Re-check after the slow LLM call: in combined-bot mode the other loop
+    # thread can refresh this key mid-scoring — never overwrite a fresher
+    # result with scores from the older queued article set.
+    if cache_key in _cache and _cache[cache_key][0] > queued_at:
         return
 
     result = _aggregate_scores(scores)
@@ -977,6 +1001,11 @@ def get_cnn_fear_greed():
         )
         data = resp.json()
         fg = data.get('fear_and_greed', {})
+        if not fg:
+            # API change or an error page that still parses as JSON — a
+            # zero-filled dict would render as deepest extreme fear (score 0)
+            print("[SENTIMENT] CNN Fear & Greed error: no 'fear_and_greed' in payload")
+            return None
         result = {
             'score': round(fg.get('score', 0), 1),
             'rating': fg.get('rating', '').replace('_', ' ').title(),
@@ -1100,18 +1129,21 @@ def sentiment_gate(symbol, asset_type='crypto'):
     """Compute a trade multiplier based on sentiment.
 
     Returns tuple: (multiplier: float, reasons: list[str])
-        0.15 = severe reduce (catastrophic news, e.g. hack/fraud)
-        0.5  = reduce position size (negative sentiment)
-        1.0  = normal (neutral or no data)
-        1.2  = increase position (positive sentiment)
-        1.5  = max increase (strong positive + calm market)
+
+    Per-source multipliers, compounded then clamped to [0.15, 1.5]
+    (1.0 = neutral / no data for every source):
+        FnG (crypto only): x0.70 extreme greed (>=90); x0.85 greed (80-89)
+        Symbol news:       x0.15 catastrophic (<=-0.5); x0.35 bearish
+                           (<=-0.3); x0.70 cautious (<=-0.1);
+                           x1.2 bullish (>=0.2); x1.35 strong bull (>=0.4)
+        Market news:       x0.85 bearish (<=-0.4); x1.1 bullish (>=0.4)
 
     Design philosophy:
     - The ML model is the primary signal. It already uses Daily_Sentiment
-      (FnG) as an input feature, so FnG is NOT applied as a position
+      (FnG) as an input feature, so FnG fear is NOT applied as a position
       reducer — that would double-count sentiment the model already saw.
-    - FnG extreme greed (>90) is the one exception: bubble risk is
-      asymmetric and worth reducing exposure for.
+    - FnG greed (>=80, harder at >=90) is the one exception: bubble risk
+      is asymmetric and worth reducing exposure for.
     - Symbol-specific news is genuinely new info the model can't see.
       Catastrophic events (hacks, fraud) warrant hard reductions.
     - Market news is diffuse — very light touch.
@@ -1181,9 +1213,18 @@ def sentiment_gate(symbol, asset_type='crypto'):
 def get_recent_headlines(symbol, asset_type='crypto', max_headlines=5):
     """Get recent news headlines for a symbol (no scoring, just text).
 
-    Returns list of headline strings, or empty list.
-    Cached alongside get_news_sentiment (same Finnhub call).
+    Returns list of headline strings, or empty list. Cached for CACHE_TTL
+    per (asset_type, symbol, max_headlines) — llm_analyst calls this in a
+    per-symbol loop, which used to fire one uncached Finnhub request per
+    symbol per refresh against the free tier's 60/min budget.
     """
+    now = time.time()
+    cache_key = f'headlines_{asset_type}_{symbol}_{max_headlines}'
+    if cache_key in _cache:
+        ts, result = _cache[cache_key]
+        if now - ts < CACHE_TTL:
+            return result
+
     client = _get_finnhub()
     if client is None:
         return []
@@ -1193,8 +1234,8 @@ def get_recent_headlines(symbol, asset_type='crypto', max_headlines=5):
             articles = client.general_news('crypto', min_id=0)
             base = symbol.replace('/USD', '').replace('-USD', '').lower()
             relevant = [a for a in articles
-                        if base in a.get('headline', '').lower()
-                        or base in a.get('summary', '').lower()]
+                        if base in (a.get('headline') or '').lower()
+                        or base in (a.get('summary') or '').lower()]
             if len(relevant) < 2:
                 relevant = articles[:10]
         else:
@@ -1211,9 +1252,11 @@ def get_recent_headlines(symbol, asset_type='crypto', max_headlines=5):
 
         headlines = []
         for a in relevant[:max_headlines]:
-            h = a.get('headline', '').strip()
+            h = (a.get('headline') or '').strip()
             if h:
                 headlines.append(h)
+        _cache[cache_key] = (now, headlines)
         return headlines
-    except Exception:
+    except Exception as e:
+        print(f"[SENTIMENT] Headlines error for {symbol}: {e}")
         return []

@@ -84,12 +84,27 @@ def test_clear_resets_store_and_counters():
     assert len(c._store) == 0 and c.hits == 0 and c.misses == 0
 
 
-def test_predict_now_wires_cache_after_data_guard():
+def test_predict_now_wires_cache_before_feature_compute():
     src = (REPO / "predict_now.py").read_text()
     assert "from prediction_cache import PredictionCache" in src
     assert "_PRED_CACHE = PredictionCache()" in src
-    # cache check sits AFTER the seq_len data guard, before inference
-    guard = src.index("Not enough data for sequence")
+    # 2026-07 review: the memo's whole value is skipping the pandas/numba
+    # feature pass (~most of the cycle's CPU), so the check must sit BEFORE
+    # compute_features — the original wiring checked after it, so an enabled
+    # cache skipped only the (cheap) model calls. Order: forming-bar drop ->
+    # cache check -> feature compute -> seq_len guard -> ... -> cache put.
+    forming = src.index("drop_forming_bar(df)")
     check = src.index("_PRED_CACHE.get(_cache_subkey, _cache_key)")
+    features = src.index("# --- Compute technical features ---")
+    guard = src.index("Not enough data for sequence")
     store = src.index("_PRED_CACHE.put(_cache_subkey, _cache_key, predicted_return)")
-    assert guard < check < store
+    assert forming < check < features < guard < store
+
+
+def test_predict_now_clears_cache_on_model_load():
+    # a hot-reload must never serve the previous model's memo, and the
+    # clear also defuses id()-reuse in the cache subkey
+    src = (REPO / "predict_now.py").read_text()
+    load = src.index("def load_model(")
+    nxt = src.index("def load_models(")
+    assert "_PRED_CACHE.clear()" in src[load:nxt]

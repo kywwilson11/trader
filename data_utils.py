@@ -5,7 +5,6 @@ for training data used by harvest scripts and hypersearch.
 """
 
 import os
-import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -18,18 +17,40 @@ _FILE_STEMS = {
     'stock': 'stock_training_data',
 }
 
+# Normal saves write the CSV seconds-to-minutes after the parquet; a CSV newer
+# than the parquet by more than this means a parquet save failed and the
+# parquet on disk is a frozen stale copy.
+_STALE_PARQUET_SLACK_S = 3600
+
 
 def _stem(prefix: str) -> str:
     return _FILE_STEMS.get(prefix, f'{prefix}_training_data')
+
+
+def _csv_is_fresher(parquet_path: Path, csv_path: Path) -> bool:
+    """True when the CSV is so much newer than the parquet that the parquet
+    must be a stale leftover from a failed save."""
+    try:
+        if not csv_path.exists():
+            return False
+        gap_s = csv_path.stat().st_mtime - parquet_path.stat().st_mtime
+    except OSError:
+        return False
+    if gap_s > _STALE_PARQUET_SLACK_S:
+        print(f"[DATA] {parquet_path.name} is {gap_s / 3600:.1f}h older than "
+              f"{csv_path.name} — treating parquet as stale, using CSV")
+        return True
+    return False
 
 
 def get_data_path(prefix: str) -> Path:
     """Return the best available data file path (.parquet preferred, .csv fallback)."""
     stem = _stem(prefix)
     parquet = _BASE_DIR / f'{stem}.parquet'
-    if parquet.exists():
+    csv = _BASE_DIR / f'{stem}.csv'
+    if parquet.exists() and not _csv_is_fresher(parquet, csv):
         return parquet
-    return _BASE_DIR / f'{stem}.csv'
+    return csv
 
 
 def load_training_data(prefix: str, columns: list[str] | None = None) -> pd.DataFrame:
@@ -46,6 +67,22 @@ def load_training_data(prefix: str, columns: list[str] | None = None) -> pd.Data
     parquet_path = _BASE_DIR / f'{stem}.parquet'
     csv_path = _BASE_DIR / f'{stem}.csv'
 
+    def _read_csv():
+        df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+        if columns:
+            available = [c for c in columns if c in df.columns]
+            df = df[available]
+        print(f"[DATA] Loaded {len(df)} rows from {csv_path.name}")
+        return df
+
+    # A much-newer CSV means the parquet is a frozen leftover from a failed
+    # save — serve the fresh CSV instead of silently training on stale data.
+    if parquet_path.exists() and _csv_is_fresher(parquet_path, csv_path):
+        try:
+            return _read_csv()
+        except Exception as e:
+            print(f"[DATA] CSV load failed ({e}), trying stale Parquet")
+
     if parquet_path.exists():
         try:
             df = pd.read_parquet(parquet_path, columns=columns)
@@ -60,61 +97,69 @@ def load_training_data(prefix: str, columns: list[str] | None = None) -> pd.Data
 
     if csv_path.exists():
         try:
-            df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
-            if columns:
-                available = [c for c in columns if c in df.columns]
-                df = df[available]
-            print(f"[DATA] Loaded {len(df)} rows from {csv_path.name}")
-            return df
+            return _read_csv()
         except Exception as e:
             print(f"[DATA] CSV load failed: {e}")
 
     return pd.DataFrame()
 
 
-def save_training_data(df: pd.DataFrame, prefix: str):
-    """Atomically save training data as Parquet (snappy) + CSV for backward compat."""
-    stem = _stem(prefix)
+def _atomic_to_disk(df: pd.DataFrame, final_path: Path) -> bool:
+    """Write df to final_path via a deterministic sibling .tmp + os.replace.
 
-    # Parquet (atomic write via temp file + rename)
-    parquet_path = _BASE_DIR / f'{stem}.parquet'
-    fd, tmp = tempfile.mkstemp(suffix='.parquet', dir=_BASE_DIR)
-    os.close(fd)
+    Deterministic tmp names let the next run overwrite a crash-orphaned tmp
+    instead of accumulating full-dataset-sized mkstemp files; mkstemp's 0600
+    mode also narrowed the data files' permissions on every save.
+    """
+    tmp = final_path.parent / (final_path.name + '.tmp')
     try:
-        df.to_parquet(tmp, compression='snappy')
-        os.replace(tmp, parquet_path)
+        if final_path.suffix == '.parquet':
+            df.to_parquet(tmp, compression='snappy')
+        else:
+            df.to_csv(tmp)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, final_path)
+        return True
+    except Exception as e:
+        print(f"[DATA] save failed for {final_path.name}: {e}")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def save_training_data(df: pd.DataFrame, prefix: str) -> bool:
+    """Atomically save training data as Parquet (snappy) + CSV for backward compat.
+
+    Returns True when at least one format persisted the new frame; False when
+    BOTH writes failed (the files on disk still hold the OLD data).
+    """
+    stem = _stem(prefix)
+    parquet_path = _BASE_DIR / f'{stem}.parquet'
+    csv_path = _BASE_DIR / f'{stem}.csv'
+
+    pq_ok = _atomic_to_disk(df, parquet_path)
+    if pq_ok:
         pq_size = parquet_path.stat().st_size / (1024 * 1024)
         print(f"[DATA] Saved {len(df)} rows to {parquet_path.name} ({pq_size:.1f} MB)")
-    except Exception as e:
-        print(f"[DATA] Parquet save failed: {e}")
-        if os.path.exists(tmp):
-            os.unlink(tmp)
 
-    # CSV (backward compat)
-    csv_path = _BASE_DIR / f'{stem}.csv'
-    fd, tmp = tempfile.mkstemp(suffix='.csv', dir=_BASE_DIR)
-    os.close(fd)
-    try:
-        df.to_csv(tmp)
-        os.replace(tmp, csv_path)
-    except Exception as e:
-        print(f"[DATA] CSV save failed: {e}")
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    csv_ok = _atomic_to_disk(df, csv_path)
 
-
-def get_latest_timestamp(prefix: str, ticker: str) -> pd.Timestamp | None:
-    """Find the latest bar timestamp for a given ticker in existing data.
-
-    Returns None if no data exists or ticker not found.
-    """
-    df = load_training_data(prefix, columns=['Ticker'])
-    if df.empty or 'Ticker' not in df.columns:
-        return None
-    ticker_rows = df[df['Ticker'] == ticker]
-    if ticker_rows.empty:
-        return None
-    return ticker_rows.index.max()
+    if csv_ok and not pq_ok and parquet_path.exists():
+        # Loaders prefer parquet on existence, so a leftover parquet would
+        # silently shadow the fresh CSV for every downstream consumer.
+        try:
+            parquet_path.unlink()
+            print(f"[DATA] parquet save failed — removed stale {parquet_path.name}, "
+                  "loaders will use the fresh CSV")
+        except OSError as e:
+            print(f"[DATA] WARNING: could not remove stale {parquet_path.name} ({e})")
+    if not pq_ok and not csv_ok:
+        print(f"[DATA] SAVE FAILED for '{prefix}' — both writes failed, "
+              "data on disk is STALE")
+    return pq_ok or csv_ok
 
 
 def append_ticker_data(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
@@ -145,7 +190,11 @@ def migrate_csv_to_parquet(prefix: str) -> bool:
 
     try:
         df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
-        df.to_parquet(parquet_path, compression='snappy')
+        # Atomic — an interrupt mid-write must not leave a corrupt .parquet
+        # where existence-only checks (get_data_path) would pick it up.
+        if not _atomic_to_disk(df, parquet_path):
+            print(f"[DATA] Migration failed for {prefix}")
+            return False
         csv_size = csv_path.stat().st_size / (1024 * 1024)
         pq_size = parquet_path.stat().st_size / (1024 * 1024)
         print(f"[DATA] Migrated {prefix}: {csv_size:.1f} MB CSV -> {pq_size:.1f} MB Parquet "
@@ -156,12 +205,26 @@ def migrate_csv_to_parquet(prefix: str) -> bool:
         return False
 
 
+def _stock_gap_spans_trading_days(gap_end: pd.Timestamp, gap_dur: pd.Timedelta) -> bool:
+    """True when a stock bar gap swallows >=2 full weekdays — likely data loss.
+
+    Weekends (56-66h), overnights (8-18h depending on bar source) and
+    single-day holidays are calendar closures, not data loss — flagging them
+    buried real gaps under thousands of spurious report entries.
+    """
+    import numpy as np
+    gap_start = gap_end - gap_dur
+    first_full_day = (gap_start + pd.Timedelta(days=1)).date()
+    return np.busday_count(first_full_day, gap_end.date()) >= 2
+
+
 def validate_training_data(df: pd.DataFrame, asset_type: str) -> dict:
     """Validate training data quality. Returns summary dict and prints report.
 
     Checks:
       - Missing/stale tickers
-      - Timestamp gaps (>2h for crypto, >8h for stocks accounting for overnight)
+      - Timestamp gaps (>3h for crypto; stocks: >16h AND spanning >=2 full
+        weekdays, so weekends/overnights/single-day holidays are not flagged)
       - NaN/inf values
       - Date range coverage
     """
@@ -195,13 +258,15 @@ def validate_training_data(df: pd.DataFrame, asset_type: str) -> dict:
                 continue
             diffs = tdf.index.to_series().diff().dropna()
             big_gaps = diffs[diffs > pd.Timedelta(hours=gap_threshold_h)]
-            if len(big_gaps) > 0:
-                for gap_ts, gap_dur in big_gaps.items():
-                    report['gaps'].append({
-                        'ticker': ticker,
-                        'at': str(gap_ts),
-                        'duration_h': round(gap_dur.total_seconds() / 3600, 1),
-                    })
+            for gap_ts, gap_dur in big_gaps.items():
+                if asset_type != 'crypto' and not _stock_gap_spans_trading_days(
+                        gap_ts, gap_dur):
+                    continue  # calendar closure, not data loss
+                report['gaps'].append({
+                    'ticker': ticker,
+                    'at': str(gap_ts),
+                    'duration_h': round(gap_dur.total_seconds() / 3600, 1),
+                })
 
     # NaN check
     nan_counts = df.isna().sum()
@@ -233,7 +298,7 @@ def validate_training_data(df: pd.DataFrame, asset_type: str) -> dict:
     print(f"  Date range: {report['date_range'][0]} to {report['date_range'][1]}")
 
     if report['gaps']:
-        # Only show first 5 gaps per ticker
+        # Only show first 3 gaps per ticker
         shown = {}
         for g in report['gaps']:
             t = g['ticker']

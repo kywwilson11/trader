@@ -14,7 +14,6 @@ Data sources:
 """
 
 import datetime
-import math
 import os
 import sqlite3
 import time
@@ -278,7 +277,7 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
                                    cached_only=False):
     """Fetch historical news for stock tickers via Finnhub and keyword-score.
 
-    Fetches in 7-day windows, rate-limited at 25 calls/min. Caches all articles
+    Fetches in 30-day windows, rate-limited at 25 calls/min. Caches all articles
     in SQLite — subsequent runs only fetch new/uncached date ranges.
 
     Args:
@@ -323,10 +322,8 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
         "SELECT symbol, date, score FROM daily_sentiment WHERE date >= ? AND date <= ?",
         (start_date, end_date),
     ).fetchall()
-    cached_symbols = set()
     for sym, dt, score in cached_rows:
         result[(sym, dt)] = score
-        cached_symbols.add(sym)
 
     # Determine which symbols need fetching
     # A symbol needs fetching if it has no articles in our date range
@@ -418,16 +415,15 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
 
                 score = _keyword_score(headline, summary)
 
-                try:
-                    db.execute(
-                        """INSERT OR IGNORE INTO articles
-                           (symbol, date, headline, summary, url, keyword_score, fetched_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (ticker, article_date, headline, summary, url, score, now_iso),
-                    )
-                    ticker_articles += 1
-                except sqlite3.IntegrityError:
-                    pass  # duplicate
+                cur = db.execute(
+                    """INSERT OR IGNORE INTO articles
+                       (symbol, date, headline, summary, url, keyword_score, fetched_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (ticker, article_date, headline, summary, url, score, now_iso),
+                )
+                # OR IGNORE swallows duplicates instead of raising, so count
+                # real inserts via rowcount (0 for an ignored row).
+                ticker_articles += cur.rowcount
 
             window_start = window_end + datetime.timedelta(days=1)
 
@@ -480,6 +476,9 @@ def get_daily_sentiment(symbol, date_str):
     return row[0] if row else 0.0
 
 
+_live_fng_warned = False
+
+
 def get_live_daily_sentiment(symbol, asset_type='crypto'):
     """Get the sentiment value live inference should see RIGHT NOW.
 
@@ -490,14 +489,19 @@ def get_live_daily_sentiment(symbol, asset_type='crypto'):
 
     Returns float in [-1, 1], defaults 0.0.
     """
+    global _live_fng_warned
     if asset_type == 'crypto':
         try:
             from sentiment import get_fear_greed
             fng = get_fear_greed()
             if fng is not None:
                 return _fng_value_to_score(fng['value'])
-        except Exception:
-            pass
+        except Exception as e:
+            # Log once — a persistently broken source was invisible because
+            # predict_now's wrapper also defaults to 0.0 without logging.
+            if not _live_fng_warned:
+                _live_fng_warned = True
+                print(f"[SENTIMENT_HIST] live FnG failed (logged once): {e}")
         return 0.0
     else:
         yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
@@ -529,7 +533,7 @@ def _is_live_mode():
 
 
 def get_backfill_stats():
-    """Get backfill progress stats for GUI display."""
+    """Get backfill progress stats (used by this module's --stats CLI)."""
     db = _get_db()
     total = db.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
     scored = db.execute(
@@ -550,6 +554,7 @@ def get_backfill_stats():
 _BATCH_CHUNK = 25            # articles per generateContent request
 _BATCH_MAX_ARTICLES = 2000   # per batch job
 _BATCH_POLL_SEC = 120
+_BATCH_MAX_AGE_H = 48        # a job pending this long is dead — clear it
 _batch_unavailable_until = 0.0
 
 _BATCH_SCORE_SCHEMA = {
@@ -692,6 +697,7 @@ def submit_sentiment_batch(db, model=None) -> bool:
 def poll_and_ingest_batch(db) -> str:
     """Poll the pending batch job. Returns 'none'|'pending'|'ingested'|'failed'."""
     import json as _json
+    import urllib.error
     from llm_config import load_llm_config
 
     state = _batch_state_get(db)
@@ -702,8 +708,32 @@ def poll_and_ingest_batch(db) -> str:
     if not api_key:
         return 'none'
 
+    # Staleness guard: a job pending for days is gone server-side (or the
+    # persisted state is malformed) — clear it so the worker can move on
+    # instead of polling forever.
+    try:
+        age_h = (datetime.datetime.now()
+                 - datetime.datetime.fromisoformat(state['submitted_at'])
+                 ).total_seconds() / 3600.0
+    except (KeyError, TypeError, ValueError):
+        age_h = float('inf')
+    if age_h > _BATCH_MAX_AGE_H:
+        print(f"[BACKFILL] Batch state older than {_BATCH_MAX_AGE_H}h — clearing")
+        _batch_state_set(db, None)
+        return 'failed'
+
     try:
         resp = _gemini_batch_http('GET', state['name'], None, api_key)
+    except urllib.error.HTTPError as e:
+        # 4xx is permanent (job deleted/expired server-side, revoked key
+        # scope) — except 408/429 which are transient. Returning 'pending'
+        # on these wedged the worker in a poll loop forever.
+        if 400 <= e.code < 500 and e.code not in (408, 429):
+            print(f"[BACKFILL] Batch poll HTTP {e.code} — clearing dead job")
+            _batch_state_set(db, None)
+            return 'failed'
+        print(f"[BACKFILL] Batch poll failed: {e}")
+        return 'pending'
     except Exception as e:
         print(f"[BACKFILL] Batch poll failed: {e}")
         return 'pending'  # transient — try again next pass
@@ -716,15 +746,22 @@ def poll_and_ingest_batch(db) -> str:
     if job_state != 'JOB_STATE_SUCCEEDED':
         return 'pending'
 
-    # Ingest: inlinedResponses are POSITIONAL per submitted chunk
+    # Ingest: match responses to chunks by the echoed metadata key (robust
+    # to reordering/omission); fall back to position, which the API
+    # preserves today.
     inlined = ((resp.get('response') or {}).get('inlinedResponses')) or []
     id_map = state.get('id_map', [])
     now_iso = datetime.datetime.now().isoformat()
     scored = 0
     updated_pairs = set()
-    for chunk_idx, item in enumerate(inlined):
-        if chunk_idx >= len(id_map):
-            break
+    for pos, item in enumerate(inlined):
+        key = (item.get('metadata') or {}).get('key') or ''
+        try:
+            chunk_idx = int(key.split('-')[1])
+        except (IndexError, ValueError):
+            chunk_idx = pos
+        if not 0 <= chunk_idx < len(id_map):
+            continue
         chunk_ids = id_map[chunk_idx]
         cand = (item.get('response') or {}).get('candidates') or []
         if not cand:
@@ -773,6 +810,7 @@ def run_backfill_worker(max_rpm=8):
     Args:
         max_rpm: Maximum LLM API calls per minute
     """
+    global _batch_unavailable_until
     try:
         from sentiment import _llm_score_batch, _validate_text
     except ImportError:
@@ -803,8 +841,13 @@ def run_backfill_worker(max_rpm=8):
                 continue
             if status == 'ingested':
                 continue  # check immediately for more work
-            # 'none' or 'failed' — try submitting a fresh job
-            if submit_sentiment_batch(db):
+            if status == 'failed':
+                # A server-side failure is often systemic (schema/model
+                # rejection) — resubmitting the same articles immediately
+                # just churns failing jobs. Cool off on the sync fallback.
+                _batch_unavailable_until = time.time() + 3600
+            # 'none' — try submitting a fresh job
+            elif submit_sentiment_batch(db):
                 time.sleep(_BATCH_POLL_SEC)
                 continue
             # submit returned False: nothing unscored, or batch unavailable

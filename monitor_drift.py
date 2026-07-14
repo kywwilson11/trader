@@ -11,14 +11,16 @@ standard early-warning metric (credit-risk practice):
 with ref_b = 0.1 per decile bin. Conventional levels: < 0.10 stable,
 0.10-0.25 moderate shift (warn), > 0.25 major shift (action). Two
 CONSECUTIVE action days (one bad day is often just a news regime) write
-{prefix}retrain_requested.flag — consumed by `run_pipeline.py --if-drift`
-— and send a notification.
+{prefix}retrain_requested.flag and send a notification.
 
 Wiring:
   - hypersearch saves holdout pred deciles in the model manifest
   - base_loop appends each cycle's predictions via log_predictions()
-  - cron runs `python monitor_drift.py` daily (and optionally
-    `python run_pipeline.py --if-drift` after it)
+  - run_pipeline runs run_check() in-process once daily
+    (_maybe_run_drift_check) and its Phase-C wait loop consumes
+    {prefix}retrain_requested.flag (_check_drift_trigger); a standalone
+    `python monitor_drift.py` invocation remains available for
+    manual/cron use
 """
 
 import argparse
@@ -26,9 +28,15 @@ import datetime as dt
 import json
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX — cross-process locking degrades to no-op
+    fcntl = None
 
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
@@ -55,6 +63,39 @@ def retrain_flag_file(prefix: str) -> Path:
     return BASE_DIR / f'{_p(prefix)}retrain_requested.flag'
 
 
+@contextmanager
+def _history_lock(prefix: str):
+    """Advisory flock on a sidecar file — serializes the bot's append
+    (log_predictions) against the daily read-rewrite-replace
+    (prune_history), which run in different processes. Sidecar because
+    os.replace swaps the history file's inode. Best-effort: on any lock
+    failure the write proceeds unlocked rather than being dropped
+    (mirrors trade_memory._cross_process_lock)."""
+    if fcntl is None:
+        yield
+        return
+    try:
+        fd = open(str(history_file(prefix)) + '.lock', 'w')
+    except OSError:
+        yield
+        return
+    locked = False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        locked = True
+    except OSError:
+        pass
+    try:
+        yield
+    finally:
+        if locked:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fd.close()
+
+
 # --- Live-side logging (called by the bots each prediction cycle) ---
 
 def log_predictions(prefix: str, preds: dict) -> None:
@@ -67,7 +108,7 @@ def log_predictions(prefix: str, preds: dict) -> None:
             'preds': {s: round(float(v), 6) for s, v in preds.items()
                       if v is not None},
         })
-        with open(history_file(prefix), 'a') as f:
+        with _history_lock(prefix), open(history_file(prefix), 'a') as f:
             f.write(line + '\n')
     except Exception:
         pass  # diagnostics must never break the trading cycle
@@ -89,8 +130,14 @@ def load_recent_predictions(prefix: str,
                     rec = json.loads(line)
                     ts = dt.datetime.fromisoformat(rec['ts'])
                     if ts >= cutoff:
-                        vals.extend(rec['preds'].values())
-                except (json.JSONDecodeError, KeyError, ValueError):
+                        # float() per value inside the per-line try: a
+                        # poison line (naive ts -> TypeError on >=, non-
+                        # numeric pred, non-dict preds) drops itself
+                        # instead of crashing the whole check at asarray
+                        vals.extend([float(v)
+                                     for v in rec['preds'].values()])
+                except (json.JSONDecodeError, KeyError, ValueError,
+                        TypeError, AttributeError):
                     continue
     except OSError:
         return np.array([])
@@ -105,19 +152,23 @@ def prune_history(prefix: str, keep_days: int = HISTORY_KEEP_DAYS) -> None:
     cutoff = (dt.datetime.now(dt.timezone.utc)
               - dt.timedelta(days=keep_days))
     try:
-        kept = []
-        with open(path) as f:
-            for line in f:
-                try:
-                    if dt.datetime.fromisoformat(
-                            json.loads(line)['ts']) >= cutoff:
-                        kept.append(line)
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    continue
-        tmp = str(path) + '.tmp'
-        with open(tmp, 'w') as f:
-            f.writelines(kept)
-        os.replace(tmp, path)
+        # Lock held across read + replace: an append by the bot process
+        # between our read and the os.replace would otherwise be lost.
+        with _history_lock(prefix):
+            kept = []
+            with open(path) as f:
+                for line in f:
+                    try:
+                        if dt.datetime.fromisoformat(
+                                json.loads(line)['ts']) >= cutoff:
+                            kept.append(line)
+                    except (json.JSONDecodeError, KeyError, ValueError,
+                            TypeError, AttributeError):
+                        continue
+            tmp = str(path) + '.tmp'
+            with open(tmp, 'w') as f:
+                f.writelines(kept)
+            os.replace(tmp, path)
     except OSError:
         pass
 
@@ -155,8 +206,8 @@ def load_ref_deciles(prefix: str) -> list | None:
         deciles = (manifest.get('holdout') or {}).get('pred_deciles')
         if deciles and len(deciles) == 11:
             return deciles
-    except (OSError, json.JSONDecodeError):
-        pass
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        pass  # non-dict manifest/holdout or unsized deciles -> not checkable
     return None
 
 
@@ -217,7 +268,11 @@ def _live_outcomes(asset: str, since_iso: str | None) -> list[tuple[str, int]]:
     try:
         from trade_memory import _load as load_trades
         data = load_trades()
-    except Exception:
+    except Exception as e:
+        # _load never raises (it quarantines corruption internally), so
+        # this is an import failure — loud, or CUSUM freezes silently
+        # looking like "no trades"
+        print(f"[CUSUM] trade_memory unavailable ({e}) — outcomes skipped")
         return []
     out = []
     for symbol, trades in data.items():
@@ -292,6 +347,20 @@ def run_cusum(prefix: str, label: str) -> dict | None:
 def run_check(prefix: str, label: str) -> dict | None:
     """Daily entry: check, update consecutive-day state, fire trigger."""
     result = check_drift(prefix)
+
+    # CUSUM + pruning run even when PSI is not checkable (legacy manifest
+    # without pred_deciles, weekend windows with <MIN_LIVE_SAMPLES stock
+    # preds): CUSUM needs only manifest hit_rate + trade_memory — exactly
+    # the outcome-side monitor wanted when predictions are missing — and
+    # prune bounds pred_history.jsonl on disk. Both print/notify only,
+    # never the retrain flag. run_cusum persists its own state keys
+    # before we load ours below, so nothing is clobbered.
+    try:
+        run_cusum(prefix, label)
+    except Exception as e:
+        print(f"[CUSUM] {label}: check failed ({e})")
+    prune_history(prefix)
+
     today = dt.date.today().isoformat()
     state = _load_state()
     st = state.get(label, {})
@@ -343,12 +412,6 @@ def run_check(prefix: str, label: str) -> dict | None:
         except Exception:
             pass
 
-    try:
-        run_cusum(prefix, label)
-    except Exception as e:
-        print(f"[CUSUM] {label}: check failed ({e})")
-
-    prune_history(prefix)
     return result
 
 

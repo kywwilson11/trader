@@ -2,10 +2,10 @@
 
 `compute_limit_price` has been spread-aware since commit 8c9d860, but its
 decision lives in buried magic constants (a 0.1% spread cutoff and a
-"10%-of-half-spread" offset whose comment says 20%) that the backtester does
-not share. This module lifts that decision into one pure, table-driven
-function with named thresholds in strategy_config, so the live loop and the
-policy backtest choose the SAME tactic and the thresholds are auditable.
+20%-of-half-spread offset) that the backtester does not share. This module
+lifts that decision into one pure, table-driven function with named
+thresholds in strategy_config, so that — once wired — the live loop and the
+policy backtest will choose the SAME tactic and the thresholds are auditable.
 
 Tactic vocabulary:
   cross  — take liquidity now (marketable). Tight spreads, mega-caps, or thin
@@ -19,15 +19,20 @@ the 1-3bps BTC/ETH spread, so posting is strictly cheaper regardless of width.
 
 NOTHING here is tuned on realized P&L — thresholds are microstructure priors +
 the offline Eff_Spread_Pct ranking (name_class). Pure function, no I/O, no
-model; unit-tested in isolation. Live wiring of these tactics into order_utils
-is a separate (Jetson-validated) step.
+model; unit-tested in isolation. NOT YET WIRED: neither order_utils (live
+tactics) nor backtest.py (replay) consumes this table — both wirings are
+separate (Jetson-validated) steps.
 """
+
+import math
 
 from strategy_config import (EXEC_TAKER_FLOOR_PCT, EXEC_WIDE_SPREAD_PCT,
                              EXEC_POST_INSIDE_FRAC, EXEC_EDGE_HEADROOM_MULT)
 
-# name_class is seeded OFFLINE from the per-name Eff_Spread_Pct ranking
-# (liquidity.py), refreshed weekly — not from live quotes.
+# name_class WILL BE seeded offline from the per-name Eff_Spread_Pct ranking
+# (liquidity.py) with a weekly refresh — not from live quotes. The seed table
+# + refresh job are not built yet, so wired callers would currently receive
+# the 'mid' default for every symbol (disabling the mega/spec rows).
 VALID_CLASSES = ('mega', 'mid', 'spec')
 
 
@@ -39,6 +44,9 @@ def choose_entry_tactic(asset_type, live_spread_pct, pred_return=None,
         asset_type: 'crypto' (always post) or 'stock'.
         live_spread_pct: current quoted bid/ask spread, PERCENT of price.
         pred_return: model's predicted return (PERCENT), for edge headroom.
+            SIGNED, for a LONG entry — a negative (short) prediction always
+            fails the headroom test, so short callers must pass the edge
+            magnitude (abs) instead.
         edge_floor: the cost/edge floor (PERCENT) the entry must clear.
         name_class: 'mega'|'mid'|'spec' from the offline liquidity ranking.
 
@@ -46,7 +54,14 @@ def choose_entry_tactic(asset_type, live_spread_pct, pred_return=None,
     inside our side of the quote to rest (PERCENT of price); 0 for cross.
     """
     nc = name_class if name_class in VALID_CLASSES else 'mid'
-    sp = max(float(live_spread_pct or 0.0), 0.0)
+    sp = float(live_spread_pct or 0.0)
+    if not math.isfinite(sp):
+        # NaN/inf spread is MISSING data, not a wide market: fail closed to
+        # the same path as None (-> cross). NaN survives `or 0.0` (truthy)
+        # and both band comparisons, and would otherwise emit a NaN offset
+        # that poisons the limit price.
+        sp = 0.0
+    sp = max(sp, 0.0)
 
     # Crypto: maker rebate dominates the spread -> always post.
     if asset_type == 'crypto':

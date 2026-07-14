@@ -254,14 +254,66 @@ _heartbeat_status = None  # Reference to current status dict
 _heartbeat_stop = threading.Event()
 _heartbeat_lock = threading.Lock()
 
+# Main-loop liveness stamp. The heartbeat daemon used to feed the systemd
+# watchdog UNCONDITIONALLY, so WatchdogSec=900 only ever caught whole-process
+# death — a logically hung main thread (blocked forever in a phase's stdout
+# read, a wedged API call) kept getting its lease renewed. The heartbeat now
+# forwards WATCHDOG=1 only while the main thread has stamped progress
+# recently; a real hang lets the lease expire and systemd restarts us.
+_last_progress = time.time()
+WATCHDOG_STALL_SEC = 600  # < WatchdogSec=900, > any legitimate quiet gap
+
+
+def mark_progress():
+    """Stamp main-loop liveness (called from phase output + monitor loops)."""
+    global _last_progress
+    _last_progress = time.time()
+
+
+def _bounded_thermal_wait(max_temp=70, deadline_sec=1800, poll_interval=30):
+    """Poll GPU temp until it drops below max_temp or deadline_sec elapses.
+
+    Replaces a direct hw_monitor.wait_for_cool_gpu() call, which can block
+    unboundedly. A deliberate thermal wait IS progress, not a hang, so
+    every poll stamps mark_progress() — without this, >WATCHDOG_STALL_SEC
+    of cooling would let the systemd watchdog lease lapse and kill an
+    otherwise-healthy pipeline mid-cooldown. Fails open (returns
+    immediately) on import/read errors or sensor unavailability.
+    """
+    try:
+        from hw_monitor import get_gpu_temp
+    except Exception:
+        return
+    deadline = time.time() + deadline_sec
+    while True:
+        try:
+            temp = get_gpu_temp()
+        except Exception:
+            return
+        mark_progress()
+        if temp is None or temp < max_temp:
+            return
+        if time.time() >= deadline:
+            _print(f"[HW] GPU still hot ({temp:.0f}C) after {deadline_sec}s"
+                   f" wait, proceeding anyway")
+            return
+        time.sleep(poll_interval)
+
 
 def _heartbeat_loop():
     """Background thread: re-write status file + systemd watchdog every 30s."""
     while not _heartbeat_stop.wait(30):
         with _heartbeat_lock:
             if _heartbeat_status is not None:
-                write_status(_heartbeat_status, force=True)
-        _sd_notify(b'WATCHDOG=1')
+                try:
+                    write_status(_heartbeat_status, force=True)
+                except RuntimeError:
+                    # json.dump saw the dict mutate mid-iteration (main
+                    # thread wrote a key concurrently) — skip this beat,
+                    # the next one 30s later self-heals.
+                    pass
+        if (time.time() - _last_progress) < WATCHDOG_STALL_SEC:
+            _sd_notify(b'WATCHDOG=1')
 
 
 def write_status(status, force=False):
@@ -322,6 +374,13 @@ def run_phase(phase, log_fh, status):
     log_fh.flush()
     _print(header, end='')
 
+    # Thermal gate before GPU-heavy phases: a multi-hour Saturday Optuna run
+    # at 25W in an enclosure otherwise starts at whatever temperature the
+    # previous phase left the die at. (setup_jetson_system.sh documented this
+    # as already wired — it never was; only the bots throttled on temp.)
+    if 'search' in phase_id:
+        _bounded_thermal_wait(max_temp=70)
+
     proc = subprocess.Popen(
         phase['cmd'],
         stdout=subprocess.PIPE,
@@ -331,9 +390,12 @@ def run_phase(phase, log_fh, status):
         bufsize=1,
         text=True,
     )
+    global _current_phase_proc
+    _current_phase_proc = proc
 
     try:
         for line in proc.stdout:
+            mark_progress()
             log_fh.write(line)
             log_fh.flush()
             if _STDOUT_IS_TTY:
@@ -397,6 +459,7 @@ def run_phase(phase, log_fh, status):
         _print(f"\n[PIPELINE] Error reading phase output: {e}")
     finally:
         proc.wait()
+        _current_phase_proc = None
     status['phase_exit_code'] = proc.returncode
 
     elapsed = ''
@@ -420,6 +483,21 @@ def run_phase(phase, log_fh, status):
 # Bot management helpers
 # ---------------------------------------------------------------------------
 
+def _rotate_log(log_path, max_bytes=20_000_000):
+    """One-deep rotation for the append-mode bot stdout logs.
+
+    predict_now prints ~5-8 lines per symbol per cycle, so these files grow
+    ~10-20MB/day forever (the RotatingFileHandler in log_config covers logger
+    output only, not subprocess stdout). Root-FS disk-full kills the bots AND
+    the swapfile lives on the same device — bound it at ~2 x max_bytes.
+    """
+    try:
+        if os.path.exists(log_path) and os.path.getsize(log_path) > max_bytes:
+            os.replace(log_path, f"{log_path}.1")
+    except OSError:
+        pass  # rotation is best-effort; never block a bot launch on it
+
+
 def _start_bot(cmd, log_path):
     """Start a trading bot as a background process.
 
@@ -427,12 +505,28 @@ def _start_bot(cmd, log_path):
     don't reserve ~300MB of GPU memory each via CUDA context init.
     Returns (proc, file_handle) so the caller can close the log FH when done.
     """
+    _rotate_log(log_path)
     fh = open(log_path, 'a')
     proc = subprocess.Popen(
         cmd, stdout=fh, stderr=subprocess.STDOUT,
         env=BOT_ENV, cwd=BASE_DIR,
     )
     return proc, fh
+
+
+def _untrack_handle(fh):
+    """Drop a closed file handle from _all_handles.
+
+    Without this, every bot start/stop/crash-restart cycle over a
+    long-running pipeline leaves the old (closed) handle in _all_handles
+    forever — unbounded growth over weeks of retrain cycles. Closing is
+    idempotent so double-close is harmless; only the tracking list needs
+    pruning.
+    """
+    try:
+        _all_handles.remove(fh)
+    except ValueError:
+        pass
 
 
 def _stop_bots(bots, log_fh):
@@ -462,6 +556,7 @@ def _stop_bots(bots, log_fh):
             fh.close()
         except Exception:
             pass
+        _untrack_handle(fh)
     bots.clear()
     # Give OS a moment to reclaim memory from terminated processes
     time.sleep(3)
@@ -541,6 +636,7 @@ def _stop_single_bot(bots, name, log_fh):
                 fh.close()
             except Exception:
                 pass
+            _untrack_handle(fh)
             bots.pop(i)
             return True
     return False
@@ -590,12 +686,29 @@ def _handle_command(cmd, bots, log_fh, status):
     _print(msg, end='')
 
     if command == 'stop_bot':
-        if want_crypto:
-            _stop_single_bot(bots, 'Crypto', log_fh)
-            _manually_stopped.add('Crypto')
-        if want_stock:
-            _stop_single_bot(bots, 'Stock', log_fh)
-            _manually_stopped.add('Stock')
+        if _COMBINED_BOTS:
+            # Combined mode runs both books as threads in ONE process — a
+            # per-book stop request has no per-book process to target.
+            # Stop the whole thing and say so loudly, instead of silently
+            # no-op'ing (the old behavior: _stop_single_bot(bots, 'Crypto'
+            # or 'Stock', ...) never matched a bot named 'Bots').
+            msg = ("  Combined mode: stopping the WHOLE 'Bots' process"
+                   " (both books trade together, or neither does)\n")
+            log_fh.write(msg)
+            log_fh.flush()
+            _print(msg, end='')
+            _stop_single_bot(bots, 'Bots', log_fh)
+            if want_crypto:
+                _manually_stopped.add('Crypto')
+            if want_stock:
+                _manually_stopped.add('Stock')
+        else:
+            if want_crypto:
+                _stop_single_bot(bots, 'Crypto', log_fh)
+                _manually_stopped.add('Crypto')
+            if want_stock:
+                _stop_single_bot(bots, 'Stock', log_fh)
+                _manually_stopped.add('Stock')
         _update_per_bot_status(bots, status)
         write_status(status, force=True)
 
@@ -606,12 +719,29 @@ def _handle_command(cmd, bots, log_fh, status):
             log_fh.write(msg)
             log_fh.flush()
             return
-        if want_crypto:
-            _manually_stopped.discard('Crypto')
-            _start_single_bot(bots, 'Crypto', log_fh)
-        if want_stock:
-            _manually_stopped.discard('Stock')
-            _start_single_bot(bots, 'Stock', log_fh)
+        if _COMBINED_BOTS:
+            combined_alive = any(n == 'Bots' and p.poll() is None
+                                 for n, p, _ in bots)
+            if combined_alive:
+                # Starting a per-book loop here would duplicate order flow
+                # alongside the already-running combined process.
+                msg = ("  Cannot start per-book bot: combined 'Bots' process"
+                       " is already running\n")
+                log_fh.write(msg)
+                log_fh.flush()
+                _print(msg, end='')
+            else:
+                run_crypto, run_stock = _BOT_SCOPE
+                _manually_stopped.discard('Crypto')
+                _manually_stopped.discard('Stock')
+                _launch_bots(bots, log_fh, run_crypto, run_stock, verb='started')
+        else:
+            if want_crypto:
+                _manually_stopped.discard('Crypto')
+                _start_single_bot(bots, 'Crypto', log_fh)
+            if want_stock:
+                _manually_stopped.discard('Stock')
+                _start_single_bot(bots, 'Stock', log_fh)
         _update_per_bot_status(bots, status)
         write_status(status, force=True)
 
@@ -632,6 +762,7 @@ def _handle_command(cmd, bots, log_fh, status):
 
 def _check_restart_bots(bots, log_fh):
     """Check for crashed bots and restart them (skips manually stopped)."""
+    mark_progress()  # each monitor cycle proves the main loop is alive
     for i, (name, proc, bot_fh) in enumerate(bots):
         if proc.poll() is not None:
             if name in _manually_stopped:
@@ -639,6 +770,7 @@ def _check_restart_bots(bots, log_fh):
                     bot_fh.close()
                 except Exception:
                     pass
+                _untrack_handle(bot_fh)
                 bots.pop(i)
                 return  # List modified; next cycle will re-check
             # Close the old log file handle before opening a new one
@@ -646,9 +778,15 @@ def _check_restart_bots(bots, log_fh):
                 bot_fh.close()
             except Exception:
                 pass
+            _untrack_handle(bot_fh)
             if name == 'Bots':  # combined-mode process
                 log_path = CRYPTO_BOT_LOG
                 cmd = [PYTHON, '-u', 'run_bots.py']
+                run_crypto, run_stock = _BOT_SCOPE
+                if run_crypto and not run_stock:
+                    cmd.append('--crypto-only')
+                elif run_stock and not run_crypto:
+                    cmd.append('--stock-only')
             else:
                 log_path = CRYPTO_BOT_LOG if name == 'Crypto' else STOCK_BOT_LOG
                 cmd = [PYTHON, '-u',
@@ -772,7 +910,14 @@ def _build_training_phases(trials, train_crypto, train_stock, mode='',
         phases.append({
             'id': 'crypto_backtest_gate',
             'label': 'Crypto Policy Backtest Gate',
-            'cmd': [PYTHON, '-u', 'backtest.py', '--days', '60',
+            # 44 days, not 60: the crypto training file spans ~1y, so the
+            # untouched holdout is its final ~12% ~= 44 days. A 60d window
+            # reached ~16 days INTO the search region (fold-3 validation,
+            # LightGBM early-stop slices, meta-label training rows) — ~27%
+            # of the gate was in-sample and biased toward passing. The stock
+            # gate keeps 60d: its file spans 2021->now, so a 60d window sits
+            # entirely inside that book's ~8-month holdout.
+            'cmd': [PYTHON, '-u', 'backtest.py', '--days', '44',
                     '--trials', str(max(trials, 10)), '--gate'],
         })
     if train_stock:
@@ -805,15 +950,97 @@ def _build_training_phases(trials, train_crypto, train_stock, mode='',
     return phases
 
 
+def _resolve_retrain_trials(args, adaptive_trial_counts):
+    """Trial-count precedence shared by the --no-retrain manual-trigger
+    branch and the Phase-C weekly retrain branch: honor an explicit
+    --retrain-trials override (anything != the 100 default) over the
+    adaptive per-book trial counts (worst case across active books).
+    """
+    if args.retrain_trials != 100:
+        return args.retrain_trials
+    return max(adaptive_trial_counts.values()) if adaptive_trial_counts else 100
+
+
+def _needs_force_harvest(train_crypto, train_stock):
+    """True if an active book's data file is missing the max-forward-bars
+    Target_Return column, plus the human-readable reasons (for the caller
+    to log). The adaptive forward_bars space can expand between retrains;
+    if the on-disk file predates that expansion, training would silently
+    run against a stale label horizon until a re-harvest happens.
+
+    Returns (needs_force: bool, reasons: list[str]).
+    """
+    import pandas as pd
+    from data_utils import get_data_path
+
+    reasons = []
+    for at, active in (('crypto', train_crypto), ('stock', train_stock)):
+        if not active:
+            continue
+        max_fb = get_max_forward_bars(at)
+        data_path = get_data_path(at)
+        if not data_path.exists():
+            continue
+        if str(data_path).endswith('.parquet'):
+            import pyarrow.parquet as pq
+            cols = pq.read_schema(data_path).names
+        else:
+            cols = pd.read_csv(data_path, nrows=0).columns.tolist()
+        if f'Target_Return_{max_fb}' not in cols:
+            reasons.append(f"{at}: Target_Return_{max_fb} missing from data,"
+                           f" forcing re-harvest")
+    return (len(reasons) > 0, reasons)
+
+
 MAX_PHASE_RETRIES = 3
 RETRY_WAIT_SECONDS = 30
 
 
+def _phase_book(phase_id):
+    """Which book a phase belongs to, from its id prefix ('crypto_...',
+    'stock_...'). Used to scope failures to one book (C8) so a crypto
+    failure doesn't silently skip the entire stock retrain."""
+    if phase_id.startswith('crypto_'):
+        return 'crypto'
+    if phase_id.startswith('stock_'):
+        return 'stock'
+    return 'other'
+
+
 def _run_training(phases, log_fh, status, is_retrain):
-    """Run all training phases. Returns True if all succeeded, 'suspended' if suspended."""
+    """Run all training phases, grouped by book (crypto/stock).
+
+    A genuine phase failure (after MAX_PHASE_RETRIES retries) skips only
+    that book's REMAINING phases and continues with the next book's group
+    — a crypto failure no longer silently skips the entire stock retrain.
+    A *_backtest_gate phase returning 3 (deterministic policy rejection,
+    model already rolled back — see backtest.py) is FINAL immediately: no
+    retry, and the book counts as completed-with-rollback, not failed.
+
+    Returns 'suspended' if a GUI suspend request landed mid-phase, else a
+    dict {book: bool} of per-book success (a rc==3 gate verdict counts as
+    success — the book's model is intact, just rolled back).
+    """
     global _suspend_requested
+    status.setdefault('phase_results', {})
+    failed_books = set()
+    book_success = {}
     for phase in phases:
+        phase_id = phase['id']
+        book = _phase_book(phase_id)
+        if book in failed_books:
+            msg = (f"\n[SKIP] {phase['label']} skipped — {book} book already"
+                   f" failed this run\n")
+            log_fh.write(msg)
+            log_fh.flush()
+            _print(msg, end='')
+            continue
+
+        rc = None
+        attempts = 0
+        gate_rejected = False
         for attempt in range(1, MAX_PHASE_RETRIES + 1):
+            attempts = attempt
             rc = run_phase(phase, log_fh, status)
             if rc == -99:
                 _suspend_requested = False
@@ -822,6 +1049,11 @@ def _run_training(phases, log_fh, status, is_retrain):
                 write_status(status, force=True)
                 return 'suspended'
             if rc == 0:
+                break
+            if phase_id.endswith('_backtest_gate') and rc == 3:
+                # Deterministic policy rejection, model already rolled
+                # back by backtest.py --gate. Retrying is useless.
+                gate_rejected = True
                 break
             # Failed — retry with fresh CUDA context (Optuna DB preserves progress)
             if attempt < MAX_PHASE_RETRIES:
@@ -839,28 +1071,40 @@ def _run_training(phases, log_fh, status, is_retrain):
                 log_fh.flush()
                 _print(msg, end='')
 
-        # Save final scores
-        if phase['id'] == 'crypto_search':
-            status['crypto_final_score'] = status.get('best_score', 0)
-        elif phase['id'] == 'stock_search':
-            status['stock_final_score'] = status.get('best_score', 0)
+        # Save final scores. Tri-state: None (JSON null) when the search
+        # itself failed, instead of echoing a stale/zero best_score — the
+        # GUI reads via .get and degrades safely on null.
+        if phase_id == 'crypto_search':
+            status['crypto_final_score'] = (status.get('best_score', 0)
+                                            if rc == 0 else None)
+        elif phase_id == 'stock_search':
+            status['stock_final_score'] = (status.get('best_score', 0)
+                                           if rc == 0 else None)
 
-        if rc != 0:
-            if is_retrain:
-                msg = (f"\nWARNING: {phase['label']} failed (exit {rc}),"
-                       f" bots continue with existing models\n")
-                log_fh.write(msg)
-                log_fh.flush()
-                _print(msg, end='')
-                return False
-            else:
-                msg = (f"\nWARNING: {phase['label']} failed (exit {rc}),"
-                       f" continuing to bot phase with existing models\n")
-                log_fh.write(msg)
-                log_fh.flush()
-                _print(msg, end='')
-                return False
-    return True
+        if gate_rejected:
+            outcome = 'gate_failed_rolled_back'
+        elif rc == 0:
+            outcome = 'ok'
+        else:
+            outcome = 'failed'
+        status['phase_results'][phase_id] = {
+            'rc': rc, 'attempts': attempts, 'outcome': outcome,
+        }
+        write_status(status, force=True)
+
+        if outcome == 'failed':
+            failed_books.add(book)
+            book_success[book] = False
+            tail = ('bots continue with existing models' if is_retrain
+                    else 'continuing to bot phase with existing models')
+            msg = (f"\nWARNING: {phase['label']} failed (exit {rc}), "
+                   f"{tail}; remaining {book} phases skipped this run\n")
+            log_fh.write(msg)
+            log_fh.flush()
+            _print(msg, end='')
+        else:
+            book_success.setdefault(book, True)
+    return book_success
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +1144,15 @@ _all_bots = []
 _shutdown_requested = False
 _manually_stopped = set()    # Bot names user explicitly stopped (skip auto-restart)
 _suspend_requested = False   # Set True when GUI requests training suspension
+# In-flight training-phase subprocess (Optuna search etc). Set by run_phase
+# right after Popen, cleared in its finally block. Lets _signal_handler
+# terminate a live phase child on Ctrl+C/SIGTERM instead of blocking
+# forever in proc.wait() on a child that never got its own signal.
+_current_phase_proc = None
+# (run_crypto, run_stock) as decided in main() — used by _check_restart_bots
+# to rebuild the combined 'Bots' cmd with the correct --crypto-only /
+# --stock-only scope flag after a crash-restart.
+_BOT_SCOPE = (True, True)
 
 
 def _signal_handler(signum, frame):
@@ -910,6 +1163,21 @@ def _signal_handler(signum, frame):
     _shutdown_requested = True
     sig_name = signal.Signals(signum).name
     _print(f"\n[PIPELINE] {sig_name} received, shutting down...")
+    # Terminate an in-flight phase subprocess (e.g. a multi-hour Optuna
+    # search) — the main thread is blocked in proc.wait() inside run_phase
+    # and that child never receives a signal of its own, so without this
+    # a Ctrl+C/SIGTERM during training hangs forever.
+    if _current_phase_proc is not None:
+        try:
+            if _current_phase_proc.poll() is None:
+                _current_phase_proc.terminate()
+                try:
+                    _current_phase_proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _current_phase_proc.kill()
+                    _current_phase_proc.wait(timeout=5)
+        except Exception:
+            pass
     # Stop bot processes
     for name, proc, fh in _all_bots:
         try:
@@ -967,6 +1235,9 @@ def main():
     run_crypto = not args.stock_only
     run_stock = not args.crypto_only
 
+    global _BOT_SCOPE
+    _BOT_SCOPE = (run_crypto, run_stock)
+
     # Preserve final scores from previous runs (e.g. crypto score when restarting stock-only)
     prev_status = {}
     try:
@@ -990,6 +1261,14 @@ def main():
         'bots_running': False,
         'crypto_bot_running': False,
         'stock_bot_running': False,
+        # Pre-seeded (not created-then-popped) so the heartbeat thread's
+        # concurrent json.dump(status) can never observe a mid-mutation
+        # dict-size change ("dict changed size during iteration") — see
+        # the read-then-assign-None sites below instead of status.pop(...).
+        '_pending_bot_start': None,
+        'phase_results': {},
+        # gui.py reads this to preserve flags across GUI-triggered restarts.
+        'launch_args': sys.argv[1:],
     }
 
     log_fh = open(LOG_FILE, 'a')
@@ -1112,6 +1391,13 @@ def main():
                         _handle_command(cmd, bots, log_fh, status)
                 _check_restart_bots(bots, log_fh)
                 _update_per_bot_status(bots, status)
+                write_status(status)
+                # Mirrors the Phase-C weekly loop: without these, the
+                # Telegram /halt //flatten kill switch and the daily PSI
+                # drift + shadow-challenger check silently never ran in
+                # --no-retrain mode.
+                _maybe_run_drift_check(log_fh)
+                _check_telegram_commands(log_fh, status)
                 trigger = _check_retrain_trigger()
                 if trigger:
                     manual_cycle += 1
@@ -1136,10 +1422,24 @@ def main():
                         atrial = get_trial_count(amode)
                         adaptive_modes[at] = amode
                         adaptive_trial_counts[at] = atrial
-                    retrain_trials = max(adaptive_trial_counts.values()) if adaptive_trial_counts else 100
-                    retrain_mode = 'explore' if 'explore' in adaptive_modes.values() else 'refine'
+                    # Same precedence as the Phase-C weekly branch (C1 fix:
+                    # --no-retrain used to always ignore --retrain-trials).
+                    retrain_trials = _resolve_retrain_trials(args, adaptive_trial_counts)
+                    retrain_mode = ('' if args.retrain_trials != 100 else
+                                    ('explore' if 'explore' in adaptive_modes.values()
+                                     else 'refine'))
+                    # Same schema check as the Phase-C weekly branch (C1
+                    # fix: --no-retrain used to never force a re-harvest
+                    # after a forward_bars expansion).
+                    force_harvest, force_reasons = _needs_force_harvest(rt_crypto, rt_stock)
+                    for r in force_reasons:
+                        msg = f"[ADAPTIVE] {r}\n"
+                        log_fh.write(msg)
+                        log_fh.flush()
+                        _print(msg, end='')
                     retrain_phases = (
-                        _build_harvest_phases(False, rt_crypto, rt_stock)
+                        _build_harvest_phases(False, rt_crypto, rt_stock,
+                                              force=force_harvest)
                         + _build_training_phases(retrain_trials, rt_crypto, rt_stock,
                                                  mode=retrain_mode, shadow=True)
                     )
@@ -1157,7 +1457,12 @@ def main():
                     write_status(status, force=True)
                     result = _run_training(retrain_phases, log_fh, status, is_retrain=True)
                     if result == 'suspended':
-                        pending = status.pop('_pending_bot_start', {})
+                        # Read-then-assign-None, not pop: the key is
+                        # pre-seeded in main() so this never changes the
+                        # dict's size out from under the heartbeat
+                        # thread's concurrent json.dump(status).
+                        pending = status.get('_pending_bot_start') or {}
+                        status['_pending_bot_start'] = None
                         if pending.get('crypto'):
                             _start_single_bot(bots, 'Crypto', log_fh)
                         if pending.get('stock'):
@@ -1268,37 +1573,19 @@ def main():
                 _print(msg, end='')
 
             # Use explicit --retrain-trials if not default, else adaptive max
-            if args.retrain_trials != 100:
-                retrain_trials = args.retrain_trials
-                retrain_mode = ''
-            else:
-                retrain_trials = max(adaptive_trial_counts.values()) if adaptive_trial_counts else 100
-                # Use explore if any asset needs it
-                retrain_mode = 'explore' if 'explore' in adaptive_modes.values() else 'refine'
+            retrain_trials = _resolve_retrain_trials(args, adaptive_trial_counts)
+            retrain_mode = ('' if args.retrain_trials != 100 else
+                            # Use explore if any asset needs it
+                            ('explore' if 'explore' in adaptive_modes.values()
+                             else 'refine'))
 
             # Check if harvest needed due to forward_bars expansion
-            force_harvest = False
-            for at in ['crypto', 'stock']:
-                if (at == 'crypto' and not rt_crypto) or (at == 'stock' and not rt_stock):
-                    continue
-                max_fb = get_max_forward_bars(at)
-                # Check columns in Parquet (fast) or CSV
-                import pandas as pd
-                from data_utils import get_data_path
-                data_path = get_data_path(at)
-                if data_path.exists():
-                    if str(data_path).endswith('.parquet'):
-                        import pyarrow.parquet as pq
-                        cols = pq.read_schema(data_path).names
-                    else:
-                        cols = pd.read_csv(data_path, nrows=0).columns.tolist()
-                    if f'Target_Return_{max_fb}' not in cols:
-                        force_harvest = True
-                        msg = (f"[ADAPTIVE] {at}: Target_Return_{max_fb} missing from data, "
-                               f"forcing re-harvest\n")
-                        log_fh.write(msg)
-                        log_fh.flush()
-                        _print(msg, end='')
+            force_harvest, force_reasons = _needs_force_harvest(rt_crypto, rt_stock)
+            for r in force_reasons:
+                msg = f"[ADAPTIVE] {r}\n"
+                log_fh.write(msg)
+                log_fh.flush()
+                _print(msg, end='')
 
             # Weekly retrains MUST re-harvest: the docstring always promised
             # "re-harvest + retrain", but skip_harvest=not force_harvest
@@ -1343,7 +1630,11 @@ def main():
             result = _run_training(retrain_phases, log_fh, status, is_retrain=True)
 
             if result == 'suspended':
-                pending = status.pop('_pending_bot_start', {})
+                # Read-then-assign-None, not pop: see the no-retrain
+                # branch above — keeps the dict size stable for the
+                # heartbeat thread's concurrent json.dump(status).
+                pending = status.get('_pending_bot_start') or {}
+                status['_pending_bot_start'] = None
                 if pending.get('crypto'):
                     _start_single_bot(bots, 'Crypto', log_fh)
                 if pending.get('stock'):

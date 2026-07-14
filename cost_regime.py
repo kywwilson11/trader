@@ -44,11 +44,13 @@ def amihud_illiq(close, volume, window=21, scale=1e6):
     Strictly trailing (rolling) -> point-in-time.
     """
     import pandas as pd
-    c = pd.Series(np.asarray(close, dtype=float))
-    v = pd.Series(np.asarray(volume, dtype=float))
+    idx = close.index if isinstance(close, pd.Series) else None
+    c = pd.Series(np.asarray(close, dtype=float), index=idx)
+    v = pd.Series(np.asarray(volume, dtype=float), index=idx)
     ret = c.pct_change().abs()
     dollar_vol = (c * v).replace(0.0, np.nan)
     daily = (ret / dollar_vol) * scale
+    daily = daily.where(np.isfinite(daily))  # zero prior close -> inf ratio
     return daily.rolling(window, min_periods=max(2, window // 2)).mean()
 
 
@@ -74,7 +76,9 @@ def parse_fred_vixcls(csv_text):
     val = pd.to_numeric(df[val_col], errors='coerce')
     s = pd.Series(val.values, index=idx).dropna()
     s = s[~s.index.isna()]
-    return s.sort_index()
+    # Header-only / all-'.' CSVs must read as failure, not an empty success —
+    # fetch_fred_vixcls's contract is 'parsed Series or None'.
+    return s.sort_index() if len(s) else None
 
 
 def fetch_fred_vixcls():
@@ -84,7 +88,8 @@ def fetch_fred_vixcls():
     try:
         req = urllib.request.Request(_FRED_VIXCLS_URL,
                                      headers={'User-Agent': 'trader/1.0'})
-        text = urllib.request.urlopen(req, timeout=30).read().decode('utf-8')
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            text = resp.read().decode('utf-8')
         return parse_fred_vixcls(text)
     except Exception as e:
         print(f"[COST-REGIME] FRED VIXCLS fetch failed: {e}")
@@ -105,8 +110,11 @@ def vix_regime_code(level):
 def vix_features_for_index(vix_daily, index, pct_window=252):
     """Point-in-time VIX meta features aligned to an (hourly) bar index.
 
-    Uses the PRIOR day's close VIX (shift 1) ffilled onto the grid — a bar on
-    day D sees D-1's official close, never D's (no look-ahead). Returns dict:
+    Uses the PRIOR observation's close (shift 1) ffilled onto the grid — a bar
+    on day D sees the close of the trading day BEFORE the most recent VIX
+    observation on or before D. On weekends/holidays that is one trading day
+    staler than the last published close (deliberately conservative; never a
+    look-ahead). Returns dict:
       VIX_Level     lagged daily VIX
       VIX_Regime    0/1/2 from fixed thresholds
       VIX_Pctile    trailing-`pct_window` percentile rank in [0,1] (self-
@@ -117,7 +125,8 @@ def vix_features_for_index(vix_daily, index, pct_window=252):
     if len(s) < 5:
         return None
     lagged = s.shift(1)                                   # only yesterday's close
-    pct = s.rolling(pct_window, min_periods=20).apply(
+    pct = s.rolling(pct_window,
+                    min_periods=max(2, min(20, pct_window))).apply(
         lambda w: (w[-1] >= w).mean(), raw=True).shift(1)  # trailing rank, lagged
     regime = lagged.map(vix_regime_code)
 
@@ -130,6 +139,13 @@ def vix_features_for_index(vix_daily, index, pct_window=252):
     pct.index = pd.DatetimeIndex(pct.index).normalize()
     uniq_days = pd.DatetimeIndex(day).unique()
     day_ser = pd.Series(day)
+
+    # _map's ffill extends the last VIX value indefinitely — a truncated FRED
+    # response would silently flatline all three features. Logging only.
+    gap_days = (day.max() - lagged.index.max()).days if len(day) else 0
+    if gap_days > 5:
+        print(f"[COST-REGIME] newest bar is {gap_days} days past the last VIX "
+              f"observation — features are stale forward-fills")
 
     def _map(series):
         # daily-grid forward-fill on a UNIQUE index, then broadcast to each bar

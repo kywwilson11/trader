@@ -16,11 +16,14 @@ harvest dropna never silently drops bars):
                    very negative funding (crowded SHORTS paying longs) with the
                    open interest to fuel a short squeeze (price-up risk)
 
-This is the FEATURE half that ships into harvest_crypto_data and lets the model
-learn the interaction; the directional squeeze-timing EVENT-STUDY (gated by net
-expectancy on a purged-CV holdout, per the wave-5 discipline) is a separate
-research script that needs the re-fetched funding/OI archives. PREFER the model
-learning from this column over any hardcoded squeeze threshold.
+This is the FEATURE half INTENDED to ship into harvest_crypto_data — that
+wiring is NOT yet done (the columns have no consumers outside this module; see
+the wave-8 activation backlog: orphaned/zero consumers) — once wired it lets
+the model learn the interaction. The directional squeeze-timing EVENT-STUDY
+(gated by net expectancy on a purged-CV holdout, per the wave-5 discipline) is
+a separate research script that needs the re-fetched funding/OI archives.
+PREFER the model learning from this column over any hardcoded squeeze
+threshold.
 """
 
 import numpy as np

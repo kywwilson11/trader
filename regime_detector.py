@@ -1,8 +1,8 @@
 """HMM-based regime detection for adaptive trading parameters.
 
 Fits a Gaussian HMM to return series and classifies the current market
-into bull/bear/neutral regimes. Based on Sargent/Sims (2011 Nobel) regime
-switching models.
+into bull/bear/neutral regimes — Hamilton (1989)-style Markov
+regime-switching, implemented as a Gaussian HMM.
 """
 
 import time
@@ -18,6 +18,22 @@ _REFIT_INTERVAL = 86400  # 1 day
 # Transition smoothing: require N consecutive bars in new regime before switching
 _REGIME_PERSISTENCE = 3
 _last_regime: dict[str, tuple[str, int]] = {}  # {symbol: (label, consecutive_count)}
+
+# Failure visibility: a permanently broken detector (missing hmmlearn,
+# incompatible model, degenerate fits) must not hide at DEBUG level.
+_import_warned = False           # hmmlearn absence is permanent per process: warn once
+_fail_counts: dict[str, int] = {}  # {kind: count} for rate-limited fit/predict warnings
+_WARN_EVERY = 25
+
+
+def _warn_every_nth(kind: str, msg: str) -> None:
+    """WARNING on the 1st and every Nth failure, DEBUG otherwise (spam guard)."""
+    n = _fail_counts.get(kind, 0) + 1
+    _fail_counts[kind] = n
+    if n == 1 or n % _WARN_EVERY == 0:
+        logger.warning("%s (failure #%d this process)", msg, n)
+    else:
+        logger.debug("%s", msg)
 
 
 def fit_hmm(returns: np.ndarray, n_states: int = 3):
@@ -37,7 +53,17 @@ def fit_hmm(returns: np.ndarray, n_states: int = 3):
 
     try:
         from hmmlearn.hmm import GaussianHMM
+    except Exception as e:
+        # Undeclared/broken dependency disables the whole regime layer
+        # (every sizing call quietly falls back to neutral) — surface it.
+        global _import_warned
+        if not _import_warned:
+            _import_warned = True
+            logger.warning("hmmlearn unavailable — HMM regime layer disabled "
+                           "(sizing stays neutral): %s", e)
+        return None, None
 
+    try:
         X = returns.reshape(-1, 1)
         model = GaussianHMM(n_components=n_states, covariance_type='full',
                             n_iter=100, random_state=42)
@@ -54,17 +80,16 @@ def fit_hmm(returns: np.ndarray, n_states: int = 3):
 
         state_labels = {}
         for rank, state_id in enumerate(sorted_states):
-            label = labels_list[rank] if rank < len(labels_list) else f'state_{state_id}'
             state_labels[state_id] = {
-                'label': label,
+                'label': labels_list[rank],
                 'mean': float(means[state_id]),
-                'vol': float(vols[state_id]) if state_id < len(vols) else 0.0,
+                'vol': float(vols[state_id]),
             }
 
         return model, state_labels
 
     except Exception as e:
-        logger.debug("HMM fit failed: %s", e)
+        _warn_every_nth('fit', f"HMM fit failed: {e}")
         return None, None
 
 
@@ -78,7 +103,11 @@ def get_current_regime(model, state_labels: dict,
         recent_returns: Recent return series (at least 10 points)
 
     Returns:
-        dict with 'label', 'probabilities', 'sizing_mult', 'threshold_mult', 'stop_mult'
+        dict with 'label', 'probabilities', 'sizing_mult'.
+        'label' comes from the Viterbi MAP state path (model.predict);
+        'probabilities' are the marginal posteriors for the last bar
+        (model.predict_proba) — the two can disagree, so the probs are
+        diagnostics, NOT the label's own distribution.
     """
     if model is None or len(recent_returns) < 10:
         return _default_regime()
@@ -94,26 +123,19 @@ def get_current_regime(model, state_labels: dict,
         info = state_labels.get(current_state, {'label': 'unknown', 'mean': 0, 'vol': 0})
         label = info['label']
 
-        # Regime-based parameter adjustments
+        # Regime-based sizing adjustment (sizing only — base_loop consumes
+        # 'sizing_mult' and 'label'; entry thresholds/stops are NOT wired)
         if label == 'bull':
             sizing_mult = 1.2
-            threshold_mult = 0.8   # lower threshold = more trades
-            stop_mult = 1.0
         elif label == 'bear':
             sizing_mult = 0.3
-            threshold_mult = 1.5   # higher threshold = fewer trades
-            stop_mult = 0.8        # tighter stops
         else:  # neutral or high-vol
             # Check if this is a high-vol state
             if info['vol'] > np.median([s['vol'] for s in state_labels.values()]) * 1.5:
                 sizing_mult = 0.5
-                threshold_mult = 1.2
-                stop_mult = 1.3    # wider stops for high vol
                 label = 'high_vol'
             else:
                 sizing_mult = 1.0
-                threshold_mult = 1.0
-                stop_mult = 1.0
 
         prob_dict = {}
         for sid, p in enumerate(probs):
@@ -124,12 +146,10 @@ def get_current_regime(model, state_labels: dict,
             'label': label,
             'probabilities': prob_dict,
             'sizing_mult': sizing_mult,
-            'threshold_mult': threshold_mult,
-            'stop_mult': stop_mult,
         }
 
     except Exception as e:
-        logger.debug("HMM regime prediction failed: %s", e)
+        _warn_every_nth('predict', f"HMM regime prediction failed: {e}")
         return _default_regime()
 
 
@@ -138,8 +158,6 @@ def _default_regime():
         'label': 'unknown',
         'probabilities': {},
         'sizing_mult': 1.0,
-        'threshold_mult': 1.0,
-        'stop_mult': 1.0,
     }
 
 
@@ -151,7 +169,8 @@ def get_cached_regime(symbol: str, returns: np.ndarray) -> dict:
         returns: Full return series for fitting (percentage returns)
 
     Returns:
-        Regime dict with label, sizing_mult, threshold_mult, stop_mult.
+        Regime dict with label, probabilities, sizing_mult
+        (see get_current_regime).
     """
     now = time.time()
 
@@ -166,9 +185,13 @@ def get_cached_regime(symbol: str, returns: np.ndarray) -> dict:
     if model is not None:
         _hmm_cache[symbol] = (model, labels, now)
         regime = get_current_regime(model, labels, returns[-50:])
+        # Log the RAW fitted label/probs before smoothing: on the first call
+        # for a symbol _smooth_regime always forces 'unknown', which would
+        # discard the fresh fit from its only INFO-level trace.
+        raw_label, raw_probs = regime['label'], regime['probabilities']
         regime = _smooth_regime(symbol, regime)
-        logger.info("[REGIME] %s: %s (probs=%s)", symbol, regime['label'],
-                    regime['probabilities'])
+        logger.info("[REGIME] %s: fitted %s (probs=%s), smoothed -> %s",
+                    symbol, raw_label, raw_probs, regime['label'])
         return regime
 
     return _default_regime()

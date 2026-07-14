@@ -9,7 +9,7 @@ probability the observed Sharpe exceeds the expected max under the null?
 
 Promotion gates in this repo:
   - holdout Sharpe > 0 on a final time slice Optuna never saw, AND
-  - DSR > DSR_MIN on that holdout (default 0.60)
+  - DSR >= DSR_MIN on that holdout (default 0.60)
 
 Also provides a coarse CSCV-style probability-of-backtest-overfitting
 estimate from per-trial fold scores, a proper Combinatorially-Symmetric
@@ -33,7 +33,7 @@ def _norm_cdf(x: float) -> float:
 
 
 def _norm_ppf(p: float) -> float:
-    """Inverse normal CDF (Acklam's rational approximation; |err| < 1.15e-9)."""
+    """Inverse normal CDF (Acklam's rational approximation; relative |err| < 1.15e-9)."""
     if not 0.0 < p < 1.0:
         raise ValueError(f"p must be in (0,1), got {p}")
     a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
@@ -93,6 +93,9 @@ def deflated_sharpe_ratio(observed_sr: float, benchmark_sr: float,
     """
     if n_obs < 10:
         return 0.0
+    if n_eff is not None and not math.isfinite(float(n_eff)):
+        n_eff = None  # a NaN slips through the min/max clamps and poisons
+        #               z -> dsr=nan; fall back to the IID raw count
     ne = n_obs if n_eff is None else float(n_eff)
     # Never let an effective count exceed the raw count or fall below the
     # 10-sample floor the gate trusts.
@@ -134,6 +137,9 @@ def dsr_from_trade_returns(trade_returns, n_trials: int,
     if n < 10 or r.std() < 1e-12:
         return {'sr': 0.0, 'expected_max_sr': 0.0, 'dsr': 0.0, 'n': n,
                 'n_eff': float(n)}
+    if n_eff is not None and not math.isfinite(float(n_eff)):
+        n_eff = None  # NaN survives the clamps and yields dsr=nan (a
+        #               confusing spurious gate fail); fall back to IID
     ne = float(n) if n_eff is None else min(max(float(n_eff), 10.0), float(n))
     sr = float(r.mean() / r.std())
     centered = r - r.mean()
@@ -165,8 +171,18 @@ def pbo_from_fold_scores(fold_score_rows) -> float | None:
     IS winner is a below-median OOS performer. With only 3 folds this is a
     coarse screen, not a substitute for the holdout gate.
     """
-    rows = [np.asarray(r, dtype=np.float64) for r in fold_score_rows
-            if r is not None and len(r) >= 2 and np.all(np.isfinite(r))]
+    rows = []
+    for r in fold_score_rows:
+        if r is None:
+            continue
+        try:
+            # Coerce first: np.isfinite on a raw row holding a non-numeric
+            # entry (e.g. None) raises TypeError instead of filtering it.
+            a = np.asarray(r, dtype=np.float64)
+        except (TypeError, ValueError):
+            continue
+        if a.ndim == 1 and a.size >= 2 and np.all(np.isfinite(a)):
+            rows.append(a)
     if len(rows) < 8:
         return None
     n_folds = min(len(r) for r in rows)
@@ -221,17 +237,20 @@ def pbo_cscv(perf_matrix, n_groups: int = 8, perf_fn=None) -> dict | None:
     the fraction of splits where the IS-winner lands at/below the OOS median
     (lambda <= 0) — i.e. in-sample selection did not carry out of sample.
 
+    Rows containing non-finite entries are DROPPED (matching
+    pbo_from_oos_blocks) — zero-filling them would silently mutate trial
+    performance and shift the OOS ranks.
+
     Returns {pbo, n_splits, median_logit, mean_oos_rank} or None if the matrix
     is too small / degenerate.
     """
     m = np.asarray(perf_matrix, dtype=np.float64)
     if m.ndim != 2:
         return None
+    m = m[np.all(np.isfinite(m), axis=1)]
     n_trials, t = m.shape
     if n_trials < 2 or n_groups < 2 or n_groups % 2 != 0 or t < n_groups:
         return None
-    if not np.all(np.isfinite(m)):
-        m = np.where(np.isfinite(m), m, 0.0)
     score = perf_fn or _sharpe_cols
 
     # Equal column groups (drop the remainder so groups are balanced).
@@ -279,7 +298,7 @@ def serial_correlation_factor(returns, max_lag: int | None = None) -> dict:
     Lo, "The Statistics of Sharpe Ratios" (FAJ 2002): when per-period returns
     are autocorrelated, the IID Sharpe standard error is wrong. The variance
     inflation factor is
-        f = 1 + 2 * sum_{k=1}^{q} (1 - k/n) * rho_k
+        f = 1 + 2 * sum_{k=1}^{q} (1 - k/(q+1)) * rho_k
     (a Newey-West-style weighting of the sample autocorrelations rho_k). The
     serial-correlation-adjusted effective sample size is n_eff = n / f, and the
     annualized-Sharpe scaling shrinks by 1/sqrt(f) when f > 1 (positive
@@ -342,9 +361,12 @@ def pbo_from_oos_blocks(block_rows, n_groups: int = 8) -> dict | None:
     Filters None / wrong-length / non-finite / zero-variance rows, stacks the
     rest into a [n_valid_trials, n_blocks] matrix and runs pbo_cscv. Returns None
     — leaving the promotion decision governed by the DSR gate — whenever there is
-    too little to judge honestly: fewer than 2 valid trials, or fewer
-    block-columns than n_groups. The gate it feeds can only ever get STRICTER,
-    never looser, so this never blocks an honest model on a thin/early run.
+    too little to judge honestly: fewer than 2 valid trials, fewer block-columns
+    than n_groups, or a width not divisible by n_groups (pbo_cscv would then
+    silently drop the trailing — i.e. MOST RECENT — width % n_groups blocks of
+    every trial's time-ordered stream). The gate it feeds can only ever get
+    STRICTER, never looser, so this never blocks an honest model on a thin/early
+    run.
     """
     from collections import Counter
     rows = [np.asarray(r, dtype=np.float64) for r in block_rows if r is not None]
@@ -354,6 +376,6 @@ def pbo_from_oos_blocks(block_rows, n_groups: int = 8) -> dict | None:
         return None
     width = Counter(r.size for r in rows).most_common(1)[0][0]  # modal length
     rows = [r for r in rows if r.size == width]
-    if len(rows) < 2 or width < n_groups:
+    if len(rows) < 2 or width < n_groups or width % n_groups != 0:
         return None
     return pbo_cscv(np.stack(rows), n_groups=n_groups)

@@ -1,10 +1,16 @@
-"""GARCH(1,1) volatility forecasting for adaptive stop-loss and position sizing.
+"""Forward-looking volatility forecasts (HAR-RV primary, EGARCH/GARCH fallback)
+for volatility-targeted position sizing.
 
-Provides forward-looking volatility estimates that adapt to changing market
-conditions, unlike ATR which is purely backward-looking. Falls back to ATR
-when GARCH fitting fails (short series, convergence issues).
+Adapts to changing market conditions, unlike ATR which is purely
+backward-looking. Every forecaster here returns the 1-step PER-BAR (hourly)
+sigma as a decimal, or None on failure (short series, convergence, missing
+deps) — there is no ATR fallback in this module; callers keep their ATR-based
+stops and base sizing when they get None. Annualize via
+sqrt(BARS_PER_YEAR[asset_type]) before comparing against annual vol numbers
+(options_overlay.iv_from_har expects an ANNUAL rv sigma, not this module's
+raw per-bar output).
 
-Based on Engle (2003 Nobel) ARCH/GARCH framework.
+Based on Engle (2003 Nobel) ARCH/GARCH and Corsi (2009) HAR-RV.
 """
 
 import time
@@ -16,6 +22,7 @@ logger = get_logger(__name__)
 # Cache fitted models per symbol (refit hourly, not every 30s cycle)
 _model_cache: dict[str, tuple[object, float]] = {}
 _REFIT_INTERVAL = 3600  # seconds
+_arch_warned = False    # missing-'arch' warning fires once, not per fit call
 
 
 def fit_garch(returns: np.ndarray, p: int = 1, q: int = 1):
@@ -35,6 +42,17 @@ def fit_garch(returns: np.ndarray, p: int = 1, q: int = 1):
 
     try:
         from arch import arch_model
+    except ImportError as e:
+        # A missing dep silently disabling GARCH forever must be visible:
+        # WARNING once (not debug-per-call), then quiet.
+        global _arch_warned
+        if not _arch_warned:
+            logger.warning("GARCH disabled — 'arch' package not installed "
+                           "(%s); get_sigma will rely on HAR-RV only", e)
+            _arch_warned = True
+        return None
+
+    try:
         # Scale returns to percentage if they look like decimals
         if np.abs(returns).mean() < 0.01:
             returns = returns * 100
@@ -61,7 +79,9 @@ def forecast_volatility(model_result) -> float | None:
     """Forecast 1-step-ahead conditional volatility (sigma).
 
     Returns:
-        Annualized sigma as a decimal (e.g. 0.25 = 25% vol), or None.
+        PER-BAR (hourly) sigma as a decimal (e.g. 0.008 = 0.8% per bar),
+        or None. NOT annualized — multiply by sqrt(BARS_PER_YEAR) first
+        where an annual figure is needed (e.g. options_overlay.iv_from_har).
     """
     if model_result is None:
         return None
@@ -78,6 +98,9 @@ def forecast_volatility(model_result) -> float | None:
         return None
 
 
+# DEAD in live paths: stops are ATR-based (base_loop) and this floor/ceil
+# does not track strategy_config stop policy. Kept only because
+# base_loop.py:40 still imports the name — delete both together.
 def get_garch_stop(entry_price: float, sigma: float, multiplier: float = 2.0,
                    floor_pct: float = 0.03, ceil_pct: float = 0.10) -> float:
     """Compute stop-loss price using GARCH volatility.
@@ -192,7 +215,11 @@ def get_sigma(symbol: str, returns: np.ndarray, bars=None,
               asset_type: str = 'stock') -> float | None:
     """Per-bar sigma: HAR-RV from intraday ranges when enough bars
     exist, EGARCH/GARCH on returns otherwise. One day of cache per
-    symbol (daily RRV only changes at the day roll)."""
+    symbol (daily RRV only changes at the day roll).
+
+    Output is PER-BAR (hourly), NOT annual — annualize via
+    sqrt(BARS_PER_YEAR[asset_type]) before use as an annual rv sigma
+    (e.g. options_overlay.iv_from_har)."""
     try:
         from strategy_config import HAR_VOL_ENABLED
     except ImportError:

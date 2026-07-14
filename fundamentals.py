@@ -1,6 +1,9 @@
 """Fundamental data layer — yfinance + Financial Modeling Prep + SEC EDGAR.
 
 Provides P/E, market cap, insider activity, and LLM-summarized SEC filings.
+NOTE: the SEC filing-summary path is currently INOPERATIVE (EFTS query +
+field mismatch — see get_sec_filings / get_filing_summary); it fails soft
+to "" so no LLM filing summary is actually produced.
 All data aggressively cached in-memory with TTL (same pattern as sentiment.py).
 """
 
@@ -107,8 +110,8 @@ def _fetch_fmp_metrics(symbol: str) -> dict | None:
     try:
         url = f"https://financialmodelingprep.com/api/v3/key-metrics/{symbol}?limit=1&apikey={api_key}"
         req = urllib.request.Request(url, headers={"User-Agent": "trader-bot/1.0"})
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
         if data and isinstance(data, list) and len(data) > 0:
             m = data[0]
             result["pe_ratio"] = m.get("peRatio")
@@ -143,8 +146,8 @@ def get_insider_activity(symbol: str) -> dict:
     try:
         url = f"https://financialmodelingprep.com/api/v4/insider-trading?symbol={symbol}&limit=10&apikey={api_key}"
         req = urllib.request.Request(url, headers={"User-Agent": "trader-bot/1.0"})
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
 
         if data and isinstance(data, list):
             buys = sum(1 for t in data if t.get("transactionType", "").lower() in ("p-purchase", "purchase", "buy"))
@@ -170,7 +173,17 @@ def get_insider_activity(symbol: str) -> dict:
 # --- SEC EDGAR filings ---
 
 def get_sec_filings(symbol: str) -> list[dict]:
-    """Fetch recent SEC filings (10-K, 10-Q, 8-K) from EDGAR."""
+    """EFTS full-text search for filings that MENTION the symbol.
+
+    NOT the symbol's own filing history: hits are relevance-ranked
+    full-text matches from ANY filer whose documents mention the symbol,
+    top 5 kept. Currently INOPERATIVE — the `dateRange=custom` query
+    below draws HTTP 500 from EFTS (verified 2026-07-02), so this caches
+    [] for 7 days; and even a working response keys the form under
+    'file_type' (there is no 'form_type' field), so form_type is always
+    "". Repairing it (submissions API, or fixed params + fields) is a
+    behavior change deliberately not folded into this doc fix.
+    """
     cache_key = f"sec_{symbol}"
     cached = _cache_get(cache_key, SEC_TTL)
     if cached is not None:
@@ -189,8 +202,8 @@ def get_sec_filings(symbol: str) -> list[dict]:
             url,
             headers={"User-Agent": "trader-bot/1.0 (kywwilson@gmail.com)"},
         )
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
 
         hits = data.get("hits", {}).get("hits", [])
         for hit in hits[:5]:
@@ -227,8 +240,8 @@ def _fetch_filing_text(doc_id: str, cik, max_chars: int = 7000) -> str | None:
                f"{int(cik)}/{acc_nodash}/{filename}")
         req = urllib.request.Request(
             url, headers={"User-Agent": "trader-bot/1.0 (kywwilson@gmail.com)"})
-        resp = urllib.request.urlopen(req, timeout=15)
-        html = resp.read().decode('utf-8', errors='replace')
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode('utf-8', errors='replace')
 
         from bs4 import BeautifulSoup
         text = BeautifulSoup(html, 'html.parser').get_text(' ')
@@ -255,9 +268,15 @@ def get_filing_summary(symbol: str) -> str:
     knowledge" WITHOUT fetching it. Current filings post-date every model's
     training cutoff, so the 'guidance changes' it produced were fabricated
     — and then fed into trade gating as fact for a week per cache entry.
-    Now: fetch the document, summarize what it actually says; if the fetch
-    fails, state only the verifiable fact (form + date), never invented
-    specifics. Cached 7 days.
+    Design: fetch the document, summarize what it actually says; if the
+    fetch fails, state only the verifiable fact (form + date), never
+    invented specifics. Cached 7 days.
+
+    RUNTIME REALITY: no summary has ever flowed from here — get_sec_filings
+    is inoperative (returns [], and any hits would carry form_type ""), so
+    the 10-K/10-Q filter below never matches and "" is cached. The fail-soft
+    "" is the correct degraded output (no fabricated prompt section); the
+    feature stays dormant pending the EFTS fix.
     """
     cache_key = f"filing_sum_{symbol}"
     cached = _cache_get(cache_key, SEC_TTL)
@@ -269,7 +288,9 @@ def get_filing_summary(symbol: str) -> str:
         _cache_set(cache_key, "")
         return ""
 
-    # Find most recent 10-K or 10-Q
+    # First 10-K/10-Q among the top-5 relevance-ranked hits — NOT the most
+    # recent (EFTS sorts by relevance); with form_type always "" (see
+    # get_sec_filings) this currently never matches
     target = None
     for f in filings:
         if f["form_type"] in ("10-K", "10-Q"):

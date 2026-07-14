@@ -367,8 +367,17 @@ TXN_COST_PCT = {'crypto': 0.60, 'stock': 0.11}
 BARS_PER_YEAR = {'crypto': 8760, 'stock': 1638}
 
 
+def _objective_long_only():
+    """Read strategy_config.OBJECTIVE_LONG_ONLY (default False = legacy)."""
+    try:
+        from strategy_config import OBJECTIVE_LONG_ONLY
+        return bool(OBJECTIVE_LONG_ONLY)
+    except Exception:
+        return False
+
+
 def simulate_trades(predictions, actual_returns, threshold, forward_bars,
-                    txn_cost_pct, return_entries=False):
+                    txn_cost_pct, return_entries=False, long_only=None):
     """Non-overlapping hold simulation. Returns per-trade net returns.
 
     The model predicts the fb-bar forward return, so once a position is
@@ -377,11 +386,21 @@ def simulate_trades(predictions, actual_returns, threshold, forward_bars,
     earning the full overlapping fb-bar return — inflating scores by
     ~sqrt(fb) and mechanically favoring the longest horizon.
 
+    long_only (None -> strategy_config.OBJECTIVE_LONG_ONLY): when True the
+        short leg is NOT scored. The live book is long-only, so a model whose
+        Sharpe is carried by bear-side accuracy can otherwise clear the trial
+        score AND the holdout DSR while the deployable long side has ~zero
+        expectancy (2026-07 review). Default False preserves the historical
+        objective — flipping the flag changes trial scores, which makes old
+        Optuna scores incomparable (CLAUDE.md gotcha #2 applies).
+
     return_entries: also return an int array of the row index (into the
         input arrays) each trade was entered at — lets the holdout gate map
         a trade back to its label span for the effective-n / uniqueness
         deflation (sample_weights.py).
     """
+    if long_only is None:
+        long_only = _objective_long_only()
     n = len(predictions)
     trade_returns = []
     entries = []
@@ -393,7 +412,7 @@ def simulate_trades(predictions, actual_returns, threshold, forward_bars,
             trade_returns.append(r - txn_cost_pct)
             entries.append(i)
             i += forward_bars
-        elif p < -threshold and np.isfinite(r):
+        elif (not long_only) and p < -threshold and np.isfinite(r):
             # Short side: realize the negated move (long-only live, but the
             # signal's bear accuracy still matters for exits)
             trade_returns.append(-r - txn_cost_pct)
@@ -940,7 +959,15 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
 # LightGBM ensemble training
 # ---------------------------------------------------------------------------
 
-LGB_MAX_ROWS = 120_000  # cap flattened-feature memory (~250MB at 24x23 cols)
+LGB_MAX_ROWS = 120_000  # absolute row ceiling (never raised by the byte cap)
+# X_train byte budget for the flattened window matrix. The old fixed 120k-row
+# cap was written against 24x23 float32 cols (~250MB); at the 72-feature
+# stationary preset with seq_len 40 the same rows are ~1.4GB PLUS LightGBM's
+# Dataset construction copy — the largest host allocation in the pipeline,
+# uncapped by the CUDA fraction and colliding with the systemd MemoryMax=6G
+# ceiling. Rows are now capped to whichever is smaller: 120k or what fits in
+# this budget at the winning config's actual (seq_len x n_features).
+LGB_X_BYTE_BUDGET = 600_000_000
 
 
 def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
@@ -978,8 +1005,15 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
         train_idx, val_idx = folds[-1]  # largest train window, latest val
         train_idx = train_idx[~np.isnan(returns[train_idx])]
         val_idx = val_idx[~np.isnan(returns[val_idx])]
-        if len(train_idx) > LGB_MAX_ROWS:  # most recent rows
-            train_idx = train_idx[np.argsort(all_times[train_idx])][-LGB_MAX_ROWS:]
+        row_bytes = int(seq_len) * int(all_features.shape[1]) * 4  # float32
+        max_rows = int(min(LGB_MAX_ROWS,
+                           max(20_000, LGB_X_BYTE_BUDGET // max(row_bytes, 1))))
+        if len(train_idx) > max_rows:  # most recent rows
+            print(f"[LGB] row cap {max_rows} "
+                  f"({row_bytes} B/row at seq {seq_len} x "
+                  f"{all_features.shape[1]} feats; budget "
+                  f"{LGB_X_BYTE_BUDGET // 1_000_000} MB)")
+            train_idx = train_idx[np.argsort(all_times[train_idx])][-max_rows:]
         if len(val_idx) > 30_000:
             val_idx = val_idx[np.argsort(all_times[val_idx])][-30_000:]
 
@@ -1126,6 +1160,42 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                 u_all = average_uniqueness(masked, ticker_boundaries)
                 u_bar_traded = u_all[global_rows]
                 n_eff = effective_n(u_bar_traded)
+
+                # Cross-sectional clustering (2026-07 review): the per-ticker
+                # uniqueness above counts same-hour trades on N correlated
+                # names as N independent draws — on the 6-coin crypto panel
+                # (pairwise rho 0.7-0.9) that overstates the DSR's sqrt(n)
+                # breadth 2-4x, raising a zero-edge model's false-pass rate
+                # from ~0.2% to 5-9% per attempt. Collapse trades whose
+                # [entry, exit] CALENDAR windows overlap across names (rho=1
+                # worst case) and take the harsher of the two counts.
+                try:
+                    from sample_weights import clustered_effective_n
+                    if isinstance(ticker_boundaries, dict):
+                        _blocks = sorted(ticker_boundaries.values())
+                    else:
+                        _blocks = sorted(ticker_boundaries)
+                    _starts = np.asarray([b[0] for b in _blocks])
+                    _ends = np.asarray([b[1] for b in _blocks])
+                    entry_t = all_times[global_rows]
+                    exit_rows = np.empty(len(global_rows), dtype=np.int64)
+                    for _k, _row in enumerate(global_rows):
+                        _bi = int(np.searchsorted(_starts, _row,
+                                                  side='right') - 1)
+                        _block_last = int(_ends[_bi]) - 1
+                        _span = tb[_row]
+                        _span = int(_span) if np.isfinite(_span) else 0
+                        exit_rows[_k] = min(_row + max(_span, 0), _block_last)
+                    exit_t = all_times[exit_rows]
+                    n_x = clustered_effective_n(entry_t, exit_t)
+                    if 0 < n_x < (n_eff if n_eff else len(global_rows)):
+                        print(f"  [HOLDOUT] cross-sectional clustering: "
+                              f"{len(global_rows)} trades -> {n_x} disjoint "
+                              f"calendar clusters (n_eff {n_eff:.1f} -> {n_x})")
+                        n_eff = float(n_x)
+                except Exception as ce:
+                    print(f"  [HOLDOUT] cross-sectional n_eff unavailable "
+                          f"({ce}) — keeping per-ticker n_eff")
             except Exception as ue:
                 print(f"  [HOLDOUT] uniqueness n_eff unavailable ({ue}) — "
                       f"falling back to IID null")

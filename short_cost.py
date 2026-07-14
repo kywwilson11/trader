@@ -49,7 +49,13 @@ def borrow_cost_bps_annual(asof, likely_etb=True, htb_score=None):
     d = _to_date(asof)
     if likely_etb:
         return 0.0 if d >= BORROW_REGIME_START else PRE_REGIME_ETB_BPS
-    return HTB_BPS * (float(htb_score) if htb_score is not None else 1.0)
+    if htb_score is None:
+        return HTB_BPS
+    s = float(htb_score)
+    # clamp to [0, 1], NaN -> 1.0: a conservative backstop must never turn
+    # into a borrow REBATE (negative cost) on out-of-domain input.
+    s = 1.0 if s != s else min(max(s, 0.0), 1.0)
+    return HTB_BPS * s
 
 
 def borrow_drag_pct(asof, hold_days, likely_etb=True, htb_score=None):
@@ -77,8 +83,11 @@ def short_round_trip_cost_pct(asof, eff_spread_pct, hold_days=1.0,
 
 def short_interest_metrics(short_interest, float_shares=None, adv_20d=None):
     """Per-print SI metrics. days_to_cover = SI / 20d ADV; si_pct_float =
-    SI / float (LOW-confidence: float from a current snapshot is not PIT, so
-    callers should treat it as soft). Returns a dict; None where inputs missing.
+    SI / float — a FRACTION of float (0.04 == 4%), NOT percent despite the
+    name: threshold vetoes (e.g. the wave-7 SI/float > 10% veto) must compare
+    against 0.10, not 10. LOW-confidence: float from a current snapshot is not
+    PIT, so callers should treat it as soft. Returns a dict; None where inputs
+    are absent (NaN inputs propagate NaN, not None).
     """
     si = float(short_interest) if short_interest is not None else None
     dtc = (si / float(adv_20d)) if (si is not None and adv_20d and adv_20d > 0) else None
@@ -105,6 +114,11 @@ def pit_publication_map(values_by_pub_date, index):
     s = pd.Series(values_by_pub_date).sort_index()
     pub = pd.DatetimeIndex(s.index).normalize()
     bars = pd.DatetimeIndex(index).normalize()
+    # strip tz on BOTH sides (harvest bar indexes are tz-aware UTC, FINRA
+    # publication dates naive) — same defense as short_flow / cost_regime,
+    # else searchsorted raises on the naive-vs-aware comparison.
+    pub = pub.tz_localize(None) if pub.tz is not None else pub
+    bars = bars.tz_localize(None) if bars.tz is not None else bars
     # last publication strictly before each bar (side='left' -> a bar ON a
     # publication date sees the PRIOR print, i.e. the shift-1 guard)
     pos = pub.searchsorted(bars, side='left') - 1

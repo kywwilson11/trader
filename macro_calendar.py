@@ -9,8 +9,13 @@ to faster traders. New ENTRIES are blocked in a window around each
 event — exits and protective stops keep running.
 
 Dates are STATIC (verified against the Fed and BLS published 2026
-schedules; BLS blocks bot fetches, so no live sync). Refresh annually —
-sound the alarm in logs when the table runs dry.
+schedules; BLS blocks bot fetches, so no live sync). Refresh annually
+AND on Fed/BLS reschedule notices — a mid-year reschedule silently
+invalidates a row (the Jan-2026-data CPI slipped Feb 11 -> Feb 13 after
+the early-Feb-2026 shutdown, so the bot stood down on a non-event day
+and traded into the real print). When refreshing, re-verify the
+remaining year's dates too, not just the new year's. Sound the alarm in
+logs when the table runs dry.
 
   - FOMC: statement 14:00 ET on day 2; presser to ~15:15 ET.
     Window: 12:00 -> 15:30 ET.
@@ -29,7 +34,9 @@ FOMC_STATEMENT_DAYS = [
     (2026, 7, 29), (2026, 9, 16), (2026, 10, 28), (2026, 12, 9),
 ]
 CPI_RELEASE_DAYS = [
-    (2026, 1, 13), (2026, 2, 11), (2026, 3, 11), (2026, 4, 10),
+    # Feb: BLS originally scheduled 02-11; the Jan-data print slipped to
+    # Fri 02-13 after the early-Feb-2026 shutdown (cpi_02132026.htm).
+    (2026, 1, 13), (2026, 2, 13), (2026, 3, 11), (2026, 4, 10),
     (2026, 5, 12), (2026, 6, 10), (2026, 7, 14), (2026, 8, 12),
     (2026, 9, 11), (2026, 10, 14), (2026, 11, 10), (2026, 12, 10),
 ]
@@ -61,6 +68,10 @@ def calendar_exhausted(now: dt.datetime | None = None) -> bool:
     """True when the static table has no future events (needs a refresh)."""
     if now is None:
         now = dt.datetime.now(dt.timezone.utc)
+    elif now.tzinfo is None:
+        # Same guard as macro_standdown: a naive datetime would otherwise
+        # be read as SYSTEM LOCAL time by astimezone (machine-dependent).
+        now = now.replace(tzinfo=dt.timezone.utc)
     et = now.astimezone(_ET)
     last = max(max(FOMC_STATEMENT_DAYS), max(CPI_RELEASE_DAYS))
     return (et.year, et.month, et.day) > last

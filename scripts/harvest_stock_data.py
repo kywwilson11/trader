@@ -11,7 +11,6 @@ import sys; from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import os
-import time
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -157,29 +156,14 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     return df
 
 
-# Daily-window features with LONG warmups (RM needs 273 trading days).
-# Letting dropna() eat their warmup rows would discard a year-plus of
-# every name; 0.0 = "no signal yet", the same value live serves during
-# its own (rare) cold starts. Pos_Range warmups fill at 0.5 (mid-range).
-WARMUP_FEATURES_ZERO = [
-    'RM_252_21', 'Ret_21d', 'RR_5', 'RR_21', 'Same_Hour_Mean_40d',
-    'ROD_Ret', 'ON_Mom_21', 'ON_Mom_252', 'TugOfWar_252',
-    'MA_Dist_10d', 'MA_Dist_20d', 'MA_Dist_50d', 'MA_Dist_100d',
-    'MA_Dist_200d', 'SVR_21', 'SVR_Z',
-    'MidRange_Gap_20h', 'MidRange_Gap_60h',
-]
-WARMUP_FEATURES_HALF = ['Pos_Range_20h', 'Pos_Range_60h',
-                        'Pos_Range_20d', 'Pos_Range_60d']
-
-
-def _fill_warmup_features(df):
-    for col in WARMUP_FEATURES_ZERO:
-        if col in df.columns:
-            df[col] = df[col].fillna(0.0)
-    for col in WARMUP_FEATURES_HALF:
-        if col in df.columns:
-            df[col] = df[col].fillna(0.5)
-    return df
+# Daily-window warmup fill — SHARED with the live path (predict_now), single
+# source of truth in indicators.py: the harvest keeps warmup rows with the
+# same neutral 0.0/0.5 values the live path serves on its short frames.
+# Diverging fills here would silently break train/serve parity.
+from indicators import (
+    WARMUP_FEATURES_ZERO, WARMUP_FEATURES_HALF,
+    fill_warmup_features as _fill_warmup_features,
+)
 
 
 def _asof_membership_mask(df, top_k=AS_OF_TOP_K):
@@ -187,7 +171,6 @@ def _asof_membership_mask(df, top_k=AS_OF_TOP_K):
     day. With this, a 2024 listing contributes no 2021 rows, and a name
     only contributes history from periods a mechanical liquidity rule
     would have selected it — membership look-ahead removed."""
-    import pandas as pd
     if '_DV30' not in df.columns or 'Ticker' not in df.columns:
         return df
     key = pd.DataFrame({'day': df.index.normalize(),
@@ -240,6 +223,17 @@ def _asof_tradability_mask(df, ticker):
     except Exception as e:
         print(f"  [AS-OF] {ticker}: mask skipped ({e})")
         return df
+
+
+def _summary_feature_split(columns):
+    """Mirror training's exclude list (hypersearch_v2): TB_* are labels,
+    not features; OHLCV stay counted because training keeps them as
+    features. Same shape as the crypto twin's summary block."""
+    target_cols = [c for c in columns if c.startswith('Target_Return')]
+    tb_cols = [c for c in columns if c.startswith('TB_')]
+    exclude = set(target_cols) | set(tb_cols) | {'Ticker', 'Date', 'Datetime'}
+    feature_count = len([c for c in columns if c not in exclude])
+    return feature_count, target_cols, tb_cols
 
 
 def main():
@@ -339,11 +333,9 @@ def main():
     # Summary
     print(f"\nDone! Saved {len(final_df)} rows of stock training data")
     print(f"Stocks harvested: {len(all_data)}/{len(STOCK_TICKERS)}")
-    target_cols = [c for c in final_df.columns if c.startswith('Target_Return')]
-    exclude = set(target_cols) | {'Ticker', 'Date', 'Datetime'}
-    feature_count = len([c for c in final_df.columns if c not in exclude])
+    feature_count, target_cols, tb_cols = _summary_feature_split(final_df.columns)
     print(f"Feature columns: {feature_count}")
-    print(f"Target columns: {target_cols}")
+    print(f"Target columns: {target_cols + tb_cols}")
     print(f"Date range: {final_df.index.min()} to {final_df.index.max()}")
 
     # Validation report

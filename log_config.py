@@ -7,6 +7,7 @@ Usage in any module:
 """
 
 import logging
+import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -18,35 +19,49 @@ _FMT = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
 _DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
 _configured = False
+_setup_lock = threading.Lock()
 
 
 def _setup():
     global _configured
     if _configured:
         return
-    _configured = True
+    with _setup_lock:
+        if _configured:
+            return
 
-    _LOG_DIR.mkdir(exist_ok=True)
+        _LOG_DIR.mkdir(exist_ok=True)
 
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
+        # Build BOTH handlers fully before adding either to the root logger,
+        # and mark configured only after success: a partial failure (logs/
+        # unwritable, disk full) then fails loud on the NEXT get_logger call
+        # instead of silently leaving the process without handlers for life.
 
-    # Console handler (INFO)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter(_FMT, datefmt=_DATE_FMT))
-    root.addHandler(ch)
+        # Console handler (INFO)
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(logging.Formatter(_FMT, datefmt=_DATE_FMT))
 
-    # Rotating file handler (DEBUG)
-    fh = RotatingFileHandler(str(_LOG_FILE), maxBytes=_MAX_BYTES,
-                             backupCount=_BACKUP_COUNT)
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter(_FMT, datefmt=_DATE_FMT))
-    root.addHandler(fh)
+        # Rotating file handler (DEBUG)
+        fh = RotatingFileHandler(str(_LOG_FILE), maxBytes=_MAX_BYTES,
+                                 backupCount=_BACKUP_COUNT, encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(_FMT, datefmt=_DATE_FMT))
 
-    # Suppress noisy third-party loggers
-    for name in ('urllib3', 'httpx', 'httpcore', 'websockets', 'yfinance'):
-        logging.getLogger(name).setLevel(logging.WARNING)
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG)
+        root.addHandler(ch)
+        root.addHandler(fh)
+
+        # Suppress noisy third-party loggers. 'numba' matters: every kernel is
+        # @njit(cache=True), so each deploy invalidates the cache and numba's
+        # byteflow/SSA DEBUG dumps would churn the rotation budget right when
+        # post-deploy forensics need the recent history.
+        for name in ('urllib3', 'httpx', 'httpcore', 'websockets', 'yfinance',
+                     'numba', 'charset_normalizer'):
+            logging.getLogger(name).setLevel(logging.WARNING)
+
+        _configured = True
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -1,11 +1,40 @@
-"""Unified LLM client — Gemini API via urllib (no SDK deps).
+"""Unified LLM client — Gemini + Anthropic (Claude) + OpenAI (+ any
+OpenAI-compatible endpoint: OpenRouter/Groq/Ollama/...) via urllib (no SDK
+deps).
 
-Reads provider + API key from llm_config.json. Returns raw text or None on failure.
-Never blocks trades: all errors result in None return.
+Reads provider + API keys from llm_config.json (Anthropic/OpenAI keys may
+also come from the ANTHROPIC_API_KEY / OPENAI_API_KEY env vars; endpoint
+keys from '<NAME>_API_KEY'). Returns raw text or None on failure. Never
+blocks trades: all errors result in None return.
 
-Supports two calling modes:
-  1. call_llm() — uses config model + automatic fallback chain
-  2. call_gemini() — calls a specific Gemini model (for tiered scoring)
+Calling modes:
+  1. call_llm()    — resolve_provider_chain()'s ordered candidate list,
+                     tried in order with per-provider cooldowns/budgets
+                     (see resolve_provider_chain's docstring for how
+                     config['selection_mode'] — 'auto'/'single'/
+                     'free-only'/'best-free' — orders candidates). A dead
+                     key on one provider no longer silences the gate as
+                     long as another provider or endpoint is usable.
+  2. call_gemini() — a specific Gemini model (tiered scoring)
+  3. call_claude() — a specific Anthropic model
+  4. call_openai() — a specific OpenAI (or OpenAI-compatible, via
+                     base_url) model
+  5. call_model()  — provider-aware dispatch by model name ('claude-*' ->
+                     Anthropic, 'gpt-*'/'o*' -> OpenAI, else Gemini); the
+                     analyst/sentiment call sites use this so a config
+                     override can point any role at any native provider
+
+resolve_provider_chain(role, config) is the selection engine itself:
+given a role ('analyst'/'sentiment'/'backfill') and the loaded config, it
+returns an ordered [(provider, model, base_url, api_key), ...] list.
+call_llm() consumes it directly; get_recommended_model() consults its head
+for analyst/sentiment (backfill stays pinned to Gemini's Batch API).
+
+Schema enforcement parity: Gemini uses responseMimeType+responseSchema;
+Anthropic uses FORCED TOOL USE (the schema becomes a tool input_schema and
+tool_choice pins the model to it); OpenAI uses response_format={'type':
+'json_schema', ..., 'strict': True} — all three return guaranteed-
+parseable JSON text, so callers are provider-agnostic.
 
 Smart model routing:
   Selects the best model per role (analyst, sentiment, backfill) based on
@@ -46,6 +75,34 @@ _GEMINI_FALLBACK_CHAIN = [
     "gemini-2.5-pro",  # Paid tier: Pro has generous limits, fast enough for fallback
 ]
 
+# Anthropic (Claude) models. The config's models.claude slot existed for a
+# long time with NO implementation behind it — this is that implementation.
+# Haiku 4.5 is the analyst-tier workhorse (fast, cheap, schema-capable);
+# Sonnet 5 is the quality upgrade via config override. Opus is priced for
+# research, not a 600s-cadence sizing gate, so it stays out of the chains.
+ANTHROPIC_MODELS = ["claude-sonnet-5", "claude-haiku-4-5"]
+_ANTHROPIC_FALLBACK_CHAIN = ["claude-haiku-4-5", "claude-sonnet-5"]
+_ANTHROPIC_VERSION = "2023-06-01"
+
+# OpenAI (and OpenAI-compatible: OpenRouter/Groq/Ollama) models. Config's
+# models.openai slot existed with no implementation either — mirrors the
+# Anthropic addition above. nano is the cheap default; the chain climbs to
+# mini/full only on fallback.
+OPENAI_MODELS = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"]
+_OPENAI_FALLBACK_CHAIN = ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.4"]
+
+# Every model any provider can route to (override validation)
+KNOWN_MODELS = GEMINI_MODELS + ANTHROPIC_MODELS + OPENAI_MODELS
+
+
+def _provider_for(model: str) -> str:
+    m = str(model)
+    if m.startswith("claude"):
+        return "anthropic"
+    if m.startswith("gpt") or m.startswith("o"):
+        return "openai"
+    return "gemini"
+
 # HTTP codes that trigger immediate fallback:
 _FALLBACK_CODES = {402, 403, 500, 502, 503, 504}
 
@@ -53,9 +110,14 @@ _FALLBACK_CODES = {402, 403, 500, 502, 503, 504}
 _429_MAX_WAIT_PRIMARY = 10   # paid tier: brief wait usually clears it
 _429_MAX_WAIT_FALLBACK = 5   # fallback models: don't wait long
 
-# 429 circuit breaker: when all models fail with 429, skip LLM for a cooldown
+# 429 circuit breaker: when a provider's models all fail with 429, skip that
+# PROVIDER for a cooldown. Per-provider (2026-07): a Gemini exhaustion must
+# not silence a healthy Claude fallback, and vice versa. Endpoint names
+# (OpenRouter/Groq/Ollama/...) aren't known ahead of time — _429_cooled_down
+# / _trigger_429_cooldown key off whatever string resolve_provider_chain
+# hands back, defaulting to "cooled down" (0.0) for keys not yet present.
 _429_COOLDOWN_SEC = 30   # short cooldown — paid tier rarely sustains 429s
-_429_cooldown_until: float = 0.0  # timestamp when cooldown expires
+_429_cooldown_until: dict[str, float] = {"gemini": 0.0, "anthropic": 0.0, "openai": 0.0}
 
 # --- Tier detection ---
 _detected_tier: str | None = None  # 'free', 'paid', or None (unknown)
@@ -66,11 +128,18 @@ _FREE_TIER_BUDGETS = {
     "gemini-2.5-pro": 0,
     "gemini-2.5-flash": 250,
     "gemini-2.5-flash-lite": 1000,
+    # Anthropic has no free tier; a present key means a paid account, and
+    # the tier detector below is Gemini-specific — so Claude budgets are
+    # identical in both tables (the $ daily cost cap is the real governor).
+    "claude-haiku-4-5": 5000,
+    "claude-sonnet-5": 2000,
 }
 _PAID_TIER_BUDGETS = {
     "gemini-2.5-pro": 1000,
     "gemini-2.5-flash": 2000,
     "gemini-2.5-flash-lite": 5000,
+    "claude-haiku-4-5": 5000,
+    "claude-sonnet-5": 2000,
 }
 
 # Actual responder of the most recent successful call (for journaling —
@@ -97,6 +166,38 @@ _COST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_cost.
 # Thread safety for quota/cost tracking
 _quota_lock = threading.Lock()
 
+# Inter-PROCESS safety for the shared cost file: the crypto and stock books
+# can run as separate processes (plus the sentiment backfill worker), and
+# _quota_lock is thread-scoped — two processes could each read $0.98, add a
+# few cents, and write back, losing an increment against the HARD daily cap.
+# flock serializes the read-modify-write. Lock ordering: _quota_lock (thread)
+# always OUTER, file lock INNER.
+try:
+    import fcntl as _fcntl
+except ImportError:  # non-POSIX — thread lock still applies
+    _fcntl = None
+
+
+class _cost_file_lock:
+    def __enter__(self):
+        self._fh = None
+        if _fcntl is not None:
+            try:
+                self._fh = open(_COST_FILE + ".lock", "w")
+                _fcntl.flock(self._fh, _fcntl.LOCK_EX)
+            except OSError:
+                self._fh = None  # degraded: thread lock only
+        return self
+
+    def __exit__(self, *exc):
+        if self._fh is not None:
+            try:
+                _fcntl.flock(self._fh, _fcntl.LOCK_UN)
+                self._fh.close()
+            except OSError:
+                pass
+        return False
+
 # Per-million-token pricing (input, output) — current Gemini list prices.
 # The old table (flash 0.15/0.60, lite 0.075/0.30) understated real spend
 # 2-4x, so the $1/day cap tripped far later than intended.
@@ -104,7 +205,32 @@ _PRICING = {
     "gemini-2.5-pro":        (1.25, 10.0),
     "gemini-2.5-flash":      (0.30, 2.50),
     "gemini-2.5-flash-lite": (0.10, 0.40),
+    # Anthropic list prices per MTok. Prices move — llm_config.json may
+    # carry a "pricing": {model: [in, out]} override that wins over this
+    # table (see _pricing), so corrections never need a code change.
+    "claude-haiku-4-5":      (1.00, 5.00),
+    "claude-sonnet-5":       (3.00, 15.00),
+    "claude-opus-4-8":       (5.00, 25.00),
+    # ⚠️ LOUD WARNING: these OpenAI gpt-5.4 prices are CONSERVATIVE
+    # PLACEHOLDERS, not verified against OpenAI's published pricing page.
+    # Correct them via config['pricing'] overrides (same mechanism as the
+    # Claude/Gemini corrections above) the moment real prices are known —
+    # do NOT trust these numbers for real budget/cost-cap decisions.
+    "gpt-5.4":               (5.00, 15.00),
+    "gpt-5.4-mini":          (1.00, 4.00),
+    "gpt-5.4-nano":          (0.25, 1.00),
 }
+
+
+def _pricing(model: str) -> tuple[float, float]:
+    """Per-MTok (input, output) price: config override > table > pro-tier."""
+    try:
+        override = load_llm_config().get("pricing", {}).get(model)
+        if override and len(override) == 2:
+            return (float(override[0]), float(override[1]))
+    except Exception:
+        pass
+    return _PRICING.get(model, (1.25, 10.0))
 
 # --- Smart model routing ---
 # Cost brackets: {max_daily_cost: {role: model}}
@@ -213,6 +339,171 @@ def probe_tier() -> str:
     return get_tier()
 
 
+# --- Multi-provider selection engine ---
+
+# 'best-free' quality ranking: lower sorts first. Governs ONLY 'best-free'
+# ordering of the free-candidate set that 'free-only' already selects.
+# Named free models rank explicitly; endpoints (whose quality varies by
+# what the user pointed them at) rank after every named model, in the
+# order they appear in config['endpoints'].
+_FREE_QUALITY_RANK = {
+    "gemini-2.5-pro": 0,
+    "gemini-2.5-flash": 1,
+    "gemini-2.5-flash-lite": 2,
+}
+_FREE_ENDPOINT_RANK = 10
+
+
+def _endpoint_api_key(endpoint: dict) -> str:
+    """Endpoint credential: explicit api_key, else env '<NAME>_API_KEY',
+    else '' (keyless — e.g. a local Ollama server, which needs no key)."""
+    key = endpoint.get("api_key") or ""
+    if key:
+        return key
+    name = str(endpoint.get("name") or "").strip()
+    if not name:
+        return ""
+    return os.environ.get(f"{name.upper()}_API_KEY", "")
+
+
+def _enabled_endpoints(config: dict, free_only: bool = False) -> list:
+    """config['endpoints'] entries with enabled: true (optionally also
+    filtered to free: true — 'free-only'/'best-free' selection modes)."""
+    out = []
+    for ep in config.get("endpoints") or []:
+        if not isinstance(ep, dict) or not ep.get("enabled"):
+            continue
+        if free_only and not ep.get("free"):
+            continue
+        out.append(ep)
+    return out
+
+
+def resolve_provider_chain(role: str, config: dict):
+    """Ordered candidate list for `role`: [(provider, model, base_url, api_key), ...].
+
+    `provider` is 'anthropic', 'gemini', 'openai', or an endpoint's `name`
+    (any provider string other than 'anthropic'/'gemini' is dispatched as
+    an OpenAI-compatible call by call_llm — see its _dispatch helper).
+    `base_url` is None for the three native providers and the endpoint's
+    configured base_url otherwise.
+
+    Backfill is PINNED to Gemini regardless of selection_mode — it rides
+    the Gemini Batch API, which has no other-provider path wired; every
+    call site needing that pin should route through here (or through
+    get_recommended_model('backfill'), which special-cases it identically).
+
+    config['selection_mode'] (default 'auto') governs everything else:
+      'single'    — just the model configured for config['provider']
+                    ('anthropic'/'claude'/'openai'/'gemini' — the legacy
+                    field that predates selection_mode; this is how it's
+                    still honored). No fallback chain, no cross-provider.
+      'auto'      — config['provider_preference'] order (default
+                    ['anthropic', 'openai', 'gemini']), skipping any
+                    provider with no usable key; each contributing
+                    provider adds its primary model then its own fallback
+                    chain, then every enabled endpoint is appended last.
+      'free-only' — only free candidates: enabled endpoints with
+                    free: true (this also covers keyless local endpoints
+                    like Ollama — they just have no api_key to check),
+                    plus Gemini appended as an always-available free-tier
+                    last resort (governed by the existing daily-cost cap
+                    and RPD budgets either way).
+      'best-free' — the same candidate set as 'free-only', reordered by
+                    _FREE_QUALITY_RANK instead of config order.
+    """
+    if role == "backfill":
+        gem_key = config.get("models", {}).get("gemini", {}).get("api_key", "")
+        gem_model = (config.get("models", {}).get("gemini", {}).get("model")
+                     or "gemini-2.5-flash-lite")
+        return [("gemini", gem_model, None, gem_key)] if gem_key else []
+
+    selection_mode = config.get("selection_mode") or "auto"
+    provider = str(config.get("provider") or "auto").lower()
+
+    if selection_mode == "single":
+        if provider in ("anthropic", "claude"):
+            model = (config.get("models", {}).get("claude", {}).get("model")
+                     or "claude-haiku-4-5")
+            key = _anthropic_key(config)
+            return [("anthropic", model, None, key)] if key else []
+        if provider == "openai":
+            model = (config.get("models", {}).get("openai", {}).get("model")
+                     or "gpt-5.4-nano")
+            key = _openai_key(config)
+            return [("openai", model, None, key)] if key else []
+        # 'gemini', 'auto', or anything unrecognized — Gemini is the
+        # original default single provider.
+        model = (config.get("models", {}).get("gemini", {}).get("model")
+                 or "gemini-2.5-flash")
+        key = config.get("models", {}).get("gemini", {}).get("api_key", "")
+        return [("gemini", model, None, key)] if key else []
+
+    if selection_mode in ("free-only", "best-free"):
+        chain = []
+        for ep in _enabled_endpoints(config, free_only=True):
+            chain.append((ep.get("name") or "endpoint", ep.get("model", ""),
+                          ep.get("base_url"), _endpoint_api_key(ep)))
+        gem_key = config.get("models", {}).get("gemini", {}).get("api_key", "")
+        if gem_key:
+            gem_model = (config.get("models", {}).get("gemini", {}).get("model")
+                         or "gemini-2.5-flash-lite")
+            chain.append(("gemini", gem_model, None, gem_key))
+            for fb in _GEMINI_FALLBACK_CHAIN:
+                if fb != gem_model:
+                    chain.append(("gemini", fb, None, gem_key))
+        if selection_mode == "best-free":
+            def _rank(entry):
+                prov, model, base_url, _key = entry
+                if prov == "gemini" and base_url is None:
+                    return _FREE_QUALITY_RANK.get(model, _FREE_ENDPOINT_RANK)
+                return _FREE_ENDPOINT_RANK
+            chain.sort(key=_rank)
+        return chain
+
+    # 'auto' (default)
+    preference = config.get("provider_preference") or ["anthropic", "openai", "gemini"]
+    chain = []
+    for prov in preference:
+        prov = str(prov).lower()
+        if prov in ("anthropic", "claude"):
+            key = _anthropic_key(config)
+            if not key:
+                continue
+            primary = (config.get("models", {}).get("claude", {}).get("model")
+                       or "claude-haiku-4-5")
+            chain.append(("anthropic", primary, None, key))
+            for fb in _ANTHROPIC_FALLBACK_CHAIN:
+                if fb != primary:
+                    chain.append(("anthropic", fb, None, key))
+        elif prov == "openai":
+            key = _openai_key(config)
+            if not key:
+                continue
+            primary = (config.get("models", {}).get("openai", {}).get("model")
+                       or "gpt-5.4-nano")
+            chain.append(("openai", primary, None, key))
+            for fb in _OPENAI_FALLBACK_CHAIN:
+                if fb != primary:
+                    chain.append(("openai", fb, None, key))
+        elif prov == "gemini":
+            key = config.get("models", {}).get("gemini", {}).get("api_key", "")
+            if not key:
+                continue
+            primary = (config.get("models", {}).get("gemini", {}).get("model")
+                       or "gemini-2.5-flash")
+            chain.append(("gemini", primary, None, key))
+            for fb in _GEMINI_FALLBACK_CHAIN:
+                if fb != primary:
+                    chain.append(("gemini", fb, None, key))
+        # unrecognized provider_preference entries are silently skipped —
+        # only 'anthropic'/'claude', 'openai', 'gemini' are native
+    for ep in _enabled_endpoints(config):
+        chain.append((ep.get("name") or "endpoint", ep.get("model", ""),
+                      ep.get("base_url"), _endpoint_api_key(ep)))
+    return chain
+
+
 # --- Smart model routing ---
 
 def get_recommended_model(role: str) -> str:
@@ -226,11 +517,32 @@ def get_recommended_model(role: str) -> str:
     """
     config = load_llm_config()
 
-    # 1. Check manual override
+    # 1. Check manual override (either provider's models)
     override_key = f"{role}_model_override"
     override = config.get(override_key)
-    if override and override in GEMINI_MODELS:
+    if override and override in KNOWN_MODELS:
         return override
+
+    # 1b. Provider selection via the resolve_provider_chain head: when the
+    # chain's first candidate is Anthropic or OpenAI (native providers —
+    # keyed by model-name prefix so call_model can route to them), send
+    # analyst/sentiment there directly. This generalizes the old hardcoded
+    # "Anthropic primary" branch to any provider selection_mode/
+    # provider_preference produces. Scoped to anthropic/openai (not
+    # arbitrary endpoints) because get_recommended_model returns a bare
+    # model-name string — call_model dispatches purely by name prefix
+    # (_provider_for) and has no base_url to reach a custom endpoint with;
+    # endpoint routing works end-to-end through call_llm's own chain loop,
+    # just not through this model-name-only path.
+    # Backfill is PINNED to Gemini regardless — sentiment_history's
+    # backfill rides the Gemini BATCH API, which has no other-provider path
+    # wired.
+    if role != 'backfill':
+        chain = resolve_provider_chain(role, config)
+        if chain and chain[0][0] in ("anthropic", "openai"):
+            head_model = chain[0][1]
+            if head_model:
+                return head_model
 
     # 2. Select routing table based on tier
     tier = get_tier()
@@ -315,19 +627,15 @@ def _rate_limit_ok() -> bool:
     return True
 
 
-def _429_cooled_down() -> bool:
-    """Check if we're past the 429 cooldown period."""
-    global _429_cooldown_until
-    if time.time() < _429_cooldown_until:
-        return False
-    return True
+def _429_cooled_down(provider: str = "gemini") -> bool:
+    """Check if the PROVIDER is past its 429 cooldown period."""
+    return time.time() >= _429_cooldown_until.get(provider, 0.0)
 
 
-def _trigger_429_cooldown():
-    """All models 429'd — skip LLM calls for a cooldown period."""
-    global _429_cooldown_until
-    _429_cooldown_until = time.time() + _429_COOLDOWN_SEC
-    print(f"[LLM] All models rate-limited, cooling down {_429_COOLDOWN_SEC}s")
+def _trigger_429_cooldown(provider: str = "gemini"):
+    """A provider's models all 429'd — skip that provider for a cooldown."""
+    _429_cooldown_until[provider] = time.time() + _429_COOLDOWN_SEC
+    print(f"[LLM] {provider}: all models rate-limited, cooling down {_429_COOLDOWN_SEC}s")
 
 
 def _load_shared_cost():
@@ -385,7 +693,7 @@ def _estimate_cost(model: str, prompt_chars: int, response_chars: int) -> float:
     """
     input_tokens = prompt_chars / 4
     output_tokens = response_chars / 4
-    price_in, price_out = _PRICING.get(model, (1.25, 10.0))
+    price_in, price_out = _pricing(model)
     return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
 
 
@@ -394,7 +702,7 @@ def _record_cost(model: str, prompt_chars: int, response_chars: int,
     """Record cost (from API usageMetadata when available) to the shared file."""
     global _daily_cost
     if usage and usage.get('promptTokenCount') is not None:
-        price_in, price_out = _PRICING.get(model, (1.25, 10.0))
+        price_in, price_out = _pricing(model)
         in_tok = usage.get('promptTokenCount', 0)
         # candidatesTokenCount excludes thinking tokens; thoughtsTokenCount
         # is billed as output too
@@ -404,10 +712,12 @@ def _record_cost(model: str, prompt_chars: int, response_chars: int,
     else:
         cost = _estimate_cost(model, prompt_chars, response_chars)
     with _quota_lock:
-        # Re-read shared file to pick up costs from other processes
-        _load_shared_cost()
-        _daily_cost += cost
-        _save_shared_cost()
+        with _cost_file_lock():
+            # Re-read under the FILE lock so a concurrent process's spend
+            # cannot be lost in this read-modify-write
+            _load_shared_cost()
+            _daily_cost += cost
+            _save_shared_cost()
 
 
 def _cost_ok() -> bool:
@@ -458,7 +768,7 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
     retry-after parsing. Does NOT fall back to other models (caller decides).
     """
     global _last_model_used
-    if not _429_cooled_down():
+    if not _429_cooled_down('gemini'):
         return None
 
     if not _cost_ok():
@@ -536,18 +846,34 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
 
 def call_llm(prompt: str, system: str = "", max_tokens: int = 2048,
              json_schema: dict | None = None,
-             temperature: float | None = None) -> str | None:
-    """Send prompt to any available Gemini model. Returns text or None.
+             temperature: float | None = None,
+             role: str = "analyst") -> str | None:
+    """Send prompt through the resolved provider chain. Returns text or None.
 
-    Tries the configured model first, then falls back through all models.
+    Generalizes the old hardcoded Gemini-primary / Anthropic-primary
+    branching into a single loop over resolve_provider_chain(role, config)
+    — see that function's docstring for how selection_mode ('auto' by
+    default) orders candidates. Legacy config['provider'] values
+    ('gemini'/'anthropic'/'claude'/'openai') are honored only under
+    selection_mode='single' (backward compat for a saved Jetson config
+    that hard-pins one provider); under the 'auto' default they don't gate
+    anything — whichever providers have usable keys are tried in
+    provider_preference order, preserving the old cross-provider
+    resilience (a dead Gemini key no longer silences the analyst gate, and
+    vice versa) now generalized to any number of providers/endpoints.
+
     The chain now ALSO fires on the dominant real-world failures the old
-    code returned None for — socket timeouts, MAX_TOKENS truncation, and
-    safety blocks — not just on specific HTTP codes.
+    code returned None for — socket timeouts, MAX_TOKENS/length
+    truncation, and safety blocks — not just on specific HTTP codes.
+
+    role: which resolve_provider_chain role to resolve against. Existing
+    call_llm call sites don't distinguish analyst/sentiment/backfill, so
+    the default 'analyst' preserves their behavior; role only matters for
+    the backfill-pinned-to-Gemini rule (backfill goes through
+    get_recommended_model + call_model instead, so no current call_llm
+    caller needs to pass it).
     """
     global _last_model_used
-    if not _429_cooled_down():
-        return None
-
     if not _cost_ok():
         print(f"[LLM] Daily cost limit reached (${_daily_cost:.2f}/${_DAILY_COST_LIMIT:.2f})")
         return None
@@ -560,134 +886,560 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048,
         print("[LLM] Rate limit reached, skipping")
         return None
 
-    gemini_key = config.get("models", {}).get("gemini", {}).get("api_key", "")
-    if not gemini_key:
+    chain = resolve_provider_chain(role, config)
+    if not chain:
         return None
 
-    model = config.get("models", {}).get("gemini", {}).get("model", "gemini-2.5-flash")
-    prompt_chars = len(prompt) + len(system)
     timeout = config.get("max_llm_latency_sec", 30)
+    prompt_chars = len(prompt) + len(system)
 
-    # Try configured model first
-    start = time.time()
-    try:
-        result, usage = _call_gemini(prompt, system, gemini_key, model, max_tokens,
-                                     timeout, json_schema=json_schema,
-                                     temperature=temperature)
-        elapsed = (time.time() - start) * 1000
-        if result:
-            record_call(model)
-            _record_cost(model, prompt_chars, len(result), usage)
-            _last_model_used = model
-            print(f"[LLM] {model}: {elapsed:.0f}ms, {len(result)} chars (${_daily_cost:.3f} today)")
-            return result
-        # None result = truncation / safety block / empty parts — retryable
-    except urllib.error.HTTPError as e:
-        elapsed = (time.time() - start) * 1000
-        if e.code == 429:
-            wait = _parse_retry_after(e)
-            if wait and wait <= _429_MAX_WAIT_PRIMARY:
-                print(f"[LLM] {model}: 429, waiting {wait:.0f}s")
-                time.sleep(wait)
-                try:
-                    start2 = time.time()
-                    result, usage = _call_gemini(prompt, system, gemini_key, model,
-                                                 max_tokens, timeout,
-                                                 json_schema=json_schema,
-                                                 temperature=temperature)
-                    elapsed2 = (time.time() - start2) * 1000
-                    if result:
-                        record_call(model)
-                        _record_cost(model, prompt_chars, len(result), usage)
-                        _last_model_used = model
-                        print(f"[LLM] {model}: {elapsed2:.0f}ms, {len(result)} chars (after wait, ${_daily_cost:.3f} today)")
-                        return result
-                except Exception:
-                    pass
-            # Fall through to chain
-        elif e.code not in _FALLBACK_CODES:
-            print(f"[LLM] {model}: HTTP {e.code} ({elapsed:.0f}ms)")
-            return None
-    except Exception as e:
-        # Timeouts/URLErrors are the most common failure — they MUST reach
-        # the chain (the old code returned None here and the advertised
-        # fallback rarely executed)
-        elapsed = (time.time() - start) * 1000
-        print(f"[LLM] {model}: {e} ({elapsed:.0f}ms)")
+    def _dispatch(provider, model, base_url, api_key):
+        if provider == "anthropic":
+            return _call_anthropic(prompt, system, api_key, model, max_tokens,
+                                   timeout, json_schema=json_schema,
+                                   temperature=temperature)
+        if provider == "gemini":
+            return _call_gemini(prompt, system, api_key, model, max_tokens,
+                                timeout, json_schema=json_schema,
+                                temperature=temperature)
+        # 'openai' or any OpenAI-compatible endpoint name
+        return _call_openai(prompt, system, api_key, model, max_tokens,
+                            timeout, json_schema=json_schema,
+                            temperature=temperature, base_url=base_url)
 
-    # Fallback chain
-    print(f"[LLM] {model}: failed, trying fallback chain")
-    return _try_gemini_chain(gemini_key, prompt, system, max_tokens, timeout,
-                             skip_model=model, json_schema=json_schema,
-                             temperature=temperature)
-
-
-def _try_gemini_chain(api_key, prompt, system, max_tokens, timeout,
-                      skip_model=None, json_schema=None, temperature=None):
-    """Try each Gemini model in fallback order.
-
-    Continues past None results (truncation/safety/empty) instead of
-    aborting the chain — `return result` on a None used to end the chain
-    at its first member.
-    """
-    global _last_model_used
-    for model in _GEMINI_FALLBACK_CHAIN:
-        if model == skip_model:
+    for i, (provider, model, base_url, api_key) in enumerate(chain):
+        if provider in ("anthropic", "openai", "gemini") and not api_key:
+            continue  # endpoints may legitimately be keyless (e.g. Ollama)
+        if not _429_cooled_down(provider):
             continue
         remaining, _total = get_budget(model)
         if remaining <= 0:
             continue
 
+        max_wait = _429_MAX_WAIT_PRIMARY if i == 0 else _429_MAX_WAIT_FALLBACK
         start = time.time()
         try:
-            result, usage = _call_gemini(prompt, system, api_key, model, max_tokens,
-                                         timeout, json_schema=json_schema,
-                                         temperature=temperature)
+            result, usage = _dispatch(provider, model, base_url, api_key)
             elapsed = (time.time() - start) * 1000
             if result:
                 record_call(model)
-                _record_cost(model, len(prompt) + len(system), len(result), usage)
+                _record_cost(model, prompt_chars, len(result), usage)
                 _last_model_used = model
-                print(f"[LLM] gemini/{model}: {elapsed:.0f}ms, {len(result)} chars")
+                print(f"[LLM] {provider}/{model}: {elapsed:.0f}ms, {len(result)} chars "
+                      f"(${_daily_cost:.3f} today)")
                 return result
-            print(f"[LLM] gemini/{model}: empty/truncated, trying next")
+            print(f"[LLM] {provider}/{model}: empty/truncated, trying next")
             continue
-
         except urllib.error.HTTPError as e:
-            elapsed = (time.time() - start) * 1000
             if e.code == 429:
-                wait = _parse_retry_after(e)
-                if wait and wait <= _429_MAX_WAIT_FALLBACK:
-                    print(f"[LLM] gemini/{model}: 429, waiting {wait:.0f}s")
+                wait = (_parse_retry_after(e) if provider == "gemini"
+                        else _parse_retry_after_anthropic(e))
+                if wait and wait <= max_wait:
+                    print(f"[LLM] {provider}/{model}: 429, waiting {wait:.0f}s")
                     time.sleep(wait)
                     try:
-                        start2 = time.time()
-                        result, usage = _call_gemini(prompt, system, api_key, model,
-                                                     max_tokens, timeout,
-                                                     json_schema=json_schema,
-                                                     temperature=temperature)
-                        elapsed2 = (time.time() - start2) * 1000
+                        result, usage = _dispatch(provider, model, base_url, api_key)
                         if result:
                             record_call(model)
-                            _record_cost(model, len(prompt) + len(system), len(result), usage)
+                            _record_cost(model, prompt_chars, len(result), usage)
                             _last_model_used = model
-                            print(f"[LLM] gemini/{model}: {elapsed2:.0f}ms, {len(result)} chars (after wait)")
+                            print(f"[LLM] {provider}/{model}: {len(result)} chars (after wait)")
                             return result
                     except Exception:
                         pass
-                print(f"[LLM] gemini/{model}: 429, trying next")
+                print(f"[LLM] {provider}/{model}: 429, trying next")
+                _trigger_429_cooldown(provider)
                 continue
-            print(f"[LLM] gemini/{model}: HTTP {e.code}, trying next")
+            print(f"[LLM] {provider}/{model}: HTTP {e.code}, trying next")
+            continue
+        except Exception as e:
+            print(f"[LLM] {provider}/{model}: {e}, trying next")
             continue
 
+    print("[LLM] All providers/models in chain exhausted")
+    return None
+
+
+# --- Anthropic (Claude) support ---
+
+def _anthropic_key(config: dict | None = None) -> str:
+    """Anthropic key: llm_config models.claude.api_key, else ANTHROPIC_API_KEY env."""
+    config = config or load_llm_config()
+    key = config.get("models", {}).get("claude", {}).get("api_key", "")
+    return key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def _openai_key(config: dict | None = None) -> str:
+    """OpenAI key: llm_config models.openai.api_key, else OPENAI_API_KEY env."""
+    config = config or load_llm_config()
+    key = config.get("models", {}).get("openai", {}).get("api_key", "")
+    return key or os.environ.get("OPENAI_API_KEY", "")
+
+
+def _parse_retry_after_anthropic(http_error) -> float | None:
+    """Anthropic 429s carry a standard retry-after header (seconds)."""
+    try:
+        ra = http_error.headers.get("retry-after")
+        if ra is not None:
+            return float(ra)
+    except Exception:
+        pass
+    return 15.0
+
+
+def _normalize_schema_for_anthropic(schema):
+    """Translate a Gemini-dialect schema into standard JSON Schema.
+
+    Callers historically author schemas for Gemini's responseSchema, which
+    accepts OpenAPI-style UPPERCASE type names ('OBJECT', 'NUMBER', ...) and
+    Gemini-only keys like propertyOrdering. Anthropic's tool input_schema is
+    strict JSON Schema — uppercase types are invalid and can fail the whole
+    call, silently disabling the analyst gate on a Claude config (fail-open
+    masks it). Lowercase every 'type', drop Gemini-only keys, recurse.
+    """
+    if isinstance(schema, list):
+        return [_normalize_schema_for_anthropic(s) for s in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {}
+    for k, v in schema.items():
+        if k == 'propertyOrdering':
+            continue  # Gemini-only hint, not JSON Schema
+        if k == 'type':
+            if isinstance(v, str):
+                out[k] = v.lower()
+            elif isinstance(v, list):
+                out[k] = [t.lower() if isinstance(t, str) else t for t in v]
+            else:
+                out[k] = v
+        elif isinstance(v, (dict, list)):
+            out[k] = _normalize_schema_for_anthropic(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _normalize_schema_for_openai(schema):
+    """Translate a (possibly Gemini-dialect) schema into OpenAI's strict
+    json_schema form.
+
+    Same lowercase-type + propertyOrdering-drop translation as
+    _normalize_schema_for_anthropic, PLUS what OpenAI's strict mode
+    additionally requires: 'additionalProperties': false on every object
+    schema (recursively — nested 'properties'/'items' objects included).
+    Without it, strict schema validation rejects the request outright.
+    """
+    if isinstance(schema, list):
+        return [_normalize_schema_for_openai(s) for s in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {}
+    for k, v in schema.items():
+        if k == 'propertyOrdering':
+            continue  # Gemini-only hint, not JSON Schema
+        if k == 'type':
+            if isinstance(v, str):
+                out[k] = v.lower()
+            elif isinstance(v, list):
+                out[k] = [t.lower() if isinstance(t, str) else t for t in v]
+            else:
+                out[k] = v
+        elif isinstance(v, (dict, list)):
+            out[k] = _normalize_schema_for_openai(v)
+        else:
+            out[k] = v
+    type_val = out.get('type')
+    is_object = type_val == 'object' or (
+        isinstance(type_val, list) and 'object' in type_val)
+    if is_object or 'properties' in out:
+        out.setdefault('additionalProperties', False)
+    return out
+
+
+def _call_anthropic(prompt, system, api_key, model, max_tokens, timeout,
+                    json_mode=False, json_schema=None, temperature=None):
+    """Call the Anthropic Messages API. Returns (text|None, usage|None);
+    raises urllib errors for the caller's retry/fallback logic.
+
+    json_schema: enforced via FORCED TOOL USE — the schema becomes a tool's
+    input_schema and tool_choice pins the model to that tool, so the returned
+    tool_use input is schema-validated JSON. It is re-serialized to a JSON
+    string so callers parse both providers identically. Usage is normalized
+    to Gemini's usageMetadata key names so _record_cost stays provider-
+    agnostic. json_mode without a schema is best-effort (prompt discipline).
+    """
+    url = "https://api.anthropic.com/v1/messages"
+    body = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+        body["system"] = system
+    if temperature is not None:
+        body["temperature"] = temperature
+    if json_schema is not None:
+        body["tools"] = [{
+            "name": "emit_json",
+            "description": "Emit the structured answer in the required schema.",
+            "input_schema": _normalize_schema_for_anthropic(json_schema),
+        }]
+        body["tool_choice"] = {"type": "tool", "name": "emit_json"}
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": _ANTHROPIC_VERSION,
+        },
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    data = json.loads(resp.read())
+    u = data.get("usage") or {}
+    usage = {
+        "promptTokenCount": u.get("input_tokens", 0),
+        "candidatesTokenCount": u.get("output_tokens", 0),
+        "thoughtsTokenCount": 0,
+    }
+    stop = data.get("stop_reason", "unknown")
+    text_parts = []
+    for block in data.get("content", []) or []:
+        if block.get("type") == "tool_use" and json_schema is not None:
+            return json.dumps(block.get("input", {})), usage
+        if block.get("type") == "text" and block.get("text", "").strip():
+            text_parts.append(block["text"])
+    if stop == "max_tokens":
+        print(f"[LLM] Claude: truncated ({sum(len(t) for t in text_parts)} chars), discarding")
+        return None, usage
+    if text_parts:
+        return "".join(text_parts), usage
+    print(f"[LLM] Claude: no usable content (stop={stop})")
+    return None, usage
+
+
+_DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+
+
+def _call_openai(prompt, system, api_key, model, max_tokens, timeout,
+                 json_schema=None, temperature=None, base_url=None):
+    """Call an OpenAI-compatible /chat/completions endpoint. Returns
+    (text|None, usage|None); raises urllib errors for the caller's
+    retry/fallback logic.
+
+    Works against OpenAI itself (base_url=None -> the default OpenAI API)
+    and any OpenAI-compatible endpoint (OpenRouter/Groq/Ollama/...) via the
+    base_url override — same request shape, since they all implement the
+    Chat Completions wire format.
+
+    json_schema: enforced via response_format={'type': 'json_schema',
+    'json_schema': {'name': 'emit_json', 'strict': True, 'schema': ...}} —
+    the schema is normalized (_normalize_schema_for_openai) since strict
+    mode requires lowercase types and additionalProperties:false on every
+    object. Usage is normalized to the Gemini-style dict so _record_cost
+    stays provider-agnostic, same as _call_anthropic.
+    """
+    base = (base_url or _DEFAULT_OPENAI_BASE_URL).rstrip("/")
+    url = f"{base}/chat/completions"
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    body = {
+        "model": model,
+        "messages": messages,
+        # Native OpenAI rejects 'max_tokens' outright on the gpt-5 family
+        # ("Unsupported parameter ... use 'max_completion_tokens'"), while
+        # third-party OpenAI-compatible endpoints (Ollama especially) only
+        # reliably understand the classic 'max_tokens'. Key the field name
+        # on which side we're talking to.
+        ("max_completion_tokens" if base_url is None else "max_tokens"): max_tokens,
+    }
+    if temperature is not None:
+        body["temperature"] = temperature
+    if json_schema is not None:
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "emit_json",
+                "strict": True,
+                "schema": _normalize_schema_for_openai(json_schema),
+            },
+        }
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers=headers,
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    data = json.loads(resp.read())
+    u = data.get("usage") or {}
+    usage = {
+        "promptTokenCount": u.get("prompt_tokens", 0),
+        "candidatesTokenCount": u.get("completion_tokens", 0),
+        "thoughtsTokenCount": 0,
+    }
+    choices = data.get("choices") or []
+    if not choices:
+        print("[LLM] OpenAI: no choices in response")
+        return None, usage
+    choice = choices[0]
+    finish = choice.get("finish_reason", "unknown")
+    text = (choice.get("message") or {}).get("content") or ""
+    if finish == "length":
+        print(f"[LLM] OpenAI: truncated ({len(text)} chars), discarding")
+        return None, usage
+    if text.strip():
+        return text, usage
+    print(f"[LLM] OpenAI: no usable content (finish={finish})")
+    return None, usage
+
+
+def call_claude(prompt: str, system: str = "", model: str = "claude-haiku-4-5",
+                max_tokens: int = 2048, json_mode: bool = False,
+                json_schema: dict | None = None,
+                temperature: float | None = None,
+                timeout: float | None = None) -> str | None:
+    """Call a specific Anthropic model. Returns text or None.
+
+    The Anthropic twin of call_gemini: same cost cap, rate limiter, budget
+    and cooldown discipline; single model, no fallback (caller decides).
+    """
+    global _last_model_used
+    if not _429_cooled_down('anthropic'):
+        return None
+    if not _cost_ok():
+        print(f"[LLM] Daily cost limit reached (${_daily_cost:.2f}/${_DAILY_COST_LIMIT:.2f})")
+        return None
+    config = load_llm_config()
+    if not config.get("enabled"):
+        return None
+    api_key = _anthropic_key(config)
+    if not api_key:
+        return None
+    if not _rate_limit_ok():
+        print(f"[LLM] Rate limit reached, skipping {model}")
+        return None
+    remaining, total = get_budget(model)
+    if remaining <= 0:
+        print(f"[LLM] {model}: daily budget exhausted ({total} RPD)")
+        return None
+
+    prompt_chars = len(prompt) + len(system)
+    if timeout is None:
+        timeout = config.get("max_llm_latency_sec", 30)
+
+    for attempt in (1, 2):
+        start = time.time()
+        try:
+            result, usage = _call_anthropic(prompt, system, api_key, model,
+                                            max_tokens, timeout,
+                                            json_mode=json_mode,
+                                            json_schema=json_schema,
+                                            temperature=temperature)
+            elapsed = (time.time() - start) * 1000
+            if result:
+                record_call(model)
+                _record_cost(model, prompt_chars, len(result), usage)
+                _last_model_used = model
+                print(f"[LLM] {model}: {elapsed:.0f}ms, {len(result)} chars "
+                      f"(${_daily_cost:.3f} today)")
+            return result
+        except urllib.error.HTTPError as e:
+            elapsed = (time.time() - start) * 1000
+            if e.code == 429 and attempt == 1:
+                wait = _parse_retry_after_anthropic(e)
+                if wait and wait <= _429_MAX_WAIT_PRIMARY:
+                    print(f"[LLM] {model}: 429, waiting {wait:.0f}s")
+                    time.sleep(wait)
+                    continue
+            print(f"[LLM] {model}: HTTP {e.code} ({elapsed:.0f}ms)")
+            return None
         except Exception as e:
             elapsed = (time.time() - start) * 1000
-            print(f"[LLM] gemini/{model}: {e}, trying next")
-            continue
-
-    print("[LLM] All Gemini models exhausted")
-    _trigger_429_cooldown()
+            print(f"[LLM] {model}: {e} ({elapsed:.0f}ms)")
+            return None
     return None
+
+
+def call_openai(prompt: str, system: str = "", model: str = "gpt-5.4-nano",
+                max_tokens: int = 2048, json_mode: bool = False,
+                json_schema: dict | None = None,
+                temperature: float | None = None,
+                timeout: float | None = None,
+                base_url: str | None = None) -> str | None:
+    """Call a specific OpenAI (or OpenAI-compatible) model. Returns text or
+    None.
+
+    The OpenAI twin of call_claude/call_gemini: same cost cap, rate
+    limiter, budget, and cooldown discipline (per-provider cooldown key
+    'openai'); single model, no fallback (caller decides). base_url
+    defaults to the real OpenAI API; pass an override to hit an
+    OpenAI-compatible third-party endpoint directly (normal usage for
+    third-party endpoints goes through resolve_provider_chain + call_llm
+    instead, which resolves base_url/api_key per-endpoint automatically).
+    """
+    global _last_model_used
+    if not _429_cooled_down('openai'):
+        return None
+    if not _cost_ok():
+        print(f"[LLM] Daily cost limit reached (${_daily_cost:.2f}/${_DAILY_COST_LIMIT:.2f})")
+        return None
+    config = load_llm_config()
+    if not config.get("enabled"):
+        return None
+    api_key = _openai_key(config)
+    if not api_key:
+        return None
+    if not _rate_limit_ok():
+        print(f"[LLM] Rate limit reached, skipping {model}")
+        return None
+    remaining, total = get_budget(model)
+    if remaining <= 0:
+        print(f"[LLM] {model}: daily budget exhausted ({total} RPD)")
+        return None
+
+    prompt_chars = len(prompt) + len(system)
+    if timeout is None:
+        timeout = config.get("max_llm_latency_sec", 30)
+
+    for attempt in (1, 2):
+        start = time.time()
+        try:
+            result, usage = _call_openai(prompt, system, api_key, model,
+                                         max_tokens, timeout,
+                                         json_schema=json_schema,
+                                         temperature=temperature,
+                                         base_url=base_url)
+            elapsed = (time.time() - start) * 1000
+            if result:
+                record_call(model)
+                _record_cost(model, prompt_chars, len(result), usage)
+                _last_model_used = model
+                print(f"[LLM] {model}: {elapsed:.0f}ms, {len(result)} chars "
+                      f"(${_daily_cost:.3f} today)")
+            return result
+        except urllib.error.HTTPError as e:
+            elapsed = (time.time() - start) * 1000
+            if e.code == 429 and attempt == 1:
+                wait = _parse_retry_after_anthropic(e)  # generic retry-after header parse
+                if wait and wait <= _429_MAX_WAIT_PRIMARY:
+                    print(f"[LLM] {model}: 429, waiting {wait:.0f}s")
+                    time.sleep(wait)
+                    continue
+            print(f"[LLM] {model}: HTTP {e.code} ({elapsed:.0f}ms)")
+            return None
+        except Exception as e:
+            elapsed = (time.time() - start) * 1000
+            print(f"[LLM] {model}: {e} ({elapsed:.0f}ms)")
+            return None
+    return None
+
+
+def call_model(prompt: str, system: str = "", model: str = "gemini-2.5-flash-lite",
+               max_tokens: int = 2048, json_mode: bool = False,
+               json_schema: dict | None = None,
+               temperature: float | None = None,
+               timeout: float | None = None) -> str | None:
+    """Provider-aware single-model call: 'claude-*' -> Anthropic,
+    'gpt-*'/'o*' -> OpenAI, else Gemini.
+
+    The analyst/tiered-sentiment call sites use this so a role override or a
+    provider switch can point them at any provider without code changes.
+    """
+    provider = _provider_for(model)
+    if provider == "anthropic":
+        return call_claude(prompt, system=system, model=model,
+                           max_tokens=max_tokens, json_mode=json_mode,
+                           json_schema=json_schema, temperature=temperature,
+                           timeout=timeout)
+    if provider == "openai":
+        return call_openai(prompt, system=system, model=model,
+                           max_tokens=max_tokens, json_mode=json_mode,
+                           json_schema=json_schema, temperature=temperature,
+                           timeout=timeout)
+    return call_gemini(prompt, system=system, model=model,
+                       max_tokens=max_tokens, json_mode=json_mode,
+                       json_schema=json_schema, temperature=temperature,
+                       timeout=timeout)
+
+
+def probe_available_models() -> dict:
+    """Ask each configured provider (+ every enabled endpoint) what models
+    the key can actually see.
+
+    'Are we relying on old models?' becomes a runtime question: every
+    native provider AND every OpenAI-compatible endpoint expose a
+    model-list endpoint, so new releases show up here without a code
+    change (route to them via the config model fields / role overrides,
+    and price them via the config "pricing" table). Ops/GUI use only —
+    never called in the trading hot path.
+    """
+    out: dict[str, list] = {"gemini": [], "anthropic": [], "openai": []}
+    config = load_llm_config()
+    gkey = config.get("models", {}).get("gemini", {}).get("api_key", "")
+    if gkey:
+        try:
+            req = urllib.request.Request(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                headers={"x-goog-api-key": gkey})
+            data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            out["gemini"] = sorted(
+                m["name"].removeprefix("models/")
+                for m in data.get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", []))
+        except Exception as e:
+            out["gemini"] = [f"probe failed: {e}"]
+    akey = _anthropic_key(config)
+    if akey:
+        try:
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": akey,
+                         "anthropic-version": _ANTHROPIC_VERSION})
+            data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            out["anthropic"] = sorted(m.get("id", "")
+                                      for m in data.get("data", []))
+        except Exception as e:
+            out["anthropic"] = [f"probe failed: {e}"]
+    okey = _openai_key(config)
+    if okey:
+        try:
+            req = urllib.request.Request(
+                f"{_DEFAULT_OPENAI_BASE_URL}/models",
+                headers={"Authorization": f"Bearer {okey}"})
+            data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            out["openai"] = sorted(m.get("id", "")
+                                   for m in data.get("data", []))
+        except Exception as e:
+            out["openai"] = [f"probe failed: {e}"]
+    for ep in _enabled_endpoints(config):
+        name = ep.get("name") or "endpoint"
+        base = (ep.get("base_url") or "").rstrip("/")
+        if not base:
+            out[name] = ["probe failed: no base_url configured"]
+            continue
+        key = _endpoint_api_key(ep)
+        headers = {}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        try:
+            req = urllib.request.Request(f"{base}/models", headers=headers)
+            data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            out[name] = sorted(m.get("id", "") for m in data.get("data", []))
+        except Exception as e:
+            out[name] = [f"probe failed: {e}"]
+    return out
 
 
 # --- Gemini API call ---

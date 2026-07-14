@@ -48,8 +48,8 @@ def fetch_cryptocompare_hourly(symbol: str, start_date: str,
         url = f'{_CC_BASE}?fsym={fsym}&tsym={tsym}&limit={_CC_MAX_BARS}&toTs={cursor_ts}'
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'trader-bot/1.0'})
-            resp = urllib.request.urlopen(req, timeout=15)
-            data = json.loads(resp.read())
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
 
             if data.get('Response') != 'Success':
                 msg = data.get('Message', 'unknown error')
@@ -108,8 +108,10 @@ def fetch_with_fallback(ticker: str, start_date: str, api=None,
                         asset_type: str = 'crypto') -> pd.DataFrame | None:
     """Fetch historical bars with fallback chain.
 
-    Chain: Alpaca (primary) -> yfinance (secondary) -> CryptoCompare (crypto only)
-    Merges all sources, deduplicates (prefer Alpaca > yfinance > CC).
+    Crypto: merges Alpaca + yfinance + CryptoCompare, deduplicated with
+    Alpaca > yfinance > CC priority on timestamp collisions.
+    Stocks: Alpaca only; yfinance is used exclusively as a fallback when
+    Alpaca returns nothing (different bar grid — never merged).
 
     Args:
         ticker: Ticker symbol (yfinance format for crypto: BTC-USD)

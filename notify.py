@@ -37,17 +37,21 @@ def _post(url: str, payload: dict):
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(),
         headers={'Content-Type': 'application/json'}, method='POST')
-    urllib.request.urlopen(req, timeout=10)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        r.read()
 
 
 def _send(message: str, level: str):
+    # Delivery failures are warnings, not debug: a misconfigured webhook
+    # would otherwise swallow every CRITICAL alert invisibly at the default
+    # INFO log level. Volume is bounded by notify()'s 10-minute dedupe gate.
     text = f"{LEVEL_EMOJI.get(level, '')} [trader/{level}] {message}"[:1900]
     webhook = os.getenv('TRADER_WEBHOOK_URL')
     if webhook:
         try:
             _post(webhook, {'content': text})
         except Exception as e:
-            logger.debug('[NOTIFY] webhook failed: %s', e)
+            logger.warning('[NOTIFY] webhook failed: %s', e)
     token = os.getenv('TRADER_TELEGRAM_BOT_TOKEN')
     chat = os.getenv('TRADER_TELEGRAM_CHAT_ID')
     if token and chat:
@@ -55,7 +59,7 @@ def _send(message: str, level: str):
             _post(f"https://api.telegram.org/bot{token}/sendMessage",
                   {'chat_id': chat, 'text': text})
         except Exception as e:
-            logger.debug('[NOTIFY] telegram failed: %s', e)
+            logger.warning('[NOTIFY] telegram failed: %s', e)
 
 
 _hb_last: dict[str, float] = {}
@@ -85,12 +89,15 @@ def ping_heartbeat(name: str):
         if url:
             def _ping():
                 try:
-                    urllib.request.urlopen(url, timeout=10)
+                    with urllib.request.urlopen(url, timeout=10) as r:
+                        r.read()
                 except Exception:
                     pass
             threading.Thread(target=_ping, daemon=True, name='heartbeat').start()
-    except Exception:
-        pass
+    except Exception as e:
+        # e.g. SD card read-only/full — the remote healthcheck will still
+        # fire, but leave an on-device trace for diagnosis
+        logger.debug('[NOTIFY] heartbeat failed: %s', e)
 
 
 # --- Remote kill switch (Telegram) + halt flag ---
@@ -105,6 +112,14 @@ _FLATTEN_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              'flatten_request.flag')
 _TG_OFFSET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                'telegram_offset.json')
+
+# Escalation state for poll_telegram_commands: transient poll blips stay at
+# debug, but a CONTINUOUSLY failing poll means /halt and /flatten are dead —
+# warn (at most hourly) so the operator learns the kill switch is offline.
+_tg_fail_since: float | None = None
+_tg_last_warn = -1e9
+_TG_FAIL_WARN_AFTER_SEC = 600
+_TG_FAIL_WARN_EVERY_SEC = 3600
 
 
 def halt_active() -> bool:
@@ -154,6 +169,7 @@ def poll_telegram_commands() -> list[str]:
     message a bot — without this check a stranger could halt trading).
     Returns lowercase command strings like '/halt'. Never raises.
     """
+    global _tg_fail_since, _tg_last_warn
     token = os.getenv('TRADER_TELEGRAM_BOT_TOKEN')
     chat = os.getenv('TRADER_TELEGRAM_CHAT_ID')
     if not token or not chat:
@@ -168,7 +184,8 @@ def poll_telegram_commands() -> list[str]:
         url = (f"https://api.telegram.org/bot{token}/getUpdates"
                f"?offset={offset + 1}&timeout=0&allowed_updates=%5B%22message%22%5D")
         req = urllib.request.Request(url)
-        data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
         cmds = []
         max_id = offset
         for upd in data.get('result', []):
@@ -184,17 +201,40 @@ def poll_telegram_commands() -> list[str]:
             with open(tmp, 'w') as f:
                 json.dump({'offset': max_id}, f)
             os.replace(tmp, _TG_OFFSET_FILE)
+        _tg_fail_since = None
         return cmds
     except Exception as e:
         logger.debug('[NOTIFY] telegram poll failed: %s', e)
+        now = time.monotonic()
+        if _tg_fail_since is None:
+            _tg_fail_since = now
+        elif (now - _tg_fail_since >= _TG_FAIL_WARN_AFTER_SEC
+                and now - _tg_last_warn >= _TG_FAIL_WARN_EVERY_SEC):
+            _tg_last_warn = now
+            logger.warning('[NOTIFY] telegram polling failing for %.0f min — '
+                           'remote kill switch (/halt, /flatten) is '
+                           'unavailable: %s', (now - _tg_fail_since) / 60, e)
         return []
+
+
+_tg_misconfig_warned = False
 
 
 def notify(message: str, level: str = 'warning', dedupe_key: str | None = None):
     """Fire-and-forget alert. Safe to call from any trading path."""
+    global _tg_misconfig_warned
     try:
-        if not (os.getenv('TRADER_WEBHOOK_URL')
-                or os.getenv('TRADER_TELEGRAM_BOT_TOKEN')):
+        webhook = os.getenv('TRADER_WEBHOOK_URL')
+        token = os.getenv('TRADER_TELEGRAM_BOT_TOKEN')
+        chat = os.getenv('TRADER_TELEGRAM_CHAT_ID')
+        if bool(token) != bool(chat) and not _tg_misconfig_warned:
+            _tg_misconfig_warned = True
+            logger.warning('[NOTIFY] telegram needs BOTH '
+                           'TRADER_TELEGRAM_BOT_TOKEN and '
+                           'TRADER_TELEGRAM_CHAT_ID — channel disabled')
+        # _send() requires token AND chat: gating on the token alone would
+        # record the dedupe entry and then provably send nothing
+        if not (webhook or (token and chat)):
             return
         key = dedupe_key or message[:80]
         now = time.monotonic()

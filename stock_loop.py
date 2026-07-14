@@ -5,12 +5,16 @@ Trades only during regular market hours (9:30 AM - 4:00 PM ET):
   2. Check stop-loss / trailing stop upgrades on open positions
   3. Sell positions where the model signals weakness or they drop from top N
   4. Buy top-N bullish stocks (sentiment-gated, bracket orders with stops)
-  5. Flatten all stock positions at 3:50 PM ET to avoid overnight gap risk
+  5. Flatten stock positions in the last ~10 minutes before the ACTUAL
+     close (Alpaca clock: holiday/early-close aware), carving out the
+     capped overnight sleeve (_select_overnight_keepers), to avoid
+     overnight gap risk
 
 Enhanced with GARCH volatility, macro regime, correlation-aware sizing,
 Kelly criterion, HMM regime detection, and VIX-based risk scaling.
 """
 
+import os
 import json
 import time
 import datetime
@@ -329,8 +333,23 @@ class StockLoop(BaseTradingLoop):
                 try:
                     pos = self.api.get_position(symbol)
                     qty = int(float(pos.qty))
-                except Exception:
-                    self.positions.pop(symbol, None)
+                except Exception as e:
+                    # Only a not-found-style error means the position is
+                    # gone (mirrors _execute_sells). A transient failure
+                    # (429/timeout/5xx) treated as "gone" would drop
+                    # tracking, mark the flatten done, and let the REAL
+                    # position ride overnight with day-TIF legs expired.
+                    err_str = str(e).lower()
+                    if ('not found' in err_str or '404' in err_str
+                            or 'no position' in err_str):
+                        info = self.positions.get(symbol)
+                        if info is not None:
+                            self._journal_external_close(symbol, info)
+                        self.positions.pop(symbol, None)
+                    else:
+                        logger.error("[FLATTEN] %s: get_position failed (%s) — will retry",
+                                     symbol, e)
+                        failures.append(symbol)
                     continue
                 if qty <= 0:
                     self.positions.pop(symbol, None)
@@ -445,8 +464,12 @@ class StockLoop(BaseTradingLoop):
                     "signal": signal,
                     "updated": datetime.datetime.now().isoformat(),
                 }
-            with open(_PRED_CACHE_FILE, 'w') as f:
+            # Atomic write (tmp + rename): the GUI polls this file, and an
+            # in-place write can hand it a torn read
+            tmp = _PRED_CACHE_FILE.with_suffix('.tmp')
+            with open(tmp, 'w') as f:
                 json.dump(data, f, indent=2)
+            os.replace(tmp, _PRED_CACHE_FILE)
         except Exception as e:
             logger.error("[CACHE] Error writing stock prediction cache: %s", e)
 
@@ -539,13 +562,7 @@ class StockLoop(BaseTradingLoop):
                     # Position closed at the broker outside our tracking
                     # (e.g. TP leg filled between cycles) — journal it so
                     # the Kelly sample isn't censored of these exits
-                    info = self.positions[symbol]
-                    quote = self.get_quote(symbol)
-                    px = quote['midpoint'] if quote else info.entry_price
-                    pnl = ((px - info.entry_price) / info.entry_price * 100
-                           if info.entry_price > 0 else 0.0)
-                    record_trade(symbol, 'sell', info.entry_price, px, pnl,
-                                 exit_reason='external_close', estimated=True)
+                    self._journal_external_close(symbol, self.positions[symbol])
                     del self.positions[symbol]
                 continue
 
@@ -590,6 +607,30 @@ class StockLoop(BaseTradingLoop):
                 self.last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(0.5)
 
+    def _journal_external_close(self, symbol, info):
+        """Journal a position that closed at the broker outside our tracking
+        (typically the bracket TP leg filling between cycles): trade_memory
+        for the Kelly sample AND a log_decision sell row so the Stage-0 /
+        slippage journals see these exits (both estimated — the real fill
+        price is unknown here)."""
+        quote = self.get_quote(symbol)
+        px = quote['midpoint'] if quote else info.entry_price
+        pnl = ((px - info.entry_price) / info.entry_price * 100
+               if info.entry_price > 0 else 0.0)
+        record_trade(symbol, 'sell', info.entry_price, px, pnl,
+                     exit_reason='external_close', estimated=True)
+        try:
+            from trade_journal import log_decision
+            log_decision({"symbol": symbol, "action": "sell",
+                          "exit_reason": "external_close",
+                          "pnl_pct": round(pnl, 4),
+                          "decision_price": quote['midpoint'] if quote else None,
+                          "fill_price": px,
+                          "slippage_bps": None,
+                          "estimated": True})
+        except Exception:
+            pass
+
     def _bucket_room_ok(self, symbol: str) -> bool:
         """Sector-bucket notional cap. Conservative: blocks when one more
         full-size entry would breach the bucket's share of MAX_EXPOSURE."""
@@ -613,7 +654,7 @@ class StockLoop(BaseTradingLoop):
         from order_utils import should_trade
         from trade_journal import log_decision
         from trading_utils import LLM_VETO_THRESHOLD
-        from portfolio import check_portfolio_correlation, get_correlation_sizing_factor
+        from portfolio import check_portfolio_correlation
 
         if self.flattened_today:
             return
@@ -705,7 +746,6 @@ class StockLoop(BaseTradingLoop):
             if pred is None:
                 vc['no_pred'] += 1
                 continue
-            n_candidates += 1
             snapshot = snapshots.get(symbol, {})
             if pred < self.trade_threshold:
                 vc['below_threshold'] += 1
@@ -717,11 +757,17 @@ class StockLoop(BaseTradingLoop):
             if quote is None:
                 vc['no_quote'] += 1
                 continue
+            # Count candidates only past pred+quote (matching base_loop) so
+            # entry_window rows are comparable across the two books
+            n_candidates += 1
 
             if not should_trade(pred, quote['spread_pct'], asset_type='stock'):
                 vc['cost_floor'] += 1
+                # spread_pct journaled for decision_report's spread-honest
+                # counterfactual (see base_loop's cost_floor site)
                 self._journal_skip(symbol, 'cost_floor', rank=rank, pred=pred,
-                                   snapshot=snapshot)
+                                   snapshot=snapshot,
+                                   spread_pct=round(quote['spread_pct'], 4))
                 continue
 
             # Winner's curse filter
@@ -823,6 +869,12 @@ class StockLoop(BaseTradingLoop):
                 continue
             qty = int(sized_notional / price)
             if qty <= 0:
+                # Sized below one share: count + journal it (a candidate
+                # that cleared every gate must not vanish from the
+                # admitted-k reconstruction without attribution)
+                vc['qty_zero'] += 1
+                self._journal_skip(symbol, 'qty_zero', rank=rank, pred=pred,
+                                   snapshot=snapshot)
                 continue
 
             # ATR-based stop and take-profit for bracket order
@@ -898,9 +950,17 @@ class StockLoop(BaseTradingLoop):
                                "fill_price": fill_price,
                                "slippage_bps": round(slippage_bps, 2) if slippage_bps is not None else None,
                                "book_risk_pct": book_risk_pct,
+                               "entry_tactic": "marketable_bracket",
+                               "maker": False,
                                "skip_reason": None}
                     buy_rec.update(self._conv_fields(symbol, pred, snapshot,
                                                      rank=rank))
+                    # Sizing decomposition — base _place_and_track_buy
+                    # attaches this to its buy rows; without it here the
+                    # VIX-ladder/macro-mult co-fire audit has no stock data
+                    sizing_detail = getattr(self, '_last_sizing_detail', None)
+                    if sizing_detail:
+                        buy_rec['sizing'] = sizing_detail
                     log_decision(buy_rec)
                     self.last_trade_time[symbol] = datetime.datetime.now()
                     self._count_trade(symbol)
@@ -944,8 +1004,21 @@ class StockLoop(BaseTradingLoop):
                         continue
                     elif stop_order.status in ('canceled', 'expired', 'rejected'):
                         info.stop_order_id = None
-                except Exception:
-                    info.stop_order_id = None
+                except Exception as e:
+                    # Discard the id only when the order is genuinely gone.
+                    # On a transient error (429/timeout/5xx) KEEP it and
+                    # retry next cycle (matches the base crypto handling):
+                    # dropping it kills the trailing upgrade for this
+                    # position and turns a later server-side fill into an
+                    # estimated external_close.
+                    err_str = str(e).lower()
+                    if 'not found' in err_str or '404' in err_str:
+                        logger.warning("[STOP-CHECK] %s: stop order %s not found — clearing id",
+                                       symbol, info.stop_order_id)
+                        info.stop_order_id = None
+                    else:
+                        logger.warning("[STOP-CHECK] %s: get_order failed (%s) — keeping id, retry next cycle",
+                                       symbol, e)
 
             quote = get_stock_quote(self.api, symbol)
             if quote is None:
@@ -1013,8 +1086,11 @@ class StockLoop(BaseTradingLoop):
         return tilt
 
     def _spy_rod_pm_tilt(self) -> float:
-        """0.5 when entering the 14:30-15:30 window into a strong-down
-        SPY tape; 1.0 otherwise. Uses the cached SPY benchmark series."""
+        """0.5 when entering 14:00-16:00 ET into a strong-down SPY tape;
+        1.0 otherwise. Uses the cached SPY benchmark series. NOTE: the
+        effective window is narrower in practice only because
+        ENTRY_WINDOWS_ENABLED constrains callers to STOCK_ENTRY_WINDOWS_ET —
+        with that flag off, this tilt applies to the full 14:00-16:00 span."""
         now = self._get_eastern_now()
         if not (14 <= now.hour < 16):
             return 1.0

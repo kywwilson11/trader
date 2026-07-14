@@ -38,25 +38,35 @@ def fit_blend_weight(lstm_oof, lgb_oof, y, objective='sharpe', threshold=0.0,
     objective='nnls'   : Breiman stacked regression, 1-DOF convex form
                          (minimize ||y - (w*lstm+(1-w)*lgb)||^2 over w in [0,1]).
     objective='sharpe' : 1-DOF search maximizing the long-only policy Sharpe.
-    Returns shrink_to on degenerate/thin input (fail-safe to the simple average).
+    Returns shrink_to (clipped to [0,1]) on degenerate/thin input — fail-safe to
+    the simple average. Unknown objectives raise ValueError.
     """
     a = np.asarray(lstm_oof, float)
     b = np.asarray(lgb_oof, float)
     y = np.asarray(y, float)
     m = np.isfinite(a) & np.isfinite(b) & np.isfinite(y)
     a, b, y = a[m], b[m], y[m]
+    shrink_to = min(max(float(shrink_to), 0.0), 1.0)
     if a.size < 20:
-        return float(shrink_to)
+        return shrink_to
 
     if objective == 'nnls':
         d = a - b
         denom = float(d @ d)
-        w = 0.5 if denom < 1e-12 else float(((y - b) @ d) / denom)
-    else:
+        if denom < 1e-12:              # identical legs: every w is the same blend
+            return shrink_to
+        w = float(((y - b) @ d) / denom)
+    elif objective == 'sharpe':
         ws = np.linspace(0.0, 1.0, 101)
-        sharpes = [_policy_sharpe(w * a + (1.0 - w) * b, y, threshold) for w in ws]
-        w = float(ws[int(np.argmax(sharpes))])
+        s = np.asarray([_policy_sharpe(w * a + (1.0 - w) * b, y, threshold) for w in ws])
+        # Sharpe depends on w only through the take-set, so the grid is piecewise
+        # constant with exact-tie plateaus; break ties toward the shrink target
+        # instead of np.argmax's leftmost (most-LGB-heavy) grid edge.
+        best = np.flatnonzero(s == s.max())
+        w = float(ws[best[np.argmin(np.abs(ws[best] - shrink_to))]])
+    else:
+        raise ValueError(f"unknown objective {objective!r}")
 
     w = min(max(w, 0.0), 1.0)
     lam = min(max(float(shrink_lambda), 0.0), 1.0)
-    return float((1.0 - lam) * w + lam * float(shrink_to))
+    return float((1.0 - lam) * w + lam * shrink_to)

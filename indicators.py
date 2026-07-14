@@ -1,6 +1,11 @@
 import pandas as pd
 import numpy as np
 
+try:
+    from indicator_config import HURST_ON_RETURNS
+except ImportError:
+    HURST_ON_RETURNS = False
+
 # Priority: C extension > Numba > pure numpy
 try:
     import indicators_c as _ic
@@ -320,8 +325,8 @@ def compute_rsi(series, length=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/length, min_periods=length).mean()
-    avg_loss = loss.ewm(alpha=1/length, min_periods=length).mean()
+    avg_gain = gain.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -551,8 +556,23 @@ def compute_features(df, btc_close=None):
     price_sign = np.sign(price_slope)
     df['Vol_Price_Confirm'] = obv_sign * price_sign  # +1=confirm, -1=diverge
 
-    # Hurst exponent (trending vs mean-reverting)
-    df['Hurst'] = compute_hurst(df['Close'], window=100)
+    # Hurst exponent (trending vs mean-reverting). R/S analysis is defined on
+    # the INCREMENTS of a process (the kernel builds partial sums of demeaned
+    # inputs internally): fed returns, a random walk reads H≈0.5 as documented.
+    # Fed price LEVELS — the historical behavior — the partial sums integrate
+    # the walk and H reads ~0.8 regardless of regime, which left the live
+    # `hurst < 0.45` mean-reversion gate structurally unable to fire. The
+    # returns mode is the correct math but MODEL-FACING (the feature's
+    # distribution shifts), so it activates via indicator_config.
+    # HURST_ON_RETURNS together with a harvest + retrain (CLAUDE.md gotcha #2:
+    # delete the study DBs), never against a deployed levels-trained model.
+    if HURST_ON_RETURNS:
+        # fillna(0.0): the leading pct_change NaN would otherwise poison the
+        # first R/S window (the kernels emit 0.5 on any NaN-bearing window)
+        df['Hurst'] = compute_hurst(df['Close'].pct_change().fillna(0.0),
+                                    window=100)
+    else:
+        df['Hurst'] = compute_hurst(df['Close'], window=100)
 
     # Calendar features
     month = idx.month
@@ -560,7 +580,7 @@ def compute_features(df, btc_close=None):
     df['Month_cos'] = np.cos(2 * np.pi * month / 12)
     # Turn-of-month flag (last 2 and first 2 trading days)
     day_of_month = idx.day
-    days_in_month = pd.Series(idx, index=idx).dt.days_in_month
+    days_in_month = idx.days_in_month
     df['Turn_of_Month'] = ((day_of_month <= 2) | (day_of_month >= days_in_month - 1)).astype(float)
 
     # BTC cross-asset features (crypto only)
@@ -583,8 +603,11 @@ def compute_vwap(high, low, close, volume):
     typical_price = (high + low + close) / 3.0
     tp_vol = typical_price * volume
 
-    # Group by date for daily reset
-    dates = close.index.date
+    # Group by date for daily reset. A normalized DatetimeIndex (midnight of
+    # the same calendar day, same tz) partitions rows identically to an
+    # object array of datetime.date but avoids materializing per-row Python
+    # date objects.
+    dates = close.index.normalize()
     cum_tp_vol = tp_vol.groupby(dates).cumsum()
     cum_vol = volume.groupby(dates).cumsum()
     vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
@@ -620,57 +643,71 @@ def compute_normalized_atr(high, low, close, length=14):
     return atr / close * 100
 
 
-def compute_stock_features(df, spy_close=None, symbol=None):
-    """Compute all features for stocks. Includes base crypto features + stock-specific ones.
-
-    Args:
-        df: DataFrame with OHLCV columns (DatetimeIndex)
-        spy_close: Optional Series of SPY close prices aligned to df's index
-                   for relative strength calculation
-    """
-    # Base features (same as crypto)
-    df = compute_features(df)
-
-    # VWAP
-    df['VWAP'] = compute_vwap(df['High'], df['Low'], df['Close'], df['Volume'])
-    df['Price_VWAP_Ratio'] = df['Close'] / df['VWAP']
-
-    # Overnight gap
-    df['Gap_Pct'] = compute_gap(df['Open'], df['Close'])
-
-    # Normalized ATR (volatility as % of price)
-    df['ATR_Pct'] = compute_normalized_atr(df['High'], df['Low'], df['Close'])
-
-    # Relative strength vs SPY
+def _session_features(df, spy_close):
+    """VWAP + Price/VWAP ratio, overnight gap, normalized ATR%, and
+    relative strength vs SPY (neutral 1.0 if no benchmark given)."""
+    vwap = compute_vwap(df['High'], df['Low'], df['Close'], df['Volume'])
+    price_vwap_ratio = df['Close'] / vwap
+    gap_pct = compute_gap(df['Open'], df['Close'])
+    atr_pct = compute_normalized_atr(df['High'], df['Low'], df['Close'])
     if spy_close is not None:
         # Align SPY close to df's index
         spy_aligned = spy_close.reindex(df.index).ffill()
-        df['RS_vs_SPY'] = compute_relative_strength(df['Close'], spy_aligned)
+        rs_vs_spy = compute_relative_strength(df['Close'], spy_aligned)
     else:
-        df['RS_vs_SPY'] = 1.0  # neutral if no benchmark
+        rs_vs_spy = 1.0  # neutral if no benchmark
+    return {
+        'VWAP': vwap,
+        'Price_VWAP_Ratio': price_vwap_ratio,
+        'Gap_Pct': gap_pct,
+        'ATR_Pct': atr_pct,
+        'RS_vs_SPY': rs_vs_spy,
+    }
 
-    # Return-of-day: cumulative % return from the PRIOR session's close to
-    # this bar (Baltussen-Da-Soebhag 2025: the prev-close-to-15:00 return
-    # negatively predicts the last half-hour, loser side only — served to
-    # the models and the meta-labeler as a soft feature, never a hard rule)
+
+def _rod_and_same_hour(df):
+    """Return-of-day and same-hour-of-day periodicity features.
+
+    ROD_Ret: cumulative % return from the PRIOR session's close to this bar
+    (Baltussen-Da-Soebhag 2025: the prev-close-to-15:00 return negatively
+    predicts the last half-hour, loser side only — served to the models
+    and the meta-labeler as a soft feature, never a hard rule).
+
+    Same_Hour_Mean_40d: (Heston-Korajczyk-Sadka JF 2010, replicated 30y in
+    Bogousslavsky JFE 2021) trailing 40-session mean of THIS clock-hour's
+    bar return, shifted so today's bar is excluded.
+    """
     dates = df.index.normalize() if hasattr(df.index, 'normalize') else df.index
     session_last = df['Close'].groupby(dates).transform('last')
     prev_close = session_last.groupby(dates).first().shift(1)
     prev_close_aligned = pd.Series(dates, index=df.index).map(prev_close)
-    df['ROD_Ret'] = (df['Close'] / prev_close_aligned - 1.0) * 100
+    rod_ret = (df['Close'] / prev_close_aligned - 1.0) * 100
 
-    # Same-hour-of-day periodicity (Heston-Korajczyk-Sadka JF 2010,
-    # replicated 30y in Bogousslavsky JFE 2021): trailing 40-session mean
-    # of THIS clock-hour's bar return, shifted so today's bar is excluded
     bar_ret = df['Close'].pct_change() * 100
-    df['Same_Hour_Mean_40d'] = (
+    same_hour_mean_40d = (
         bar_ret.groupby(df.index.hour)
         .transform(lambda s: s.rolling(40, min_periods=10).mean().shift(1)))
 
-    # --- Daily-frequency cross-sectional signals (computed on daily
-    # closes, shift(1) so intraday bars only see COMPLETED days, then
-    # ffilled onto the hourly grid) ---
-    daily_close = df['Close'].resample('1D').last().dropna()
+    return {'ROD_Ret': rod_ret, 'Same_Hour_Mean_40d': same_hour_mean_40d}
+
+
+def _map_daily_to_hourly(daily_series, daily_dates):
+    """Project a daily-frequency Series onto the hourly grid via the shared
+    `daily_dates` (index.normalize()) mapping, shift(1)'d so intraday bars
+    only ever see COMPLETED days. Single implementation shared by every
+    daily-window feature below (RM_252_21, Ret_21d, RR_5/RR_21,
+    MA_Dist_*d, ON_Mom_*, TugOfWar_252, Pos_Range_*d) — no behavior change,
+    just one mapping instead of the same expression repeated 14x.
+    """
+    return daily_dates.map(daily_series.shift(1)).values
+
+
+def _daily_residual_block(df, daily_close, daily_dates, spy_close, symbol):
+    """Residual momentum (RM_252_21), plain 21-day return (Ret_21d), and
+    residual short-term reversal (RR_5/RR_21) — all built on daily-close
+    returns market-stripped against SPY. `r_d`/`resid` are each computed
+    ONCE here and reused by both RM_252_21 and RR_5/RR_21.
+    """
     r_d = daily_close.pct_change()
 
     # Residual momentum rm_252_21 (Blitz-Huij-Martens JEmpFin 2011):
@@ -701,9 +738,10 @@ def compute_stock_features(df, spy_close=None, symbol=None):
     # dollar-volume rank so the model can learn both regimes
     ret21 = daily_close.pct_change(21) * 100
 
-    daily_dates = pd.Series(df.index.normalize(), index=df.index)
-    df['RM_252_21'] = daily_dates.map(rm.shift(1)).values
-    df['Ret_21d'] = daily_dates.map(ret21.shift(1)).values
+    feats = {
+        'RM_252_21': _map_daily_to_hourly(rm, daily_dates),
+        'Ret_21d': _map_daily_to_hourly(ret21, daily_dates),
+    }
 
     # Residual short-term reversal (wave 4; Nagel: short-horizon reversal
     # is the return to LIQUIDITY PROVISION, priced up when intermediaries
@@ -716,46 +754,62 @@ def compute_stock_features(df, spy_close=None, symbol=None):
     else:
         rr5 = pd.Series(np.nan, index=daily_close.index)
         rr21 = rr5
-    df['RR_5'] = daily_dates.map(rr5.shift(1)).values
-    df['RR_21'] = daily_dates.map(rr21.shift(1)).values
+    feats['RR_5'] = _map_daily_to_hourly(rr5, daily_dates)
+    feats['RR_21'] = _map_daily_to_hourly(rr21, daily_dates)
 
-    # Multi-horizon MA distances (Han-Zhou-Zhu trend factor): trends at
-    # short/intermediate/long horizons carry INDEPENDENT information;
-    # serve the distances and let the learner weight them
+    return feats
+
+
+def _ma_distances(daily_close, daily_dates):
+    """Multi-horizon MA distances (Han-Zhou-Zhu trend factor): trends at
+    short/intermediate/long horizons carry INDEPENDENT information; serve
+    the distances and let the learner weight them.
+    """
+    feats = {}
     for k in (10, 20, 50, 100, 200):
         sma_k = daily_close.rolling(k, min_periods=k).mean()
         dist = (daily_close / sma_k - 1.0) * 100
-        df[f'MA_Dist_{k}d'] = daily_dates.map(dist.shift(1)).values
+        feats[f'MA_Dist_{k}d'] = _map_daily_to_hourly(dist, daily_dates)
+    return feats
 
-    # Session-decomposed momentum (Lou-Polk-Skouras tug of war): the
-    # momentum premium accrues OVERNIGHT (institutions trade intraday,
-    # retail at the open; overnight financing/lending frictions keep the
-    # two from being arbitraged together)
+
+def _session_momentum(df, daily_close, daily_dates):
+    """Session-decomposed momentum (Lou-Polk-Skouras tug of war): the
+    momentum premium accrues OVERNIGHT (institutions trade intraday,
+    retail at the open; overnight financing/lending frictions keep the
+    two from being arbitraged together).
+    """
     daily_open = df['Open'].resample('1D').first().reindex(daily_close.index)
     on_ret = (daily_open / daily_close.shift(1) - 1.0) * 100
     id_ret = (daily_close / daily_open - 1.0) * 100
-    df['ON_Mom_21'] = daily_dates.map(
-        on_ret.rolling(21, min_periods=15).mean().shift(1)).values
-    df['ON_Mom_252'] = daily_dates.map(
-        on_ret.rolling(252, min_periods=126).mean().shift(1)).values
-    df['TugOfWar_252'] = daily_dates.map(
-        (on_ret.rolling(252, min_periods=126).mean()
-         - id_ret.rolling(252, min_periods=126).mean()).shift(1)).values
+    on_mom_21 = on_ret.rolling(21, min_periods=15).mean()
+    on_mom_252 = on_ret.rolling(252, min_periods=126).mean()
+    tug_of_war = on_mom_252 - id_ret.rolling(252, min_periods=126).mean()
+    return {
+        'ON_Mom_21': _map_daily_to_hourly(on_mom_21, daily_dates),
+        'ON_Mom_252': _map_daily_to_hourly(on_mom_252, daily_dates),
+        'TugOfWar_252': _map_daily_to_hourly(tug_of_war, daily_dates),
+    }
 
-    # JKX image-scale distillation (Jiang-Kelly-Xiu JF 2023): the CNN's
-    # edge comes largely from the IMAGE SCALING — every chart renormalizes
-    # price by the window's high-low range, putting all names on a common
-    # 'pattern scale'. Distilled: position-in-range and midrange gap at
-    # the paper's window lengths, no CNN required.
+
+def _jkx_ranges(df, daily_close, daily_dates):
+    """JKX image-scale distillation (Jiang-Kelly-Xiu JF 2023): the CNN's
+    edge comes largely from the IMAGE SCALING — every chart renormalizes
+    price by the window's high-low range, putting all names on a common
+    'pattern scale'. Distilled: position-in-range and midrange gap at the
+    paper's window lengths (hourly 20h/60h, daily 20d/60d), no CNN
+    required.
+    """
+    feats = {}
     for label, win_hi, win_lo, win_cl in (
             ('20h', df['High'].rolling(20, min_periods=20).max(),
              df['Low'].rolling(20, min_periods=20).min(), df['Close']),
             ('60h', df['High'].rolling(60, min_periods=60).max(),
              df['Low'].rolling(60, min_periods=60).min(), df['Close'])):
         rng = (win_hi - win_lo).replace(0, np.nan)
-        df[f'Pos_Range_{label}'] = ((win_cl - win_lo) / rng).clip(0, 1)
-        df[f'MidRange_Gap_{label}'] = ((0.5 * (win_hi + win_lo) - win_cl)
-                                       / rng).clip(-1, 1)
+        feats[f'Pos_Range_{label}'] = ((win_cl - win_lo) / rng).clip(0, 1)
+        feats[f'MidRange_Gap_{label}'] = ((0.5 * (win_hi + win_lo) - win_cl)
+                                          / rng).clip(-1, 1)
     d_hi = df['High'].resample('1D').max().reindex(daily_close.index)
     d_lo = df['Low'].resample('1D').min().reindex(daily_close.index)
     for k in (20, 60):
@@ -763,8 +817,94 @@ def compute_stock_features(df, spy_close=None, symbol=None):
         lo_k = d_lo.rolling(k, min_periods=k).min()
         rng = (hi_k - lo_k).replace(0, np.nan)
         pos = ((daily_close - lo_k) / rng).clip(0, 1)
-        df[f'Pos_Range_{k}d'] = daily_dates.map(pos.shift(1)).values
+        feats[f'Pos_Range_{k}d'] = _map_daily_to_hourly(pos, daily_dates)
+    return feats
 
+
+def compute_stock_features(df, spy_close=None, symbol=None):
+    """Compute all features for stocks. Includes base crypto features + stock-specific ones.
+
+    Args:
+        df: DataFrame with OHLCV columns (DatetimeIndex)
+        spy_close: Optional Series of SPY close prices aligned to df's index
+                   for relative strength calculation
+
+    Orchestrates (in this order): base crypto features, session features
+    (VWAP/gap/ATR%/RS-vs-SPY), return-of-day + same-hour periodicity, then
+    the daily-window blocks (residual momentum/RR, MA distances, session
+    momentum, JKX ranges) — all threaded through ONE `daily_close`/
+    `daily_dates` computed here, not re-resampled per helper.
+    """
+    # Base features (same as crypto)
+    df = compute_features(df)
+
+    for col, series in _session_features(df, spy_close).items():
+        df[col] = series
+
+    for col, series in _rod_and_same_hour(df).items():
+        df[col] = series
+
+    # --- Daily-frequency cross-sectional signals (computed on daily
+    # closes, shift(1) so intraday bars only see COMPLETED days, then
+    # ffilled onto the hourly grid) ---
+    daily_close = df['Close'].resample('1D').last().dropna()
+    daily_dates = pd.Series(df.index.normalize(), index=df.index)
+
+    for col, series in _daily_residual_block(
+            df, daily_close, daily_dates, spy_close, symbol).items():
+        df[col] = series
+
+    for col, series in _ma_distances(daily_close, daily_dates).items():
+        df[col] = series
+
+    for col, series in _session_momentum(df, daily_close, daily_dates).items():
+        df[col] = series
+
+    for col, series in _jkx_ranges(df, daily_close, daily_dates).items():
+        df[col] = series
+
+    return df
+
+
+# --- Daily-window warmup fill (single source of truth) ---
+# Daily-window features have LONG warmups (RM_252_21 needs 273 trading days;
+# MA_Dist_200d needs 200). Two consumers must fill their NaN warmups with the
+# SAME neutral values or train/serve parity breaks:
+#   * the harvest (scripts/harvest_stock_data.py) — so dropna() doesn't
+#     discard a year-plus of every name's history, and
+#   * the live path (predict_now) — where a ~45-day frame can NEVER warm the
+#     long windows, so these columns are all-NaN by construction. Before this
+#     fill existed live, the whole-frame dropna() deleted EVERY row and stock
+#     predictions returned None each cycle.
+# 0.0 = "no signal yet" (matching the warmup rows the model trained on);
+# Pos_Range warmups fill at 0.5 (mid-range).
+#
+# NOTE this list claims to be the single source of truth for WHICH columns
+# get filled and WITH WHAT VALUE, but it is NOT the source of truth for
+# where SVR_21/SVR_Z's VALUES come from: those two are computed entirely in
+# short_flow.py (its own daily short-volume-ratio pipeline) and only
+# FILLED here — this is cross-file coupling. Renaming or dropping them in
+# short_flow.py silently turns this into a no-op fill for those two columns
+# (fillna on a column that no longer exists is a no-op, not an error).
+WARMUP_FEATURES_ZERO = [
+    'RM_252_21', 'Ret_21d', 'RR_5', 'RR_21', 'Same_Hour_Mean_40d',
+    'ROD_Ret', 'ON_Mom_21', 'ON_Mom_252', 'TugOfWar_252',
+    'MA_Dist_10d', 'MA_Dist_20d', 'MA_Dist_50d', 'MA_Dist_100d',
+    'MA_Dist_200d', 'SVR_21', 'SVR_Z',
+    'MidRange_Gap_20h', 'MidRange_Gap_60h',
+]
+WARMUP_FEATURES_HALF = ['Pos_Range_20h', 'Pos_Range_60h',
+                        'Pos_Range_20d', 'Pos_Range_60d']
+
+
+def fill_warmup_features(df):
+    """Neutral-fill the daily-window features' NaN warmup rows (see above)."""
+    for col in WARMUP_FEATURES_ZERO:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
+    for col in WARMUP_FEATURES_HALF:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.5)
     return df
 
 

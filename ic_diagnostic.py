@@ -30,10 +30,16 @@ def rank_ic(pred, fwd_return):
 def ic_by_name(rows, name_key='symbol', pred_key='pred', fwd_key='fwd_return',
                n_subperiods=4):
     """Per-name overall rank-IC + IC in each of n_subperiods (time order) +
-    positive-consistency (fraction of sub-periods with IC > 0).
+    positive-consistency (fraction of ALL n_subperiods with a computable
+    IC > 0 — a sub-period whose IC cannot be computed counts as not positive).
 
-    rows: an iterable of dicts, assumed time-ordered PER NAME (the caller sorts).
-    Returns {name: {ic, n, subperiod_ics, positive_consistency}}.
+    rows: an iterable of dicts. The DUMPER must emit rows bar-ordered per name
+    — the row schema carries no timestamp to sort by here, and the sub-period
+    ICs / consistency are meaningless on unordered rows (the overall IC is
+    permutation-invariant and survives either way).
+    Returns {name: {ic, n, n_finite, subperiod_ics, positive_consistency}}
+    where n_finite counts rows with BOTH pred and fwd finite — the sample the
+    IC was actually computed on.
     """
     by_name = {}
     for r in rows:
@@ -43,19 +49,28 @@ def ic_by_name(rows, name_key='symbol', pred_key='pred', fwd_key='fwd_return',
         pred = [r.get(pred_key) for r in rs]
         fwd = [r.get(fwd_key) for r in rs]
         ic = rank_ic(pred, fwd)
+        pa = np.asarray(pred, float)
+        fa = np.asarray(fwd, float)
+        n_finite = int((np.isfinite(pa) & np.isfinite(fa)).sum())
         subs = []
         n = len(rs)
-        if n >= n_subperiods * 5:
+        has_subperiods = n >= n_subperiods * 5
+        if has_subperiods:
             edges = np.linspace(0, n, n_subperiods + 1).astype(int)
             for i in range(n_subperiods):
                 s = rank_ic(pred[edges[i]:edges[i + 1]], fwd[edges[i]:edges[i + 1]])
                 if s is not None:
                     subs.append(s)
-        if subs:
-            consistency = float(np.mean([s > 0 for s in subs]))
+        if has_subperiods:
+            # Denominator is ALL sub-periods: an uncomputable slice (too few
+            # finite pairs / degenerate) is missing evidence of consistency,
+            # not evidence to ignore — else one computable quarter could
+            # carry the whole hurdle.
+            consistency = float(sum(1 for s in subs if s > 0) / n_subperiods)
         else:
             consistency = 1.0 if (ic is not None and ic > 0) else 0.0
         out[name] = {'ic': round(ic, 4) if ic is not None else None, 'n': n,
+                     'n_finite': n_finite,
                      'subperiod_ics': [round(s, 4) for s in subs],
                      'positive_consistency': round(consistency, 3)}
     return out
@@ -66,16 +81,21 @@ def promote_set(ic_table, min_ic=0.0, min_consistency=0.6, min_t=2.0):
 
     Three hurdles, all required: overall IC above min_ic, positive in
     >= min_consistency of sub-periods, AND statistically SIGNIFICANT
-    (|IC|*sqrt(n-1) >= min_t). The significance hurdle is the one that matters —
-    a small spurious IC over a short history (e.g. 0.07 at n=400, ~1.3 sigma) is
-    indistinguishable from zero and must NOT be promoted on a √breadth argument.
-    Everything that fails stays training-only. Returns a sorted list.
+    (IC*sqrt(n_finite-1) >= min_t — signed, so a negative IC can never clear
+    it). The significance hurdle is the one that matters — a small spurious IC
+    over a short history (e.g. 0.07 at n=400, ~1.4 sigma) is indistinguishable
+    from zero and must NOT be promoted on a √breadth argument. The t-stat uses
+    n_finite (rows where both pred and forward return are finite — the sample
+    the IC was computed on), never the raw row count, so warmup/no-coverage
+    rows cannot inflate significance; tables from older dumps without
+    n_finite fall back to n. Everything that fails stays training-only.
+    Returns a sorted list.
     """
     out = []
     for name, m in ic_table.items():
         if m['ic'] is None or m['ic'] <= min_ic or m['positive_consistency'] < min_consistency:
             continue
-        t = abs(m['ic']) * np.sqrt(max(m['n'] - 1, 1))
+        t = m['ic'] * np.sqrt(max(m.get('n_finite', m['n']) - 1, 1))
         if t >= min_t:
             out.append(name)
     return sorted(out)

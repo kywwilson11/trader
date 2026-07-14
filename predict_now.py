@@ -19,10 +19,12 @@ if os.environ.get('CUDA_VISIBLE_DEVICES', None) == '':
     torch.set_num_threads(int(os.environ.get('TORCH_NUM_THREADS', '2')))
 
 from model_v2 import RegressionLSTM
-from indicators import compute_features, compute_stock_features
+from indicators import (
+    compute_features, compute_stock_features, fill_warmup_features,
+)
 from market_data import (
     fetch_bars_alpaca, fetch_bars_yfinance,
-    fetch_stock_bars_alpaca,
+    fetch_stock_bars_alpaca, drop_forming_bar,
 )
 
 # Lazy-load with retry: try once per cycle, stop spamming after first failure log
@@ -91,6 +93,11 @@ def load_model(inference_device=None, prefix=''):
     ).to(dev)
     model.load_state_dict(torch.load(paths['model'], map_location=dev, weights_only=True))
     model.eval()
+
+    # Every (re)load invalidates the bar-keyed prediction memo: a hot-reloaded
+    # model must never be served the previous model's cached result, and this
+    # keeps correctness independent of id() reuse in the cache subkey.
+    _PRED_CACHE.clear()
 
     try:
         dummy = torch.randn(1, config['seq_len'], config['input_dim']).to(dev)
@@ -181,31 +188,55 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         print("Error: No data found for symbol.")
         return _none_ret
 
-    # --- Compute technical features ---
-    if asset_type == 'stock':
-        df = compute_stock_features(df, spy_close=spy_close, symbol=symbol)
-    else:
-        df = compute_features(df, btc_close=btc_close)
-    df = df.dropna()
-
-    if len(df) < seq_len:
-        print(f"  Not enough data for sequence (need {seq_len}, have {len(df)})")
+    # Closed bars only: the newest fetched row is usually the IN-PROGRESS
+    # hourly bar (partial volume, minutes-old close). Training windows hold
+    # closed bars only (offsets -seq_len..-1 exclude the entry bar) and the
+    # backtest enters at the signal bar's close — inference must match, or the
+    # final sequence row comes from a distribution the model never trained on.
+    df = drop_forming_bar(df)
+    if df is None or df.empty:
+        print("Error: no closed bars for symbol.")
         return _none_ret
 
-    # Bar-keyed memo (wave-8 #5): within a bar the closed inputs are identical,
-    # so skip the feature+LSTM+LGB recompute. Keyed on the latest closed-bar
-    # timestamp + the model object (a hot-reload swaps the object, auto-
-    # invalidating). Inert unless PREDICTION_CACHE_ENABLED.
+    # Bar-keyed memo (wave-8 #5): the closed bars that drive the prediction
+    # only change when a new bar closes, so the memo is checked BEFORE the
+    # feature pass — that pandas/numba pass is most of the cycle's CPU, and
+    # the key needs only the last closed bar's timestamp. load_model() clears
+    # the cache, so a hot-reload can never serve a stale model's memo (and the
+    # id()-reuse hazard of keying on a freed object's address dies with it).
+    # Inert unless PREDICTION_CACHE_ENABLED.
     try:
         from strategy_config import PREDICTION_CACHE_ENABLED
     except Exception:
         PREDICTION_CACHE_ENABLED = False
-    _cache_subkey = (symbol, id(model), return_snapshot)
+    _cache_subkey = (symbol, id(model), id(config), return_snapshot)
     _cache_key = _bar_key(df.index[-1]) if PREDICTION_CACHE_ENABLED else None
     if _cache_key is not None:
         _cached = _PRED_CACHE.get(_cache_subkey, _cache_key)
         if _cached is not _CACHE_MISS:
             return _cached
+
+    # --- Compute technical features ---
+    if asset_type == 'stock':
+        df = compute_stock_features(df, spy_close=spy_close, symbol=symbol)
+        # Mirror the harvest's neutral warmup fill (0.0 / 0.5): on a live
+        # ~45-day frame the long-window daily features (RM_252_21,
+        # MA_Dist_200d, ...) are all-NaN by construction. Training kept its
+        # warmup rows with these same neutral values, so live serves them
+        # identically — without this fill the dropna below deleted EVERY row
+        # and stock predictions returned None each cycle.
+        df = fill_warmup_features(df)
+    else:
+        df = compute_features(df, btc_close=btc_close)
+    # Drop only rows NaN in columns the model actually consumes — an unused
+    # column's NaN must not veto rows (that was the all-stock wipeout: one
+    # all-NaN column made the whole-frame dropna delete the entire frame).
+    _present = [c for c in feature_cols if c in df.columns]
+    df = df.dropna(subset=_present) if _present else df.dropna()
+
+    if len(df) < seq_len:
+        print(f"  Not enough data for sequence (need {seq_len}, have {len(df)})")
+        return _none_ret
 
     # Inject live sentiment if the model was trained with it
     if 'Daily_Sentiment' in feature_cols and 'Daily_Sentiment' not in df.columns:
@@ -414,10 +445,11 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         print("Recommendation:  [HOLD/WEAK]")
 
     if return_snapshot:
-        # Build snapshot of latest indicator values (all available, not just model features)
+        # Build snapshot of latest indicator values (all available, not just
+        # model features). Every row is a CLOSED bar (the forming bar is
+        # dropped before feature computation), so the last row is usable
+        # directly — including its volume.
         last_row = df.iloc[-1]
-        # Use previous completed bar for volume (current bar is incomplete)
-        prev_row = df.iloc[-2] if len(df) >= 2 else last_row
         _SNAPSHOT_COLS = [
             'Close', 'RSI', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
             'STOCHk_14_3_3', 'STOCHd_14_3_3', 'ATR',
@@ -442,11 +474,11 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         if q10_pred is not None and _q10_floor is not None:
             snapshot['Q10'] = q10_pred
             snapshot['Q10_Floor'] = _q10_floor
-        # Volume from last completed bar — only include if real data exists
-        # (Alpaca crypto bars often report zero volume)
-        prev_vol = prev_row.get('Volume', 0) if 'Volume' in prev_row.index else 0
-        if prev_vol and prev_vol > 0 and 'Volume_Ratio' in prev_row.index:
-            val = prev_row['Volume_Ratio']
+        # Volume — only include if real data exists (Alpaca crypto bars
+        # occasionally report zero volume even on closed bars)
+        last_vol = last_row.get('Volume', 0) if 'Volume' in last_row.index else 0
+        if last_vol and last_vol > 0 and 'Volume_Ratio' in last_row.index:
+            val = last_row['Volume_Ratio']
             if val is not None and val == val:
                 snapshot['Volume_Ratio'] = float(val)
         _PRED_CACHE.put(_cache_subkey, _cache_key, (predicted_return, snapshot))

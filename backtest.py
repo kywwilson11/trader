@@ -14,6 +14,27 @@ The --gate mode is wired into run_pipeline's weekly retrain: if the
 freshly-saved model's policy backtest fails (net Sharpe <= 0 or DSR below
 threshold), the previous model artifacts are restored and the retrain is
 effectively rejected at the POLICY level, not just the fit level.
+
+Exit codes (main()): 0 = gate passed, or nothing to gate (no --gate flag,
+or a FileNotFoundError before any model was evaluated); 3 = --gate FAILURE
+— a deterministic policy rejection, the model was rolled back to .prev;
+any other nonzero code means the process crashed before reaching a verdict.
+run_pipeline treats 3 specially: it is a final, non-retryable outcome for
+the *_backtest_gate phase (retrying a deterministic rejection is useless),
+and it does not abort the rest of that retrain run since the model has
+already been safely rolled back.
+
+Coverage caveat: this replay evaluates the threshold/cost-floor entry
+gate, the ATR exit stack (hard stop / trailing / take-profit / signal /
+EOD / vertical), stock entry windows, cooldowns/lockouts, the meta-label
+veto, and the q10 tail veto — the same gates the live loop enforces before
+sizing a trade. It does NOT model the live-only rejectors: winner's-curse
+derating, cross-asset correlation caps, macro/VIX halts, sentiment/LLM
+vetoes, or effective-threshold escalation under drawdown. Those layers
+only ever make live trading MORE conservative than this replay, so the
+replay is a permissive superset admission surface by design — extending
+it to model those rejectors too is a deliberate policy decision for a
+future change, not an oversight in this one.
 """
 import argparse
 import json
@@ -62,24 +83,40 @@ def _load_artifacts(prefix: str):
 
 
 def _load_lgb(prefix: str):
+    """LightGBM booster leg, or None. Mirrors meta_label._load: a missing
+    file is expected (silent None) but a PRESENT, unloadable file is a
+    real problem — logged loudly so a corrupt artifact isn't mistaken for
+    "no LightGBM leg trained" (the backtest would otherwise silently
+    evaluate the LSTM-only blend against a policy tuned for the ensemble).
+    """
+    p = f'{prefix}_' if prefix else ''
+    path = BASE_DIR / f'{p}lgb_model.txt'
     try:
         from model_lgb import load_lgb_model
         return load_lgb_model(prefix=prefix)
-    except Exception:
+    except Exception as e:
+        if path.exists():
+            print(f"[GATE] {path.name} present but failed to load ({e})"
+                  f" — evaluating WITHOUT this leg")
         return None
 
 
 def _load_q10(prefix: str):
-    """(booster, veto_floor) for the q10 tail model, or None."""
+    """(booster, veto_floor) for the q10 tail model, or None. Same
+    present-but-unloadable distinction as _load_lgb."""
+    p = f'{prefix}_' if prefix else ''
+    path = BASE_DIR / f'{p}lgb_q10.txt'
     try:
         import json as _json
         import lightgbm as _lgb
-        p = f'{prefix}_' if prefix else ''
         booster = _lgb.Booster(model_file=f'{p}lgb_q10.txt')
         with open(f'{p}lgb_q10_meta.json') as f:
             floor = float(_json.load(f)['floor'])
         return booster, floor
-    except Exception:
+    except Exception as e:
+        if path.exists():
+            print(f"[GATE] {path.name} present but failed to load ({e})"
+                  f" — evaluating WITHOUT this leg")
         return None
 
 
@@ -272,10 +309,31 @@ def aggregate_metrics(all_trades: list[dict], asset_type: str,
     sharpe = 0.0
     if rets.std() > 1e-9:
         sharpe = float(rets.mean() / rets.std() * np.sqrt(max(trades_per_year, 1)))
-    dsr = dsr_from_trade_returns(rets, n_trials=max(n_search_trials, 2))
+
+    # Cross-sectional effective-n (2026-07 review): the replay pools trades
+    # across every name in the book, but same-hour trades on correlated names
+    # are not independent draws. Cluster overlapping [entry, exit] calendar
+    # intervals across names (rho=1 worst case) and hand the DSR the cluster
+    # count as its effective breadth — never loosens the gate, only widens
+    # the null when trades crowd the same hours. Falls back to IID on any
+    # parse failure.
+    n_eff = None
+    try:
+        import pandas as pd
+        from sample_weights import clustered_effective_n
+        ets = pd.to_datetime([t['entry_time'] for t in all_trades]).values
+        xts = pd.to_datetime([t['exit_time'] for t in all_trades]).values
+        n_clusters = clustered_effective_n(ets, xts)
+        if 0 < n_clusters < len(rets):
+            n_eff = float(n_clusters)
+    except Exception:
+        n_eff = None
+    dsr = dsr_from_trade_returns(rets, n_trials=max(n_search_trials, 2),
+                                 n_eff=n_eff)
 
     return {
         'n_trades': len(rets),
+        'n_eff_clustered': (int(n_eff) if n_eff is not None else len(rets)),
         'sharpe': round(sharpe, 3),
         'dsr': round(dsr['dsr'], 4),
         'net_total_pct': round(float(rets.sum()), 2),
@@ -301,16 +359,29 @@ ARTIFACT_SUFFIXES = ['model_v2.pth', 'config_v2.pkl', 'scaler_v2.pkl',
 
 
 def restore_previous_model(prefix: str) -> bool:
-    """Roll back to the .prev artifacts saved before the last promotion."""
+    """Roll back to the .prev artifacts saved before the last promotion.
+
+    The first 4 suffixes (LSTM leg) are required — restore is a no-op
+    unless all 4 have a .prev. Suffixes from index 4 on (manifest, LGB,
+    meta, q10) are optional legs: restored from .prev when one exists;
+    when a leg's .prev is MISSING but its current file EXISTS, that leg
+    was never gated by a prior promotion (e.g. LightGBM added after the
+    last promoted LSTM) — it is deleted so the post-restore disk state is
+    always exactly one previously-gated artifact set, never a stale mix
+    of old-LSTM + new-never-gated legs.
+    """
     p = f'{prefix}_' if prefix else ''
     prevs = [(BASE_DIR / f'{p}{s}.prev', BASE_DIR / f'{p}{s}')
              for s in ARTIFACT_SUFFIXES]
     if not all(src.exists() for src, _ in prevs[:4]):  # manifest optional
         print("[GATE] No .prev artifacts to restore — keeping current model")
         return False
-    for src, dst in prevs:
+    for i, (src, dst) in enumerate(prevs):
         if src.exists():
             os.replace(src, dst)
+        elif i >= 4 and dst.exists():
+            os.remove(dst)
+            print(f"[GATE] removed never-gated orphan {dst.name}")
     print("[GATE] Restored previous model artifacts")
     return True
 
@@ -336,16 +407,27 @@ def run_backtest(prefix: str = '', days: int = 60,
         raise SystemExit("No training data found for backtest")
     cutoff = df.index.max() - timedelta(days=days)
     df = df[df.index >= cutoff]
+    if df.empty:
+        # Re-checked AFTER the cutoff filter: a nonempty file whose most
+        # recent bar is still older than `days` ago (stale harvest, a
+        # thinly-covered ticker-only slice) used to fall through to a
+        # 'NaT .. NaT' report with n_trades=0 — a silent, misleading pass
+        # surface. Fail loud instead so the gate treats it as an error.
+        raise SystemExit(f"No training data in the last {days}d window")
 
     all_trades = []
     tickers = df['Ticker'].unique()
+    n_evaluated = 0
+    skipped_tickers = []
     for ticker in tickers:
         tdf = df[df['Ticker'] == ticker].sort_index()
         if len(tdf) < config['seq_len'] + 10:
+            skipped_tickers.append(ticker)
             continue
         missing = [c for c in feature_cols if c not in tdf.columns]
         if missing:
             print(f"  [SKIP] {ticker}: missing features {missing[:3]}...")
+            skipped_tickers.append(ticker)
             continue
         preds, q10_preds = _predict_ticker(model, scaler, config,
                                            feature_cols, tdf,
@@ -363,6 +445,7 @@ def run_backtest(prefix: str = '', days: int = 60,
                                  meta_probs=meta_probs, q10_preds=q10_preds,
                                  q10_floor=q10_floor)
         all_trades.extend(trades)
+        n_evaluated += 1
         print(f"  {ticker}: {len(trades)} trades")
 
     span_days = (df.index.max() - df.index.min()).total_seconds() / 86400
@@ -372,6 +455,17 @@ def run_backtest(prefix: str = '', days: int = 60,
     metrics['threshold'] = threshold
     metrics['prefix'] = prefix
     metrics['generated_at'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    # Coverage self-description (2026-07 review): a replay that silently
+    # skipped most of the universe (missing features, too-short history)
+    # can still report a passing Sharpe/DSR on the handful of names left —
+    # surface the coverage so a passing gate on 2/40 names is visible.
+    n_skipped = len(skipped_tickers)
+    metrics['n_tickers_evaluated'] = n_evaluated
+    metrics['n_tickers_skipped'] = n_skipped
+    metrics['skipped_tickers'] = list(skipped_tickers[:20])
+    if n_skipped > n_evaluated:
+        print(f"[GATE] WARNING: replay covered only "
+              f"{n_evaluated}/{n_evaluated + n_skipped} names")
 
     report_path = BASE_DIR / f"backtest_{f'{prefix}_' if prefix else ''}report.json"
     tmp = str(report_path) + '.tmp'
@@ -397,7 +491,9 @@ def main():
     ap.add_argument('--gate', action='store_true',
                     help='restore the previous model if the backtest fails')
     ap.add_argument('--min-sharpe', type=float, default=0.0)
-    ap.add_argument('--min-dsr', type=float, default=0.5)
+    # Default aligned to validation.DSR_MIN (2026-07 review: the gate ran at
+    # 0.5 while the documented promotion bar was 0.60 — a silent drift)
+    ap.add_argument('--min-dsr', type=float, default=DSR_MIN)
     args = ap.parse_args()
 
     try:
@@ -423,6 +519,12 @@ def main():
                        level='warning', dedupe_key=f'gate-{args.prefix}')
             except Exception:
                 pass
+            # Distinct exit code: a deterministic policy rejection, not a
+            # crash. run_pipeline treats 3 as final for *_backtest_gate
+            # phases — no retry (retrying a deterministic rejection is
+            # useless) — and non-fatal to the rest of the retrain run
+            # (the model is already rolled back).
+            return 3
         else:
             print(f"\n[GATE] PASSED: sharpe={metrics['sharpe']}, dsr={metrics['dsr']}")
     return 0

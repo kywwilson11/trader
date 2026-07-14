@@ -1,9 +1,10 @@
 # CLAUDE.md — trader
 
 Autonomous **paper-trading** system (Alpaca) for **crypto** (24/7) and **US stocks** (market hours).
-Dual bear/bull LSTM ensemble + meta-labeling, Numba TA features, honest validation
-(purged walk-forward + Deflated Sharpe), cost-aware gating, and a policy backtester that
-replays *real* exits before any model is promoted. Runs in production on an **NVIDIA Jetson
+One **RegressionLSTM + LightGBM blend per book** (the old dual bear/bull ensemble is gone —
+"bear/bull" survives only as regime diagnostics and the champion/challenger shadow slots)
++ meta-labeling, Numba TA features, honest validation (purged walk-forward + Deflated Sharpe),
+cost-aware gating, and a policy backtester that replays *real* exits before any model is promoted. Runs in production on an **NVIDIA Jetson
 Orin Nano (8 GB)**. Research is organized into numbered "waves" (see `research/waveN_research.json`).
 
 > **The README is stale** — it describes old internals. Trust the code and this file, not `README.md`.
@@ -41,7 +42,7 @@ collection errors):
 python3 -m pytest tests/ --continue-on-collection-errors -q
 ```
 
-**Current baseline (verified 2026-06-18): `616 passed, 34 failed, 1 skipped, 14 errors`.**
+**Current baseline (verified 2026-07-02): `780 passed, 34 failed, 1 skipped, 14 errors`.**
 The 34 failures + 14 errors are **ALL pre-existing missing-dependency failures** (dotenv / torch /
 lightgbm / optuna / joblib / numba / sklearn), **not regressions**. On the full Jetson stack the
 suite is green.
@@ -72,6 +73,8 @@ for reference (exact flags verified from the source):
 | `python scripts/hypersearch_v2.py --trials N [--prefix stock] [--data F] [--fresh] [--shadow] [--preset stationary]` | Optuna TPE search (LSTM + LightGBM leg), holdout DSR gate |
 | `python backtest.py --prefix {crypto\|stock} --days N [--gate]` | Policy replay (real entries/exits/fees); `--gate` rolls back to `.prev` on Sharpe/DSR fail |
 | `python decision_report.py --days N` | Per-trade gate attribution + conviction calibration (Stage-0 measurement) |
+| `python beta_ledger.py --days N` | Realized-beta ledger: daily equity vs SPY+BTC (lagged AKL betas, HAC alpha t-stat, up/down + trend-conditional betas). Measurement-only |
+| `python indicator_leadlag.py --data F [--preset P]` | Per-feature leading/lagging diagnostic: predictive IC vs reactive coupling at 1–48h (overlap-adjusted, FDR), redundancy clusters + exact dupes. Measurement-only |
 | `python gui.py` | PySide6 dashboard (8 tabs, 9 themes); reads `pipeline_status.json` + logs |
 
 ---
@@ -103,7 +106,10 @@ gate), `meta_label.py` (secondary classifier; veto p<0.30).
 execution → `order_utils.py`, `execution_policy.py`, `liquidity.py`; costs/risk → `fees.py`,
 `short_cost.py`, `borrow_proxy.py`, `cost_regime.py`, `risk_budget.py`, `portfolio*.py`; models →
 `model_v2.py` (LSTM), `model_lgb.py`, `predict_now.py`; LLM → `llm_client.py`/`llm_analyst.py`
-(Gemini, schema-enforced); ops → `gui.py`, `gpu_lock.py`, `hw_monitor.py`, `monitor_drift.py`.
+(Gemini + Anthropic/Claude, both schema-enforced — Gemini responseSchema, Claude forced tool use;
+provider switch + per-role overrides + pricing corrections in `llm_config.json`; cross-provider
+fallback; `ANTHROPIC_API_KEY` env accepted; backfill role stays Gemini — Batch API);
+ops → `gui.py`, `gpu_lock.py`, `hw_monitor.py`, `monitor_drift.py`.
 For full detail see the `trader-architecture-truth` memory.
 
 **PIT discipline (do not break):** all features strictly trailing; sentiment/short-interest lagged
@@ -137,7 +143,10 @@ to publication date; borrow cost regime-dated; universe membership as-of (no sur
   `TRADER_ORDER_STREAM`, `TORCH_NUM_THREADS` (=2 for bots), `CUDA_VISIBLE_DEVICES` (='' → bots CPU-only).
   Notifications: `TRADER_TELEGRAM_*`, `TRADER_WEBHOOK_URL`, `TRADER_HEALTHCHECK_URL`.
 - **Config flags in `strategy_config.py`** (not env): `HAR_VOL_ENABLED`, `CONVICTION_JOURNAL_ENABLED`,
-  `MAKER_ENTRIES_ENABLED`, `ENTRY_WINDOWS_ENABLED`, `OVERNIGHT_SLEEVE_ENABLED`.
+  `MAKER_ENTRIES_ENABLED`, `ENTRY_WINDOWS_ENABLED`, `OVERNIGHT_SLEEVE_ENABLED`;
+  `OBJECTIVE_LONG_ONLY` (default off — score only the deployable long side in hypersearch; flipping
+  = objective change ⇒ gotcha #2). In `indicator_config.py`: `HURST_ON_RETURNS` (default off — correct
+  R/S input; model-facing, flip only with harvest+retrain ⇒ gotcha #2).
 
 ## What's committed vs generated
 

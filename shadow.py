@@ -18,8 +18,9 @@ Mechanics:
     forward-bars horizon (skill score, comparable across horizons);
     DM uses Newey-West LRV with lag = horizon-1 (h-step forecasts are
     MA(h-1)).
-  - Decisions: promote early after >=14d at p<0.05; at >=28d promote at
-    p<0.10 if the mean loss diff favors the challenger, else discard.
+  - Decisions (both promote branches also require n >= MIN_OBS=200):
+    promote early after >=14d at p<0.05; at >=28d promote at p<0.10 if
+    the mean loss diff favors the challenger, else discard.
     Status-quo bias is intentional — promotion churn has real costs.
   - Promotion copies the full artifact stack (LSTM, scaler, config,
     feature cols, LGB, q10) with .prev backups, manifest LAST; the
@@ -103,8 +104,16 @@ def maybe_log_shadow(loop, champ_preds: dict, benchmark) -> None:
         mtime = int(man.stat().st_mtime)
         stack = getattr(loop, '_shadow_stack', None)
         if stack is None or stack[0] != mtime:
-            from predict_now import load_model
-            model, scaler, config, _seq, fcols = load_model(
+            import predict_now
+            # New challenger artifacts: predict_now's per-prefix LGB/q10
+            # booster caches pair with the OLD generation — drop them so the
+            # blend reloads from disk (mirrors base_loop._hot_reload_check,
+            # which only pops the champion prefix). Keys are challenger-only;
+            # champion entries and combined-bot threads are untouched.
+            predict_now._lgb_models.pop(cp, None)
+            predict_now._q10_models.pop(cp, None)
+            _prune_stale_rows(prefix, mtime)
+            model, scaler, config, _seq, fcols = predict_now.load_model(
                 inference_device='cpu', prefix=cp)
             stack = (mtime, model, scaler, config, fcols)
             loop._shadow_stack = stack
@@ -113,6 +122,23 @@ def maybe_log_shadow(loop, champ_preds: dict, benchmark) -> None:
     except Exception as e:
         logger.warning("[SHADOW] challenger load failed: %s", e)
         return
+
+    # Hypersearch writes the challenger manifest BEFORE train_lgb_ensemble
+    # finishes, so the first tick can permanently cache a None booster for a
+    # file that lands minutes later. Evict the cached None once the file
+    # exists so the shadow record tests the same LSTM+LGB blend promotion
+    # would deploy — not an LSTM-only chimera.
+    try:
+        import predict_now
+        if (predict_now._lgb_models.get(cp) is None
+                and (BASE_DIR / f'{cp}_lgb_model.txt').exists()):
+            predict_now._lgb_models.pop(cp, None)
+        if (predict_now._q10_models.get(cp) is None
+                and (BASE_DIR / f'{cp}_lgb_q10.txt').exists()
+                and (BASE_DIR / f'{cp}_lgb_q10_meta.json').exists()):
+            predict_now._q10_models.pop(cp, None)
+    except Exception:
+        pass
 
     _, model, scaler, config, fcols = stack
     asset_type = loop.get_asset_type()
@@ -144,8 +170,45 @@ def maybe_log_shadow(loop, champ_preds: dict, benchmark) -> None:
             with open(shadow_log_file(prefix), 'a') as f:
                 f.write('\n'.join(rows) + '\n')
             logger.info("[SHADOW] logged %d side-by-side predictions", len(rows))
-        except OSError:
-            pass
+        except OSError as e:
+            # A silently-empty shadow record wastes the whole 4-week
+            # experiment (discarded for lack of data) — leave evidence.
+            logger.warning("[SHADOW] failed to append %d rows to %s: %s",
+                           len(rows), shadow_log_file(prefix), e)
+
+
+def _prune_stale_rows(prefix: str, current_mtime: int) -> None:
+    """Drop rows logged against a REPLACED challenger (stale cm).
+
+    The log is append-only and every challenger replacement restarts the
+    clock, so without pruning it grows without bound across weekly retrains
+    and every daily eval re-parses dead rows. Behavior-neutral: stale-cm
+    rows are already excluded from every computation (_load_rows filters).
+    Rewrite is tmp+os.replace so a concurrent reader sees a consistent file.
+    """
+    path = shadow_log_file(prefix)
+    if not path.exists():
+        return
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+        keep = []
+        for line in lines:
+            try:
+                if json.loads(line).get('cm') == current_mtime:
+                    keep.append(line if line.endswith('\n') else line + '\n')
+            except json.JSONDecodeError:
+                continue
+        if len(keep) == len(lines):
+            return
+        tmp = f'{path}.tmp'
+        with open(tmp, 'w') as f:
+            f.writelines(keep)
+        os.replace(tmp, path)
+        logger.info("[SHADOW] pruned %d stale rows from %s",
+                    len(lines) - len(keep), path.name)
+    except OSError as e:
+        logger.warning("[SHADOW] shadow-log prune failed: %s", e)
 
 
 # --- Statistics: Diebold-Mariano with HLN correction ---
@@ -212,8 +275,15 @@ def _load_rows(prefix: str) -> list[dict]:
 
 def _fetch_closes(api, symbol: str, asset_type: str):
     from market_data import fetch_bars_alpaca, fetch_stock_bars_alpaca
-    df = (fetch_bars_alpaca(api, symbol) if asset_type == 'crypto'
-          else fetch_stock_bars_alpaca(api, symbol))
+    # The window must reach back past the OLDEST shadow row (up to
+    # MAX_SHADOW_DAYS old) plus the forward horizon — the default live-loop
+    # limits (250 crypto bars ~ 10d) cover only a third of it, and any older
+    # row would silently anchor at the window's first bar (fabricated
+    # returns). Distinct (asset, symbol, limit) cache keys keep this separate
+    # from the live loops' bar cache entries.
+    df = (fetch_bars_alpaca(api, symbol, limit=24 * (MAX_SHADOW_DAYS + 4))
+          if asset_type == 'crypto'
+          else fetch_stock_bars_alpaca(api, symbol, limit=600))
     if df is None or df.empty:
         return None
     closes = df['Close']
@@ -224,6 +294,11 @@ def _fetch_closes(api, symbol: str, asset_type: str):
 
 def _realized(closes, ts: dt.datetime, fb: int) -> float | None:
     """Forward fb-bar % return from the first bar at/after ts."""
+    if len(closes) == 0 or ts < closes.index[0]:
+        # The true anchor bar predates the fetched window: searchsorted
+        # would alias to the window's FIRST bar and fabricate a return
+        # anchored days after the prediction. Stay unresolved instead.
+        return None
     i = int(closes.index.searchsorted(ts))
     j = i + int(fb)
     if i >= len(closes) or j >= len(closes):
@@ -278,9 +353,11 @@ def evaluate_shadow(prefix: str, api=None) -> dict | None:
             recs.append((ts, (r['champ'] - rc) ** 2, (r['chall'] - rx) ** 2,
                          rc, rx, r['champ'], r['chall']))
     if len(recs) < 10:
+        r0 = rows[0]
+        fb_max = max(int(r0.get('fb_champ') or 24), int(r0.get('fb_chall') or 24))
         return {'n': len(recs), 'age_days': _age_days(rows), 'p': 1.0,
                 'dm': 0.0, 'mean_d': 0.0, 'hit_champ': None,
-                'hit_chall': None, 'fb_max': 24}
+                'hit_chall': None, 'fb_max': fb_max}
 
     recs.sort(key=lambda t: t[0])
     e2c = np.array([t[1] for t in recs])
@@ -328,6 +405,18 @@ def promote_challenger(prefix: str, report: dict | None = None) -> bool:
         if not (BASE_DIR / f'{cp}_{suffix}').exists():
             logger.error("[SHADOW] promote aborted: missing %s_%s", cp, suffix)
             return False
+    # The challenger manifest is mandatory too — parse it in pre-flight
+    # (reused for the final write). Discovering it missing/corrupt only at
+    # the manifest-write step would leave a half-promoted champion, and a
+    # missing manifest would be a silent zombie (evaluate_and_maybe_promote
+    # returns None forever, so no retry ever heals the mixed state).
+    try:
+        with open(challenger_manifest(prefix)) as f:
+            man = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error("[SHADOW] promote aborted: challenger manifest "
+                     "unreadable: %s", e)
+        return False
     for suffix in _ARTIFACT_SUFFIXES + ['model_v2.manifest.json']:
         champ = BASE_DIR / f'{p}{suffix}'
         if champ.exists():
@@ -347,7 +436,14 @@ def promote_challenger(prefix: str, report: dict | None = None) -> bool:
         cfg['prefix'] = prefix
         joblib.dump(cfg, cfg_path)
     except Exception as e:
-        logger.error("[SHADOW] config prefix rewrite failed: %s", e)
+        # Abort BEFORE the manifest write: continuing would deploy a config
+        # still pointing at the challenger prefix, whose LGB/q10 files
+        # _discard_challenger then deletes — the new champion would silently
+        # lose its ensemble legs. The challenger stays intact, so the next
+        # daily eval retries and heals the partially-copied champion.
+        logger.error("[SHADOW] config prefix rewrite failed: %s — promotion "
+                     "aborted (champion manifest not written; will retry)", e)
+        return False
     # Champion meta artifacts pair with the OLD model — remove (the meta
     # gate fails open to neutral until the background retrain finishes)
     for suffix in _STALE_META_SUFFIXES:
@@ -355,10 +451,8 @@ def promote_challenger(prefix: str, report: dict | None = None) -> bool:
             (BASE_DIR / f'{p}{suffix}').unlink(missing_ok=True)
         except OSError:
             pass
-    # Manifest last: bots hot-reload on it
+    # Manifest last: bots hot-reload on it (content parsed in pre-flight)
     try:
-        with open(challenger_manifest(prefix)) as f:
-            man = json.load(f)
         man['promoted_from_shadow'] = dt.datetime.now(
             dt.timezone.utc).isoformat()
         if report:
@@ -407,9 +501,9 @@ def evaluate_and_maybe_promote(prefix: str, label: str, api=None) -> dict | None
         return None
     age, n, p, mean_d = (report['age_days'], report['n'],
                          report['p'], report['mean_d'])
-    print(f"[SHADOW] {label}: n={n} age={age:.1f}d DM={report['dm']} "
-          f"p={p} mean_d={mean_d:+.4f} "
-          f"hit champ/chall={report['hit_champ']}/{report['hit_chall']}")
+    logger.info("[SHADOW] %s: n=%d age=%.1fd DM=%s p=%s mean_d=%+.4f "
+                "hit champ/chall=%s/%s", label, n, age, report['dm'], p,
+                mean_d, report['hit_champ'], report['hit_chall'])
 
     decision = None
     if n >= MIN_OBS and age >= MIN_SHADOW_DAYS and p < EARLY_PROMOTE_P:

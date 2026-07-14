@@ -1,19 +1,34 @@
 """Indicator preset configuration — choose which features to train on.
 
 Harvest scripts always compute ALL indicators to CSV. The preset only filters
-which columns hypersearch_dual.py uses for training. The existing
+which columns scripts/hypersearch_v2.py uses for training. The existing
 feature_cols.pkl mechanism ensures inference matches training.
 
-Persists to indicator_config.json (gitignored). Default preset: "standard".
-No heavy imports (json, pathlib only) so it's safe for the GUI env.
+Persists to indicator_config.json (gitignored) via an atomic write. Default
+preset: "standard". No heavy imports (json, pathlib, os, tempfile, contextlib
+only) so it's safe for the GUI env.
 """
 
+import contextlib
 import json
+import os
+import tempfile
 from pathlib import Path
 
 _FILE = Path(__file__).resolve().parent / "indicator_config.json"
 
 _DEFAULTS = {"preset": "standard"}
+
+# --- Hurst input mode (2026-07 review fix, DEFAULT OFF) ---
+# R/S analysis is defined on a process's INCREMENTS. The historical call fed
+# price LEVELS, so the partial sums integrate the walk and H reads ~0.8 on a
+# pure random walk — the feature carried no regime information and the live
+# `hurst < 0.45` mean-reversion gate could never fire. True = compute on
+# returns (correct math; random walk ≈ 0.5). MODEL-FACING: the feature's
+# distribution shifts, so flip ONLY together with a fresh harvest + retrain
+# on the Jetson (and CLAUDE.md gotcha #2: delete the study DBs first) —
+# never against a deployed levels-trained model/scaler.
+HURST_ON_RETURNS = False
 
 # Columns only present in crypto training data
 CRYPTO_ONLY_COLS = ["BTC_Return_1h", "BTC_SMA_Ratio", "BTC_RSI",
@@ -163,6 +178,28 @@ _STATIONARY_FEATURES = [
     "CS_Rank_Pos_Range_20d", "CS_Rank_MA_Dist_50d",
 ]
 
+# --- stationary_lean (2026-07 indicator review) ---
+# stationary minus STRUCTURAL redundancy only — exact duplicates and linear
+# identities, no data-mined cuts (empirical pruning belongs to
+# indicator_leadlag.py on the Jetson's real panel):
+#   ROC           == Return_12h bit-for-bit (same formula, indicators.py) —
+#                    every preset shipped one column twice
+#   CS_Rank_ROC   == CS_Rank_Return_12h (rank of the identical column)
+#   MACDs_12_26_9 == MACD_12_26_9 - MACDh_12_26_9 (exact linear identity;
+#                    keeping all three is rank-2 information in 3 columns)
+#   STOCHd_14_3_3 == SMA3(STOCHk) — reconstructable from the %K sequence
+#                    both the LSTM window and the flattened LGB window see
+#   Month_sin/cos + Turn_of_Month — <= 5 observed yearly cycles in the
+#                    training span; unlearnable amplitude, pure overfit surface
+# Selecting this preset is MODEL-FACING (feature-set change): first Jetson
+# retrain after switching => CLAUDE.md gotcha #2 (delete study DBs, reset
+# best_score), and it deploys via the challenger -> shadow path as usual.
+_LEAN_EXCLUDE = {
+    "ROC", "CS_Rank_ROC", "MACDs_12_26_9", "STOCHd_14_3_3",
+    "Month_sin", "Month_cos", "Turn_of_Month",
+}
+_STATIONARY_LEAN = [f for f in _STATIONARY_FEATURES if f not in _LEAN_EXCLUDE]
+
 PRESETS = {
     "minimal": {
         "description": "Core signals only. Fastest training, lowest overfitting risk.",
@@ -176,6 +213,12 @@ PRESETS = {
         "description": "Stationary features only (returns, ratios, oscillators). "
                        "Best for regression models — no raw price/volume drift.",
         "features": _STATIONARY_FEATURES,
+    },
+    "stationary_lean": {
+        "description": "stationary minus structural redundancy (exact dupes, "
+                       "linear identities, unlearnable calendar cycles). "
+                       "A/B candidate vs stationary via shadow.",
+        "features": _STATIONARY_LEAN,
     },
     "full": {
         "description": "All indicators including divergence and cross-asset signals. "
@@ -192,15 +235,22 @@ def load_indicator_config() -> dict:
             config = json.load(f)
         if isinstance(config, dict) and config.get("preset") in PRESETS:
             return config
-    except (OSError, json.JSONDecodeError, TypeError):
+    except (OSError, ValueError, TypeError):
         pass
     return dict(_DEFAULTS)
 
 
 def save_indicator_config(config: dict) -> None:
-    """Persist indicator config to disk."""
-    with open(_FILE, "w") as f:
-        json.dump(config, f, indent=2)
+    """Persist indicator config to disk atomically (tempfile + os.replace)."""
+    fd, tmp = tempfile.mkstemp(dir=str(_FILE.parent), prefix=_FILE.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f, indent=2)
+        os.replace(tmp, _FILE)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def get_preset_name() -> str:
@@ -209,11 +259,12 @@ def get_preset_name() -> str:
 
 
 def get_preset_features(preset_name: str) -> list[str] | None:
-    """Return the feature list for a preset, or None for 'full' (all columns)."""
+    """Return a copy of the feature list for a preset, or None for 'full' (all columns)."""
     preset = PRESETS.get(preset_name)
     if preset is None:
         return None
-    return preset["features"]
+    features = preset["features"]
+    return list(features) if features is not None else None
 
 
 def get_all_preset_info() -> dict:

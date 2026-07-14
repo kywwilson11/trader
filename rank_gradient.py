@@ -12,6 +12,9 @@ panel). Pure numpy — Mac-testable.
 """
 import numpy as np
 
+# decision_report.py re-declares these boundaries inline (plus an extra
+# ('rank_8_plus', 8, 9999)) — the go/no-go compares THIS holdout side against
+# that live side, so the two definitions must stay in sync.
 DEFAULT_BUCKETS = (('rank_1_3', 1, 3), ('rank_4_5', 4, 5), ('rank_6_7', 6, 7))
 
 
@@ -24,7 +27,10 @@ def rank_gradient_from_panel(panel, buckets=DEFAULT_BUCKETS, cost_pct=0.0):
     """
     collected = {label: [] for label, _, _ in buckets}
     for period in panel:
-        ranked = sorted(period, key=lambda c: c.get('signal', 0.0), reverse=True)
+        # c['signal'] (not .get) so a malformed panel fails loudly, exactly
+        # like the c['fwd_return'] below — a silently mid-ranked candidate
+        # would feed garbage bucket means into the ship gate.
+        ranked = sorted(period, key=lambda c: c['signal'], reverse=True)
         for i, c in enumerate(ranked, start=1):
             net = float(c['fwd_return']) - cost_pct
             for label, lo, hi in buckets:
@@ -42,20 +48,29 @@ def rank_gradient_from_panel(panel, buckets=DEFAULT_BUCKETS, cost_pct=0.0):
 
 def rank_gradient_verdict(buckets, ratio_threshold=0.5):
     """Go/no-go: does a real rank gradient exist? Consumes the bucket dict from
-    EITHER decision_report or rank_gradient_from_panel.
+    EITHER decision_report or rank_gradient_from_panel — including the full
+    decision_report.json object (rank buckets nested under 'conviction'), so
+    `rank_gradient_report.py --buckets decision_report.json` works as documented.
 
-    PASS iff rank-6-7 carries materially less edge than rank-1-3: rank_6_7 mean
-    net <= 0, OR rank_6_7 mean < ratio_threshold * rank_1_3 mean. If absent, the
-    concentration / edge-Kelly levers are regime-mining — ship NEITHER.
+    PASS iff rank-1-3 actually beats rank-6-7 AND rank-6-7 carries materially
+    less edge: rank_1_3 > rank_6_7, and (rank_6_7 mean net <= 0 OR rank_6_7
+    mean < ratio_threshold * rank_1_3 mean). Without the direction guard an
+    inverted or flat-negative panel (both buckets losing, top bucket worst)
+    would read as CONFIRMED. If absent, the concentration / edge-Kelly levers
+    are regime-mining — ship NEITHER. ratio_6_7_over_1_3 is only reported when
+    rank_1_3 > 0 (negative/negative reads as a healthy gradient when it is
+    actually inverted).
     """
+    if 'rank_1_3' not in buckets and isinstance(buckets.get('conviction'), dict):
+        buckets = buckets['conviction']   # full decision_report.json wrapper
     r13 = (buckets.get('rank_1_3') or {}).get('mean_net_pct')
     r67 = (buckets.get('rank_6_7') or {}).get('mean_net_pct')
     if r13 is None or r67 is None:
         return {'gradient_exists': None,
                 'verdict': 'insufficient rank coverage — need rank_1_3 and rank_6_7 buckets',
                 'rank_1_3': r13, 'rank_6_7': r67}
-    exists = (r67 <= 0.0) or (r13 > 0 and r67 < ratio_threshold * r13)
-    ratio = round(r67 / r13, 3) if r13 not in (0, None) else None
+    exists = (r13 > r67) and ((r67 <= 0.0) or (r13 > 0 and r67 < ratio_threshold * r13))
+    ratio = round(r67 / r13, 3) if r13 > 0 else None
     return {
         'gradient_exists': bool(exists),
         'rank_1_3': r13, 'rank_6_7': r67, 'ratio_6_7_over_1_3': ratio,

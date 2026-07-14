@@ -13,7 +13,20 @@ from indicator_config import (
 
 class TestPresets:
     def test_all_presets_exist(self):
-        assert set(PRESETS.keys()) == {"minimal", "standard", "stationary", "full"}
+        assert set(PRESETS.keys()) == {"minimal", "standard", "stationary",
+                                       "stationary_lean", "full"}
+
+    def test_stationary_lean_cuts_only_structural_redundancy(self):
+        stationary = set(PRESETS["stationary"]["features"])
+        lean = set(PRESETS["stationary_lean"]["features"])
+        assert lean.issubset(stationary)
+        # exactly the documented structural cuts, nothing data-mined
+        assert stationary - lean == {
+            "ROC", "CS_Rank_ROC", "MACDs_12_26_9", "STOCHd_14_3_3",
+            "Month_sin", "Month_cos", "Turn_of_Month"}
+        # the surviving halves of each identity stay
+        assert {"Return_12h", "CS_Rank_Return_12h", "MACD_12_26_9",
+                "MACDh_12_26_9", "STOCHk_14_3_3"} <= lean
 
     def test_minimal_subset_of_standard(self):
         minimal = set(PRESETS["minimal"]["features"])
@@ -71,7 +84,8 @@ class TestStationaryPreset:
 class TestGetAllPresetInfo:
     def test_returns_all_presets(self):
         info = get_all_preset_info()
-        assert set(info.keys()) == {"minimal", "standard", "stationary", "full"}
+        assert set(info.keys()) == {"minimal", "standard", "stationary",
+                                    "stationary_lean", "full"}
 
     def test_info_has_count_and_description(self):
         info = get_all_preset_info()

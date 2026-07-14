@@ -3,14 +3,20 @@
 Alpaca crypto charges 15 bps maker / 25 bps taker PER SIDE at tier 1
 (<$100k 30-day volume; see docs.alpaca.markets/us/docs/crypto-fees), so a
 taker round trip costs 50 bps before spread. US equities are commission-free
-but pay SEC ($20.60 per $1M, sells) + FINRA TAF (~$0.000195/share, sells)
-plus spread/slippage.
+but pay small sell-side regulatory fees (SEC Section 31 + FINRA TAF), order of
+magnitude ~0.2-0.3 bps per round trip; both rates are reset periodically by
+rule, so STOCK_REGULATORY_BPS is an allowance, not a live rate. Plus
+spread/slippage.
 
 The old gate compared predictions against spread alone (and training assumed
 5 bps round trip) — admitting structurally negative-expectancy crypto trades.
 Every entry gate and the training objective should price costs through this
 module so live and simulated economics agree.
 """
+
+import logging
+
+log = logging.getLogger(__name__)
 
 # Alpaca crypto fee schedule, tier 1, bps per side
 CRYPTO_TAKER_BPS = 25.0
@@ -21,6 +27,12 @@ CRYPTO_MAKER_BPS = 15.0
 STOCK_REGULATORY_BPS = 0.3   # sell-side SEC + TAF, expressed per round trip
 STOCK_SLIPPAGE_BPS_PER_SIDE = 3.0
 
+# Flat per-round-trip spread haircut (PERCENT) when no per-bar estimate exists.
+# Canonical copy — backtest.SPREAD_PCT and meta_label's inline fallback must
+# stay equal to these values (tests/test_review_b10.py cross-checks their
+# sources until they import this dict directly).
+FLAT_SPREAD_PCT = {'crypto': 0.10, 'stock': 0.05}
+
 # Entry gate: predicted move must exceed this multiple of round-trip cost
 MIN_EDGE_MULTIPLE = 2.0
 
@@ -29,7 +41,8 @@ MAKER_SHARE_WINDOW_DAYS = 14
 MAKER_SHARE_MIN_ENTRIES = 30
 _MAKER_SHARE_TTL = 3600
 
-_maker_share_cache: tuple[float, float | None] | None = None  # (mono_ts, share)
+# (days, min_entries) -> (mono_ts, share); tests reset it to None (tolerated)
+_maker_share_cache: dict[tuple[int, int], tuple[float, float | None]] | None = None
 
 
 def realized_crypto_maker_share(days: int = MAKER_SHARE_WINDOW_DAYS,
@@ -47,8 +60,12 @@ def realized_crypto_maker_share(days: int = MAKER_SHARE_WINDOW_DAYS,
 
     global _maker_share_cache
     now = _time.monotonic()
-    if _maker_share_cache and (now - _maker_share_cache[0]) < _MAKER_SHARE_TTL:
-        return _maker_share_cache[1]
+    if not isinstance(_maker_share_cache, dict):
+        _maker_share_cache = {}
+    key = (days, min_entries)
+    hit = _maker_share_cache.get(key)
+    if hit is not None and (now - hit[0]) < _MAKER_SHARE_TTL:
+        return hit[1]
 
     share = None
     try:
@@ -66,14 +83,18 @@ def realized_crypto_maker_share(days: int = MAKER_SHARE_WINDOW_DAYS,
                     except json.JSONDecodeError:
                         continue
                     sym = e.get('symbol', '')
-                    if (e.get('action') == 'buy' and '/' in sym
-                            and e.get('entry_tactic')):
+                    if (e.get('action') == 'buy' and isinstance(sym, str)
+                            and '/' in sym and e.get('entry_tactic')):
                         tactics.append(e['entry_tactic'])
         if len(tactics) >= min_entries:
             share = sum(1 for t in tactics if t.startswith('maker')) / len(tactics)
-    except Exception:
+    except Exception as exc:
+        # Fail-safe to full-taker pricing, but leave a trace: a silent None
+        # here disables the maker-share feedback with zero operator signal.
+        log.warning("maker-share journal scan failed (%s: %s) — live crypto "
+                    "entry gate prices full taker", type(exc).__name__, exc)
         share = None
-    _maker_share_cache = (now, share)
+    _maker_share_cache[key] = (now, share)
     return share
 
 
@@ -116,6 +137,11 @@ def round_trip_cost_pct(asset_type: str, spread_pct: float = 0.0,
         else:
             entry_bps = crypto_entry_fee_bps(live=live)
         return (entry_bps + CRYPTO_TAKER_BPS) / 100.0 + spread_cost
+    if asset_type != 'stock':
+        # Stock pricing is ~8x cheaper than crypto — an unrecognized label
+        # must not silently understate the cost floor.
+        log.warning("round_trip_cost_pct: unknown asset_type %r priced as stock",
+                    asset_type)
     return (STOCK_REGULATORY_BPS + 2 * STOCK_SLIPPAGE_BPS_PER_SIDE) / 100.0 + spread_cost
 
 

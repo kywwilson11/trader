@@ -2,10 +2,12 @@
 
 Reads from stock_universe.json, falling back to hardcoded defaults.
 Supports both stock symbols (TSLA) and crypto pairs (BTC/USD).
-No heavy imports (json, pathlib only) so it's safe for the GUI env.
+No heavy imports (stdlib only) so it's safe for the GUI env.
 """
 
 import json
+import logging
+import os
 from pathlib import Path
 
 _FILE = Path(__file__).resolve().parent / "stock_universe.json"
@@ -43,16 +45,25 @@ def load_stock_universe() -> list[str]:
             symbols = json.load(f)
         if isinstance(symbols, list) and symbols:
             return _clean(symbols)
-    except (OSError, json.JSONDecodeError, TypeError):
-        pass
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError) as exc:
+        # AttributeError: _clean on non-string entries. The file is committed,
+        # so ANY fallback silently swaps the traded universe — warn loudly.
+        logging.getLogger(__name__).warning(
+            "stock_universe.json unreadable (%r) — falling back to %d "
+            "hardcoded defaults", exc, len(_DEFAULTS))
     return list(_DEFAULTS)
 
 
 def save_stock_universe(symbols: list[str]) -> None:
     """Persist a new market universe to disk (sorted, deduplicated)."""
     clean = _clean(symbols)
-    with open(_FILE, 'w') as f:
+    # Atomic replace: bot loops re-read this file every cycle while the GUI
+    # writes it, so a truncate-then-rewrite (or crash mid-write) must never
+    # be observable as torn JSON.
+    tmp = _FILE.with_name(_FILE.name + '.tmp')
+    with open(tmp, 'w') as f:
         json.dump(clean, f, indent=2)
+    os.replace(tmp, _FILE)
 
 
 # Leveraged ETFs: ticker -> leverage multiplier
@@ -185,8 +196,7 @@ TRADABLE_K_HOLD = 28
 # restoring them (6 -> 10) gives the crypto cross-sectional ranks + dispersion
 # 67% more breadth. This is MODEL-FACING: the crypto model was trained on the
 # 6-coin panel, so the 4 must be added HERE only together with a crypto
-# harvest+retrain (train/serve parity), on the Jetson. Listed in CRYPTO_POOL
-# below so the harvest can include them without the live loop trading them yet.
+# harvest+retrain (train/serve parity), on the Jetson.
 CRYPTO_SYMBOLS = [
     'BTC/USD',
     'ETH/USD',
@@ -196,6 +206,9 @@ CRYPTO_SYMBOLS = [
     'LINK/USD',
 ]
 
-# The intended full coin set (Jetson: harvest+retrain on this, then promote into
-# CRYPTO_SYMBOLS for live trading — see wave-9 #6).
+# The intended full coin set for wave-9 #6 — a DECLARATION ONLY, nothing reads
+# it yet. The harvest does NOT consume this: scripts/harvest_crypto_data.py
+# hardcodes its own 6-coin CRYPTO_TICKERS list (~line 30), which must be
+# updated to this set in the SAME Jetson change (then harvest+retrain, then
+# promote the coins into CRYPTO_SYMBOLS for live trading).
 CRYPTO_POOL = CRYPTO_SYMBOLS + ['AVAX/USD', 'BCH/USD', 'DOT/USD', 'LTC/USD']

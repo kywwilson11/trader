@@ -72,16 +72,18 @@ def _hour_encode(hour: float) -> tuple[float, float]:
 def build_feature_matrix(tdf, preds) -> np.ndarray:
     """Per-bar meta features from a harvest-style DataFrame (training)."""
     n = len(tdf)
+    # Single hour pass feeding both trig columns — vectorized twin of
+    # _hour_encode (the live scalar path); keep the two in sync.
+    hours = np.array([t.hour for t in tdf.index], dtype=np.float64)
+    hour_ang = 2 * np.pi * hours / 24.0
     cols = {}
     for name in META_FEATURES:
         if name == 'pred':
             cols[name] = np.asarray(preds, dtype=np.float64)
         elif name == 'hour_sin':
-            hours = np.array([t.hour for t in tdf.index], dtype=np.float64)
-            cols['hour_sin'] = np.sin(2 * np.pi * hours / 24.0)
+            cols['hour_sin'] = np.sin(hour_ang)
         elif name == 'hour_cos':
-            hours = np.array([t.hour for t in tdf.index], dtype=np.float64)
-            cols['hour_cos'] = np.cos(2 * np.pi * hours / 24.0)
+            cols['hour_cos'] = np.cos(hour_ang)
         elif name in tdf.columns:
             cols[name] = tdf[name].values.astype(np.float64)
         else:
@@ -146,11 +148,18 @@ def invalidate_cache():
     _loaded.clear()
 
 
+_calib_fallback_warned = False
+
+
 def _calibrated(calib, raw: np.ndarray) -> np.ndarray:
+    global _calib_fallback_warned
     try:
         return np.clip(calib.predict(raw), 0.0, 1.0)
-    except Exception:
-        return raw
+    except Exception as e:
+        if not _calib_fallback_warned:
+            _calib_fallback_warned = True
+            print(f"[META] calibrator predict failed ({e}) — serving raw scores")
+        return np.clip(raw, 0.0, 1.0)
 
 
 def meta_probability_live(prefix: str, snapshot: dict, pred: float) -> float | None:
@@ -195,7 +204,7 @@ def _gen_meta_rows(tdf, preds, asset_type, threshold, policy):
 
     Entries at META_THRESHOLD_FRACTION x the live threshold so the meta
     model also sees the marginal signals it should learn to veto.
-    Returns (features, labels, net_returns, entry_times).
+    Returns (features, labels, net_returns, entry_times, exit_times).
     """
     from policy_exits import exit_walk, eod_mask_from_index
     from fees import round_trip_cost_pct
@@ -222,7 +231,8 @@ def _gen_meta_rows(tdf, preds, asset_type, threshold, policy):
             rt_cost_arr = per_bar_round_trip_cost(
                 asset_type, tdf['Eff_Spread_Pct'].values,
                 adv_dollar=adv_arr, notional=impact_notional, impact_k=impact_k)
-        except Exception:
+        except Exception as e:
+            print(f"[META] per-bar spread cost failed ({e}) — flat-cost fallback")
             rt_cost_arr = None
     cooldown_bars = max(1, int(math.ceil(policy['cooldown_min'] / 60)))
     entry_threshold = threshold * META_THRESHOLD_FRACTION
@@ -288,7 +298,7 @@ def train_meta(prefix: str = '') -> bool:
     times_ns = df.index.view('int64')
     cutoff = np.quantile(times_ns, 1.0 - HOLDOUT_FRACTION)
 
-    X, y, nets, ts, exit_ts = [], [], [], [], []
+    X, y, ts, exit_ts = [], [], [], []
     for ticker in df['Ticker'].unique():
         tdf = df[df['Ticker'] == ticker].sort_index()
         tdf = tdf[tdf.index.view('int64') <= cutoff]
@@ -296,10 +306,10 @@ def train_meta(prefix: str = '') -> bool:
             continue
         if any(c not in tdf.columns for c in feature_cols):
             continue
-        preds = _predict_ticker(model, scaler, config, feature_cols, tdf,
-                                lgb_model=lgb_primary)
-        r, l, nr, t, et = _gen_meta_rows(tdf, preds, asset_type, threshold, policy)
-        X.extend(r); y.extend(l); nets.extend(nr); ts.extend(t); exit_ts.extend(et)
+        preds, _ = _predict_ticker(model, scaler, config, feature_cols, tdf,
+                                   lgb_model=lgb_primary)
+        r, l, _nr, t, et = _gen_meta_rows(tdf, preds, asset_type, threshold, policy)
+        X.extend(r); y.extend(l); ts.extend(t); exit_ts.extend(et)
         print(f"  [META] {ticker}: {len(r)} replayed trades")
 
     if len(X) < 200:

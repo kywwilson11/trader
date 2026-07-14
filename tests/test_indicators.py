@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import indicators
 from indicators import (
     compute_atr,
     compute_bbands,
@@ -33,11 +34,77 @@ class TestComputeRSI:
         assert rsi.min() >= 0
         assert rsi.max() <= 100
 
-    def test_constant_series(self):
+    def test_constant_series_is_nan_everywhere(self):
+        # Constant price -> zero gain AND zero loss everywhere -> RSI is a
+        # 0/0 indeterminate form (avg_gain/avg_loss = 0/0), which both the
+        # numba kernel and the pandas fallback resolve to NaN, not 50. A
+        # previous version of this test dropna()'d BEFORE asserting, which
+        # made it pass vacuously on an empty series (all(... for v in []) is
+        # True) without checking anything.
         series = pd.Series([50.0] * 30)
+        rsi = compute_rsi(series)
+        assert len(rsi) == len(series)
+        assert rsi.isna().all()
+
+    def test_gently_varying_series_in_range(self):
+        # Companion to the constant-series case: RSI IS defined (non-NaN)
+        # on data with genuine mixed up/down ticks, and must stay in [0, 100].
+        np.random.seed(3)
+        series = pd.Series(50.0 + np.cumsum(np.random.randn(80) * 0.3))
         rsi = compute_rsi(series).dropna()
-        # Constant price → RSI should be ~50 (no gains or losses)
-        assert all(abs(v - 50) < 1 for v in rsi)
+        assert len(rsi) > 0
+        assert rsi.min() >= 0
+        assert rsi.max() <= 100
+
+    def test_fallback_matches_wilder_recursive_reference(self, monkeypatch):
+        # Regression test for the fallback fix: compute_rsi's pure-pandas
+        # branch must match the numba kernel's recursive (adjust=False,
+        # Wilder-style) EWM exactly, not pandas' default adjust=True
+        # (weighted-average-of-all-history) form. Force the fallback branch
+        # explicitly so this test is meaningful regardless of which
+        # accelerated backend (C ext / numba) happens to be installed.
+        monkeypatch.setattr(indicators, "_HAS_C", False)
+        monkeypatch.setattr(indicators, "_HAS_NUMBA", False)
+
+        length = 14
+        np.random.seed(11)
+        n = 60
+        close = pd.Series(100 + np.cumsum(np.random.randn(n) * 0.5))
+
+        rsi = indicators.compute_rsi(close, length=length)
+
+        # Hand-computed Wilder recursive reference, built independently of
+        # indicators.py/pandas .ewm() — a plain recursive loop matching the
+        # numba _rsi_core / _ewm_alpha semantics (seed on first observation,
+        # then avg = alpha*x + (1-alpha)*avg; emit once `length` observations
+        # have been seen).
+        delta = close.diff()
+        gain = delta.clip(lower=0).values
+        loss = (-delta.clip(upper=0)).values
+        alpha = 1.0 / length
+        avg_gain = np.full(n, np.nan)
+        avg_loss = np.full(n, np.nan)
+        s_gain = np.nan
+        s_loss = np.nan
+        count = 0
+        for i in range(n):
+            g, l = gain[i], loss[i]
+            if np.isnan(g):
+                continue
+            count += 1
+            if np.isnan(s_gain):
+                s_gain, s_loss = g, l
+            else:
+                s_gain = alpha * g + (1 - alpha) * s_gain
+                s_loss = alpha * l + (1 - alpha) * s_loss
+            if count >= length:
+                avg_gain[i] = s_gain
+                avg_loss[i] = s_loss
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rs = avg_gain / avg_loss
+            expected = 100 - (100 / (1 + rs))
+
+        assert np.allclose(rsi.values, expected, equal_nan=True, atol=1e-9)
 
     def test_strong_uptrend_high_rsi(self):
         # Random walk biased strongly upward
@@ -195,6 +262,31 @@ class TestComputeVWAP:
         within = ((vwap >= df["Low"].loc[vwap.index] - 1) &
                   (vwap <= df["High"].loc[vwap.index] + 1))
         assert within.mean() > 0.8
+
+    def test_multiday_matches_date_based_grouping(self):
+        # Regression test for the perf micro-fix: grouping by a normalized
+        # DatetimeIndex (index.normalize()) must partition rows identically
+        # to grouping by an object array of datetime.date (the prior
+        # implementation), across a day boundary.
+        idx = pd.date_range("2025-01-01 09:00", periods=20, freq="h", tz="UTC")
+        rng = np.random.default_rng(5)
+        close = pd.Series(100 + np.cumsum(rng.normal(0, 0.5, len(idx))), index=idx)
+        high = close + 0.3
+        low = close - 0.3
+        volume = pd.Series(rng.uniform(100, 1000, len(idx)), index=idx)
+
+        vwap = compute_vwap(high, low, close, volume)
+
+        # Reference: identical formula, grouped by an array of date()
+        # objects (the pre-perf-fix approach) instead of a normalized index.
+        typical_price = (high + low + close) / 3.0
+        tp_vol = typical_price * volume
+        dates = close.index.date
+        cum_tp_vol = tp_vol.groupby(dates).cumsum()
+        cum_vol = volume.groupby(dates).cumsum()
+        expected = cum_tp_vol / cum_vol.replace(0, np.nan)
+
+        assert np.allclose(vwap.values, expected.values, equal_nan=True)
 
 
 class TestComputeGap:

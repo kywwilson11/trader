@@ -4,34 +4,90 @@ One file per day in journals/ directory: journals/2026-02-08.jsonl
 Each line is a self-contained JSON object with all inputs and reasoning.
 """
 
-import json
 import datetime
+import json
 from pathlib import Path
 
 from llm_config import load_llm_config
+from log_config import get_logger
+
+logger = get_logger(__name__)
 
 JOURNAL_DIR = Path(__file__).resolve().parent / "journals"
 
+_disabled_warned = False
+
 
 def log_decision(entry: dict):
-    """Append one decision record to today's journal file."""
-    config = load_llm_config()
-    if not config.get("journal_enabled", True):
-        return
+    """Append one decision record to today's journal file.
 
-    JOURNAL_DIR.mkdir(exist_ok=True)
+    Never raises: call sites are live trading loops — buy sites journal
+    AFTER the order filled but BEFORE cooldown/trade-count stamping, so an
+    exception here would skip that bookkeeping and abort the cycle.
 
-    entry["ts"] = datetime.datetime.now().isoformat()
-    today = datetime.date.today().isoformat()
-    filepath = JOURNAL_DIR / f"{today}.jsonl"
-
+    The `journal_enabled` config switch (GUI "Trade Journal" checkbox)
+    silences EVERY row type, not just trade rows: account_risk rows, the
+    llm_analysis rows llm_eval scores, the conviction/Stage-0 skip rows,
+    and the buy rows fees.py's live maker-share feedback reads (which then
+    drifts to full-taker pricing). Disable with care.
+    """
+    global _disabled_warned
     try:
-        line = json.dumps(entry, default=str) + "\n"
+        config = load_llm_config()
+        if not config.get("journal_enabled", True):
+            if not _disabled_warned:
+                _disabled_warned = True
+                logger.warning("[JOURNAL] journaling disabled — dropping ALL "
+                               "rows (trade/skip/account_risk/llm_analysis; "
+                               "Stage-0 and maker-share inputs)")
+            return
+
+        JOURNAL_DIR.mkdir(exist_ok=True)
+
+        # One clock read for both the ts field and the filename (a row
+        # stamped 23:59:59.9 must not land in the next day's file), and
+        # offset-aware so the two Stage-0 consumers agree on the epoch:
+        # decision_report's pd.Timestamp tz-localizes naive ts as UTC while
+        # llm_eval's fromisoformat().timestamp() reads it as local time —
+        # with an explicit offset both are exact regardless of box timezone.
+        now = datetime.datetime.now().astimezone()
+        record = {**entry, "ts": now.isoformat()}
+        filepath = JOURNAL_DIR / f"{now.date().isoformat()}.jsonl"
+
+        line = json.dumps(record, default=str) + "\n"
         with open(filepath, "a") as f:
             f.write(line)
             f.flush()
     except Exception as e:
-        print(f"[JOURNAL] Error writing: {e}")
+        logger.warning("[JOURNAL] Error writing: %s", e)
+
+
+def iter_journal_rows(days: int = 30):
+    """Yield parsed rows from the last days+1 daily journal files
+    (today inclusive), oldest file first, rows in append order.
+
+    Canonical shared reader: skips blank lines and corrupt rows per line
+    (a torn trailing line from a concurrent append is expected). Consumers
+    apply their own row filters.
+    """
+    today = datetime.date.today()
+    for offset in range(days, -1, -1):
+        day = today - datetime.timedelta(days=offset)
+        filepath = JOURNAL_DIR / f"{day.isoformat()}.jsonl"
+        if not filepath.exists():
+            continue
+        try:
+            with open(filepath) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+        except OSError as e:
+            logger.warning("[JOURNAL] Error reading %s: %s", filepath, e)
 
 
 def get_journal_summary(date: str = None) -> dict:
@@ -41,7 +97,12 @@ def get_journal_summary(date: str = None) -> dict:
         date: ISO date string (e.g. '2026-02-08'). Defaults to today.
 
     Returns dict with:
-        total, buys, sells, skips, llm_blocks, avg_multiplier, entries
+        total, buys, sells, skips, llm_blocks, avg_multiplier,
+        skipped_lines, entries
+
+    Note: `total` counts every row in the file, including non-decision
+    rows (llm_analysis / entry_window / account_risk), not just the
+    buy/sell/skip decisions broken out below it.
     """
     if date is None:
         date = datetime.date.today().isoformat()
@@ -49,17 +110,25 @@ def get_journal_summary(date: str = None) -> dict:
     filepath = JOURNAL_DIR / f"{date}.jsonl"
     if not filepath.exists():
         return {"total": 0, "buys": 0, "sells": 0, "skips": 0,
-                "llm_blocks": 0, "avg_multiplier": 1.0, "entries": []}
+                "llm_blocks": 0, "avg_multiplier": 1.0,
+                "skipped_lines": 0, "entries": []}
 
     entries = []
+    skipped_lines = 0
     try:
         with open(filepath) as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Torn line from a concurrent append — skip the row,
+                    # keep every row after it readable.
+                    skipped_lines += 1
     except Exception as e:
-        print(f"[JOURNAL] Error reading {filepath}: {e}")
+        logger.warning("[JOURNAL] Error reading %s: %s", filepath, e)
 
     buys = sum(1 for e in entries if e.get("action") == "buy")
     sells = sum(1 for e in entries if e.get("action") == "sell")
@@ -79,5 +148,6 @@ def get_journal_summary(date: str = None) -> dict:
         "skips": skips,
         "llm_blocks": llm_blocks,
         "avg_multiplier": round(avg_mult, 2),
+        "skipped_lines": skipped_lines,
         "entries": entries,
     }

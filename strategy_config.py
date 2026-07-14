@@ -9,6 +9,12 @@ most names (raw 2-2.5x hourly ATR is ~0.6-3%), making stops effectively
 fixed-percent and pushing the 3:1-RR take-profit to an unreachable 15-30%.
 Floors now only guard against degenerate sub-spread stops; ATR does the
 work. TP ratio lowered to 2:1 accordingly.
+
+Related constants defined elsewhere (siblings — check them when editing here):
+  - fees.FLAT_SPREAD_PCT (canonical flat spread) and its copy backtest.SPREAD_PCT
+    (drift guarded by tests/test_review_b10.py).
+  - cooldown_bars = max(1, ceil(cooldown_min/60)) is derived verbatim in BOTH
+    meta_label.py and backtest.py (drift guarded by tests/test_improve_stratcfg.py).
 """
 
 CRYPTO_POLICY = {
@@ -48,7 +54,12 @@ PORTFOLIO_VOL_TARGET = {         # annualized portfolio volatility targets
     'crypto': 0.35,
     'stock': 0.18,
 }
-TILT_MIN, TILT_MAX = 0.70, 1.30  # combined regime/sentiment/LLM tilt bounds
+TILT_MAX = 1.30    # combined regime/sentiment/LLM tilt BOOST cap (enforced in base_loop)
+TILT_MIN = 0.70    # UNUSED/reserved — NOT enforced anywhere. The live de-risk floor is a
+                   # hardcoded 0.1 in base_loop (tilt = max(0.1, min(TILT_MAX, tilt))),
+                   # i.e. de-risking down to 10% is honored by design. Do not wire this
+                   # in without an explicit decision (raising the floor 0.1 -> 0.70 is
+                   # model-facing).
 HAR_VOL_ENABLED = True           # HAR-RV (realized range) sigma with GARCH
                                  # fallback — set False to force GARCH-only
 CONVICTION_JOURNAL_ENABLED = True  # wave-5 Tier1-1: per-candidate veto
@@ -81,6 +92,9 @@ EXEC_EDGE_HEADROOM_MULT = 1.5    # need pred >= this * edge_floor to risk a pass
 # it cancels). ENTRY caps are tight (re-chase next loop); EXIT/flatten caps are
 # WIDE with a true-market backstop so a stop can never silently fail to fill.
 # Per name_class from the offline Eff_Spread_Pct ranking.
+# DECLARED-AHEAD: order_utils.ioc_limit_price/place_marketable_ioc implement the
+# mechanics but have NO production caller yet — no live order is IOC-capped today.
+# Wiring these into the order path is owned by the execution/order_utils track.
 IOC_CAP_BPS = {'mega': 8, 'mid': 20, 'spec': 40}
 IOC_EXIT_CAP_BPS = {'mega': 15, 'mid': 35, 'spec': 50}
 
@@ -123,6 +137,16 @@ IMPACT_TYPICAL_NOTIONAL = 25_000 # representative $ order size for the %-return 
 # (the loss change makes old Optuna scores incomparable — CLAUDE.md gotcha #2).
 UNIQUENESS_WEIGHTS_ENABLED = False
 
+# --- Long-only objective scoring (2026-07 review, DEFAULT OFF) ---
+# hypersearch's simulate_trades historically booked a SHORT leg (-r - cost on
+# p < -threshold) into the trial score AND the holdout DSR, but the live book
+# is long-only: a model whose certified edge is carried by bear-side accuracy
+# deploys only its weak long side. True = score longs only (the deployable
+# policy). Flipping this changes trial scores — old Optuna scores become
+# incomparable, so flip ONLY on the Jetson together with CLAUDE.md gotcha #2
+# (delete v2_study.db + stock_v2_study.db, reset the adaptive best_score).
+OBJECTIVE_LONG_ONLY = False
+
 # --- Meta-label probability calibration (wave-9 #1) ---
 # 'legacy'     = original isotonic fit on the same val slice the booster early-
 #                stopped on (a leak -> upward-biased p that gates cost + sizes bets).
@@ -132,6 +156,16 @@ UNIQUENESS_WEIGHTS_ENABLED = False
 #                any p-consuming sizing lever (edge-Kelly, conviction tiers).
 META_CALIBRATION_MODE = 'legacy'
 
+# ============================================================================
+# WAVE-9 FORWARD-DECLARED FLAGS — RESERVED / NOT YET WIRED.
+# None of the constants from here through TIER_A_K has a production reader:
+# the kernels (bet_sizing.afml_bet_size/kelly_edge_odds, panel_ranks.cs_size_tilt,
+# crypto_trend.trend_scalar, portfolio_backtest.conviction_gated) take their
+# thresholds as FUNCTION ARGUMENTS. Flipping any flag below is a SILENT NO-OP
+# today. Activation = the Jetson wiring step, which must import these constants
+# at the call sites. tests/test_improve_stratcfg.py asserts they stay default-off
+# until that wiring lands (update the test in the same change that wires them).
+# ============================================================================
 # --- Edge/probability bet sizing (wave-9 #5) ---
 # OFF by default and HARD-GATED on META_CALIBRATION_MODE='purged_oof' being live
 # and certified: edge-Kelly over-bets on an optimistic p (Chopra-Ziemba). When
@@ -151,7 +185,9 @@ CRYPTO_CS_RANK_ENABLED = False
 CRYPTO_CS_DISPERSION_FLOOR = 0.01
 
 # --- BTC trend / TSMOM risk-off gate (wave-9 #7) ---
-# OFF by default. Graded BTC-200h-SMA de-risk scalar via CryptoLoop._extra_tilt,
+# OFF by default. Graded BTC-200h-SMA de-risk scalar to be COMPOSED INTO
+# CryptoLoop._extra_tilt — which today returns the perp FUNDING tilt
+# (funding.funding_tilt); the two must MULTIPLY, not overwrite —
 # debounced (Schmitt + persistence). Wiring MUST floor the COMBINED macro x HMM x
 # book-vol x trend product (4 de-risk terms can stack-collapse size) and run the
 # co-fire counterfactual (if it fires with the shipped vol-scaler >70% of the

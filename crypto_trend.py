@@ -23,7 +23,16 @@ import numpy as np
 
 
 def sma_gap(closes, window=200):
-    """(last close - trailing SMA(window)) / SMA, or None if < window bars."""
+    """(last close - trailing SMA(window)) / SMA, or None if < window FINITE bars.
+
+    Non-finite closes are compacted out BEFORE windowing: the SMA spans the
+    last `window` FINITE closes and the numerator is the last FINITE close.
+    So NaN voids inside the window stretch the effective lookback across wall
+    time (mixing in older prices), and a trailing-NaN tail leaves the gap
+    silently stale — callers cannot distinguish fresh from stale gaps. A
+    ~220-bar fetch bounds the stretch: below `window` finite bars this
+    returns None and downstream fails open (trend_scalar -> 1.0).
+    """
     c = np.asarray(closes, dtype=float)
     c = c[np.isfinite(c)]
     if len(c) < window:
@@ -51,7 +60,10 @@ def trend_scalar(gap, floor=0.5, scale=0.05):
 def hysteresis_state(gap, prev_state='risk_on', b_lo=-0.02, b_hi=0.01):
     """Asymmetric Schmitt trigger: flip to 'risk_off' when gap < b_lo (de-risk
     FAST), back to 'risk_on' only when gap > b_hi (re-arm SLOW). Between the
-    bands hold the prior state — no whipsaw. Fail-open: hold prev on bad input."""
+    bands hold the prior state — no whipsaw. Fail-HOLD on a missing/non-finite
+    gap: keep the prior state (note: NOT fail-open — a stale 'risk_off'
+    persists until data returns; the graded trend_scalar path is the one that
+    fails open to 1.0)."""
     if gap is None or not np.isfinite(gap):
         return prev_state
     if gap < b_lo:
@@ -63,7 +75,8 @@ def hysteresis_state(gap, prev_state='risk_on', b_lo=-0.02, b_hi=0.01):
 
 def smooth_state(raw_states, persistence=3):
     """Require `persistence` consecutive raw states before committing a switch —
-    a single-bar flip never moves the committed state (whipsaw guard)."""
+    a single-bar flip never moves the committed state (whipsaw guard; with
+    persistence <= 1 the committed state just tracks the raw states)."""
     out = []
     if not raw_states:
         return out
@@ -79,5 +92,9 @@ def smooth_state(raw_states, persistence=3):
                 committed, candidate, count = candidate, candidate, 0
         else:
             candidate, count = s, 1
+            # Same commit check as above so persistence<=1 commits on THIS
+            # bar (count=1 < persistence for any persistence>=2: no-op there)
+            if count >= persistence:
+                committed, count = candidate, 0
         out.append(committed)
     return out

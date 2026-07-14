@@ -14,21 +14,23 @@ Usage:
 """
 import argparse
 import json
-import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 
-BASE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BASE_DIR))
+import fees
+from trade_journal import JOURNAL_DIR
 
-JOURNAL_DIR = BASE_DIR / "journals"
+BASE_DIR = Path(__file__).resolve().parent
 
 
 def _load(days: int):
+    """Return (rows, n_skipped). A partial trailing line from a concurrent
+    append is expected; counting skips makes systematic corruption visible."""
     rows = []
+    n_skipped = 0
     today = datetime.now().date()
     for d in range(days + 1):
         path = JOURNAL_DIR / f"{(today - timedelta(days=d)).isoformat()}.jsonl"
@@ -42,18 +44,36 @@ def _load(days: int):
                 try:
                     e = json.loads(line)
                 except json.JSONDecodeError:
+                    n_skipped += 1
                     continue
                 if e.get('slippage_bps') is not None:
                     rows.append(e)
-    return rows
+    return rows, n_skipped
+
+
+def _write_json(report: dict) -> None:
+    out = BASE_DIR / 'execution_report.json'
+    with open(out, 'w') as f:
+        json.dump(report, f, indent=2)
+    print(f"Report: {out}")
 
 
 def run_report(days: int = 14) -> dict:
-    rows = _load(days)
+    rows, n_skipped = _load(days)
+    if n_skipped:
+        print(f"note: {n_skipped} unparseable journal line(s) skipped")
+
+    # Stamped so a stale execution_report.json on disk is distinguishable
+    # from a fresh run; written even on an empty window for the same reason.
+    report = {
+        'generated_at': datetime.now().isoformat(),
+        'window_days': days,
+    }
     if not rows:
         print("No fills with slippage data yet — the loops journal "
               "decision_price/fill_price on every confirmed fill.")
-        return {}
+        _write_json(report)
+        return report
 
     def crypto(sym):
         return '/' in sym or (sym.endswith('USD') and len(sym) > 5)
@@ -69,7 +89,6 @@ def run_report(days: int = 14) -> dict:
     print(f"\n=== IMPLEMENTATION SHORTFALL (last {days}d, {len(rows)} fills) ===")
     print(f"{'asset':<8}{'action':<7}{'reason':<14}{'n':>5}"
           f"{'mean bps':>10}{'median':>9}{'p90':>8}{'worst':>9}")
-    report = {}
     for (asset, action, reason), vals in sorted(groups.items()):
         a = np.array(vals)
         entry = {
@@ -90,27 +109,32 @@ def run_report(days: int = 14) -> dict:
     print(f"\nOverall mean shortfall: {overall:+.1f} bps per fill")
 
     # Maker share of crypto entries (the maker ladder journals
-    # entry_tactic per buy). Realized fee/RT = 30bps + 25*maker_share
-    # off the 50bps taker-taker baseline — feeds the fees.py review.
-    tactics = [e.get('entry_tactic') for e in rows
-               if e.get('action') == 'buy' and crypto(e.get('symbol', ''))
-               and e.get('entry_tactic')]
+    # entry_tactic per buy). Realized fee/RT = 50 - 10*maker_share bps
+    # (entry 25 - 10*share, exit always taker 25) vs the 50 bps
+    # taker-taker baseline — feeds the fees.py review. Same '/'-only
+    # symbol predicate as fees.realized_crypto_maker_share, so the share
+    # printed here is the one the live fee gate actually computes.
+    tactics = []
+    for e in rows:
+        sym = e.get('symbol', '')
+        if (e.get('action') == 'buy' and isinstance(sym, str)
+                and '/' in sym and e.get('entry_tactic')):
+            tactics.append(e['entry_tactic'])
     if tactics:
         maker_n = sum(1 for t in tactics if t.startswith('maker'))
         share = maker_n / len(tactics)
         report['crypto_maker_share'] = round(share, 3)
+        caveat = ('' if len(tactics) >= fees.MAKER_SHARE_MIN_ENTRIES else
+                  f' (below live-gate min n={fees.MAKER_SHARE_MIN_ENTRIES})')
         # Entry-leg fee: 15 bps maker vs 25 bps taker
         print(f"Crypto maker share (entries): {share:.0%} of {len(tactics)} "
-              f"— entry fee ≈ {25 - 10 * share:.1f} bps vs 25 taker")
+              f"— entry fee ≈ {25 - 10 * share:.1f} bps vs 25 taker{caveat}")
     print("Compare against the backtest's assumptions (fees.py spread "
           "haircuts: crypto 10 bps, stock 5 bps round trip). If realized "
           "shortfall is persistently higher, the backtest is optimistic — "
           "raise SPREAD_PCT in backtest.py and the entry edge floor.")
 
-    out = BASE_DIR / 'execution_report.json'
-    with open(out, 'w') as f:
-        json.dump(report, f, indent=2)
-    print(f"Report: {out}")
+    _write_json(report)
     return report
 
 

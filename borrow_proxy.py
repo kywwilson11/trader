@@ -12,7 +12,13 @@ fail to PREVENT phantom alpha, never invent it.
 `/float` and IPO-recency are deliberately treated as LOW-confidence here
 (a current yfinance snapshot is not point-in-time), so the score leans on the
 market-cap bucket + the in-repo name_class, both of which we already have.
+The market-cap input carries the SAME caveat: cap_lookup PIT-ness is the
+CALLER's responsibility — a current-snapshot cap fed into a historical sim can
+misclassify upward re-raters (small-cap then, large-cap now) as historically
+borrowable. Prefer as-of caps when available.
 """
+
+import logging
 
 # Speculative / pre-profit classes (stock_config.SECTOR_BUCKETS) that lean HTB
 # regardless of a transiently large cap — these are the meme/moonshot names
@@ -36,7 +42,9 @@ def htb_risk_score(market_cap=None, name_class=None):
     conservative default, since we'd rather drop a borrowable name than
     backtest a short we could never put on.
     """
-    if market_cap is None or market_cap <= 0:
+    # `not (cap > 0)` rather than `cap <= 0`: NaN caps (what a pandas-sourced
+    # lookup yields for missing data) must also route to the missing default.
+    if market_cap is None or not (market_cap > 0):
         base = 0.7
     elif market_cap >= LARGE_CAP:
         base = 0.05
@@ -57,6 +65,9 @@ def likely_shortable(symbol, market_cap=None, name_class=None,
 
     Returns True only when htb_risk_score is strictly BELOW the exclude
     threshold — uncertain / HTB / speculative names return False by design.
+    `symbol` is currently unused (kept for call-site clarity and future
+    per-symbol overrides); the proxy is deliberately time-invariant (no
+    `asof`) because no free point-in-time borrow history exists.
     """
     return htb_risk_score(market_cap, name_class) < threshold
 
@@ -66,7 +77,9 @@ def restrict_short_universe(symbols, cap_lookup=None, class_lookup=None):
 
     cap_lookup(symbol)->market_cap and class_lookup(symbol)->name_class are
     optional callables; when omitted, names fall to the conservative
-    missing-cap default (likely excluded). Returns the kept list.
+    missing-cap default (likely excluded). cap_lookup PIT-ness is the
+    caller's responsibility (see module docstring): pass as-of caps for
+    historical sims where available. Returns the kept list.
     """
     kept = []
     for s in symbols:
@@ -82,5 +95,10 @@ def class_lookup_from_config():
     try:
         from stock_config import SECTOR_BUCKETS
         return lambda s: SECTOR_BUCKETS.get(s)
-    except Exception:
+    except Exception as exc:
+        # fail-OPEN degradation (spec_growth names lose their HTB floor and
+        # can pass on cap alone) — must never happen silently.
+        logging.getLogger(__name__).warning(
+            'stock_config.SECTOR_BUCKETS unavailable (%r); HTB class floor '
+            'disabled — proxy degrades to cap-only', exc)
         return lambda s: None

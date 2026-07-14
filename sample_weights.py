@@ -57,6 +57,8 @@ def _avg_uniqueness_block(hold_bars):
         h = hold_bars[i]
         if not (h == h) or h < 0.0:  # NaN or negative -> not a label
             continue
+        if h > n:  # inf / absurd spans: pre-clip so int() cast is safe (numba int64 UB)
+            h = float(n)
         end = i + int(h)
         if end > n - 1:
             end = n - 1
@@ -73,6 +75,8 @@ def _avg_uniqueness_block(hold_bars):
         if not (h == h) or h < 0.0:
             out[i] = np.nan
             continue
+        if h > n:  # inf / absurd spans: pre-clip so int() cast is safe (numba int64 UB)
+            h = float(n)
         end = i + int(h)
         if end > n - 1:
             end = n - 1
@@ -140,6 +144,71 @@ def effective_n(u_bar, mask=None):
     return float(u.sum())
 
 
+def clustered_effective_n(entry_times, exit_times):
+    """Cross-sectional effective trade count via calendar-interval clustering.
+
+    average_uniqueness / effective_n correct for overlap WITHIN one price
+    series; they still count same-hour trades on N correlated names as N
+    independent draws. On a 6-coin book at pairwise rho 0.7-0.9 that
+    overstates the DSR z-statistic's sqrt(n) breadth ~2-4x (2026-07 review:
+    a zero-edge model's holdout false-pass rate rises from 0.2% to 5-9% at
+    realistic correlations). This collapses trades whose [entry, exit]
+    CALENDAR intervals overlap — across any names — into single clusters:
+    the rho=1 lockstep worst case, the same convention as CROSS_BOOK_RHO.
+
+    Args: parallel arrays of entry/exit times (datetime64, pandas Timestamps
+    via .values, or numeric epochs). NaT/NaN pairs are dropped.
+
+    Returns the cluster count (int, <= n trades). The honest n_eff for a DSR
+    null is min(this, the within-ticker effective_n) — this function never
+    loosens a gate, only tightens it.
+    """
+    et = np.asarray(entry_times)
+    xt = np.asarray(exit_times)
+    if et.size == 0 or xt.size != et.size:
+        return 0
+    if np.issubdtype(et.dtype, np.datetime64):
+        xt = np.asarray(xt, dtype=et.dtype)
+        ok = ~(np.isnat(et) | np.isnat(xt))
+    else:
+        et = et.astype(np.float64)
+        xt = xt.astype(np.float64)
+        ok = np.isfinite(et) & np.isfinite(xt)
+    et, xt = et[ok], xt[ok]
+    if et.size == 0:
+        return 0
+    order = np.argsort(et, kind='stable')
+    et, xt = et[order], xt[order]
+    clusters = 0
+    cluster_end = None
+    for e, x in zip(et, xt):
+        if x < e:
+            x = e  # degenerate span: treat as a point interval
+        if cluster_end is None or e > cluster_end:
+            clusters += 1
+            cluster_end = x
+        elif x > cluster_end:
+            cluster_end = x
+    return int(clusters)
+
+
+def _blend_normalize(w, returns, ret_cap):
+    """Blend optional |return| emphasis into w, normalize mean-1 over finite>0 rows."""
+    if returns is not None:
+        r = np.abs(np.asarray(returns, dtype=np.float64)) + 1.0
+        if len(r) != len(w):
+            raise ValueError(
+                f"returns length {len(r)} != weights length {len(w)}; "
+                "returns must align 1:1 with the weighted rows")
+        np.clip(r, None, ret_cap, out=r)
+        r = np.where(np.isfinite(r), r, 0.0)
+        w = w * r
+    finite = w[np.isfinite(w) & (w > 0)]
+    if finite.size and finite.mean() > 0:
+        w = w / finite.mean()
+    return w
+
+
 def uniqueness_weights(hold_bars, returns=None, ret_cap=50.0,
                        ticker_boundaries=None):
     """Training sample weights: average-uniqueness, optionally blended with a
@@ -156,15 +225,7 @@ def uniqueness_weights(hold_bars, returns=None, ret_cap=50.0,
     """
     u = average_uniqueness(hold_bars, ticker_boundaries)
     w = np.where(np.isfinite(u), u, 0.0)
-    if returns is not None:
-        r = np.abs(np.asarray(returns, dtype=np.float64)) + 1.0
-        np.clip(r, None, ret_cap, out=r)
-        r = np.where(np.isfinite(r), r, 0.0)
-        w = w * r
-    finite = w[np.isfinite(w) & (w > 0)]
-    if finite.size and finite.mean() > 0:
-        w = w / finite.mean()
-    return w
+    return _blend_normalize(w, returns, ret_cap)
 
 
 def fold_train_weights(hold_bars_panel, row_indices, ticker_boundaries=None,
@@ -200,12 +261,4 @@ def fold_train_weights(hold_bars_panel, row_indices, ticker_boundaries=None,
     idx = np.asarray(row_indices, dtype=np.int64)
     u_fold = u[idx]
     w = np.where(np.isfinite(u_fold), u_fold, 0.0)
-    if returns is not None:
-        r = np.abs(np.asarray(returns, dtype=np.float64)) + 1.0
-        np.clip(r, None, ret_cap, out=r)
-        r = np.where(np.isfinite(r), r, 0.0)
-        w = w * r
-    finite = w[np.isfinite(w) & (w > 0)]
-    if finite.size and finite.mean() > 0:
-        w = w / finite.mean()
-    return w
+    return _blend_normalize(w, returns, ret_cap)

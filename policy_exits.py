@@ -9,8 +9,22 @@ forward returns is answering a question the live system never asks — the
 bot exits via ATR stops / trailing / take-profit / EOD flatten, not by
 holding exactly fb bars. Triple-barrier labels ask the RIGHT question
 ("what does the exit stack realize from an entry here?"), and sharing one
-kernel guarantees label semantics == backtest semantics == live semantics
-(stocks even get the EOD flatten as their vertical barrier).
+kernel keeps label semantics == backtest semantics == live semantics up to
+documented bar-level approximations and live-only overlays (stocks even
+get the EOD flatten as their vertical barrier).
+
+Live-only overlays the kernel does NOT model (see also backtest.py's
+"Bar-level approximations" note):
+  - macro-regime stop tightening: base_loop multiplies stop/trail
+    distances by macro_regime.stop_mult (< 1) in risk-off regimes
+  - two-consecutive-reading breach confirmation before a stop exit
+    (~1 extra 30s cycle); the kernel exits on the first touching bar
+  - live HWM tracks 30s quote MIDPOINTS; the kernel uses bar HIGHS
+  - stock EOD flatten fills at the day-last bar's CLOSE here vs the
+    live ~15:50 ET flatten order
+  - no-ATR fallback TP asymmetry: live crypto entries get NO take-profit
+    and live stock fallbacks use tp = TAKE_PROFIT_CEIL_PCT, while the
+    kernel prices tp = stop_fallback_pct * tp_rr on NaN ATR
 
 The kernel computes, for EVERY bar i, the exit the live stack would
 produce for an entry at bar i's close:
@@ -256,8 +270,27 @@ def exit_walk(close, high, low, open_, atr, is_eod, policy,
 
     Returns:
         (exit_idx, exit_px, reason_code) arrays, one entry per bar.
+
+    Raises:
+        ValueError on array-length mismatch, on use_signal_exit without
+        preds, or on a side other than +1/-1.
     """
+    # Fail loud BEFORE the kernel: njit does not bounds-check, so a length
+    # mismatch that raises IndexError under the pure-python fallback reads
+    # out-of-range memory (garbage labels / segfault) on the Jetson.
     n = len(close)
+    for name, arr in (('high', high), ('low', low), ('open_', open_),
+                      ('atr', atr), ('is_eod', is_eod)):
+        if len(arr) != n:
+            raise ValueError(
+                f"exit_walk: len({name})={len(arr)} != len(close)={n}")
+    if preds is not None and len(preds) != n:
+        raise ValueError(
+            f"exit_walk: len(preds)={len(preds)} != len(close)={n}")
+    if use_signal_exit and preds is None:
+        raise ValueError("exit_walk: use_signal_exit=True requires preds")
+    if side not in (1, -1):
+        raise ValueError(f"exit_walk: side must be +1 or -1, got {side!r}")
     if preds is None:
         preds = np.full(n, np.nan)
     kernel = _exit_walk_kernel if side >= 0 else _exit_walk_kernel_short
@@ -297,14 +330,19 @@ def compute_tb_labels(df, forward_bars_list, asset_type: str, side: int = 1):
     Adds, per fb in forward_bars_list:
       TB_Ret_{fb}   gross % return realized by the exit stack (vertical
                     barrier = fb bars; stocks ALSO exit at each day's last
-                    bar — exactly the live 15:50 flatten, fixing the old
-                    mismatch where labels spanned multiple days while live
-                    stock holds were capped at ~6.5 hours)
+                    bar — the live ~15:50 flatten, approximated at the
+                    day-last bar's CLOSE, fixing the old mismatch where
+                    labels spanned multiple days while live stock holds
+                    were capped at ~6.5 hours; other live-only overlays
+                    the labels do not model are listed in the module
+                    docstring)
       TB_Bars_{fb}  bars held
       TB_Reason_{fb} exit reason code
 
-    Bars whose vertical window crosses the end of the series get NaN
-    (matching Target_Return semantics).
+    Bars whose vertical window crosses the end of the series get NaN in
+    ALL THREE columns (matching Target_Return semantics) — including
+    TB_Reason, since the kernel stamps 'vertical' on truncated windows
+    whose barrier was never actually reached.
 
     side: +1 long (default — what the harvest stamps and the live system
         trades). side=-1 produces SHORT labels from the mirror kernel: the
@@ -331,11 +369,13 @@ def compute_tb_labels(df, forward_bars_list, asset_type: str, side: int = 1):
             max_hold=int(fb), use_signal_exit=False, side=side)
         ret = sign * (exit_px - close) / np.where(close > 0, close, np.nan) * 100.0
         bars = (exit_idx - np.arange(n)).astype(np.float64)
+        reason_f = reason.astype(np.float64)
         # Truncated windows at the series end -> NaN
         invalid = np.arange(n) + fb >= n
         ret[invalid] = np.nan
         bars[invalid] = np.nan
+        reason_f[invalid] = np.nan
         out[f'TB_Ret_{fb}'] = ret
         out[f'TB_Bars_{fb}'] = bars
-        out[f'TB_Reason_{fb}'] = reason.astype(np.float64)
+        out[f'TB_Reason_{fb}'] = reason_f
     return out

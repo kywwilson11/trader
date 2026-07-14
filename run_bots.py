@@ -17,10 +17,21 @@ run_pipeline.py uses this as the default bot launch mode; pass
 --separate-bots there to keep the old one-process-per-bot layout.
 """
 import argparse
+import os
 import signal
 import sys
 import threading
 import time
+
+# Bots are CPU-only BY DESIGN (a CUDA context costs 0.6-1.2GB of unified
+# memory on the Jetson; trading_utils.choose_inference_device hard-returns
+# 'cpu'). run_pipeline launches bots with these already set (BOT_ENV), but a
+# manual `python run_bots.py` used to initialize the CUDA driver and spawn
+# default 6-thread torch intra-op pools x 5 prediction workers. setdefault
+# preserves any explicit operator override.
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
+os.environ.setdefault('TORCH_NUM_THREADS', '2')
+os.environ.setdefault('OMP_NUM_THREADS', '2')
 
 from log_config import get_logger
 

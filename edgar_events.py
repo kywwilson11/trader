@@ -11,9 +11,12 @@ hourly momentum/mean-reversion signals:
      (5.02 also catches routine board churn — over-broad, but it only
      pauses NEW entries for a few days.)
 
-  2. Pending M&A on the target — price pins to deal terms and trades on
-     deal odds, not technicals (425 / SC 14D9 / DEFM14A / S-4 filings).
-     Blocked for MA_WINDOW_DAYS.
+  2. Pending M&A — a target's price pins to deal terms and trades on
+     deal odds, not technicals (425 / SC 14D9 / DEFM14A / DEFM14C / S-4
+     filings). Because each CIK's OWN submissions are scanned, acquirer-
+     side S-4/425 filings trigger the veto too — over-broad vs the
+     target-pin rationale, but accepted conservatism. Blocked for
+     MA_WINDOW_DAYS.
 
 EDGAR etiquette: declared User-Agent, <=10 req/s (we do ~top-N sequential
 fetches once per day per symbol, disk-cached). FAIL OPEN — an EDGAR
@@ -25,6 +28,7 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -39,6 +43,9 @@ _UA = {'User-Agent': 'trader-research kywwilson@gmail.com'}
 _CACHE_FILE = BASE_DIR / 'edgar_cache.json'
 _TICKER_MAP_FILE = BASE_DIR / 'edgar_tickers.json'
 _TICKER_MAP_MAX_AGE_DAYS = 7
+_map_memo: tuple[str, float, dict[str, str]] | None = None  # (path, mtime, map)
+_FAIL_OPEN_WARN_SEC = 3600  # rate limit for the fail-open WARNING
+_last_fail_open_warn = -float('inf')  # monotonic clock starts near 0 at boot
 
 VETO_8K_ITEMS = {
     '1.03': 'bankruptcy filing',
@@ -58,24 +65,40 @@ def _get_json(url: str, timeout: int = 5):
 
 
 def _ticker_cik_map() -> dict[str, str]:
-    """{TICKER: 10-digit CIK}, disk-cached for a week."""
+    """{TICKER: 10-digit CIK}, disk-cached for a week and memoized
+    in-process on file mtime (the ~1-2 MB map otherwise re-parses once
+    per symbol on each day's first scan)."""
+    global _map_memo
     try:
         st = _TICKER_MAP_FILE.stat()
         age = dt.datetime.now().timestamp() - st.st_mtime
         if age < _TICKER_MAP_MAX_AGE_DAYS * 86400:
+            if (_map_memo is not None
+                    and _map_memo[:2] == (str(_TICKER_MAP_FILE), st.st_mtime)):
+                return _map_memo[2]
             with open(_TICKER_MAP_FILE) as f:
-                return json.load(f)
-    except OSError:
+                out = json.load(f)
+            _map_memo = (str(_TICKER_MAP_FILE), st.st_mtime, out)
+            return out
+    except (OSError, ValueError):
+        # ValueError covers json.JSONDecodeError: a corrupt-but-fresh map
+        # must fall through to the refetch below, not escape to
+        # entry_blocked's fail-open handler (veto silently OFF for a week)
         pass
     data = _get_json('https://www.sec.gov/files/company_tickers.json',
                      timeout=10)
     out = {}
     for rec in data.values():
         out[str(rec['ticker']).upper()] = f"{int(rec['cik_str']):010d}"
-    tmp = str(_TICKER_MAP_FILE) + '.tmp'
+    tmp = f"{_TICKER_MAP_FILE}.{os.getpid()}.tmp"  # pid-unique: bot + CLI
     with open(tmp, 'w') as f:
         json.dump(out, f)
     os.replace(tmp, _TICKER_MAP_FILE)
+    try:
+        _map_memo = (str(_TICKER_MAP_FILE), _TICKER_MAP_FILE.stat().st_mtime,
+                     out)
+    except OSError:
+        _map_memo = None
     return out
 
 
@@ -120,7 +143,9 @@ def _load_cache() -> dict:
 
 def _save_cache(cache: dict) -> None:
     try:
-        tmp = str(_CACHE_FILE) + '.tmp'
+        # pid-unique tmp: a fixed '.tmp' let a live bot and a manual CLI
+        # run interleave writes before os.replace published the file
+        tmp = f"{_CACHE_FILE}.{os.getpid()}.tmp"
         with open(tmp, 'w') as f:
             json.dump(cache, f)
         os.replace(tmp, _CACHE_FILE)
@@ -143,7 +168,19 @@ def entry_blocked(symbol: str) -> tuple[bool, str | None]:
             blocked, reason = _evaluate(_recent_filings(cik), today)
             if blocked:
                 logger.info("[EDGAR] %s: entry blocked — %s", symbol, reason)
+        else:
+            # ETFs (ARKK/TQQQ/...) live in SEC's separate mutual-fund map
+            # and carry no 8-K/M&A-target risk; a real company landing
+            # here means a ticker change/mismatch worth investigating
+            logger.debug("[EDGAR] %s: no CIK in ticker map — veto not "
+                         "applicable", symbol)
     except Exception as e:
+        global _last_fail_open_warn
+        if time.monotonic() - _last_fail_open_warn >= _FAIL_OPEN_WARN_SEC:
+            _last_fail_open_warn = time.monotonic()
+            logger.warning("[EDGAR] corporate-event veto failing open "
+                           "(%s: %s) — entries unprotected until EDGAR "
+                           "recovers", symbol, e)
         logger.debug("[EDGAR] %s: check failed (%s) — fail open", symbol, e)
         return False, None  # do NOT cache failures; retry next call
     cache[symbol] = {'date': today.isoformat(), 'blocked': blocked,

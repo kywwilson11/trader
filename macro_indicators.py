@@ -7,14 +7,13 @@ and stop-loss adjustments.
 Sources:
 - Financial Stress: FRED STLFSI2 (free, no auth)
 - VIX: yfinance (already installed)
-- CAPE: Shiller data via free API
+- CAPE: estimated from SPY trailing P/E x1.6 (real-time Shiller APIs
+  proved unreliable — see fetch_cape)
 - Stablecoins: Alpaca crypto quotes
 """
 
 import time
 from log_config import get_logger
-from types import SimpleNamespace
-from dataclasses import dataclass
 
 logger = get_logger(__name__)
 
@@ -83,6 +82,8 @@ def fetch_vix() -> float | None:
                 return val
     except Exception as e:
         logger.debug("[MACRO] FRED VIX fallback error: %s", e)
+    logger.warning("[MACRO] VIX unavailable from ALL sources — "
+                   "VIX risk ladders blind (pass at 1.0x)")
     return None
 
 
@@ -100,7 +101,7 @@ def fetch_financial_stress() -> float | None:
 
     try:
         import requests
-        # FRED provides a free JSON API for public series
+        # FRED fredgraph.csv endpoint (free CSV export, no auth)
         url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=STLFSI2"
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
@@ -115,6 +116,8 @@ def fetch_financial_stress() -> float | None:
                     return val
     except Exception as e:
         logger.debug("[MACRO] STLFSI2 fetch error: %s", e)
+    logger.warning("[MACRO] Financial stress (STLFSI2) unavailable — "
+                   "stress rule blind")
     return None
 
 
@@ -143,6 +146,8 @@ def fetch_cape() -> float | None:
             return cape_est
     except Exception as e:
         logger.debug("[MACRO] CAPE fetch error: %s", e)
+    logger.warning("[MACRO] CAPE estimate unavailable (no SPY trailingPE) — "
+                   "valuation rule blind")
     return None
 
 
@@ -188,6 +193,14 @@ def check_stablecoin_pegs(api) -> dict:
         except Exception as e:
             logger.debug("[CONTAGION] Error checking %s: %s", symbol, e)
 
+    if _STABLECOINS and not result['deviations']:
+        # Every quote fetch failed: peg status is UNKNOWN, not "fine".
+        # Do NOT cache — the next call retries immediately instead of
+        # serving a total outage as all-clear for the full TTL.
+        logger.warning("[CONTAGION] All stablecoin quote fetches failed — "
+                       "peg status UNKNOWN")
+        return result
+
     _set_cached('stablecoins', result)
     return result
 
@@ -213,12 +226,15 @@ def get_spy_trend_ok(api) -> bool | None:
                             adjustment='all')
         closes = [float(b.c) for b in bars]
         if len(closes) < 200:
+            logger.warning("[MACRO] SPY trend: only %d daily bars (<200) — "
+                           "filter fails OPEN", len(closes))
             return None
         sma200 = sum(closes[-200:]) / 200
         ok = closes[-1] > sma200
         _set_cached('spy_trend', ok)
         return ok
-    except Exception:
+    except Exception as e:
+        logger.warning("[MACRO] SPY trend fetch failed (filter fails OPEN): %s", e)
         return None
 
 
@@ -266,6 +282,11 @@ def get_macro_regime(api=None, asset_type='crypto') -> 'MacroRegime':
             labels.append('caution')
         else:
             labels.append('normal')
+    else:
+        # A blind regime otherwise labels itself 'normal' — indistinguishable
+        # in the operator logs from a genuinely calm market.
+        logger.warning("[MACRO] Regime computed WITHOUT VIX — "
+                       "VIX tiers skipped, label may read 'normal' while blind")
 
     # Financial stress
     if stress is not None and stress > 1.0:
@@ -295,9 +316,12 @@ def get_macro_regime(api=None, asset_type='crypto') -> 'MacroRegime':
 
     regime_label = '+'.join(labels) if labels else 'normal'
 
-    # In defensive or crisis regime, shorten VIX cache for faster reaction
+    # Above VIX 20 (mid-'caution' and up), drop the cached VIX so the next
+    # regime update refetches. Regime updates run every 10th loop cycle
+    # (~5 min per bot at the 30s LOOP_INTERVAL); combined-bot mode has two
+    # loops sharing this module cache, so effective refetch can be ~2-3 min.
     if vix is not None and vix > 20:
-        _cache.pop('vix', None)  # Force refresh next call (15-min natural throttle)
+        _cache.pop('vix', None)
 
     return MacroRegime(
         stress_level=stress,

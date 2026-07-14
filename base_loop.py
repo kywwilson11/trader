@@ -475,8 +475,20 @@ class BaseTradingLoop(ABC):
             if failures:
                 logger.error("[CIRCUIT BREAKER] Unconfirmed flattens: %s — will retry next cycle",
                              ', '.join(failures))
-                # Keep failed symbols tracked so stops still manage them
-                self.positions = {s: p for s, p in self.positions.items() if s in failures}
+                # Keep failed symbols tracked so stops still manage them.
+                # emergency_flatten reports BROKER-format symbols ('BTCUSD')
+                # while self.positions is keyed universe-format ('BTC/USD') —
+                # compare on the normalized form, or the filter keeps NOTHING
+                # for crypto and an unflattened, unprotected position silently
+                # vanishes from tracking (2026-07 review P1). The
+                # list-positions sentinel means broker state is UNKNOWN:
+                # keep every position tracked rather than guess.
+                if '<list_positions failed>' in failures:
+                    pass  # unknown broker state — keep all positions tracked
+                else:
+                    failed_norm = {f.replace('/', '') for f in failures}
+                    self.positions = {s: p for s, p in self.positions.items()
+                                      if s.replace('/', '') in failed_norm}
             else:
                 self.positions.clear()
             self._halted_until = self._next_baseline_reset()
@@ -1299,25 +1311,46 @@ class BaseTradingLoop(ABC):
                 pass
 
         # --- 4. Advisory tilt (single product, asymmetric clamp) ---
+        # Each factor is computed into a named local and recorded into the
+        # sizing-decomposition journal (2026-07 indicator review): the
+        # de-risk layers share drivers (VIX enters BOTH the ladder and
+        # macro sizing_mult; vol enters ATR base, vol_mult, VIX, HMM and
+        # the book scalar), and only per-fill decomposition rows can show
+        # how often they co-fire and pin size at the 0.1 floor.
+        # Measurement-only — the arithmetic is unchanged.
         tilt = 1.0
+        detail = {'stop_dist': round(stop_dist, 5),
+                  'base': round(base, 2),
+                  'kelly_mult': round(kelly_mult, 4),
+                  'vol_mult': round(vol_mult, 4)}
         # Signal confidence (tamed: was 0.5-2.0)
         if pred_return is not None and self.trade_threshold > 0.001:
-            tilt *= min(1.25, max(0.75, pred_return / self.trade_threshold))
+            f_conf = min(1.25, max(0.75, pred_return / self.trade_threshold))
+            tilt *= f_conf
+            detail['signal_conf'] = round(f_conf, 4)
         # VIX ladder (arXiv 2508.16598: shrink Kelly in high vol)
         vix = self.macro_regime.vix if self.macro_regime else None
         if vix is not None:
-            tilt *= 0.3 if vix > 35 else 0.5 if vix > 25 else 0.7 if vix > 15 else 1.0
+            f_vix = 0.3 if vix > 35 else 0.5 if vix > 25 else 0.7 if vix > 15 else 1.0
+            tilt *= f_vix
+            detail['vix_tilt'] = f_vix
+            detail['vix'] = round(vix, 1)
         # Drawdown de-leveraging ladder (peak persisted across restarts, wave-8 #4)
         from drawdown import drawdown_fraction, drawdown_size_multiplier
-        tilt *= drawdown_size_multiplier(
+        f_dd = drawdown_size_multiplier(
             drawdown_fraction(self._peak_equity, self._equity))
+        tilt *= f_dd
+        detail['dd_mult'] = round(f_dd, 4)
         # Macro regime
         if self.macro_regime:
             tilt *= self.macro_regime.sizing_mult
+            detail['macro_mult'] = round(self.macro_regime.sizing_mult, 4)
         # Correlation with existing book
         if self.corr_matrix and self.positions:
-            tilt *= get_correlation_sizing_factor(
+            f_corr = get_correlation_sizing_factor(
                 symbol, list(self.positions.keys()), self.corr_matrix)
+            tilt *= f_corr
+            detail['corr_mult'] = round(f_corr, 4)
         # HMM regime (advisory) + disagreement penalty
         hmm_label = 'unknown'
         if returns is not None and len(returns) > 200:
@@ -1325,6 +1358,7 @@ class BaseTradingLoop(ABC):
                 regime = get_cached_regime(symbol, returns)
                 tilt *= regime['sizing_mult']
                 hmm_label = regime.get('label', 'unknown')
+                detail['hmm_mult'] = round(regime['sizing_mult'], 4)
             except Exception:
                 pass
         votes = []
@@ -1339,27 +1373,39 @@ class BaseTradingLoop(ABC):
             votes.append(0)
         if len(votes) >= 2 and len(set(votes)) > 1:
             tilt *= 0.8
+            detail['disagree_mult'] = 0.8
         # Regime-conditional Kelly cap: never let recent-win streaks scale
         # size ABOVE baseline in stressed/bear regimes (procyclicality fix)
         if (vix is not None and vix > 25) or hmm_label == 'bear':
             kelly_mult = min(kelly_mult, 1.0)
+            detail['kelly_mult'] = round(kelly_mult, 4)
         # Sentiment gate, LLM conviction, meta-label probability
         # (vetoes handled by callers)
         tilt *= sentiment_mult
         tilt *= llm_mult
         tilt *= meta_mult
+        detail['sentiment_mult'] = round(sentiment_mult, 4)
+        detail['llm_mult'] = round(llm_mult, 4)
+        detail['meta_mult'] = round(meta_mult, 4)
         # Asset-specific extra tilt (crypto: funding-rate positioning)
-        tilt *= self._extra_tilt(symbol)
+        f_extra = self._extra_tilt(symbol)
+        tilt *= f_extra
+        if f_extra != 1.0:
+            detail['extra_tilt'] = round(f_extra, 4)
         # Book-level realized-vol scalar (EWMA of the account equity
         # curve; de-risk only — catches correlation buildup that
         # per-position GARCH targeting can't see)
         try:
             from portfolio import get_book_vol_scalar_cached
-            tilt *= get_book_vol_scalar_cached(self.api, self.get_asset_type())
+            f_bookvol = get_book_vol_scalar_cached(self.api, self.get_asset_type())
+            tilt *= f_bookvol
+            detail['book_vol_mult'] = round(f_bookvol, 4)
         except Exception:
             pass
         # Boosts capped; de-risking honored
+        detail['tilt_raw'] = round(tilt, 4)
         tilt = max(0.1, min(TILT_MAX, tilt))
+        detail['tilt'] = round(tilt, 4)
 
         # DEGRADED-MODE CLAMP: the advisory gates share upstream data
         # sources (yfinance, Alpaca bars), and each one silently defaults
@@ -1378,8 +1424,21 @@ class BaseTradingLoop(ABC):
                 logger.warning("[SIZING] %s: %d advisory inputs unavailable — "
                                "degraded mode, tilt capped at 0.5x", symbol, missing)
             tilt = min(tilt, 0.5)
+            detail['degraded_inputs'] = missing
+            detail['tilt'] = round(tilt, 4)
 
         sized = base * kelly_mult * vol_mult * tilt
+        detail['sized_pre_caps'] = round(sized, 2)
+        # Stash for the buy journal (measurement-only; see _execute_buys).
+        # The dict keeps being mutated below (book-risk shrink, leverage),
+        # and the journal write reads the same object at fill time, so the
+        # logged row carries the final values.
+        try:
+            from strategy_config import CONVICTION_JOURNAL_ENABLED
+            self._last_sizing_detail = (detail if CONVICTION_JOURNAL_ENABLED
+                                        else None)
+        except Exception:
+            self._last_sizing_detail = None
 
         # --- 4b. Correlation-adjusted BOOK risk cap (ENB) ---
         # Per-trade risk alone lets N near-lockstep positions stack
@@ -1409,6 +1468,7 @@ class BaseTradingLoop(ABC):
                     logger.info("[BOOK-RISK] %s: entry shrunk to fit book "
                                 "risk cap ($%d -> $%d, rho=%.2f)",
                                 symbol, int(sized), int(scaled), rho)
+                    detail['book_risk_scale'] = round(scaled / max(sized, 1e-9), 4)
                     sized = scaled
             except Exception:
                 pass
@@ -1424,6 +1484,7 @@ class BaseTradingLoop(ABC):
         leverage = self._leveraged_etfs.get(symbol, 1)
         if leverage > 1:
             sized /= leverage
+            detail['leverage_div'] = leverage
 
         if sized < MIN_ORDER_NOTIONAL:
             return 0
@@ -1616,8 +1677,13 @@ class BaseTradingLoop(ABC):
             if not should_trade(pred_return, quote['spread_pct'],
                                 asset_type=self.get_asset_type()):
                 vc['cost_floor'] += 1
+                # spread_pct journaled so decision_report can price this
+                # veto at the REAL reject-time spread: cost_floor fires on
+                # wide-spread names by construction, and a flat-spread
+                # counterfactual reads it as "charging admission" falsely.
                 self._journal_skip(symbol, 'cost_floor', pred=pred_return,
-                                   snapshot=snapshot)
+                                   snapshot=snapshot,
+                                   spread_pct=round(quote['spread_pct'], 4))
                 continue
             if pred_return < effective_threshold:
                 vc['below_threshold'] += 1
@@ -1829,6 +1895,13 @@ class BaseTradingLoop(ABC):
                            "skip_reason": None}
                 if conv:
                     buy_rec.update(conv)
+                # Sizing decomposition (2026-07 review): which de-risk
+                # layers actually moved this fill's size, for the vol-stack
+                # co-fire measurement (VIX is counted in BOTH the ladder
+                # and macro_mult today).
+                sizing_detail = getattr(self, '_last_sizing_detail', None)
+                if sizing_detail:
+                    buy_rec['sizing'] = sizing_detail
                 log_decision(buy_rec)
                 self.last_trade_time[symbol] = datetime.datetime.now()
                 self._count_trade(symbol)

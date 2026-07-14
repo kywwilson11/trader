@@ -1,7 +1,20 @@
 """Correlation-aware portfolio management.
 
-Prevents over-concentrated positions by checking pairwise correlation
-before adding new positions. Based on Markowitz (1990 Nobel) portfolio theory.
+Three components, all driven by the same pairwise-|corr| inputs:
+
+1. Correlation gate + sizing (Markowitz 1990 Nobel): reject candidates whose
+   avg pairwise correlation with the book exceeds MAX_AVG_CORRELATION, and
+   shrink entries by 1/sqrt(1 + n*rho_bar) so a clone's marginal RISK stays
+   constant as the book fills (check_portfolio_correlation,
+   get_correlation_sizing_factor).
+
+2. Equicorrelation ENB book-risk kernels (diversified_book_risk,
+   book_risk_budget): closed-form diversified book stop-risk and the max risk
+   a new position may add under the book cap. risk_budget.py imports these to
+   net BOTH books at the account level.
+
+3. Account-level realized-vol scalar (get_book_vol_scalar_cached): de-risk-only
+   entry multiplier from the EWMA vol of the shared account equity curve.
 """
 
 import time
@@ -20,6 +33,12 @@ MAX_AVG_CORRELATION = 0.7  # reject if avg pairwise > this
 
 def get_correlation_matrix_cached(api, symbols, asset_type='crypto'):
     """Correlation matrix with a 1h TTL cache.
+
+    WARNING: the cache key is asset_type ONLY — `symbols` is ignored on a
+    cache hit. Callers MUST pass the full universe (as
+    base_loop._update_correlations does): a subset passed first would pin a
+    tiny matrix as the asset class's matrix for the whole TTL, and every
+    other pair lookup would silently fail open to 0.0.
 
     Pairwise correlations over 30 bars barely move cycle to cycle; the old
     path serially refetched the whole universe and re-ran ~1,000
@@ -59,6 +78,7 @@ def compute_correlation_matrix(returns_dict: dict[str, np.ndarray],
             min_len = min(len(r1), len(r2))
             if min_len < 10:
                 corr[(s1, s2)] = 0.0
+                corr[(s2, s1)] = 0.0
                 continue
             try:
                 from sklearn.covariance import LedoitWolf
@@ -132,7 +152,7 @@ def check_portfolio_correlation(current_positions: list[str],
         c = corr_matrix.get(pair, corr_matrix.get(alt_pair, 0.0))
         correlations.append(abs(c))
 
-    avg_corr = np.mean(correlations) if correlations else 0.0
+    avg_corr = float(np.mean(correlations))
 
     if avg_corr > max_avg_corr:
         logger.info("[PORTFOLIO] %s rejected: avg corr %.2f > %.2f with %s",
@@ -165,7 +185,7 @@ def get_correlation_sizing_factor(candidate: str,
         c = corr_matrix.get(pair, corr_matrix.get(alt_pair, 0.0))
         correlations.append(abs(c))
 
-    avg_corr = float(np.mean(correlations)) if correlations else 0.0
+    avg_corr = float(np.mean(correlations))
     n = len(current_positions)
     return max(0.4, 1.0 / float(np.sqrt(1.0 + n * avg_corr)))
 
@@ -220,14 +240,22 @@ def book_risk_budget(existing_risks: list[float], avg_corr: float,
     return float(-rho * s1 + np.sqrt(rho ** 2 * s1 ** 2 + cap ** 2 - a))
 
 
-# --- Book-level realized-vol scalar (closes the loop that per-asset GARCH
-# targeting leaves open: correlation buildup raises BOOK vol even when each
-# position individually sits at its own target) ---
+# --- Account-level realized-vol scalar, applied per-book against per-book
+# targets (closes the loop that per-asset GARCH targeting leaves open:
+# correlation buildup raises BOOK vol even when each position individually
+# sits at its own target). api.get_portfolio_history is ACCOUNT-level — both
+# books share one equity curve, so crypto-book vol de-risks stock entries and
+# vice versa. ---
 
 _book_vol_cache: dict[str, tuple[float, float]] = {}
 _BOOK_VOL_TTL = 3600
 
 EWMA_LAMBDA = 0.94          # RiskMetrics daily decay
+# Annualization assumes ~252 daily equity points/year. If Alpaca's 1D
+# portfolio history includes weekend points for a crypto-holding account
+# (verify from a real payload's timestamps on the Jetson), 365 points/year
+# would make this understate realized vol ~17% (sqrt(252/365)) and
+# under-de-risk the crypto book — switch to 365 if weekends are present.
 _TRADING_DAYS = 252
 
 

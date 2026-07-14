@@ -13,10 +13,16 @@ Selection logic lives in trading_utils.get_api():
   - otherwise -> legacy SDK (battle-tested in this repo)
 
 Every returned object is a thin shim exposing the legacy attribute names
-(bar.o/.h/.l/.c/.v/.t, quote.bp/.ap, order.filled_avg_price, ...).
+(bar.o/.h/.l/.c/.v/.t, quote.bp/.ap, order.filled_avg_price, ...), with
+three exceptions that return raw alpaca-py objects: get_calendar,
+close_all_positions and cancel_all_orders (surface-parity methods with no
+current callers repo-wide).
 """
 
+import logging
 from types import SimpleNamespace
+
+logger = logging.getLogger(__name__)
 
 
 def _shim_order(o):
@@ -33,6 +39,10 @@ def _shim_order(o):
         filled_qty=float(o.filled_qty) if getattr(o, 'filled_qty', None) is not None else 0.0,
         filled_avg_price=(float(o.filled_avg_price)
                           if getattr(o, 'filled_avg_price', None) is not None else None),
+        notional=(float(o.notional)
+                  if getattr(o, 'notional', None) is not None else None),
+        submitted_at=getattr(o, 'submitted_at', None),
+        filled_at=getattr(o, 'filled_at', None),
         legs=[_shim_order(l) for l in (getattr(o, 'legs', None) or [])],
     )
 
@@ -41,6 +51,8 @@ def _shim_position(p):
     return SimpleNamespace(
         symbol=p.symbol,
         qty=float(p.qty),
+        side=getattr(getattr(p, 'side', None), 'value',
+                     str(getattr(p, 'side', ''))),
         avg_entry_price=float(p.avg_entry_price),
         current_price=(float(p.current_price)
                        if getattr(p, 'current_price', None) is not None else None),
@@ -48,12 +60,58 @@ def _shim_position(p):
                       if getattr(p, 'market_value', None) is not None else 0.0),
         unrealized_pl=(float(p.unrealized_pl)
                        if getattr(p, 'unrealized_pl', None) is not None else 0.0),
+        unrealized_plpc=(float(p.unrealized_plpc)
+                         if getattr(p, 'unrealized_plpc', None) is not None else 0.0),
     )
 
 
 def _shim_bar(b):
     return SimpleNamespace(o=b.open, h=b.high, l=b.low, c=b.close,
                            v=b.volume, t=b.timestamp)
+
+
+def _shim_account(a):
+    return SimpleNamespace(
+        equity=float(a.equity),
+        last_equity=float(a.last_equity),
+        cash=float(a.cash),
+        portfolio_value=float(a.portfolio_value),
+        buying_power=float(a.buying_power),
+        status=getattr(getattr(a, 'status', None), 'value',
+                       str(getattr(a, 'status', ''))),
+        trading_blocked=bool(getattr(a, 'trading_blocked', False)),
+    )
+
+
+def _shim_snapshot(s):
+    # GUI watchlist reads latest_trade.p, daily_bar.o/.h/.l/.c/.v and
+    # prev_daily_bar.c (legacy entity names).
+    lt = getattr(s, 'latest_trade', None)
+    daily = getattr(s, 'daily_bar', None)
+    prev = getattr(s, 'previous_daily_bar', None)
+    return SimpleNamespace(
+        latest_trade=(SimpleNamespace(p=lt.price) if lt is not None else None),
+        daily_bar=_shim_bar(daily) if daily is not None else None,
+        prev_daily_bar=_shim_bar(prev) if prev is not None else None,
+    )
+
+
+def _shim_portfolio_history(h):
+    # The arrays are index-paired by every consumer (beta_ledger builds
+    # pd.Series(equity, index=timestamp); the GUI chart zips them), so
+    # None-equity points must be dropped from ALL arrays together —
+    # filtering equity alone misaligned timestamps and crashed beta_ledger
+    # on any None equity point.
+    ts, eq = list(h.timestamp or []), list(h.equity or [])
+    pl = list(getattr(h, 'profit_loss', None) or [])
+    plp = list(getattr(h, 'profit_loss_pct', None) or [])
+    keep = [i for i in range(min(len(ts), len(eq))) if eq[i] is not None]
+    return SimpleNamespace(
+        equity=[float(eq[i]) for i in keep],
+        timestamp=[ts[i] for i in keep],
+        profit_loss=[pl[i] for i in keep if i < len(pl)],
+        profit_loss_pct=[plp[i] for i in keep if i < len(plp)],
+    )
 
 
 class CompatREST:
@@ -75,9 +133,13 @@ class CompatREST:
                      trail_percent=None, notional=None, order_class=None,
                      take_profit=None, stop_loss=None, client_order_id=None,
                      **_ignored):
+        if _ignored:
+            logger.warning("[COMPAT] submit_order ignoring kwargs: %s",
+                           sorted(_ignored))
         from alpaca.trading.requests import (
             MarketOrderRequest, LimitOrderRequest, StopOrderRequest,
-            TrailingStopOrderRequest, TakeProfitRequest, StopLossRequest)
+            StopLimitOrderRequest, TrailingStopOrderRequest,
+            TakeProfitRequest, StopLossRequest)
         from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
         kwargs = dict(
@@ -107,6 +169,11 @@ class CompatREST:
             req = LimitOrderRequest(limit_price=limit_price, **kwargs)
         elif type == 'stop':
             req = StopOrderRequest(stop_price=stop_price, **kwargs)
+        elif type == 'stop_limit':
+            # crypto_loop's resting GTC protective stop — the exit designed
+            # to survive process death; must not be adapter-only dead.
+            req = StopLimitOrderRequest(stop_price=stop_price,
+                                        limit_price=limit_price, **kwargs)
         elif type == 'trailing_stop':
             req = TrailingStopOrderRequest(trail_percent=trail_percent, **kwargs)
         else:
@@ -121,10 +188,23 @@ class CompatREST:
         from datetime import datetime
         if v is None or isinstance(v, datetime):
             return v
-        return datetime.fromisoformat(str(v).replace('Z', '+00:00'))
+        s = str(v).strip()
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s.replace('Z', '+00:00'))
+        except ValueError:
+            # The legacy SDK shipped raw strings to the server; alpaca-py
+            # needs datetimes. Degrade to "no filter" instead of crashing
+            # the caller on a hand-edited date file (GUI .clean_slate).
+            logger.warning("[COMPAT] unparseable datetime %r — ignoring", v)
+            return None
 
     def list_orders(self, status='open', symbols=None, limit=None,
                     after=None, until=None, direction=None, **_ignored):
+        if _ignored:
+            logger.warning("[COMPAT] list_orders ignoring kwargs: %s",
+                           sorted(_ignored))
         from alpaca.trading.requests import GetOrdersRequest
         from alpaca.trading.enums import QueryOrderStatus
         # after/until/direction were silently swallowed by **_ignored —
@@ -146,6 +226,19 @@ class CompatREST:
     def cancel_all_orders(self):
         return self._trading.cancel_orders()
 
+    def delete(self, path):
+        """Raw-verb escape hatch (the legacy SDK exposed raw HTTP verbs).
+
+        Only DELETE /positions/{symbol} is supported: the GUI's manual
+        Close Position button calls it with a URL-encoded symbol because
+        legacy close_position broke on crypto symbols containing '/'.
+        """
+        from urllib.parse import unquote
+        if path.startswith('/positions/'):
+            return self._trading.close_position(
+                unquote(path.split('/positions/', 1)[1]))
+        raise NotImplementedError(f"raw DELETE unsupported for: {path}")
+
     # --- Positions / account ---
 
     def list_positions(self):
@@ -158,15 +251,7 @@ class CompatREST:
         return self._trading.close_all_positions(cancel_orders=cancel_orders)
 
     def get_account(self):
-        a = self._trading.get_account()
-        return SimpleNamespace(
-            equity=float(a.equity),
-            last_equity=float(a.last_equity),
-            buying_power=float(a.buying_power),
-            status=getattr(getattr(a, 'status', None), 'value',
-                           str(getattr(a, 'status', ''))),
-            trading_blocked=bool(getattr(a, 'trading_blocked', False)),
-        )
+        return _shim_account(self._trading.get_account())
 
     def get_clock(self):
         c = self._trading.get_clock()
@@ -180,14 +265,13 @@ class CompatREST:
 
     def get_portfolio_history(self, period='1M', timeframe='1D',
                               extended_hours=None, **_ignored):
+        if _ignored:
+            logger.warning("[COMPAT] get_portfolio_history ignoring "
+                           "kwargs: %s", sorted(_ignored))
         from alpaca.trading.requests import GetPortfolioHistoryRequest
         req = GetPortfolioHistoryRequest(period=period, timeframe=timeframe,
                                          extended_hours=extended_hours)
-        h = self._trading.get_portfolio_history(req)
-        return SimpleNamespace(
-            equity=[float(e) for e in (h.equity or []) if e is not None],
-            timestamp=list(h.timestamp or []),
-        )
+        return _shim_portfolio_history(self._trading.get_portfolio_history(req))
 
     # --- Market data ---
 
@@ -205,10 +289,15 @@ class CompatREST:
             return TimeFrame(int(tf[:-3]), TimeFrameUnit.Minute)
         if tf.endswith('Hour'):
             return TimeFrame(int(tf[:-4]), TimeFrameUnit.Hour)
-        return TimeFrame.Hour
+        # Fail loud (matching submit_order): a silent hourly fallback would
+        # hand a future '1Week'/'1Month' caller distorted data.
+        raise ValueError(f"unsupported timeframe: {tf}")
 
     def get_bars(self, symbol, timeframe, start=None, end=None, limit=None,
                  adjustment='raw', **_ignored):
+        if _ignored:
+            logger.warning("[COMPAT] get_bars ignoring kwargs: %s",
+                           sorted(_ignored))
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.enums import Adjustment
         req = StockBarsRequest(
@@ -222,6 +311,9 @@ class CompatREST:
 
     def get_crypto_bars(self, symbol, timeframe, start=None, end=None,
                         limit=None, **_ignored):
+        if _ignored:
+            logger.warning("[COMPAT] get_crypto_bars ignoring kwargs: %s",
+                           sorted(_ignored))
         from alpaca.data.requests import CryptoBarsRequest
         req = CryptoBarsRequest(
             symbol_or_symbols=symbol,
@@ -230,6 +322,18 @@ class CompatREST:
         )
         bars = self._crypto_data.get_crypto_bars(req)
         return [_shim_bar(b) for b in bars.data.get(symbol, [])]
+
+    def get_snapshots(self, symbols):
+        from alpaca.data.requests import StockSnapshotRequest
+        req = StockSnapshotRequest(symbol_or_symbols=list(symbols))
+        snaps = self._stock_data.get_stock_snapshot(req)
+        return {sym: _shim_snapshot(s) for sym, s in snaps.items()}
+
+    def get_crypto_snapshots(self, symbols):
+        from alpaca.data.requests import CryptoSnapshotRequest
+        req = CryptoSnapshotRequest(symbol_or_symbols=list(symbols))
+        snaps = self._crypto_data.get_crypto_snapshot(req)
+        return {sym: _shim_snapshot(s) for sym, s in snaps.items()}
 
     def get_latest_quote(self, symbol):
         from alpaca.data.requests import StockLatestQuoteRequest

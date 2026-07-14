@@ -44,7 +44,13 @@ BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
 JOURNAL_DIR = BASE_DIR / "journals"
-VETO_THRESHOLD = 0.15
+# Single-sourced from trading_utils so this evaluator can never drift from
+# the threshold the live loop actually vetoes at (they were two independent
+# 0.15 literals before — 2026-07 review).
+try:
+    from trading_utils import LLM_VETO_THRESHOLD as VETO_THRESHOLD
+except Exception:  # standalone use without the trading stack
+    VETO_THRESHOLD = 0.15
 # Below this many realized samples a partial-rho / coefficient is indistinguishable
 # from zero (null std ~0.15-0.19 at n=30-50); abstain rather than flip.
 MIN_POWER_N = 60

@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QComboBox, QCheckBox, QFrame,
     QSplitter, QGroupBox, QProgressBar, QToolBar,
     QSizePolicy, QLineEdit, QPushButton, QSpinBox,
-    QScrollArea, QMessageBox,
+    QScrollArea, QMessageBox, QDialog,
 )
 import pyqtgraph as pg
 import numpy as np
@@ -111,6 +111,14 @@ STUDY_DBS = {
 }
 
 PIPELINE_COMMAND = BASE_DIR / "pipeline_command.json"
+
+# Unified pipeline_status.json staleness threshold (seconds). Trials can take
+# up to ~10 minutes, so this must be generous enough that mid-trial gaps
+# don't look dead. Shared by every staleness check (Models tab render, the
+# retrain click handler, and the running/not-running probe) so they never
+# disagree with each other (previously they used 600 vs 120, which could
+# make the tab render "running" while the click handler said "not running").
+PIPELINE_STALE_SEC = 600
 
 
 def _model_deployed_ts(name):
@@ -308,6 +316,24 @@ THEMES = {
         "bg_border": QColor(40, 75, 80),
         "bg_hover":  QColor(26, 48, 54),
         "bg_log":    QColor(4, 10, 12),
+    },
+    # --- Hacker noir ---
+    "Salander": {
+        # Lisbeth Salander — matte cold-black, toxic terminal-green signature,
+        # blood red for danger, steel-cyan secondary. The Dragon Tattoo aesthetic.
+        "green":     QColor(0, 230, 118),   # profit
+        "red":       QColor(255, 40, 60),   # blood red / danger
+        "yellow":    QColor(92, 214, 205),  # cold steel-cyan highlight
+        "white":     QColor(222, 230, 224), # cold green-tinted off-white
+        "muted":     QColor(104, 126, 114), # green-grey
+        "bg_dark":   QColor(7, 9, 8),
+        "bg_card":   QColor(15, 19, 17),
+        "bg_table":  QColor(11, 14, 12),
+        "accent":    QColor(0, 245, 130),   # toxic terminal green
+        "bg_header": QColor(19, 25, 21),
+        "bg_border": QColor(36, 52, 43),
+        "bg_hover":  QColor(24, 34, 28),
+        "bg_log":    QColor(3, 5, 4),
     },
     # --- Other themes ---
     "Black Metal": {
@@ -570,10 +596,51 @@ _THEME_SVGS = {
         font-weight="bold" fill="#8a6e00">$</text>
   <circle cx="100" cy="100" r="55" fill="url(#shine)"/>
 </svg>""",
+
+    "Salander": """\
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="44%" r="58%">
+      <stop offset="0%" stop-color="#0c130f"/>
+      <stop offset="100%" stop-color="#020403"/>
+    </radialGradient>
+    <linearGradient id="scale" x1="20%" y1="0%" x2="80%" y2="100%">
+      <stop offset="0%" stop-color="#5cffa8"/>
+      <stop offset="55%" stop-color="#00f582"/>
+      <stop offset="100%" stop-color="#00945a"/>
+    </linearGradient>
+  </defs>
+  <circle cx="100" cy="100" r="97" fill="url(#bg)" stroke="#00f582" stroke-width="3"/>
+  <!-- coiled tribal dragon body (S-curve) -->
+  <path d="M 70,158
+           C 56,128 86,120 86,98
+           C 86,78 58,76 64,54
+           C 69,36 98,34 112,46
+           C 100,42 82,48 84,64
+           C 86,82 114,84 110,108
+           C 107,132 80,132 82,156 Z"
+        fill="url(#scale)"/>
+  <!-- horned head -->
+  <path d="M 112,46
+           C 128,37 150,45 150,61
+           C 150,70 142,75 133,72
+           L 141,82 128,77 131,90 119,77
+           C 110,73 104,65 108,55 Z"
+        fill="#00f582"/>
+  <!-- swept-back horn -->
+  <path d="M 138,50 C 150,40 162,42 160,52 C 154,49 146,50 142,57 Z" fill="#00945a"/>
+  <!-- eye -->
+  <circle cx="130" cy="59" r="3.2" fill="#020403"/>
+  <!-- dorsal spikes -->
+  <path d="M 74,98 l -12,-3 9,11 z" fill="#00b86a"/>
+  <path d="M 96,72 l 11,-7 -3,13 z" fill="#00b86a"/>
+  <path d="M 96,128 l -12,4 11,8 z" fill="#00b86a"/>
+</svg>""",
 }
 
 
 _THEME_IMAGES = {
+    "Salander": BASE_DIR / "logos" / "salander.png",
     "Batman": BASE_DIR / "logos" / "batman.png",
     "Joker": BASE_DIR / "logos" / "joker.png",
     "Harley Quinn": BASE_DIR / "logos" / "harley_quinn.png",
@@ -689,7 +756,7 @@ def make_card(title, value="\u2014", parent=None):
     layout = QVBoxLayout(frame)
     layout.setContentsMargins(12, 8, 12, 8)
 
-    lbl_title = QLabel(title)
+    lbl_title = QLabel(title.upper())
     lbl_title.setProperty("card_title", True)
     lbl_title.setAlignment(Qt.AlignLeft)
 
@@ -1522,67 +1589,152 @@ def apply_theme(app):
     palette.setColor(QPalette.HighlightedText, t["bg_dark"])
     app.setPalette(palette)
 
+    # A subtly translucent accent for selections/glows (works on any theme).
+    acc = t["accent"]
+    acc_soft = QColor(acc.red(), acc.green(), acc.blue(), 46).name(QColor.HexArgb)
+    acc_glow = QColor(acc.red(), acc.green(), acc.blue(), 90).name(QColor.HexArgb)
+
     app.setStyleSheet(f"""
+        QWidget {{
+            font-family: "Inter", "SF Pro Display", "Segoe UI", "Roboto",
+                         "Helvetica Neue", "DejaVu Sans", sans-serif;
+            font-size: 13px;
+        }}
+        QMainWindow, QDialog {{ background-color: {t["bg_dark"].name()}; }}
         QToolTip {{ color: {t["white"].name()}; background-color: {t["bg_card"].name()};
-                    border: 1px solid {t["accent"].name()}; }}
-        QTabWidget::pane {{ border: 1px solid {t["bg_border"].name()}; }}
+                    border: 1px solid {t["accent"].name()}; padding: 5px 8px;
+                    border-radius: 4px; }}
+
+        /* ---- Tabs: premium top nav ---- */
+        QTabWidget::pane {{
+            border: 1px solid {t["bg_border"].name()}; border-radius: 8px;
+            top: -1px; background: {t["bg_dark"].name()};
+        }}
+        QTabBar {{ qproperty-drawBase: 0; }}
         QTabBar::tab {{
-            background: {t["bg_header"].name()}; color: {t["muted"].name()};
-            padding: 10px 20px; border: 1px solid {t["bg_border"].name()};
-            border-bottom: none; border-top-left-radius: 6px;
-            border-top-right-radius: 6px; margin-right: 2px;
-            font-size: 13px; font-weight: bold;
+            background: transparent; color: {t["muted"].name()};
+            padding: 9px 22px; border: none; margin-right: 2px;
+            border-top-left-radius: 7px; border-top-right-radius: 7px;
+            font-size: 12px; font-weight: 600; letter-spacing: 0.4px;
         }}
         QTabBar::tab:selected {{
-            background: {t["bg_dark"].name()}; color: {t["accent"].name()};
+            background: {t["bg_card"].name()}; color: {t["accent"].name()};
             border-bottom: 2px solid {t["accent"].name()};
         }}
-        QTabBar::tab:hover {{ background: {t["bg_hover"].name()}; color: {t["white"].name()}; }}
-        QComboBox {{
-            background: {t["bg_header"].name()}; color: {t["white"].name()};
-            border: 1px solid {t["bg_border"].name()}; padding: 4px 8px; border-radius: 4px;
+        QTabBar::tab:hover:!selected {{
+            background: {t["bg_hover"].name()}; color: {t["white"].name()};
         }}
-        QComboBox::drop-down {{ border: none; }}
+
+        /* ---- Default buttons (inline-styled buttons still override) ---- */
+        QPushButton {{
+            background-color: {t["bg_header"].name()}; color: {t["white"].name()};
+            border: 1px solid {t["bg_border"].name()}; border-radius: 6px;
+            padding: 6px 14px; font-weight: 600;
+        }}
+        QPushButton:hover {{
+            background-color: {t["bg_hover"].name()}; border-color: {t["accent"].name()};
+            color: {t["accent"].name()};
+        }}
+        QPushButton:pressed {{ background-color: {acc_glow}; color: {t["bg_dark"].name()}; }}
+        QPushButton:disabled {{
+            color: {t["muted"].name()}; background-color: {t["bg_dark"].name()};
+            border-color: {t["bg_border"].name()};
+        }}
+
+        /* ---- Inputs ---- */
+        QComboBox, QLineEdit, QSpinBox {{
+            background: {t["bg_table"].name()}; color: {t["white"].name()};
+            border: 1px solid {t["bg_border"].name()}; padding: 5px 8px;
+            border-radius: 6px; selection-background-color: {t["accent"].name()};
+            selection-color: {t["bg_dark"].name()};
+        }}
+        QComboBox:hover, QLineEdit:hover, QSpinBox:hover {{ border-color: {t["muted"].name()}; }}
+        QComboBox:focus, QLineEdit:focus, QSpinBox:focus {{ border: 1px solid {t["accent"].name()}; }}
+        QComboBox::drop-down {{ border: none; width: 20px; }}
         QComboBox QAbstractItemView {{
-            background: {t["bg_header"].name()};
+            background: {t["bg_card"].name()}; color: {t["white"].name()};
+            border: 1px solid {t["bg_border"].name()}; border-radius: 6px;
+            padding: 4px; outline: none;
             selection-background-color: {t["accent"].name()};
+            selection-color: {t["bg_dark"].name()};
         }}
-        QCheckBox {{ spacing: 6px; color: {t["white"].name()}; }}
+        QSpinBox::up-button, QSpinBox::down-button {{
+            background: {t["bg_header"].name()}; border: none; width: 16px;
+        }}
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {t["bg_hover"].name()}; }}
+
+        /* ---- Checkboxes ---- */
+        QCheckBox {{ spacing: 7px; color: {t["white"].name()}; }}
+        QCheckBox::indicator {{ width: 16px; height: 16px; }}
         QCheckBox::indicator:checked {{
             background-color: {t["accent"].name()};
-            border: 1px solid {t["accent"].name()}; border-radius: 2px;
+            border: 1px solid {t["accent"].name()}; border-radius: 4px;
         }}
         QCheckBox::indicator:unchecked {{
             background-color: {t["bg_header"].name()};
-            border: 1px solid {t["bg_border"].name()}; border-radius: 2px;
-        }}
-        QProgressBar {{
-            background: {t["bg_header"].name()};
             border: 1px solid {t["bg_border"].name()}; border-radius: 4px;
         }}
-        QProgressBar::chunk {{ border-radius: 3px; }}
+        QCheckBox::indicator:unchecked:hover {{ border: 1px solid {t["accent"].name()}; }}
+
+        /* ---- Tables: selection accent + header hover ---- */
+        QTableWidget {{
+            selection-background-color: {acc_soft}; selection-color: {t["white"].name()};
+            alternate-background-color: {t["bg_card"].name()};
+        }}
+        QTableWidget::item:selected {{ background: {acc_soft}; color: {t["white"].name()}; }}
+        QHeaderView::section:hover {{ background-color: {t["bg_hover"].name()}; }}
+
+        /* ---- Progress ---- */
+        QProgressBar {{
+            background: {t["bg_header"].name()}; text-align: center;
+            color: {t["white"].name()};
+            border: 1px solid {t["bg_border"].name()}; border-radius: 6px;
+        }}
+        QProgressBar::chunk {{ background: {t["accent"].name()}; border-radius: 5px; }}
+
+        /* ---- Status / toolbar / groups ---- */
         QStatusBar {{
             background: {t["bg_dark"].name()}; color: {t["muted"].name()};
             border-top: 1px solid {t["bg_border"].name()};
         }}
+        QStatusBar QLabel {{ padding: 0 8px; }}
+        QStatusBar::item {{ border: none; }}
         QGroupBox {{ color: {t["accent"].name()}; }}
-        QScrollBar:vertical {{ background: {t["bg_dark"].name()}; width: 10px; margin: 0; }}
+
+        /* ---- Scrollbars (vertical + horizontal) ---- */
+        QScrollBar:vertical {{ background: transparent; width: 11px; margin: 2px; }}
         QScrollBar::handle:vertical {{
-            background: {t["bg_border"].name()}; border-radius: 4px; min-height: 20px;
+            background: {t["bg_border"].name()}; border-radius: 5px; min-height: 28px;
         }}
         QScrollBar::handle:vertical:hover {{ background: {t["accent"].name()}; }}
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        QScrollBar:horizontal {{ background: transparent; height: 11px; margin: 2px; }}
+        QScrollBar::handle:horizontal {{
+            background: {t["bg_border"].name()}; border-radius: 5px; min-width: 28px;
+        }}
+        QScrollBar::handle:horizontal:hover {{ background: {t["accent"].name()}; }}
+        QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
+        QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+
+        /* ---- Splitter ---- */
+        QSplitter::handle {{ background: {t["bg_border"].name()}; }}
+        QSplitter::handle:hover {{ background: {t["accent"].name()}; }}
+        QSplitter::handle:horizontal {{ width: 3px; }}
+        QSplitter::handle:vertical {{ height: 3px; }}
+
         QToolBar {{
             background: {t["bg_dark"].name()}; border-bottom: 1px solid {t["bg_border"].name()};
-            spacing: 8px; padding: 4px;
+            spacing: 8px; padding: 4px 8px;
         }}
-        QLabel#toolbar_label {{ color: {t["muted"].name()}; font-size: 11px; }}
+        QToolBar::separator {{ background: {t["bg_border"].name()}; width: 1px; margin: 6px 6px; }}
+        QLabel#toolbar_label {{ color: {t["muted"].name()}; font-size: 11px;
+                                font-weight: 600; letter-spacing: 0.5px; }}
+
         QMessageBox {{ background-color: {t["bg_card"].name()}; color: {t["white"].name()}; }}
         QMessageBox QLabel {{ color: {t["white"].name()}; }}
         QMessageBox QPushButton {{
             background-color: {t["bg_header"].name()}; color: {t["white"].name()};
-            border: 1px solid {t["bg_border"].name()}; border-radius: 4px;
-            padding: 6px 16px; min-width: 60px;
+            border: 1px solid {t["bg_border"].name()}; border-radius: 6px;
+            padding: 6px 16px; min-width: 64px;
         }}
         QMessageBox QPushButton:hover {{
             background-color: {t["accent"].name()}; color: {t["bg_dark"].name()};
@@ -1753,10 +1905,14 @@ class TradingDashboard(QMainWindow):
         # Table styling helper
         table_style = (
             f"QTableWidget {{ background-color: {t['bg_table'].name()};"
-            f" gridline-color: {t['bg_border'].name()}; }}"
-            f" QTableWidget::item {{ padding: 4px; }}"
+            f" gridline-color: {t['bg_border'].name()};"
+            f" border: 1px solid {t['bg_border'].name()}; border-radius: 8px; }}"
+            f" QTableWidget::item {{ padding: 6px 8px; }}"
+            f" QHeaderView {{ background-color: {t['bg_header'].name()}; }}"
             f" QHeaderView::section {{ background-color: {t['bg_header'].name()};"
-            f" padding: 6px; border: 1px solid {t['bg_border'].name()}; }}"
+            f" color: {t['muted'].name()}; padding: 8px 8px; border: none;"
+            f" border-bottom: 2px solid {t['bg_border'].name()};"
+            f" font-weight: 600; }}"
         )
         group_style = (
             f"QGroupBox {{ font-weight: bold; border: 1px solid {t['bg_border'].name()};"
@@ -1781,10 +1937,13 @@ class TradingDashboard(QMainWindow):
             card.setStyleSheet(card_style)
             title_lbl = card.layout().itemAt(0).widget()
             if title_lbl:
-                title_lbl.setStyleSheet(f"color: {t['muted'].name()}; font-size: 11px;")
+                title_lbl.setStyleSheet(
+                    f"color: {t['muted'].name()}; font-size: 10px; font-weight: 600;"
+                    f" letter-spacing: 1px;")
             val_lbl = card.findChild(QLabel, "card_value")
             if val_lbl:
-                val_lbl.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {t['white'].name()};")
+                val_lbl.setStyleSheet(
+                    f"font-size: 24px; font-weight: 700; color: {t['white'].name()};")
 
         # Tables
         for table in [self._positions_table, self._open_orders_table,
@@ -1827,7 +1986,9 @@ class TradingDashboard(QMainWindow):
         trade_input_style = (
             f"QLineEdit {{ background-color: {t['bg_table'].name()};"
             f" color: {t['white'].name()}; border: 1px solid {t['bg_border'].name()};"
-            f" border-radius: 4px; padding: 4px; }}"
+            f" border-radius: 6px; padding: 5px 8px; }}"
+            f" QLineEdit:hover {{ border: 1px solid {t['muted'].name()}; }}"
+            f" QLineEdit:focus {{ border: 1px solid {t['accent'].name()}; }}"
         )
         for widget in [self._manual_symbol, self._manual_qty, self._manual_notional]:
             widget.setStyleSheet(trade_input_style)
@@ -1836,7 +1997,9 @@ class TradingDashboard(QMainWindow):
         input_style = (
             f"QLineEdit, QSpinBox, QComboBox {{ background-color: {t['bg_table'].name()};"
             f" color: {t['white'].name()}; border: 1px solid {t['bg_border'].name()};"
-            f" border-radius: 4px; padding: 4px; }}"
+            f" border-radius: 6px; padding: 5px 8px; }}"
+            f" QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{"
+            f" border: 1px solid {t['accent'].name()}; }}"
         )
         btn_style = (
             f"QPushButton {{ background-color: {t['bg_header'].name()}; color: {t['white'].name()};"
@@ -3160,6 +3323,12 @@ class TradingDashboard(QMainWindow):
         pipeline_layout.addWidget(self._pipeline_scores, 3, 1)
         pipeline_layout.addWidget(self._pipeline_retrain, 4, 0, 1, 2)
 
+        # Per-phase outcome badges (ok / failed / gate-rolled-back), incl.
+        # attempt counts — makes a gate rollback visible instead of silent.
+        self._pipeline_phase_results = QLabel("")
+        self._pipeline_phase_results.setWordWrap(True)
+        pipeline_layout.addWidget(self._pipeline_phase_results, 5, 0, 1, 2)
+
         # Pipeline restart control
         restart_row = QHBoxLayout()
         self._restart_pipeline_btn = QPushButton("Restart Pipeline")
@@ -3171,7 +3340,7 @@ class TradingDashboard(QMainWindow):
         restart_row.addWidget(self._restart_pipeline_btn)
         restart_row.addWidget(self._restart_pipeline_status)
         restart_row.addStretch()
-        pipeline_layout.addLayout(restart_row, 5, 0, 1, 2)
+        pipeline_layout.addLayout(restart_row, 6, 0, 1, 2)
 
         # Manual retrain controls
         retrain_row = QHBoxLayout()
@@ -3197,7 +3366,7 @@ class TradingDashboard(QMainWindow):
         retrain_row.addWidget(self._retrain_cancel_btn)
         retrain_row.addWidget(self._retrain_status)
         retrain_row.addStretch()
-        pipeline_layout.addLayout(retrain_row, 6, 0, 1, 2)
+        pipeline_layout.addLayout(retrain_row, 7, 0, 1, 2)
 
         layout.addWidget(pipeline_group)
 
@@ -3317,6 +3486,39 @@ class TradingDashboard(QMainWindow):
         llm_usage_layout.addWidget(self._llm_lite_label, 1, 2)
 
         layout.addWidget(llm_usage_group)
+
+        # Reports group (offline measurement-only scripts — safe to launch
+        # directly, no promotion gate needed per repo conventions)
+        reports_group = QGroupBox("Reports")
+        reports_layout = QHBoxLayout(reports_group)
+        self._decision_report_btn = QPushButton("Decision Report (30d)")
+        self._beta_ledger_btn = QPushButton("Beta Ledger (90d)")
+        self._leadlag_btn = QPushButton("Indicator Lead/Lag")
+        for btn in [self._decision_report_btn, self._beta_ledger_btn,
+                    self._leadlag_btn]:
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.PointingHandCursor)
+        self._decision_report_btn.clicked.connect(
+            lambda: self._run_report_clicked(
+                ["decision_report.py", "--days", "30"],
+                "Decision Report (30d)"))
+        self._beta_ledger_btn.clicked.connect(
+            lambda: self._run_report_clicked(
+                ["beta_ledger.py", "--days", "90"],
+                "Beta Ledger (90d)"))
+        self._leadlag_btn.clicked.connect(
+            lambda: self._run_report_clicked(
+                ["indicator_leadlag.py", "--data", "crypto_training_data.parquet"],
+                "Indicator Lead/Lag"))
+        reports_layout.addWidget(self._decision_report_btn)
+        reports_layout.addWidget(self._beta_ledger_btn)
+        reports_layout.addWidget(self._leadlag_btn)
+        self._reports_status = QLabel("")
+        self._reports_status.setStyleSheet("font-size: 11px;")
+        reports_layout.addWidget(self._reports_status)
+        reports_layout.addStretch()
+
+        layout.addWidget(reports_group)
         layout.addStretch()
         self.tabs.addTab(tab, "Models")
 
@@ -4262,7 +4464,7 @@ class TradingDashboard(QMainWindow):
         is_training = False
         try:
             age = dt.datetime.now().timestamp() - status_path.stat().st_mtime
-            is_running = age < 600
+            is_running = age < PIPELINE_STALE_SEC
             if is_running:
                 pinfo = _read_pipeline_status()
                 phase = pinfo.get("phase", "")
@@ -4317,12 +4519,132 @@ class TradingDashboard(QMainWindow):
         from PySide6.QtCore import QTimer
         QTimer.singleShot(delay_ms, self._refresh_models_tab)
 
+    def _run_report_clicked(self, script_args, title):
+        """Launch a measurement-only report script (U5).
+
+        Mirrors _refresh_all_llm_clicked's subprocess pattern: stdout goes
+        to a file (not PIPE — nothing reads the pipe, so a chatty child
+        would fill it and hang forever), completion is polled on a QTimer,
+        and the triggering buttons stay disabled while it runs. Unlike the
+        LLM refresh, we capture to a per-run tempfile so the output can be
+        shown back to the user in a dialog once the process exits.
+        """
+        import subprocess
+        import tempfile
+
+        if getattr(self, '_report_proc', None) is not None:
+            self._reports_status.setText("A report is already running...")
+            self._reports_status.setStyleSheet(
+                f"color: {T['yellow'].name()}; font-size: 11px;")
+            return
+
+        report_btns = [self._decision_report_btn, self._beta_ledger_btn,
+                        self._leadlag_btn]
+        for btn in report_btns:
+            btn.setEnabled(False)
+        self._reports_status.setText(f"Running {title}...")
+        self._reports_status.setStyleSheet(
+            f"color: {T['accent'].name()}; font-size: 11px;")
+        QApplication.processEvents()
+
+        python = _engine_python()
+        script = str(BASE_DIR / script_args[0])
+        args = script_args[1:]
+        env = _engine_env()
+        tf = tempfile.NamedTemporaryFile(
+            mode="w+", suffix=".log", prefix="gui_report_", delete=False)
+        try:
+            proc = subprocess.Popen(
+                [python, "-u", script, *args],
+                stdout=tf, stderr=subprocess.STDOUT,
+                env=env, cwd=str(BASE_DIR),
+            )
+            self._report_proc = proc
+            self._report_tempfile = tf
+            self._report_title = title
+            from PySide6.QtCore import QTimer
+            self._report_timer = QTimer()
+            self._report_timer.timeout.connect(self._check_report_run)
+            self._report_timer.start(2000)
+        except Exception as e:
+            tf.close()
+            self._reports_status.setText(f"Error: {e}")
+            self._reports_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+            for btn in report_btns:
+                btn.setEnabled(True)
+
+    def _check_report_run(self):
+        """Poll the report subprocess for completion; show output on finish."""
+        if not hasattr(self, '_report_proc'):
+            return
+        proc = self._report_proc
+        rc = proc.poll()
+        if rc is None:
+            # Still running (output accumulates in the tempfile)
+            return
+        self._report_timer.stop()
+        for btn in [self._decision_report_btn, self._beta_ledger_btn,
+                    self._leadlag_btn]:
+            btn.setEnabled(True)
+
+        tf = self._report_tempfile
+        title = self._report_title
+        output = ""
+        try:
+            tf.flush()
+            tf.seek(0)
+            output = tf.read()
+        except OSError:
+            pass
+        finally:
+            try:
+                tf.close()
+                os.unlink(tf.name)
+            except OSError:
+                pass
+
+        if rc == 0:
+            self._reports_status.setText(f"{title} complete")
+            self._reports_status.setStyleSheet(
+                f"color: {T['green'].name()}; font-size: 11px;")
+        else:
+            self._reports_status.setText(f"{title} failed (exit {rc})")
+            self._reports_status.setStyleSheet(
+                f"color: {T['red'].name()}; font-size: 11px;")
+
+        self._show_report_dialog(title, output)
+
+        del self._report_proc
+        del self._report_tempfile
+        del self._report_title
+
+    def _show_report_dialog(self, title, text):
+        """Modal dialog with the captured report output (read-only, monospace)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(900, 600)
+        vbox = QVBoxLayout(dlg)
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setFont(QFont("Monospace", 10))
+        view.setPlainText(text)
+        vbox.addWidget(view)
+        dlg.exec()
+
     def _is_pipeline_running(self):
-        """Check if pipeline process is running (status file < 120s old)."""
+        """Check if pipeline process is running (status file recently updated).
+
+        Uses the same PIPELINE_STALE_SEC threshold as the Models tab render
+        and the retrain click handler (U4) — previously this used a much
+        tighter 120s cutoff, so the tab could show "running" while this
+        method (and the retrain button) said "not running": an enabled but
+        effectively dead button.
+        """
         try:
             age = dt.datetime.now().timestamp() - (
                 BASE_DIR / "pipeline_status.json").stat().st_mtime
-            return age < 120
+            return age < PIPELINE_STALE_SEC
         except OSError:
             return False
 
@@ -4628,10 +4950,11 @@ class TradingDashboard(QMainWindow):
 
         # Determine if pipeline is actively running (status file updated recently)
         is_running = False
+        age = None
         status_path = BASE_DIR / "pipeline_status.json"
         try:
             age = now_ts - status_path.stat().st_mtime
-            is_running = age < 600  # Trials can take up to 10 minutes
+            is_running = age < PIPELINE_STALE_SEC  # trials can take up to 10 minutes
         except OSError:
             pass
 
@@ -4695,8 +5018,22 @@ class TradingDashboard(QMainWindow):
             self._halt_btn.setText(
                 "Resume Entries" if halted else "Halt Entries")
 
+        # Show how fresh the status file is while running (U3) — the status
+        # file can go quiet for minutes mid-trial without meaning the
+        # pipeline died (see PIPELINE_STALE_SEC), so surface the age instead
+        # of hiding it.
+        if is_running and age is not None:
+            status_text += f"  (updated {age:.0f}s ago)"
+
+        stale_prefix = ""
+        if age is not None and 120 < age < PIPELINE_STALE_SEC:
+            stale_prefix = (
+                f"<span style='color:{T['yellow'].name()}'>"
+                f"⚠ status {age:.0f}s stale</span>  ")
+
         self._pipeline_status.setText(
-            f"Status: <span style='color:{status_color}'>{status_text}</span>")
+            f"{stale_prefix}Status: "
+            f"<span style='color:{status_color}'>{status_text}</span>")
 
         self._pipeline_phase.setText(f"Phase: {phase_label}")
 
@@ -4749,15 +5086,58 @@ class TradingDashboard(QMainWindow):
         else:
             self._pipeline_elapsed.setText("Elapsed: \u2014")
 
-        # Show final scores from completed phases
+        # Show final scores from completed phases. Tri-state (U2): the key
+        # can be present-but-None (the search itself failed — status.py
+        # writes None instead of echoing a stale/zero best_score) vs. the
+        # key being absent entirely (phase hasn't run yet this session) —
+        # those two must render differently, not both fall back to blank.
         scores_parts = []
-        crypto_final = pinfo.get("crypto_final_score")
-        stock_final = pinfo.get("stock_final_score")
-        if crypto_final is not None:
-            scores_parts.append(f"Crypto: {crypto_final:.4f}")
-        if stock_final is not None:
-            scores_parts.append(f"Stock: {stock_final:.4f}")
+        if "crypto_final_score" in pinfo:
+            crypto_final = pinfo.get("crypto_final_score")
+            if crypto_final is not None:
+                scores_parts.append(f"Crypto: {crypto_final:.4f}")
+            else:
+                scores_parts.append(
+                    f"Crypto: <span style='color:{T['red'].name()}'>"
+                    f"search failed</span>")
+        if "stock_final_score" in pinfo:
+            stock_final = pinfo.get("stock_final_score")
+            if stock_final is not None:
+                scores_parts.append(f"Stock: {stock_final:.4f}")
+            else:
+                scores_parts.append(
+                    f"Stock: <span style='color:{T['red'].name()}'>"
+                    f"search failed</span>")
         self._pipeline_scores.setText("  |  ".join(scores_parts) if scores_parts else "")
+
+        # Per-phase outcome badges (U1) — a gate rollback (model already
+        # reverted to .prev by backtest.py --gate) is otherwise invisible
+        # in the GUI, so it gets its own badge distinct from a hard failure.
+        pr = pinfo.get("phase_results", {})
+        if pr:
+            badge_parts = []
+            for phase_id, info in pr.items():
+                if not isinstance(info, dict):
+                    continue
+                outcome = info.get("outcome")
+                rc = info.get("rc")
+                attempts = info.get("attempts", 1)
+                if outcome == "ok":
+                    badge, badge_color = "✓", T["green"].name()
+                elif outcome == "gate_failed_rolled_back":
+                    badge, badge_color = "⤺ rolled back", T["yellow"].name()
+                elif outcome == "failed":
+                    badge, badge_color = "✗", T["red"].name()
+                else:
+                    badge, badge_color = str(outcome), T["muted"].name()
+                text = f"{phase_id}: {badge}"
+                if attempts and attempts > 1:
+                    text += f" (rc{rc}, {attempts}x)"
+                badge_parts.append(
+                    f"<span style='color:{badge_color}'>{text}</span>")
+            self._pipeline_phase_results.setText("  ".join(badge_parts))
+        else:
+            self._pipeline_phase_results.setText("")
 
         # Next retrain time
         next_retrain = pinfo.get("next_retrain")

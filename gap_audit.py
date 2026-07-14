@@ -61,10 +61,17 @@ def gap_stats(overnight):
     t_df = None
     try:
         from scipy.stats import t as student_t
-        df, _, _ = student_t.fit(r, floc=mu)
-        t_df = float(df)
-    except Exception:
-        pass
+    except ImportError:
+        student_t = None    # scipy optional — t_df stays None, silently
+    if student_t is not None:
+        try:
+            df, _, _ = student_t.fit(r, floc=mu)
+            t_df = float(df)
+        except Exception as e:
+            # A genuine fit failure must be visible to the operator, not
+            # indistinguishable from scipy-not-installed.
+            print(f"gap_stats: Student-t fit failed "
+                  f"({type(e).__name__}: {e}) — t_df=None")
     return {'n': int(n), 'std': float(sd), 'skew': skew,
             'excess_kurtosis': kurt, 't_df': t_df}
 
@@ -124,12 +131,23 @@ def audit_name(daily_df, notional, stop_dist_frac, side='long'):
 def fetch_daily(symbol, period='3y'):
     """Free daily OHLC via yfinance (NOT fetch_with_fallback — that is hardcoded
     interval='1h' with no daily path). Lazy import so the module + pure
-    analysis functions load without yfinance/network."""
+    analysis functions load without yfinance/network. Single ticker only:
+    a multi-symbol download would silently interleave names' gaps into one
+    series, so it is rejected up front."""
+    if (not isinstance(symbol, str) or not symbol.strip()
+            or len(symbol.split()) != 1 or ',' in symbol):
+        raise ValueError(f"fetch_daily takes a single ticker, got {symbol!r}")
+    import pandas as pd
     import yfinance as yf
     df = yf.download(symbol, period=period, interval='1d', progress=False,
                      auto_adjust=False)
     if df is None or df.empty:
         return None
+    if isinstance(df.columns, pd.MultiIndex):
+        # yfinance >= 0.2.x returns (Price, Ticker) MultiIndex columns;
+        # collapse to the Price level (single ticker guaranteed above —
+        # and rename(str.title) must never see the ticker level).
+        df.columns = df.columns.get_level_values(0)
     df = df.rename(columns=str.title)
     return df[['Open', 'High', 'Low', 'Close']].dropna()
 

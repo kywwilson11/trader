@@ -21,10 +21,13 @@ Point-in-time discipline: the rolling estimate at bar t uses only bars in
 the harvest introduces no look-ahead — exactly like the _DV30 stamp.
 """
 
+import logging
 import math
 
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 # Clips on the raw estimate (percent of price). EDGE is an RMS estimator and
 # can go slightly negative on short windows / halt prints; floor it to a tiny
@@ -64,7 +67,11 @@ def edge_spread_series(ohlc_df, window=DEFAULT_WINDOW,
     try:
         from bidask import edge_rolling
         frac = edge_rolling(df[['Open', 'High', 'Low', 'Close']], window=window)
-    except Exception:
+    except Exception as exc:
+        # The fallback is several-fold upward-biased; a silent estimator swap
+        # would shift the whole offline cost surface with zero trace.
+        log.warning("bidask EDGE failed on %d-bar frame (%s: %s) — using "
+                    "upward-biased AR fallback", n, type(exc).__name__, exc)
         frac = _abdi_ranaldo_rolling(df, window)
     pct = pd.Series(frac, index=ohlc_df.index).astype(float) * 100.0
     # EDGE can emit NaN (first window-1 rows) or non-finite noise -> floor.
@@ -75,11 +82,16 @@ def edge_spread_series(ohlc_df, window=DEFAULT_WINDOW,
 
 
 def _abdi_ranaldo_rolling(df, window):
-    """Abdi-Ranaldo (2017) close-high-low spread proxy — bidask fallback.
+    """Simplified close-vs-mid dispersion proxy — break-glass bidask fallback.
 
-    2*sqrt(max(E[(c-eta)^2], 0)) where eta = (high+low)/2 (log mids). A robust
-    secondary estimator for when bidask is unavailable or EDGE degenerates.
-    Returns a price-FRACTION Series (caller scales to percent).
+    2*sqrt(max(E[(c-eta)^2], 0)) where eta = (high+low)/2 (log mids). NOT the
+    true Abdi-Ranaldo (2017) estimator: AR uses the cross-product
+    E[(c_t-eta_t)(c_t-eta_{t+1})], which cancels efficient-price variance; the
+    same-bar squared form here is vol-dominated and several-fold UPWARD-biased,
+    so treat it as a conservative spread UPPER BOUND, not an estimate.
+    Upgrading to the cross-product form changes stamped Eff_Spread_Pct —
+    Jetson re-harvest + promotion gate required. Returns a price-FRACTION
+    array (caller scales to percent).
     """
     c = np.log(df['Close'].to_numpy(dtype=float))
     h = np.log(df['High'].to_numpy(dtype=float))
@@ -91,7 +103,7 @@ def _abdi_ranaldo_rolling(df, window):
         sl = slice(t - window + 1, t + 1)
         cc = c[sl]
         m = mid[sl]
-        if len(cc) < 3:
+        if len(cc) < 3:   # only reachable when window < 3 (slice len == window)
             continue
         # E[(c_t - eta_t)(c_t - eta_{t+1})] form, simplified single-window var
         d = cc - m
@@ -136,13 +148,17 @@ def impact_inputs_from_df(df):
     try:
         from strategy_config import (IMPACT_COST_ENABLED, IMPACT_K,
                                       IMPACT_TYPICAL_NOTIONAL)
-    except Exception:
+    except Exception as exc:
+        log.warning("impact_inputs_from_df: strategy_config import failed "
+                    "(%s: %s) — impact term disabled", type(exc).__name__, exc)
         return None, None, 1.0
     if not IMPACT_COST_ENABLED:
         return None, None, 1.0
     for col in ('DV30', '_DV30'):
         if col in df.columns:
             return df[col].values, float(IMPACT_TYPICAL_NOTIONAL), float(IMPACT_K)
+    log.warning("IMPACT_COST_ENABLED but no DV30/_DV30 column in frame — "
+                "impact term inactive")
     return None, None, 1.0
 
 
@@ -162,16 +178,20 @@ def per_bar_round_trip_cost(asset_type, spread_pct_array,
     per-side capped) is ADDED per bar — larger for thinner names. adv_dollar=None
     (the default) preserves the exact prior spread-only behavior.
     """
-    from fees import round_trip_cost_pct
+    from fees import FLAT_SPREAD_PCT, round_trip_cost_pct
     fee_const = round_trip_cost_pct(asset_type, 0.0, maker, live)
-    flat = 0.10 if asset_type == 'crypto' else 0.05
+    flat = FLAT_SPREAD_PCT['crypto' if asset_type == 'crypto' else 'stock']
     s = np.asarray(spread_pct_array, dtype=float)
     s = np.where(np.isfinite(s) & (s >= 0.0), s, flat)
     cost = fee_const + s
     if adv_dollar is not None and notional is not None:
-        adv = np.asarray(adv_dollar, dtype=float)
-        part = np.where(np.isfinite(adv) & (adv > 0.0), float(notional) / adv, 0.0)
-        impact_one_side = np.clip(impact_k * s * np.sqrt(np.clip(part, 0.0, None)),
-                                  0.0, IMPACT_CAP_PCT)
-        cost = cost + 2.0 * impact_one_side
+        n_dollar, k = float(notional), float(impact_k)
+        # Parity with market_impact_pct's fail-open: a non-finite size/k must
+        # skip the impact term, not propagate NaN into every bar's cost.
+        if math.isfinite(n_dollar) and math.isfinite(k) and n_dollar > 0:
+            adv = np.asarray(adv_dollar, dtype=float)
+            part = np.where(np.isfinite(adv) & (adv > 0.0), n_dollar / adv, 0.0)
+            impact_one_side = np.clip(k * s * np.sqrt(np.clip(part, 0.0, None)),
+                                      0.0, IMPACT_CAP_PCT)
+            cost = cost + 2.0 * impact_one_side
     return cost

@@ -25,6 +25,9 @@ import numpy as np
 from scipy.stats import norm
 
 # Minimum edge-to-friction multiple an overlay must clear to be worth running.
+# Intentionally DECOUPLED from fees.MIN_EDGE_MULTIPLE (same value today): this
+# is the pre-registered options-overlay gate and must not silently track
+# live-gate tuning.
 MIN_EDGE_MULTIPLE = 2.0
 
 # Empirical index-option IV/RV ratio band (variance risk premium): realized
@@ -98,9 +101,7 @@ def vertical_debit(S, K1, K2, T, r, sigma, call=True):
     Returns the positive premium paid; max loss == this debit (gap-proof)."""
     if K2 <= K1:
         raise ValueError("need K2 > K1")
-    if call:
-        return bs_price(S, K1, T, r, sigma, True) - bs_price(S, K2, T, r, sigma, True)
-    return bs_price(S, K2, T, r, sigma, False) - bs_price(S, K1, T, r, sigma, False)
+    return vertical_value(S, K1, K2, T, r, sigma, call)
 
 
 def vertical_value(S, K1, K2, T, r, sigma, call=True):
@@ -207,13 +208,21 @@ def overlay_decision(close_prices, open_prices, tier, rv_sigma_annual,
     c = np.asarray(close_prices, dtype=float)
     o = np.asarray(open_prices, dtype=float)
     n = min(len(c), len(o))
-    if n < 5:
-        return {'verdict': 'INSUFFICIENT_DATA', 'n': int(n)}
     c, o = c[:n], o[:n]
+    # drop non-finite pairs up front: bad data must surface as a data verdict
+    # (INSUFFICIENT_DATA), never poison the means into a nan-fielded NO_GO.
+    finite = np.isfinite(c) & np.isfinite(o)
+    c, o = c[finite], o[finite]
+    if len(c) < 5:
+        return {'verdict': 'INSUFFICIENT_DATA', 'n': int(len(c))}
     spread = SPREAD_TIERS.get(tier, SPREAD_TIERS['C'])
     _, iv, _ = iv_from_har(rv_sigma_annual)
     T_close = dte / TRADING_DAYS
-    overnight_frac = (17.0 / 24.0) / TRADING_DAYS  # ~15:50->09:30 calendar slice
+    # 15:50 -> 09:30 next day = 17h40m of CALENDAR time over a 24h day, on the
+    # 252 trading-day year basis: ~71% of a full trading day's theta/variance-
+    # time elapses overnight. Deliberately decay-conservative (neither pure
+    # trading-time nor pure calendar-time).
+    overnight_frac = (17.67 / 24.0) / TRADING_DAYS
 
     pnls, debits = [], []
     for ct, ot in zip(c, o):
@@ -232,9 +241,12 @@ def overlay_decision(close_prices, open_prices, tier, rv_sigma_annual,
 
     pnls = np.asarray(pnls); debits = np.asarray(debits)
     mean_debit = float(debits.mean())
-    # friction as a fraction of debit (legs = the two option premiums).
+    # friction as a fraction of debit (legs = the two option premiums, priced
+    # at the SAME strikes the simulation trades: the put's short leg is OTM
+    # BELOW spot, not the call's strike above it).
+    k2m = c.mean() * ((1.0 + width_frac) if call else (1.0 - width_frac))
     legs = [bs_price(c.mean(), c.mean(), T_close, r, iv, call),
-            bs_price(c.mean(), c.mean() * (1 + width_frac), T_close, r, iv, call)]
+            bs_price(c.mean(), k2m, T_close, r, iv, call)]
     friction_frac = option_round_trip_cost(legs, spread) / max(mean_debit, 1e-9)
     mean_edge_frac = float((pnls / debits).mean())
     clears, required = required_edge_clears(mean_edge_frac, friction_frac,

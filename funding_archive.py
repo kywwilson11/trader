@@ -19,13 +19,12 @@ import argparse
 import datetime as dt
 import io
 import os
-import sys
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BASE_DIR))
 
 ARCHIVE_FILE = BASE_DIR / 'funding_archive.parquet'
 
@@ -35,6 +34,18 @@ BINANCE_SYMBOLS = {
     'SOL/USD': 'SOLUSDT', 'DOGE/USD': 'DOGEUSDT', 'LINK/USD': 'LINKUSDT',
     'AVAX/USD': 'AVAXUSDT', 'DOT/USD': 'DOTUSDT', 'LTC/USD': 'LTCUSDT',
     'BCH/USD': 'BCHUSDT',
+}
+
+# First month each perp has archive data (its Binance listing month).
+# sync() floors its scan here: pre-listing months are guaranteed 404s that
+# would otherwise be re-requested on EVERY run forever, because they never
+# yield rows and so never enter the parquet-derived 'have' set. Floors are
+# conservative (at or before actual listing); a missing entry means no floor.
+LISTING_MONTH = {
+    'BTC/USD': '2019-09', 'ETH/USD': '2019-11', 'XRP/USD': '2020-01',
+    'SOL/USD': '2020-09', 'DOGE/USD': '2020-07', 'LINK/USD': '2020-01',
+    'AVAX/USD': '2020-09', 'DOT/USD': '2020-08', 'LTC/USD': '2020-01',
+    'BCH/USD': '2019-11',
 }
 
 _URL = ("https://data.binance.vision/data/futures/um/monthly/fundingRate/"
@@ -75,11 +86,15 @@ def _parse_zip(data: bytes):
                 elif series.abs().median() < 0.05:
                     rate_col = c
             if time_col is None or rate_col is None:
+                # A schema change would otherwise make months vanish
+                # silently AND re-download on every sync (never in 'have')
+                print(f"[FUNDING-ARCHIVE] {name}: could not identify "
+                      f"time/rate columns in {list(df.columns)} — skipped")
                 continue
-            ts = pd.to_datetime(pd.to_numeric(df[time_col]), unit='ms', utc=True)
+            ts = pd.to_datetime(pd.to_numeric(df[time_col], errors='coerce'),
+                                unit='ms', utc=True)
             rate = pd.to_numeric(df[rate_col], errors='coerce')
             rows.append(pd.DataFrame({'ts': ts, 'rate': rate}).dropna())
-    import pandas as pd
     return pd.concat(rows) if rows else None
 
 
@@ -88,8 +103,9 @@ def load_archive():
     if ARCHIVE_FILE.exists():
         try:
             return pd.read_parquet(ARCHIVE_FILE)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[FUNDING-ARCHIVE] corrupt archive {ARCHIVE_FILE}: {e} "
+                  f"— treating as empty")
     return pd.DataFrame(columns=['symbol', 'ts', 'rate'])
 
 
@@ -108,9 +124,11 @@ def get_funding_series(alpaca_symbol: str):
 def sync(symbols=None, start: str = '2020-01') -> bool:
     """Download missing months for each symbol into the parquet store.
 
-    Idempotent: months already present are skipped (one network burst on
-    first run, a single small zip per symbol per month thereafter). 404s
-    (symbol not yet listed that month) are skipped silently.
+    Idempotent: months already stored are skipped, and months before a
+    perp's listing (guaranteed 404s) are never requested — one network
+    burst on the first run, then roughly one new zip per symbol per
+    month. Remaining 404s (e.g. last month's zip not yet published) are
+    skipped silently; other failures are counted and reported.
     """
     import pandas as pd
     symbols = symbols or list(BINANCE_SYMBOLS)
@@ -120,11 +138,12 @@ def sync(symbols=None, start: str = '2020-01') -> bool:
         have = set(zip(arc['symbol'], arc['ts'].dt.strftime('%Y-%m')))
 
     new_frames = []
+    errors = 0
     for alp in symbols:
         bsym = BINANCE_SYMBOLS.get(alp)
         if not bsym:
             continue
-        for month in _months(start):
+        for month in _months(max(start, LISTING_MONTH.get(alp, start))):
             if (alp, month) in have:
                 continue
             url = _URL.format(sym=bsym, month=month)
@@ -135,17 +154,31 @@ def sync(symbols=None, start: str = '2020-01') -> bool:
                 if e.code == 404:
                     continue  # not listed yet that month
                 print(f"[FUNDING-ARCHIVE] {bsym} {month}: HTTP {e.code}")
+                errors += 1
                 continue
             except Exception as e:
                 print(f"[FUNDING-ARCHIVE] {bsym} {month}: {e}")
+                errors += 1
                 continue
-            parsed = _parse_zip(data)
+            # A parse failure must not abort the sync: that would discard
+            # every month already fetched this run, and the bad month would
+            # re-download and re-crash every future run (never in 'have')
+            try:
+                parsed = _parse_zip(data)
+            except Exception as e:
+                print(f"[FUNDING-ARCHIVE] {bsym} {month}: parse failed: {e}")
+                errors += 1
+                continue
             if parsed is not None and not parsed.empty:
                 parsed['symbol'] = alp
                 new_frames.append(parsed)
 
     if not new_frames:
-        print(f"[FUNDING-ARCHIVE] up to date ({len(arc)} rows)")
+        if errors:
+            print(f"[FUNDING-ARCHIVE] no new data — {errors} month-fetches "
+                  f"failed ({len(arc)} rows kept)")
+        else:
+            print(f"[FUNDING-ARCHIVE] up to date ({len(arc)} rows)")
         return not arc.empty
 
     combined = pd.concat([arc] + new_frames, ignore_index=True)
@@ -154,7 +187,8 @@ def sync(symbols=None, start: str = '2020-01') -> bool:
     combined.to_parquet(tmp)
     os.replace(tmp, ARCHIVE_FILE)
     print(f"[FUNDING-ARCHIVE] synced: {len(combined)} rows "
-          f"({len(new_frames)} new month-files)")
+          f"({len(new_frames)} new month-files"
+          f"{f'; {errors} fetches failed' if errors else ''})")
     return True
 
 

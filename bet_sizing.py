@@ -34,6 +34,8 @@ def afml_bet_size(p, base_rate=0.5, step=0.0):
     m = 2.0 * norm.cdf(z) - 1.0
     if step and step > 0:
         m = np.round(m / step) * step
+        # AFML clips AFTER rounding: steps that don't divide 1 evenly overshoot.
+        m = np.clip(m, -1.0, 1.0)
     return float(m) if np.ndim(m) == 0 else m
 
 
@@ -48,6 +50,8 @@ def kelly_edge_odds(p, b, a, fraction=1.0, cap=1.0):
     if a <= 0 or b <= 0:
         return 0.0
     p = np.asarray(p, float)
+    # Fail closed: a non-finite probability sizes to 0, out-of-range p is clipped.
+    p = np.where(np.isfinite(p), np.clip(p, 0.0, 1.0), 0.0)
     f = (p / a - (1 - p) / b) * float(fraction)
     f = np.clip(f, 0.0, float(cap))
     return float(f) if np.ndim(f) == 0 else f
@@ -60,5 +64,12 @@ def concurrency_scale(n_concurrent):
 
 
 def breakeven_p(b, a):
-    """Win probability at which the edge/odds Kelly fraction is exactly 0."""
-    return float(a) / (float(a) + float(b))
+    """Win probability at which the edge/odds Kelly fraction is exactly 0.
+
+    Degenerate odds (a<=0 or b<=0) return 1.0 — the fail-closed "unreachable
+    breakeven", consistent with kelly_edge_odds sizing 0 for the same inputs.
+    """
+    a = float(a); b = float(b)
+    if a <= 0 or b <= 0:
+        return 1.0
+    return a / (a + b)

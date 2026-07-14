@@ -43,15 +43,16 @@ def conviction_gated(k_max, signal_floor=None, meta_floor=None,
 
     signal_floor: minimum signal; meta_floor: minimum meta_p; ratio_floor:
     minimum pred/threshold ratio. Any floor left None is not applied.
+    A non-finite (NaN) field fails any floor that is set (fail-closed).
     """
     def policy(cands):
         out = []
         for c in cands[:max(int(k_max), 0)]:
-            if signal_floor is not None and c.get('signal', 0) < signal_floor:
+            if signal_floor is not None and not (c.get('signal', 0) >= signal_floor):
                 continue
-            if meta_floor is not None and c.get('meta_p', 1.0) < meta_floor:
+            if meta_floor is not None and not (c.get('meta_p', 1.0) >= meta_floor):
                 continue
-            if ratio_floor is not None and c.get('pred_thresh_ratio', 1.0) < ratio_floor:
+            if ratio_floor is not None and not (c.get('pred_thresh_ratio', 1.0) >= ratio_floor):
                 continue
             out.append(c)
         return out
@@ -145,7 +146,8 @@ def compare(panel, policies, cost_pct=0.0,
 
 
 def compare_deflated(panel, policies, cost_pct=0.0,
-                     periods_per_year=DEFAULT_PERIODS_PER_YEAR, baseline=None):
+                     periods_per_year=DEFAULT_PERIODS_PER_YEAR, baseline=None,
+                     fwd_bars=1):
     """compare() + a DEFLATED Sharpe and turnover per policy (wave-9 #4).
 
     The plain compare() ranks policies by RAW Sharpe with NO correction for how
@@ -155,6 +157,14 @@ def compare_deflated(panel, policies, cost_pct=0.0,
     is promoted to first-class (a higher-Sharpe-but-higher-turnover policy is not
     free on a cost-bound book). THIS is the difference between certifying a real
     conviction edge and shipping a mined one.
+
+    fwd_bars — REQUIRED to match the panel's forward-return horizon whenever
+    the panel is sampled every bar (panel_from_frame on an hourly frame with a
+    fb-bar fwd_return_col). Adjacent per-period nets then share fb-1 bars of
+    the SAME move: they are not independent draws, and with fwd_bars=1 a
+    zero-edge 24h-overlap panel scores DSR ~0.99 (2026-07 review, verified).
+    The DSR null is widened by n_eff = n_periods / fwd_bars. Leave at 1 only
+    for genuinely non-overlapping period returns.
     """
     from validation import dsr_from_trade_returns
     names = list(policies)
@@ -164,8 +174,11 @@ def compare_deflated(panel, policies, cost_pct=0.0,
         m = run_policy(panel, policies[name], cost_pct, periods_per_year,
                        with_series=True)
         nets = m.pop('_nets')
-        d = dsr_from_trade_returns(nets, n_trials=len(names))
+        n_eff = (len(nets) / max(int(fwd_bars), 1)) if len(nets) else None
+        d = dsr_from_trade_returns(nets, n_trials=len(names), n_eff=n_eff)
         m['dsr'] = round(d['dsr'], 4)
+        m['n_eff'] = round(n_eff, 1) if n_eff else 0.0
+        m['fwd_bars'] = int(fwd_bars)
         m['expected_max_sr'] = round(d['expected_max_sr'], 4)
         m['turnover'] = round((m['entries'] + m['exits']) / max(m['n_periods'], 1), 4)
         results[name] = m
@@ -187,11 +200,14 @@ def panel_from_frame(df, signal_col, fwd_return_col, ticker_col='Ticker',
     signal_lag>0 takes the signal from `signal_lag` bars earlier PER TICKER
     (strict PIT: the admission decides on info known before fwd_return realizes).
     Rows with a missing signal/fwd_return after lagging are dropped.
+    Rows are stably sorted by timestamp before lagging, so an unsorted frame
+    cannot leak a future bar's signal.
     """
     extra_cols = list(extra_cols or [])
     cols = [ticker_col, signal_col, fwd_return_col] + extra_cols
     work = df[cols].copy()
     if signal_lag:
+        work = work.sort_index(kind='stable')
         work[signal_col] = work.groupby(ticker_col)[signal_col].shift(signal_lag)
     work = work.dropna(subset=[signal_col, fwd_return_col])
     panel = []
