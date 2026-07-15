@@ -1,0 +1,255 @@
+{
+  "wave": "econ-research-2026-07",
+  "date": "2026-07-15",
+  "question": "Nobel-laureate + nominee-tier research, modern economic research, and trading strategies: what proven results apply to this system?",
+  "method": "Workflow wf_31535c40-fde: 6 themed Sonnet literature searchers (Nobel lineages, ML/factor zoo, vol & tails, momentum/reversal/seasonality, crypto, sizing/execution/costs) -> Opus compiler (dedup, wave-2..9 kill-list filter, applicability mapping) -> Fable digest (this ordering + activation tags).",
+  "raw_counts": [
+    {
+      "theme": "nobel",
+      "n": 10
+    },
+    {
+      "theme": "ml_factor",
+      "n": 8
+    },
+    {
+      "theme": "vol_risk",
+      "n": 7
+    },
+    {
+      "theme": "mom_rev",
+      "n": 9
+    },
+    {
+      "theme": "crypto",
+      "n": 8
+    },
+    {
+      "theme": "sizing_exec",
+      "n": 8
+    }
+  ],
+  "fable_digest": [
+    {
+      "rank": 1,
+      "key": "dsr-honest-trials",
+      "survivor": "Honest effective-trials accounting for the DSR deflation",
+      "tag": "mac_now",
+      "why": "Integrity-first (closes review-2026-07-01 defect #8). DSR_MIN=0.60 under-deflates while pruned trials, study-DB resets, and per-wave A/Bs go uncounted. Pure counter plumbing in validation.py/hypersearch_v2 is Mac-provable with synthetic tests; the honest-N re-check of current champions runs on the Jetson."
+    },
+    {
+      "rank": 2,
+      "key": "max-lottery-feature",
+      "survivor": "MAX / lottery-demand feature (idiosyncratic skewness discount)",
+      "tag": "mac_now_code_jetson_activate",
+      "why": "Best evidence-per-effort of the alpha-adjacent items: two decades OOS in equities, larger effect in crypto, long-only usable as a down-weight, rides the existing CS-rank substrate. Model-facing: ships only via harvest+retrain+gates (gotcha #2), after indicator_leadlag IC + redundancy check vs ATR_Pct/IVOL."
+    },
+    {
+      "rank": 3,
+      "key": "no-trade-band",
+      "survivor": "No-trade band / partial-adjustment sizing layer (aim-portfolio)",
+      "tag": "jetson_later",
+      "why": "Pure cost saving on the cost-bound ~50bps crypto book; already graded B+ by the 2026-07-02 review. Measurement-first: size the band from a backtest.py A/B (continuous vs banded) net of the EDGE cost model before any live wiring."
+    },
+    {
+      "rank": 4,
+      "key": "semivariance-shar",
+      "survivor": "Realized semivariance / signed-jump features (SHAR / HAR-RS)",
+      "tag": "jetson_later",
+      "why": "Independent confirmation of the in-house top BUILD item from the indicators review. Blocked on minute-bar harvest (availability + storage on Jetson). Downside-RS is the genuinely leading 12-48h component."
+    },
+    {
+      "rank": 5,
+      "key": "momentum-crash-derisk",
+      "survivor": "Momentum-crash de-risk regime flag",
+      "tag": "jetson_later",
+      "why": "Replicated tail-risk overlay, but the book already stacks 6-8 damping layers that floor at 0.1x with a known VIX double-count. Ship only after a decision_report co-fire audit proves it fires when existing layers do NOT."
+    },
+    {
+      "rank": 6,
+      "key": "cs-funding-rank",
+      "survivor": "Cross-sectional funding-rate rank (crypto)",
+      "tag": "jetson_later",
+      "why": "Cheap but practitioner-grade evidence only. Gate purely on indicator_leadlag incremental IC vs the existing time-series Funding_Z; drop without ceremony if it fails FDR."
+    }
+  ],
+  "survivors": [
+    {
+      "name": "MAX / lottery-demand feature (idiosyncratic skewness discount)",
+      "source": "Bali, Cakici & Whitelaw JFE 2011; crypto replication Financial Innovation 2021 (mom_rev theme)",
+      "claim": "Names with the highest trailing max daily return underperform >1%/mo (equities) and >1.5%/wk (crypto) risk-adjusted, robust to size/momentum/reversal/liquidity/vol/skew controls; the effect is LARGER in crypto than equities.",
+      "evidence": "One of the most robustly replicated cross-sectional anomalies (two-plus decades OOS in equities), with a clean lottery/skewness-overpricing mechanism and a rare clean transfer to crypto at larger magnitude. Not present in the current feature set (unlike momentum/reversal/seasonality) and not on any wave kill list.",
+      "mapping": "New feature in indicators.py: MAX = trailing-21d max daily return (stock) / trailing-7d max daily return (crypto), plus CS_Rank_MAX in panel_ranks.py over the as-of universe. Long-only usage = down-rank / soft down-tilt high-MAX names (they are the underperformers), not a new hard gate. Rides the existing CS-rank substrate on both books.",
+      "effort": "S",
+      "expected_effect": "Modest cross-sectional selection IC gain from de-weighting lottery/overpriced names; complements the wave-9 IVOL low-vol honorable-mention family. No new turnover.",
+      "prereq_measurement": "indicator_leadlag.py predictive-IC on CS_Rank_MAX and redundancy vs ATR_Pct/IVOL before promoting through challenger->shadow->DM-HLN."
+    },
+    {
+      "name": "No-trade band / partial-adjustment sizing layer (aim-portfolio)",
+      "source": "Garleanu & Pedersen JF 2013; Constantinides 1986; Bongaerts-Kang-van Dijk FAJ 2020 (sizing_exec + vol_risk themes)",
+      "claim": "Under transaction costs the optimal policy trades only a fraction of the way toward the target weight and does nothing inside a no-trade band sized by cost vs signal decay; band/threshold rebalancing beats continuous/calendar rebalancing net of costs, and banded vol-targeting keeps the Sharpe/DD benefit while sharply cutting turnover.",
+      "evidence": "JF paper, AQR-implemented, large follow-on literature with no documented failure of the core partial-adjustment logic; the 2026-07-02 in-house review already graded Garleanu-Pedersen bands B+ and endorsed widening entry/exit hysteresis with cost (crypto >> stock).",
+      "mapping": "New band layer between the model's target weight and order_utils/execution_policy: skip re-size / re-entry when |target - current| < band, band sized from per-name EDGE spread (liquidity.py) + ATR; apply the same hysteresis to the vol-target recompute so small hourly vol wiggles don't churn. Distinct from the stock HOLD_RANK selection hysteresis (this acts on position SIZE) and composes with the existing cost gate.",
+      "effort": "M",
+      "expected_effect": "Turnover and cost-drag reduction, largest on the ~50bps crypto book. Pure cost saving, no alpha claim.",
+      "prereq_measurement": "backtest.py A/B of continuous vs banded rebalancing net of the existing fee/EDGE model, using the wave-3 realized-turnover tracker to size the band before shipping."
+    },
+    {
+      "name": "Realized semivariance / signed-jump features (SHAR / HAR-RS)",
+      "source": "Barndorff-Nielsen-Kinnebrock-Shephard 2010; Patton & Sheppard REStat 2015; GJR/EGARCH leverage effect (vol_risk + nobel themes)",
+      "claim": "Splitting realized variance into upside/downside semivariance and feeding both into a HAR-type model (SHAR) improves 1-day-ahead RV forecasts, with the downside component carrying most predictive power; signed asymmetry is a genuinely leading 12-48h signal.",
+      "evidence": "Widely replicated in equities and in crypto (BTC RV); asymmetric HAR is the one well-replicated free upgrade over plain HAR, and the leverage effect is a decades-robust stylized fact. Already the top item on the 2026-07-02 in-house BUILD list, not yet built.",
+      "mapping": "Harvest change (Jetson): pull Alpaca MINUTE bars, compute hourly RS+ (sum of squared positive minute returns) and RS- (negative) plus signed-jump = RS+ - RS-, feed to LSTM/LGB as features (volatility.py/indicators.py). Optional second use: condition policy_exits trailing-stop asymmetry on recent RS- (tighten trail faster after downside-vol spikes).",
+      "effort": "M",
+      "expected_effect": "Modest incremental IC on the return-conditional model at 1-5d horizon (fades at longer horizons) plus better downside-vol timing for sizing/exits. Not a regime change over existing HAR_RV.",
+      "prereq_measurement": "Confirm Alpaca minute-bar availability + Jetson storage cost; indicator_leadlag IC of RS-/signed-jump vs existing HAR_RV before the feature clears the DSR gate."
+    },
+    {
+      "name": "Honest effective-trials accounting for the DSR deflation",
+      "source": "Bailey & Lopez de Prado 2014; Harvey-Liu-Zhu RFS 2016 (nobel + ml_factor themes)",
+      "claim": "The Deflated Sharpe correction is only as good as the trial count fed in, and the significance hurdle should scale with the true number of configurations tried, including pruned and abandoned ones.",
+      "evidence": "Standard result; the correction mechanically under-corrects when N is undercounted. The 2026-07-01 in-house review defect #8 already flagged that pruned trials + study-DB resets + per-wave flag decisions are uncounted, so DSR_MIN=0.60 is currently a partly false floor.",
+      "mapping": "validation.py / hypersearch_v2: maintain a persisted cumulative effective-trials counter (Optuna completed+pruned across study-DB resets, plus per-wave preset/flag A/Bs) and feed it as N into deflated_sharpe_ratio, replacing the current trial-count-agnostic constant.",
+      "effort": "S",
+      "expected_effect": "False-discovery / overfit-promotion risk reduction (honest gate). Tightens promotions, adds no P&L. Keep separate from the uniqueness effective-n correction (gotcha #4 - do not stack).",
+      "prereq_measurement": "Audit the real cumulative trial count vs what DSR currently assumes, then re-check whether recent champions still clear DSR_MIN under the honest N."
+    },
+    {
+      "name": "Momentum-crash de-risk regime flag",
+      "source": "Daniel & Moskowitz RFS 2016; Barroso & Santa-Clara JFE 2015 (mom_rev theme)",
+      "claim": "Momentum returns are left-skewed and crash in post-drawdown, high-volatility, high-dispersion rebound regimes; scaling momentum exposure inversely to momentum's OWN trailing variance nearly eliminates the crashes and roughly doubles Sharpe.",
+      "evidence": "Repeatedly replicated internationally and in crypto; distinct from generic vol-targeting because it conditions on the momentum sleeve's own variance and post-bear rebound state, not account equity. The book is momentum-loaded and this specific crash signature is not currently risk-managed.",
+      "mapping": "Measurement-first de-risk scalar on momentum-loaded positions triggered by (recent large market drawdown + rebound + elevated CS_Dispersion + high trailing momentum-factor variance), separate from the account-level drawdown ladder; expressed as a sizing multiplier in risk_budget/base_loop.",
+      "effort": "M",
+      "expected_effect": "Tail-risk reduction (avoid momentum crashes) on the momentum-loaded long book. Not incremental alpha.",
+      "prereq_measurement": "CRITICAL co-fire audit vs the existing VIX tilt + macro mult + book-vol scalar + DD ladder (the review already found a VIX double-count and 6-8 vol layers flooring at 0.1x) - ship only if it fires when the others do NOT, else it worsens over-damping."
+    },
+    {
+      "name": "Cross-sectional funding-rate rank (crypto)",
+      "source": "Presto Research + practitioner studies 2023-2025; consistent with Liu-Tsyvinski-Wu JF 2022 crypto factor work (crypto theme)",
+      "claim": "Funding-rate LEVEL has weak single-asset timing power but is more robust when used cross-sectionally to rank coins (down-weight high-funding / crowded-long coins) rather than as an absolute per-coin timing threshold.",
+      "evidence": "Practitioner/quant-grade only (not top-journal), directionally consistent with crypto-carry crowding and positioning-proxy literature. LOW confidence - explicitly a weak-fit hypothesis to test before promoting.",
+      "mapping": "Add CS_Rank_Funding_Z to panel_ranks.add_crypto_panel_ranks (funding z-score ranked vs the live crypto universe) and route it through the soft cs_size_tilt, rather than only the time-series Funding_Z already in the feature block.",
+      "effort": "S",
+      "expected_effect": "Small cross-sectional selection / crowding-avoidance improvement on the crypto book. Low confidence.",
+      "prereq_measurement": "indicator_leadlag predictive-IC of CS_Rank_Funding_Z vs the existing time-series Funding_Z; promote only if incremental IC survives FDR, else drop (weak evidence bar)."
+    }
+  ],
+  "killed_overlaps": [
+    {
+      "name": "Post-earnings-announcement drift (PEAD/SUE)",
+      "kill_ref": "wave2-roadmap Research-REJECTED: 'PEAD module (dead post-2006 large caps)'; mom_rev finding itself confirms decay to insignificance ex-microcaps"
+    },
+    {
+      "name": "CAPE / valuation mean-reversion signal",
+      "kill_ref": "review-2026-07-01 ML verdict: cut pseudo-CAPE (fake SPY P/E x1.6 data driving a real 0.7x haircut); horizon mismatch for a 20h book"
+    },
+    {
+      "name": "Variance risk premium (VRP) overlay",
+      "kill_ref": "wave3-selection-timing RED-TEAM KILLS: 'VRP overlay (sign-flipped post-2016, t=-2.84)'; no liquid single-name/crypto option surface anyway"
+    },
+    {
+      "name": "Moreira-Muir single-factor volatility-timing as return alpha",
+      "kill_ref": "wave6 KILLED: 'strategy-level vol-targeting'; Cederburg 2020 / DeMiguel 2024 show single-factor vol-timing fails net of costs (only portfolio-level risk control survives)"
+    },
+    {
+      "name": "Crypto cross-pair cointegration / pairs trading / BTC-lagged spillover",
+      "kill_ref": "review-2026-07-02 BUILD #6 flagged kill-adjacent (cross-industry lead-lag killed wave4); crypto cointegration unstable + crowded/decayed - measurement only via indicator_leadlag"
+    },
+    {
+      "name": "Crypto basis / funding-rate carry sleeve",
+      "kill_ref": "wave7 KILLED: 'cross-sectional crypto carry rank' + funding-harvest (Alpaca spot can't); Crypto Carry Sharpe negative in 2025 (crypto finding confirms decay)"
+    },
+    {
+      "name": "On-chain flows / order-book imbalance features",
+      "kill_ref": "wave2 Research-REJECTED: 'order-book imbalance filters at retail latency'; on-chain flows = unbuilt new-data dependency (arXiv working-paper evidence, not replicated)"
+    },
+    {
+      "name": "Ledoit-Wolf covariance shrinkage / mean-variance cross-asset optimizer",
+      "kill_ref": "wave2 REJECTED HRP/ERC at N<=10; wave6 KILLED Marchenko-Pastur denoising; DeMiguel 1/N - system deliberately has a risk cap, not a covariance optimizer to shrink"
+    },
+    {
+      "name": "Analyst-revision / investor-attention (search) momentum",
+      "kill_ref": "wave2-roadmap Research-REJECTED: 'analyst-revision momentum (free data too slow)'; attention proxies are a new data dependency"
+    },
+    {
+      "name": "Intraday first-half-hour momentum",
+      "kill_ref": "timescale/cross-section mismatch (index-level 30-min effect, weak at single-name per 2024 replication); rejected by fit - not applicable to hourly single-name book"
+    }
+  ],
+  "already_implemented": [
+    {
+      "name": "Tobin/Markowitz two-fund separation",
+      "where": "Kelly x vol-target sizing is a practical separation (signal picks the risky combo, sizing picks leverage): strategy_config KELLY_CAP + base_loop vol scalar; deliberately NOT a mean-variance optimizer"
+    },
+    {
+      "name": "Merton continuous-time return/variance sizing rule",
+      "where": "fractional-Kelly x vol-target functional form in base_loop + bet_sizing.py"
+    },
+    {
+      "name": "Kelly estimation-error / Bayesian shrinkage (avoid overbetting noisy edge)",
+      "where": "wave-9 calibration.py + bet_sizing.py shrink-to-0.5 (behind flags); KELLY_CAP=0.25"
+    },
+    {
+      "name": "Fractional-Kelly drawdown control",
+      "where": "KELLY_CAP=0.25 + persisted drawdown ladder (drawdown.py, wave-8 peak_equity fix)"
+    },
+    {
+      "name": "HAR-RV volatility forecasting",
+      "where": "volatility.py har_forecast_sigma (HAR_VOL_ENABLED); QLIKE/semivariance upgrade is the separate survivor above"
+    },
+    {
+      "name": "Deflated Sharpe / CSCV-PBO / Harvey-Liu-Zhu multiple-testing bar",
+      "where": "validation.py DSR_MIN=0.60 + pbo_cscv + wave-8 scripts/cscv_audit.py (trial-count accuracy is the separate survivor above)"
+    },
+    {
+      "name": "Overnight vs intraday momentum decomposition (Lou-Polk-Skouras)",
+      "where": "wave-4 ON_Mom_21/252 + TugOfWar_252 session-momentum features (stock book)"
+    },
+    {
+      "name": "Mechanical exit stack as disposition-effect antidote",
+      "where": "policy_exits.py hard/trailing/TP/signal/EOD numba kernel (shared by labels/backtest/live)"
+    },
+    {
+      "name": "Granger causality / lead-lag diagnostics",
+      "where": "indicator_leadlag.py predictive-IC vs reactive-coupling at 1-48h (measurement tool, not a pairs strategy)"
+    },
+    {
+      "name": "ML nonlinear tree+NN blend (Gu-Kelly-Xiu) + crypto market/size/momentum 3-factor",
+      "where": "RegressionLSTM + LightGBM blend; panel_ranks.py CS_Rank_* + wave-9 crypto CS ranks; shallow-model choice validated against transformer horse-races"
+    },
+    {
+      "name": "Portfolio-level volatility targeting (multifactor vol-management)",
+      "where": "base_loop EWMA(0.94) book-vol scalar + vol targeting (portfolio level, not per-signal timing)"
+    },
+    {
+      "name": "Almgren-Chriss / patient maker execution at retail scale",
+      "where": "execution_policy.choose_entry_tactic (cross/post/ladder) + order_utils IOC caps + crypto maker ladder"
+    },
+    {
+      "name": "CAPM beta / Betting-Against-Beta realized-beta measurement",
+      "where": "beta_ledger.py (AKL lagged betas, HAC alpha t-stat, up/down + trend-conditional betas)"
+    },
+    {
+      "name": "Residual / factor-momentum-neutralized momentum",
+      "where": "RM_252_21 residual momentum (252d rolling SPY beta stripped) - already neutralizes the Ehsani-Linnainmaa factor-momentum concern"
+    },
+    {
+      "name": "Short-term residual reversal, VIX-conditioned (Nagel liquidity provision)",
+      "where": "RR_5/RR_21 residual reversal + VIX>25 RR_5 popper tiebreak (unconditional reversal deliberately not run)"
+    },
+    {
+      "name": "Turn-of-month + session seasonality",
+      "where": "Turn_of_Month feature (already dropped in the stationary_lean preset given post-2015 US large-cap decay)"
+    }
+  ],
+  "compiler_top10": [
+    "MAX / lottery-demand feature \u2014 cheap OHLCV cross-sectional signal, heavily replicated incl. crypto (larger effect), long-only usable, not yet built (effort S)",
+    "No-trade band / partial-adjustment sizing \u2014 JF/AQR-grade turnover+cost cut on the cost-bound crypto book, already review-endorsed as B+ (effort M)",
+    "Realized semivariance / signed-jump (SHAR/HAR-RS) \u2014 the one well-replicated free upgrade over plain HAR, already the top in-house BUILD item, leading 12-48h signal (effort M, Jetson harvest)",
+    "Honest effective-trials DSR accounting \u2014 closes known review defect #8; DSR_MIN=0.60 is a partly false floor until pruned/reset trials are counted (effort S, integrity)",
+    "Momentum-crash de-risk regime flag \u2014 replicated tail-risk overlay conditioning on momentum's own variance, but measurement-first to avoid worsening the existing vol-layer over-damping (effort M)",
+    "Cross-sectional funding rank (crypto) \u2014 cheap crowding-avoidance tweak to crypto CS ranks, but only practitioner-grade evidence; gate on indicator_leadlag IC before promoting (effort S, low confidence)"
+  ],
+  "notes": "Survivors are RESEARCH VERDICTS, not shipped code. Model-facing items (MAX feature, semivariance, CS funding rank) require harvest+retrain via challenger->shadow->DM-HLN and gotcha #2 (delete study DBs). Sizing/gate overlays (bands, momentum-crash flag) are measurement-first. killed_overlaps are binding: do not rebuild."
+}

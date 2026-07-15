@@ -57,8 +57,12 @@ def test_naive_ts_line_drops_only_itself(sandbox):
     assert list(vals) == pytest.approx([0.5])
 
     monitor_drift.prune_history('')  # must not raise
-    text = monitor_drift.history_file('').read_text()
-    assert '9.9' not in text and '0.5' in text
+    # Parse survivors instead of substring-matching the raw text: the live
+    # timestamp written above can itself contain "9.9" (e.g. :29.939683).
+    survivors = [json.loads(line) for line in
+                 monitor_drift.history_file('').read_text().splitlines()
+                 if line.strip()]
+    assert [s['preds'] for s in survivors] == [{'B': 0.5}]
 
 
 def test_poison_pred_values_drop_only_their_line(sandbox):

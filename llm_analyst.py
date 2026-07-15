@@ -10,11 +10,13 @@ Returns score (0.0–1.0) with bull/bear reasoning per symbol.
 On any failure, returns {} for pass-through (never blocks trades).
 """
 
+import copy
+import hashlib
 import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from llm_config import load_llm_config
@@ -30,6 +32,7 @@ except Exception:  # standalone use without the trading stack
     LLM_VETO_THRESHOLD = 0.15
 
 _ANALYSIS_FILE = Path(__file__).resolve().parent / "llm_analysis.json"
+_REPLAY_DIR = Path(__file__).resolve().parent / "journals" / "llm_replay"
 
 _ANALYST_TEMPERATURE = 0.2  # a sizing gate should be near-deterministic
 _ANALYST_TIMEOUT_SEC = 45   # gate runs every 600s; latency is cheap here
@@ -92,6 +95,55 @@ context, not the answer — do not simply agree with it.\
 _SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.replace(
     "__VETO__", f"{LLM_VETO_THRESHOLD:.2f}")
 
+# --- Advisor v2 (opt-in, shadow-only) --------------------------------------
+# Prompt-version registry: journaled on every shadow row so a future prompt
+# change is a segmentable, measured event (llm_eval per-version stats)
+# instead of a silent regime shift in the journal. PROMPT_VERSION_V1 is the
+# prompt above, unmodified; PROMPT_VERSION_V2 appends _V2_SYSTEM_ADDENDUM
+# below (never mutates _SYSTEM_PROMPT itself — see
+# tests/test_llm_analyst.py:236 byte-identity snapshot).
+PROMPT_VERSION_V1 = 'analyst-v1'
+PROMPT_VERSION_V2 = 'advisor-v2'
+PROMPT_REGISTRY = {
+    PROMPT_VERSION_V1: 'Base qualitative analyst: s/bull/bear/r only.',
+    PROMPT_VERSION_V2: ('Extended decision dossier: adds p_up, conviction, '
+                        'abstain, key_risks, event_flags as shadow-only '
+                        'journal fields (never gate/size a trade).'),
+}
+
+# Fixed vocabulary the LLM's own event_flags output is whitelist-filtered
+# against (llm_eval compares these to the separately-computed
+# `computed_events` — the LLM's read of the news vs. the calendar's PIT
+# facts).
+EVENT_FLAG_VOCAB = (
+    'earnings_within_3d', 'post_earnings', 'overnight_block', 'fomc_today',
+    'cpi_today', 'macro_standdown', 'regulatory', 'legal', 'mna',
+    'guidance_change', 'hack_or_exploit', 'delisting_or_insolvency', 'other',
+)
+
+# Static addendum (no per-call interpolation — maximizes provider prompt-
+# prefix caching, the dominant cost lever). Appended to _SYSTEM_PROMPT only
+# when advisor_v2_enabled; explicitly tells the model these fields are
+# recorded for measurement and do NOT change how `s` is used/consumed.
+_V2_SYSTEM_ADDENDUM = f"""
+
+ADVISOR V2 — ADDITIONAL FIELDS (recorded for measurement only; they do NOT \
+change how your score `s` is used, and `abstain` never alters `s`):
+- p_up: your probability (0.0-1.0) that price is HIGHER than today at the \
+ML model's forward horizon shown in Market Context.
+- conviction: an INTEGER 1-5 evidence-quality bucket — 1 = thin/conflicting \
+evidence, 5 = exceptional multi-source evidence. A separate axis from `s`.
+- abstain: true when the evidence is insufficient, stale, or too \
+conflicting to justify moving `s` off 0.50 — still output your best-effort \
+`s` and `p_up` even when abstain is true; abstain is measured against \
+outcomes, not used to hide a guess.
+- key_risks: up to 3 short, concrete risk phrases (not full sentences).
+- event_flags: zero or more tags from this fixed vocabulary — \
+{", ".join(EVENT_FLAG_VOCAB)} — describing scheduled or breaking events you \
+are aware of for this symbol. Use only tags that apply; omit if none do.
+These fields are journaled for offline measurement and do not gate or size \
+any trade."""
+
 
 def _sanitize_untrusted(text: str, max_len: int = 220) -> str:
     """Sanitize headline/article text before prompt insertion.
@@ -111,12 +163,17 @@ def _sanitize_untrusted(text: str, max_len: int = 220) -> str:
     return text[:max_len]
 
 
-def _response_schema(symbols: list[str]) -> dict:
+def _response_schema(symbols: list[str], extended: bool = False) -> dict:
     """Gemini responseSchema: one required entry per symbol.
 
     Schema enforcement at the API layer replaces ~130 lines of fence
     stripping, brace counting, truncation repair, and array-format
     conversion that this file used to need.
+
+    extended=True (advisor_v2_enabled) adds the v2 shadow-only fields
+    (p_up, conviction, abstain, key_risks, event_flags) — ALL appended to
+    `required` (OpenAI strict mode requires every property be listed).
+    Default (extended=False) is byte/dict-identical to the pre-v2 schema.
     """
     entry = {
         "type": "OBJECT",
@@ -130,6 +187,29 @@ def _response_schema(symbols: list[str]) -> dict:
         },
         "required": ["s", "bull", "bear", "r"],
     }
+    if extended:
+        entry["properties"].update({
+            "p_up": {"type": "NUMBER",
+                     "description": "probability price is higher than "
+                                    "today at the ML horizon (0.0-1.0)"},
+            "conviction": {"type": "INTEGER",
+                          "description": "evidence-quality bucket 1-5 "
+                                         "(1=thin/conflicting, "
+                                         "5=exceptional multi-source)"},
+            "abstain": {"type": "BOOLEAN",
+                       "description": "true if evidence is insufficient "
+                                      "to justify moving s off 0.5"},
+            "key_risks": {"type": "ARRAY", "items": {"type": "STRING"},
+                         "description": "up to 3 short concrete risk "
+                                        "phrases"},
+            "event_flags": {"type": "ARRAY",
+                            "items": {"type": "STRING",
+                                     "enum": list(EVENT_FLAG_VOCAB)},
+                            "description": "zero or more scheduled/"
+                                           "breaking event tags"},
+        })
+        entry["required"] = entry["required"] + [
+            "p_up", "conviction", "abstain", "key_risks", "event_flags"]
     return {
         "type": "OBJECT",
         "properties": {sym: dict(entry) for sym in symbols},
@@ -137,11 +217,214 @@ def _response_schema(symbols: list[str]) -> dict:
     }
 
 
+def _macro_event_flags() -> list[str]:
+    """Best-effort fomc_today/cpi_today/macro_standdown flags for right now
+    (ET calendar day). Pure-stdlib static schedule (macro_calendar.py) —
+    PIT-safe by construction. Never raises; failure returns []."""
+    try:
+        import macro_calendar
+        now = datetime.now(timezone.utc)
+        et = now.astimezone(macro_calendar._ET)
+        today = (et.year, et.month, et.day)
+        flags = []
+        if today in macro_calendar.FOMC_STATEMENT_DAYS:
+            flags.append('fomc_today')
+        if today in macro_calendar.CPI_RELEASE_DAYS:
+            flags.append('cpi_today')
+        standdown, _reason = macro_calendar.macro_standdown(now)
+        if standdown:
+            flags.append('macro_standdown')
+        return flags
+    except Exception:
+        return []
+
+
+def _compute_event_lines(symbol: str, asset_type: str) -> tuple[list, list]:
+    """As-of scheduled-event prompt line + flags for one symbol.
+
+    Stocks: earnings proximity/overnight-block/post-print via the daily
+    events_calendar cache (announced future dates only — PIT-safe). Both
+    books: FOMC/CPI/stand-down via the static published macro_calendar
+    schedule. Wrapped so ANY exception returns ([], []) — this feeds the
+    prompt and the shadow journal, never a live gate.
+    """
+    try:
+        flags = []
+        if asset_type == 'stock':
+            import events_calendar
+            if events_calendar.earnings_within_days(symbol, 3):
+                flags.append('earnings_within_3d')
+            if events_calendar.reported_recently(symbol):
+                flags.append('post_earnings')
+            if events_calendar.blocks_overnight_hold(symbol):
+                flags.append('overnight_block')
+        flags.extend(_macro_event_flags())
+        lines = []
+        if flags:
+            lines.append("- Known scheduled events (computed): " +
+                         ", ".join(flags))
+        return lines, flags
+    except Exception:
+        return [], []
+
+
+def _fng_label(fng_value) -> str | None:
+    """Same F&G bucket breakpoints as _build_prompt's market-context line."""
+    if fng_value is None:
+        return None
+    return ("Extreme Fear" if fng_value <= 10 else
+            "Fear" if fng_value <= 25 else
+            "Neutral" if fng_value <= 55 else
+            "Greed" if fng_value <= 75 else "Extreme Greed")
+
+
+def _pred_sign(pred_return) -> int | None:
+    """Direction only — magnitude drift alone must not defeat the dedup
+    cache; a sign FLIP is a genuine evidence change and IS a miss."""
+    if pred_return is None:
+        return None
+    try:
+        pr = float(pred_return)
+    except (TypeError, ValueError):
+        return None
+    if pr > 0:
+        return 1
+    if pr < 0:
+        return -1
+    return 0
+
+
+def _evidence_hash(candidates, asset_type, positions, fng_value,
+                   computed_events_by_sym) -> str:
+    """Canonical sha256 over the qualitative evidence analyze_trades would
+    show the LLM — used to detect "nothing changed, skip the call" for the
+    opt-in dedup cache. Equity is excluded (volatile, immaterial to
+    qualitative scoring); pred is reduced to SIGN only (see _pred_sign)."""
+    positions = positions or []
+    computed_events_by_sym = computed_events_by_sym or {}
+    per_symbol = []
+    for c in candidates:
+        sym = c.get('symbol')
+        per_symbol.append((
+            sym,
+            list(c.get('news_headlines') or []),
+            c.get('fundamentals_text', '') or '',
+            c.get('profile') or '',
+            sym in positions,
+            _pred_sign(c.get('pred_return')),
+            list(computed_events_by_sym.get(sym, [])),
+        ))
+    per_symbol.sort(key=lambda t: t[0] or '')
+    payload = {
+        'asset_type': asset_type,
+        'symbols': per_symbol,
+        'fng_label': _fng_label(fng_value),
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+# asset_type -> {'hash', 'ts', 'result', 'prompt_sha256', 'prompt_version'}.
+# Opt-in (analyst_dedup_ttl_sec > 0 only); empty/unused on the default path.
+_DEDUP_CACHE: dict[str, dict] = {}
+
+
+def _dedup_cache_hit(cache_entry, evidence_hash, ttl) -> bool:
+    """SAFETY: a cached veto-region score must NEVER be re-served — the
+    2-consecutive-strike liquidation guard in base_loop assumes two
+    INDEPENDENT analyses. Any cached s within 0.05 of LLM_VETO_THRESHOLD
+    forces a fresh call."""
+    if not cache_entry:
+        return False
+    if cache_entry.get('hash') != evidence_hash:
+        return False
+    if (time.time() - cache_entry.get('ts', 0)) >= ttl:
+        return False
+    cached_result = cache_entry.get('result') or {}
+    if not cached_result:
+        return False
+    for entry in cached_result.values():
+        s = entry.get('s')
+        if s is None or s < LLM_VETO_THRESHOLD + 0.05:
+            return False
+    return True
+
+
+def _journal_advisor_shadow(result, candidates, asset_type, model_config,
+                            fng_value, system_prompt, user_prompt, model,
+                            computed_events_by_sym, dedup_hit,
+                            prompt_sha256=None, prompt_version=None):
+    """Journal one 'llm_advisor_v2' shadow row. Never raises — call sites
+    are live trading loops via analyze_trades. Only called when
+    advisor_v2_enabled; trade_journal.log_decision itself honors
+    journal_enabled, so no separate check is needed here."""
+    try:
+        from trade_journal import log_decision
+    except Exception:
+        return
+    try:
+        if prompt_sha256 is None:
+            prompt_sha256 = hashlib.sha256(
+                (system_prompt + '\x00' + user_prompt).encode('utf-8')
+            ).hexdigest()
+        if prompt_version is None:
+            prompt_version = PROMPT_VERSION_V2
+
+        forward_bars = (model_config or {}).get('forward_bars', 24) or 24
+
+        calendar_fetched_at = None
+        try:
+            import events_calendar
+            calendar_fetched_at = events_calendar._load_cache().get('fetched_at')
+        except Exception:
+            pass
+
+        scores = {}
+        for c in candidates:
+            sym = c.get('symbol')
+            entry = result.get(sym) or {}
+            headlines = c.get('news_headlines') or []
+            scores[sym] = {
+                's': entry.get('s'),
+                'pred': c.get('pred_return'),
+                'p_up': entry.get('p_up'),
+                'conviction': entry.get('conviction'),
+                'abstain': entry.get('abstain'),
+                'event_flags': entry.get('event_flags') or [],
+                'computed_events': (computed_events_by_sym or {}).get(sym, []),
+                'n_headlines': len(headlines),
+                'key_risks': entry.get('key_risks') or [],
+            }
+
+        row = {
+            'action': 'llm_advisor_v2',
+            'asset_type': asset_type,
+            'forward_bars': forward_bars,
+            'prompt_version': prompt_version,
+            'prompt_sha256': prompt_sha256,
+            'model': model,
+            'dedup_hit': bool(dedup_hit),
+            'fng_value': fng_value,
+            'context': {
+                'built_at': datetime.now(timezone.utc).isoformat(),
+                'calendar_fetched_at': calendar_fetched_at,
+            },
+            'scores': scores,
+        }
+        log_decision(row)
+    except Exception:
+        pass
+
+
 def analyze_trades(candidates: list[dict], asset_type: str,
                    equity: float = 0, positions: list[str] = None,
                    fng_value: int = None,
                    model_config: dict = None,
-                   position_details: dict = None) -> dict[str, dict]:
+                   position_details: dict = None,
+                   system_prompt: str | None = None,
+                   include_pred: bool = True,
+                   persist: bool = True,
+                   model_override: str | None = None) -> dict[str, dict]:
     """Batch-analyze trade candidates with LLM.
 
     Args:
@@ -153,47 +436,169 @@ def analyze_trades(candidates: list[dict], asset_type: str,
         positions: list of currently held symbols
         fng_value: current Fear & Greed index value
         model_config: model training config (seq_len, forward_bars, etc.)
+        system_prompt: override the system prompt (None = _SYSTEM_PROMPT,
+            or _SYSTEM_PROMPT + _V2_SYSTEM_ADDENDUM when advisor_v2_enabled
+            — an explicit override always wins and disables advisor v2 for
+            that call). Offline prompt-A/B harness use only
+            (scripts/prompt_ab.py) — live call sites never pass this.
+        include_pred: when False, withholds the "ML model prediction" line
+            from the prompt (offline A/B: pred-blind scoring experiment,
+            see PART B #2). Default True reproduces current behavior.
+        persist: when False, skips _save_analysis() (llm_analysis.json),
+            replay-capture (journals/llm_replay/), the advisor-v2 shadow
+            journal row, AND the dedup cache — the harness scores
+            candidates without touching any live state. Default True
+            reproduces current behavior byte-for-byte.
+        model_override: pin the exact model requested, bypassing smart
+            routing — used by the harness so both A/B variants are asked
+            of the SAME model for a fair comparison.
 
     Returns:
         dict mapping symbol -> {'m': float, 's': float, 'r': str,
                                  'bull': str, 'bear': str}
         Empty dict on failure (all symbols get default pass-through).
+
+    Opt-in extensions (both default OFF — see llm_config.py), active only
+    on the plain live path (system_prompt is None and persist is True):
+      advisor_v2_enabled     extended prompt/schema/parse (p_up, conviction,
+                            abstain, key_risks, event_flags) journaled as a
+                            SHADOW-ONLY 'llm_advisor_v2' row; the returned
+                            dict's 's' handling and llm_analysis.json shape
+                            are unaffected either way.
+      analyst_dedup_ttl_sec  evidence-hash call-dedup cache; a cache HIT
+                            skips call_model/_save_analysis entirely (see
+                            _dedup_cache_hit for the veto-margin safety
+                            rule protecting the 2-strike liquidation guard).
+    With both at their shipped defaults (False / 0) this function's
+    behavior is byte-identical to before these options existed.
     """
     config = load_llm_config()
     if not config.get("enabled") or not candidates:
         return {}
 
+    positions = positions or []
+    # advisor v2 and the dedup cache only engage on the plain live path —
+    # an explicit system_prompt override (offline A/B harness) or
+    # persist=False always gets the v1 prompt/schema/parse untouched.
+    advisor_v2 = (bool(config.get("advisor_v2_enabled", False))
+                 and system_prompt is None)
+    try:
+        ttl = min(max(int(config.get("analyst_dedup_ttl_sec", 0) or 0), 0), 7000)
+    except (TypeError, ValueError):
+        ttl = 0
+    use_dedup = ttl > 0 and persist and system_prompt is None
+
+    computed_events_by_sym = {}
+    if advisor_v2:
+        for c in candidates:
+            sym = c.get("symbol")
+            try:
+                _lines, flags = _compute_event_lines(sym, asset_type)
+            except Exception:
+                flags = []
+            computed_events_by_sym[sym] = flags
+
+    evidence_hash = None
+    if use_dedup:
+        try:
+            evidence_hash = _evidence_hash(candidates, asset_type, positions,
+                                           fng_value, computed_events_by_sym)
+            cache_entry = _DEDUP_CACHE.get(asset_type)
+            if _dedup_cache_hit(cache_entry, evidence_hash, ttl):
+                cached_result = copy.deepcopy(cache_entry["result"])
+                if advisor_v2:
+                    _journal_advisor_shadow(
+                        cached_result, candidates, asset_type, model_config,
+                        fng_value, "", "", cache_entry.get("model", ""),
+                        computed_events_by_sym, dedup_hit=True,
+                        prompt_sha256=cache_entry.get("prompt_sha256"),
+                        prompt_version=cache_entry.get("prompt_version"))
+                return cached_result
+        except Exception:
+            evidence_hash = None
+
+    system = system_prompt or (_SYSTEM_PROMPT + _V2_SYSTEM_ADDENDUM
+                               if advisor_v2 else _SYSTEM_PROMPT)
     prompt = _build_prompt(candidates, asset_type, equity, positions,
                            fng_value, model_config,
-                           position_details=position_details)
+                           position_details=position_details,
+                           include_pred=include_pred,
+                           extended=advisor_v2)
 
     symbols = [c["symbol"] for c in candidates]
-    schema = _response_schema(symbols)
-    analyst_model = get_recommended_model('analyst')
+    schema = _response_schema(symbols, extended=advisor_v2)
+    analyst_model = model_override or get_recommended_model('analyst')
     n_syms = len(candidates)
-    max_tok = max(4096, n_syms * 400)
+    max_tok = max(4096, n_syms * (550 if advisor_v2 else 400))
 
     # Provider-aware: analyst_model may be a Gemini or Claude model
     # (config provider switch / role override) — call_model dispatches.
-    response = call_model(prompt, system=_SYSTEM_PROMPT,
-                          model=analyst_model, max_tokens=max_tok,
-                          json_schema=schema,
-                          temperature=_ANALYST_TEMPERATURE,
-                          timeout=_ANALYST_TIMEOUT_SEC)
+    # Transport is fail-soft (module contract, docstring line 10: "On any
+    # failure, returns {} for pass-through") — an unexpected exception from
+    # either transport (network/provider-SDK error) degrades to no-response
+    # rather than propagating into the caller's trading loop.
+    try:
+        response = call_model(prompt, system=system,
+                              model=analyst_model, max_tokens=max_tok,
+                              json_schema=schema,
+                              temperature=_ANALYST_TEMPERATURE,
+                              timeout=_ANALYST_TIMEOUT_SEC)
+    except Exception as e:
+        print(f"[LLM-ANALYST] call_model failed: {e}")
+        response = None
     if not response:
-        response = call_llm(prompt, system=_SYSTEM_PROMPT,
-                            max_tokens=max_tok, json_schema=schema,
-                            temperature=_ANALYST_TEMPERATURE)
+        try:
+            response = call_llm(prompt, system=system,
+                                max_tokens=max_tok, json_schema=schema,
+                                temperature=_ANALYST_TEMPERATURE)
+        except Exception as e:
+            print(f"[LLM-ANALYST] call_llm fallback failed: {e}")
+            response = None
     if not response:
         return {}
 
-    result = _parse_response(response, symbols)
+    result = _parse_response(response, symbols, extended=advisor_v2)
 
     # Persist analysis to disk for GUI display — recording the model that
     # ACTUALLY responded, not the one we asked for (fallbacks used to be
-    # silently mis-attributed)
-    if result:
-        _save_analysis(result, asset_type, get_last_model_used() or analyst_model)
+    # silently mis-attributed). Gated on `persist` so the offline A/B
+    # harness (scripts/prompt_ab.py) can score candidates without touching
+    # llm_analysis.json or the replay journal.
+    if result and persist:
+        model_used = get_last_model_used() or analyst_model
+        _save_analysis(result, asset_type, model_used)
+        _journal_replay(candidates, asset_type, equity, positions,
+                        fng_value, model_config, position_details, result,
+                        model_used)
+
+        prompt_sha256_val = None
+        if advisor_v2 or use_dedup:
+            try:
+                prompt_sha256_val = hashlib.sha256(
+                    (system + '\x00' + prompt).encode('utf-8')).hexdigest()
+            except Exception:
+                prompt_sha256_val = None
+
+        if advisor_v2:
+            _journal_advisor_shadow(
+                result, candidates, asset_type, model_config, fng_value,
+                system, prompt, model_used, computed_events_by_sym,
+                dedup_hit=False, prompt_sha256=prompt_sha256_val,
+                prompt_version=PROMPT_VERSION_V2)
+
+        if use_dedup and evidence_hash:
+            try:
+                _DEDUP_CACHE[asset_type] = {
+                    "hash": evidence_hash,
+                    "ts": time.time(),
+                    "result": copy.deepcopy(result),
+                    "prompt_sha256": prompt_sha256_val,
+                    "prompt_version": (PROMPT_VERSION_V2 if advisor_v2
+                                       else PROMPT_VERSION_V1),
+                    "model": model_used,
+                }
+            except Exception:
+                pass
 
     return result
 
@@ -419,8 +824,15 @@ def _build_symbol_profiles(symbols):
 
 
 def _build_prompt(candidates, asset_type, equity, positions, fng_value,
-                  model_config, position_details=None):
-    """Build the user prompt with qualitative and price context."""
+                  model_config, position_details=None, include_pred=True,
+                  extended=False):
+    """Build the user prompt with qualitative and price context.
+
+    extended=True (advisor_v2_enabled) inserts a per-symbol computed-event
+    line (after the OPEN POSITION block) and one market-context macro
+    line — both derived from _compute_event_lines/_macro_event_flags.
+    Default (extended=False) output is byte-identical to before v2.
+    """
     lines = []
 
     # Market context
@@ -453,6 +865,19 @@ def _build_prompt(candidates, asset_type, equity, positions, fng_value,
         fb = model_config.get('forward_bars')
         if fb:
             lines.append(f"- ML model horizon: ~{fb} hours forward")
+    if extended:
+        try:
+            macro_flags = _macro_event_flags()
+            if macro_flags:
+                label_map = {
+                    'fomc_today': 'FOMC statement today',
+                    'cpi_today': 'CPI release today',
+                    'macro_standdown': 'macro stand-down window active',
+                }
+                bits = [label_map.get(f, f) for f in macro_flags]
+                lines.append(f"- Macro calendar: {', '.join(bits)}")
+        except Exception:
+            pass
     lines.append("")
 
     # Trade memory injection
@@ -481,14 +906,22 @@ def _build_prompt(candidates, asset_type, equity, positions, fng_value,
             except (TypeError, ValueError):
                 pass
 
+        if extended:
+            try:
+                event_lines, _flags = _compute_event_lines(sym, asset_type)
+                lines.extend(event_lines)
+            except Exception:
+                pass
+
         # Comprehensive data profile (price, technicals, fundamentals, news)
         profile = c.get("profile")
         if profile:
             lines.append(profile)
 
-        # ML model prediction context
+        # ML model prediction context (omit entirely when include_pred=False
+        # — the offline pred-blind A/B experiment, PART B #2)
         pred_return = c.get("pred_return")
-        if pred_return is not None:
+        if include_pred and pred_return is not None:
             direction = "bullish" if pred_return > 0 else "bearish"
             lines.append(f"- ML model prediction: {pred_return:+.4f}% ({direction} signal)")
 
@@ -522,7 +955,8 @@ def _build_prompt(candidates, asset_type, equity, positions, fng_value,
     return "\n".join(lines)
 
 
-def _parse_response(response: str, symbols: list[str]) -> dict[str, dict]:
+def _parse_response(response: str, symbols: list[str],
+                    extended: bool = False) -> dict[str, dict]:
     """Parse the schema-enforced JSON response into symbol -> entry dict.
 
     With responseSchema enforced at the API layer the response IS the JSON
@@ -530,6 +964,12 @@ def _parse_response(response: str, symbols: list[str]) -> dict[str, dict]:
     array-conversion machinery (and its long tail of bugfix commits) is no
     longer needed. A thin fence-strip remains for any non-enforced fallback
     provider.
+
+    extended=True additionally extracts and validates the v2 shadow-only
+    fields (p_up, conviction, abstain, key_risks, event_flags) as EXTRA
+    keys on each result entry. s/m/r/bull/bear handling is unchanged either
+    way, so llm_analysis.json (which only ever reads that fixed key set)
+    is unaffected regardless of `extended`.
     """
     text = response.strip()
     text = re.sub(r'^```(?:json)?\s*', '', text)
@@ -563,7 +1003,262 @@ def _parse_response(response: str, symbols: list[str]) -> dict[str, dict]:
             "bear": entry.get("bear", ""),
         }
 
+        if extended:
+            p_up = entry.get("p_up")
+            try:
+                p_up = max(0.0, min(1.0, float(p_up)))
+            except (TypeError, ValueError):
+                p_up = None
+
+            conviction = entry.get("conviction")
+            try:
+                conviction = max(1, min(5, int(conviction)))
+            except (TypeError, ValueError):
+                conviction = None
+
+            abstain = bool(entry.get("abstain", False))
+
+            raw_risks = entry.get("key_risks")
+            key_risks = []
+            if isinstance(raw_risks, list):
+                for kr in raw_risks[:3]:
+                    key_risks.append(_sanitize_untrusted(kr, 100))
+
+            raw_flags = entry.get("event_flags")
+            event_flags = []
+            if isinstance(raw_flags, list):
+                event_flags = [f for f in raw_flags if f in EVENT_FLAG_VOCAB]
+
+            result[sym]["p_up"] = p_up
+            result[sym]["conviction"] = conviction
+            result[sym]["abstain"] = abstain
+            result[sym]["key_risks"] = key_risks
+            result[sym]["event_flags"] = event_flags
+
     return result
+
+
+def rich_context_enabled() -> bool:
+    """One-line accessor for the loops; fail-soft False.
+
+    Gate-behavior-changing (finding 1/2 of the review): default OFF until a
+    prompt_ab.py ADOPT verdict — see llm_config.py docstring.
+    """
+    try:
+        return bool(load_llm_config().get("rich_context_enabled", False))
+    except Exception:
+        return False
+
+
+def build_compact_evidence(symbol: str, snapshot: dict | None,
+                           fundamentals: dict | None,
+                           position: dict | None = None,
+                           asset_type: str = "stock") -> str | None:
+    """Build a compact quant evidence block from data already fetched THIS
+    cycle — zero new network calls in the hot loop.
+
+    Sources: the prediction snapshot dict (predict_now.py's
+    _SNAPSHOT_COLS — price/momentum/technicals, already computed every
+    cycle), the TTL-cached fundamentals dict the candidate builder already
+    holds, the earnings-calendar disk cache (read-only, no fetch), and the
+    in-memory Position. Deliberately does NOT restate the ML pred — that
+    lives in its own prompt line, and this block must not become a second
+    echo channel.
+
+    Returns a short plain-text block (<=600 chars) via the EXISTING
+    `profile` prompt slot, or None if there's no snapshot to build from.
+    """
+    if not snapshot:
+        return None
+
+    def _f(key):
+        v = snapshot.get(key)
+        if v is None:
+            return None
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        if v != v:  # NaN
+            return None
+        return v
+
+    close = _f('Close')
+    lines = []
+
+    # --- Price / momentum line ---
+    parts = []
+    if close is not None:
+        parts.append(f"Close ${close:,.2f}")
+    r4 = _f('Return_4h')
+    if r4 is not None:
+        parts.append(f"Ret4h {r4:+.2f}%")
+    r12 = _f('Return_12h')
+    if r12 is not None:
+        parts.append(f"Ret12h {r12:+.2f}%")
+    vol12 = _f('Volatility_12h')
+    if vol12 is not None:
+        parts.append(f"Vol12h {vol12:.2f}%")
+    atr_pct = _f('ATR_Pct')
+    if atr_pct is not None:
+        parts.append(f"ATR {atr_pct:.2f}%")
+    rsi = _f('RSI')
+    if rsi is not None:
+        tag = " OVERSOLD" if rsi < 30 else " OVERBOUGHT" if rsi > 70 else ""
+        parts.append(f"RSI {rsi:.0f}{tag}")
+    sma_ratio = _f('Price_SMA20_Ratio')
+    if sma_ratio is not None:
+        parts.append(f"Px/SMA20 {sma_ratio:.3f}")
+    bbp = _f('BBP_20_2.0')
+    if bbp is not None:
+        parts.append(f"BBP {bbp:.2f}")
+    vol_ratio = _f('Volume_Ratio')
+    if vol_ratio is not None:
+        parts.append(f"Vol {vol_ratio:.1f}x avg")
+    hurst = _f('Hurst')
+    if hurst is not None:
+        parts.append(f"Hurst {hurst:.2f}")
+    if parts:
+        lines.append("- " + " | ".join(parts))
+
+    # --- Relative-strength line ---
+    rs_parts = []
+    if asset_type == 'crypto':
+        btc_rsi = _f('BTC_RSI')
+        if btc_rsi is not None:
+            rs_parts.append(f"BTC RSI {btc_rsi:.0f}")
+        btc_sma = _f('BTC_SMA_Ratio')
+        if btc_sma is not None:
+            rs_parts.append(f"BTC Px/SMA {btc_sma:.3f}")
+        btc_ret = _f('BTC_Return_1h')
+        if btc_ret is not None:
+            rs_parts.append(f"BTC Ret1h {btc_ret:+.2f}%")
+    else:
+        rs_spy = _f('RS_vs_SPY')
+        if rs_spy is not None:
+            rs_parts.append(f"RS vs SPY {rs_spy:+.2f}%")
+    if rs_parts:
+        lines.append("- " + " | ".join(rs_parts))
+
+    # --- Valuation one-liner (crypto fundamentals are all-None -> omitted) ---
+    if fundamentals:
+        val_parts = []
+        pe = fundamentals.get('pe_ratio')
+        if pe is not None:
+            val_parts.append(f"P/E {pe:.1f}")
+        pb = fundamentals.get('pb_ratio')
+        if pb is not None:
+            val_parts.append(f"P/B {pb:.1f}")
+        mc = fundamentals.get('market_cap')
+        if mc:
+            if mc >= 1e12:
+                val_parts.append(f"MktCap ${mc / 1e12:.1f}T")
+            elif mc >= 1e9:
+                val_parts.append(f"MktCap ${mc / 1e9:.1f}B")
+            else:
+                val_parts.append(f"MktCap ${mc / 1e6:.0f}M")
+        rg = fundamentals.get('revenue_growth')
+        if rg is not None:
+            val_parts.append(f"RevGrowth {rg * 100:+.1f}%")
+        beta = fundamentals.get('beta')
+        if beta is not None:
+            val_parts.append(f"Beta {beta:.2f}")
+        sector = fundamentals.get('sector')
+        if sector:
+            val_parts.append(f"Sector {sector}")
+        w_hi = fundamentals.get('week52_high')
+        w_lo = fundamentals.get('week52_low')
+        if w_hi and w_lo and close is not None and w_hi > w_lo:
+            pos52 = (close - w_lo) / (w_hi - w_lo)
+            val_parts.append(f"52w-pos {pos52:.2f}")
+        if val_parts:
+            lines.append("- " + " | ".join(val_parts))
+
+    # --- Next earnings date (stocks; cache-read only, no network call) ---
+    if asset_type != 'crypto':
+        try:
+            from events_calendar import next_earnings_date
+            ed = next_earnings_date(symbol)
+            if ed:
+                lines.append(f"- Next earnings: {ed}")
+        except Exception:
+            pass
+
+    # --- Position state ---
+    if position:
+        try:
+            qty = position.get('qty')
+            entry = position.get('entry_price')
+            if qty is not None and entry:
+                entry = float(entry)
+                pos_line = f"- OPEN POSITION: {qty} @ ${entry:,.4f} entry"
+                if close is not None and entry > 0:
+                    pnl = (close - entry) / entry * 100
+                    pos_line += f" ({pnl:+.2f}% unrealized)"
+                lines.append(pos_line)
+        except (TypeError, ValueError):
+            pass
+
+    if not lines:
+        return None
+
+    block = "Quantitative snapshot (last CLOSED hourly bar):\n" + "\n".join(lines)
+    return block[:600]
+
+
+def _journal_replay(candidates, asset_type, equity, positions, fng_value,
+                    model_config, position_details, result, model_used):
+    """Journal the full candidate-cycle inputs for offline prompt A/B replay.
+
+    Without this, scripts/prompt_ab.py has nothing to replay: the existing
+    `llm_analysis` journal row (base_loop.py) only carries {sym: {s, pred}}
+    — headlines/fundamentals/fng/positions are NOT journaled there. This is
+    measurement-only and must NEVER affect analyze_trades' return value —
+    entire body fail-soft (mirrors every other journal write in this repo).
+    """
+    try:
+        config = load_llm_config()
+        if not config.get("replay_capture_enabled", True):
+            return
+        replay_dir = _REPLAY_DIR
+        replay_dir.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now(timezone.utc).astimezone()
+        record = {
+            "ts": now.isoformat(),
+            "asset_type": asset_type,
+            "forward_bars": (model_config or {}).get("forward_bars", 24),
+            "equity": equity,
+            "positions": list(positions) if positions else [],
+            "position_details": position_details or {},
+            "fng": fng_value,
+            "candidates": candidates,
+            "live_scores": {sym: v.get("s") for sym, v in result.items()},
+            "live_model": model_used,
+        }
+        path = replay_dir / f"{now.date().isoformat()}.jsonl"
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+
+        _prune_replay_journal(replay_dir)
+    except Exception as e:
+        print(f"[LLM-ANALYST] replay capture failed (non-fatal): {e}")
+
+
+def _prune_replay_journal(replay_dir: Path, max_age_days: int = 45):
+    """Delete journals/llm_replay/*.jsonl files older than max_age_days
+    (Jetson disk hygiene; ~<=5 MB/day worst case)."""
+    try:
+        cutoff = datetime.now(timezone.utc).date() - timedelta(days=max_age_days)
+        for f in replay_dir.glob("*.jsonl"):
+            try:
+                day = datetime.strptime(f.stem, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if day < cutoff:
+                f.unlink()
+    except Exception:
+        pass
 
 
 def refresh_one(symbol: str, asset_type: str = 'stock'):

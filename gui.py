@@ -25,9 +25,9 @@ from notify import halt_active, set_halt, clear_halt, request_flatten
 from hw_monitor import get_gpu_temp as hw_get_gpu_temp
 
 from PySide6.QtCore import (
-    Qt, QTimer, QThread, Signal, Slot, QObject,
+    Qt, QTimer, QThread, Signal, Slot, QObject, QRectF, QPointF,
 )
-from PySide6.QtGui import QColor, QPalette, QFont, QAction, QPainter, QPixmap, QDesktopServices, QIcon
+from PySide6.QtGui import QColor, QPalette, QFont, QAction, QPainter, QPixmap, QDesktopServices, QIcon, QPicture
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget,
@@ -40,6 +40,9 @@ from PySide6.QtWidgets import (
 )
 import pyqtgraph as pg
 import numpy as np
+import chart_core
+
+pg.setConfigOptions(antialias=True)
 
 class NumericTableItem(QTableWidgetItem):
     """QTableWidgetItem that sorts by UserRole (numeric) when available."""
@@ -421,6 +424,125 @@ def set_theme(name):
     """Switch the active theme colors."""
     global T
     T = THEMES[name]
+
+
+def _chart_palette():
+    """Theme -> chart-color derivation. The ONLY place this happens."""
+    return chart_core.derive_chart_palette({k: v.name() for k, v in T.items()})
+
+
+class ChartCrosshair:
+    """Reusable time/value crosshair for a pyqtgraph PlotItem — display only,
+    never touches files or triggers a fetch. Snaps to the nearest data point
+    via chart_core.nearest_index so the readout always matches a real bar."""
+
+    def __init__(self, plot_item, pal, y_fmt=lambda v: f'${v:,.2f}'):
+        self._plot_item = plot_item
+        self._y_fmt = y_fmt
+        self._t = np.array([], dtype=float)
+        self._y = np.array([], dtype=float)
+        self._vline = pg.InfiniteLine(angle=90, movable=False,
+                                       pen=pg.mkPen(pal['crosshair'], style=Qt.DotLine))
+        self._hline = pg.InfiniteLine(angle=0, movable=False,
+                                       pen=pg.mkPen(pal['crosshair'], style=Qt.DotLine))
+        plot_item.addItem(self._vline, ignoreBounds=True)
+        plot_item.addItem(self._hline, ignoreBounds=True)
+        self._text = pg.TextItem(anchor=(0, 1), color=pal['fg'])
+        plot_item.addItem(self._text, ignoreBounds=True)
+        self._vline.hide()
+        self._hline.hide()
+        self._text.hide()
+        self._proxy = pg.SignalProxy(plot_item.scene().sigMouseMoved, rateLimit=30,
+                                      slot=self._moved)
+
+    def set_series(self, t, y):
+        self._t = np.asarray(t, dtype=float)
+        self._y = np.asarray(y, dtype=float)
+
+    def set_palette(self, pal):
+        self._vline.setPen(pg.mkPen(pal['crosshair'], style=Qt.DotLine))
+        self._hline.setPen(pg.mkPen(pal['crosshair'], style=Qt.DotLine))
+        self._text.setColor(pal['fg'])
+
+    def _moved(self, evt):
+        pos = evt[0]
+        if not self._plot_item.sceneBoundingRect().contains(pos) or len(self._t) == 0:
+            self._vline.hide()
+            self._hline.hide()
+            self._text.hide()
+            return
+        p = self._plot_item.getViewBox().mapSceneToView(pos)
+        i = chart_core.nearest_index(self._t, p.x())
+        t_val, y_val = self._t[i], self._y[i]
+        self._vline.setPos(t_val)
+        self._hline.setPos(y_val)
+        label = dt.datetime.fromtimestamp(t_val).strftime('%m-%d %H:%M') + '  ' + self._y_fmt(y_val)
+        self._text.setText(label)
+        self._text.setPos(t_val, y_val)
+        self._vline.show()
+        self._hline.show()
+        self._text.show()
+
+
+class CandlestickItem(pg.GraphicsObject):
+    """OHLC candlestick series drawn into a cached QPicture — repaint cost is
+    zero on pan/theme-repaint (Jetson-friendly). up/down colors passed in by
+    the caller so it never touches the theme system directly."""
+
+    def __init__(self):
+        super().__init__()
+        self._picture = QPicture()
+        self._rect = QRectF()
+
+    def set_data(self, t, o, h, l, c, w, up_mask, up_color, down_color,
+                 bg_color=None):
+        t = np.asarray(t, dtype=float)
+        if len(t) == 0:
+            self._picture = QPicture()
+            self._rect = QRectF()
+            self.prepareGeometryChange()
+            self.update()
+            return
+        o = np.asarray(o, dtype=float)
+        h = np.asarray(h, dtype=float)
+        l = np.asarray(l, dtype=float)
+        c = np.asarray(c, dtype=float)
+        w = np.asarray(w, dtype=float)
+        up_mask = np.asarray(up_mask, dtype=bool)
+
+        self._picture = QPicture()
+        painter = QPainter(self._picture)
+        try:
+            # Direction is never encoded by hue alone (palette validator:
+            # green/red collapses under deuteranopia in some themes):
+            # up-candles are HOLLOW (surface fill), down-candles FILLED.
+            up_fill = bg_color if bg_color is not None else up_color
+            for mask, color, fill in ((up_mask, up_color, up_fill),
+                                      (~up_mask, down_color, down_color)):
+                pen = pg.mkPen(color, width=1)
+                brush = pg.mkBrush(fill)
+                painter.setPen(pen)
+                painter.setBrush(brush)
+                for i in np.nonzero(mask)[0]:
+                    painter.drawLine(QPointF(t[i], l[i]), QPointF(t[i], h[i]))
+                    painter.drawRect(QRectF(t[i] - w[i] / 2, o[i], w[i], c[i] - o[i]))
+        finally:
+            painter.end()
+
+        wmax = float(np.max(w)) if len(w) else 0.0
+        self._rect = QRectF(
+            float(t.min()) - wmax, float(l.min()),
+            float(t.max() - t.min()) + 2 * wmax,
+            float(h.max() - l.min()) or 1e-9,
+        )
+        self.prepareGeometryChange()
+        self.update()
+
+    def paint(self, p, *args):
+        p.drawPicture(0, 0, self._picture)
+
+    def boundingRect(self):
+        return self._rect
 
 
 _THEME_SVGS = {
@@ -1162,22 +1284,29 @@ class DataFetcher(QObject):
         resolution: 'daily' | 'hourly' | '15min' | '5min'
         Uses get_crypto_bars() for crypto symbols (containing '/').
         Caches per (symbol, resolution) so zoom switches within the same
-        resolution are instant.
+        resolution are instant. This is the ONLY place chart trade-marker
+        file IO (chart_core.load_trade_markers) may happen — never from a
+        paint/update path.
         """
+        import datetime as _dt
+        now_ts = _dt.datetime.now().timestamp()
         try:
-            import datetime as _dt
-
-            now_ts = _dt.datetime.now().timestamp()
+            ttl_by_resolution = {'daily': 300, 'hourly': 300, '15min': 120, '5min': 60}
+            ttl = ttl_by_resolution.get(resolution, 300)
 
             # Check cache
             sym_cache = self._chart_cache.get(symbol, {})
             cached = sym_cache.get(resolution)
-            if cached and (now_ts - cached['cached_at']) < self._chart_cache_ttl:
-                self.chart_updated.emit({
-                    'symbol': symbol, 'resolution': resolution,
-                    'closes': cached['closes'],
-                    'timestamps': cached['timestamps'],
-                })
+            if cached and (now_ts - cached['cached_at']) < ttl:
+                payload = dict(cached)
+                payload['symbol'] = symbol
+                payload['resolution'] = resolution
+                try:
+                    payload['markers'] = chart_core.load_trade_markers(
+                        symbol, str(BASE_DIR / 'journals'), since_ts=now_ts - 366 * 86400)
+                except Exception:
+                    payload['markers'] = None
+                self.chart_updated.emit(payload)
                 return
 
             # Resolution → API params. Limits must cover the whole lookback
@@ -1203,8 +1332,21 @@ class DataFetcher(QObject):
 
             closes = []
             timestamps = []
+            opens, highs, lows, volumes = [], [], [], []
+            ohlc_complete = True
             for b in bars:
                 closes.append(float(b.c))
+                o_val = getattr(b, 'o', None)
+                h_val = getattr(b, 'h', None)
+                l_val = getattr(b, 'l', None)
+                v_val = getattr(b, 'v', None)
+                if o_val is None or h_val is None or l_val is None:
+                    ohlc_complete = False
+                else:
+                    opens.append(float(o_val))
+                    highs.append(float(h_val))
+                    lows.append(float(l_val))
+                volumes.append(float(v_val) if v_val is not None else 0.0)
                 try:
                     t = b.t
                     if hasattr(t, 'timestamp'):
@@ -1215,6 +1357,15 @@ class DataFetcher(QObject):
                         timestamps.append(ts_parsed.timestamp())
                 except Exception:
                     timestamps.append(start.timestamp() + len(timestamps) * 3600)
+
+            entry = {
+                'closes': closes, 'timestamps': timestamps, 'cached_at': now_ts,
+                'volumes': volumes,
+            }
+            if ohlc_complete and len(opens) == len(closes):
+                entry['opens'] = opens
+                entry['highs'] = highs
+                entry['lows'] = lows
 
             # Store in nested cache: sym -> {resolution -> data}
             if symbol not in self._chart_cache:
@@ -1228,19 +1379,21 @@ class DataFetcher(QObject):
                     del self._chart_cache[oldest_sym]
                 self._chart_cache[symbol] = {}
 
-            self._chart_cache[symbol][resolution] = {
-                'closes': closes, 'timestamps': timestamps,
-                'cached_at': now_ts,
-            }
+            self._chart_cache[symbol][resolution] = entry
 
-            self.chart_updated.emit({
-                'symbol': symbol, 'resolution': resolution,
-                'closes': closes, 'timestamps': timestamps,
-            })
+            payload = dict(entry)
+            payload['symbol'] = symbol
+            payload['resolution'] = resolution
+            try:
+                payload['markers'] = chart_core.load_trade_markers(
+                    symbol, str(BASE_DIR / 'journals'), since_ts=now_ts - 366 * 86400)
+            except Exception:
+                payload['markers'] = None
+            self.chart_updated.emit(payload)
         except Exception as e:
             self.chart_updated.emit({
                 'symbol': symbol, 'resolution': resolution,
-                'closes': [], 'timestamps': [], 'error': str(e),
+                'closes': [], 'timestamps': [], 'error': str(e), 'cached_at': now_ts,
             })
 
     @Slot()
@@ -1759,6 +1912,8 @@ class TradingDashboard(QMainWindow):
         self._orders_cache = []
         self._hw_cache = {}
         self._last_fng = None  # Fear & Greed, fetched off-thread by fetch_news
+        self._chart_fp = {}  # chart fingerprint memo — skips redundant repaints
+        self._chart_last_ok = {'perf': None, 'price': None}  # staleness ticker
 
         # Restore last used theme
         settings = _load_gui_settings()
@@ -1843,6 +1998,16 @@ class TradingDashboard(QMainWindow):
         self._clock_timer.timeout.connect(self._update_clock)
         self._clock_timer.start(1_000)
         self._update_clock()
+
+        # Markets-tab chart auto-refresh (every 2 min, only while tab visible)
+        self._chart_timer = QTimer(self)
+        self._chart_timer.timeout.connect(self._auto_refresh_chart)
+        self._chart_timer.start(120_000)
+
+        # Chart staleness ticker (every 30s — re-titles without re-fetching)
+        self._chart_stale_timer = QTimer(self)
+        self._chart_stale_timer.timeout.connect(self._refresh_chart_staleness)
+        self._chart_stale_timer.start(30_000)
 
     # ---- Toolbar ---------------------------------------------------------
     def _build_toolbar(self):
@@ -1955,13 +2120,24 @@ class TradingDashboard(QMainWindow):
         for group in self.findChildren(QGroupBox):
             group.setStyleSheet(group_style)
 
-        # Plots
-        for plot in [self._equity_plot, self._pnl_plot, self._stock_chart]:
-            plot.setBackground(t["bg_dark"].name())
+        # Plots — theme -> chart palette flows through chart_core exclusively
+        pal = _chart_palette()
+        self._chart_pal = pal
+        self._equity_plot.setBackground(pal['bg'])
+        self._pnl_plot.setBackground(pal['bg'])
+        self._stock_chart_widget.setBackground(pal['bg'])
+        for plot in [self._equity_plot, self._pnl_plot, self._stock_chart, self._stock_vol_plot]:
+            self._style_plot(plot, pal)
 
         # Plot pen colors
-        self._equity_curve.setPen(pg.mkPen(t["accent"].name(), width=2))
-        self._stock_chart_line.setPen(pg.mkPen(t["accent"].name(), width=2))
+        self._equity_curve.setPen(pg.mkPen(pal['equity'], width=2))
+        self._equity_hwm.setPen(pg.mkPen(pal['hwm'], width=1, style=Qt.DashLine))
+        self._equity_dd_fill.setBrush(pg.mkBrush(pal['dd_fill']))
+        self._stock_chart_line.setPen(pg.mkPen(pal['equity'], width=2))
+        self._equity_xhair.set_palette(pal)
+        self._stock_xhair.set_palette(pal)
+        self._entry_scatter.setPen(pg.mkPen(pal['bg'], width=2))
+        self._exit_scatter.setPen(pg.mkPen(pal['bg'], width=2))
 
         # Zoom buttons
         for buttons in [self._stock_zoom_buttons, self._perf_zoom_buttons]:
@@ -2074,6 +2250,58 @@ class TradingDashboard(QMainWindow):
         self._clock_label_right.setStyleSheet(
             f"font-size: 12px; font-weight: bold; padding: 0 8px; color: {t['accent'].name()};"
         )
+
+        # Re-apply cached data so data-colored items (P&L bars, candles,
+        # heatmap tiles) repaint under the new theme instead of staying
+        # stuck with the previous theme's colors until the next fetch.
+        self._chart_fp.clear()
+        cached = self._perf_history_cache.get(self._perf_api_period()[0])
+        if cached:
+            self._apply_perf_data(cached)
+        self._apply_chart_zoom()
+        if getattr(self, '_stock_data_cache', None):
+            self.on_stocks(self._stock_data_cache)
+
+    def _style_plot(self, plot, pal):
+        """Themed axes for a PlotWidget OR PlotItem — fixes the grey-tick-on
+        -every-theme DateAxisItem defect. Backgrounds stay on the top-level
+        widget (setBackground); this only touches axis pens/text/grid."""
+        pi = plot.getPlotItem() if hasattr(plot, 'getPlotItem') else plot
+        for side in ('left', 'bottom'):
+            ax = pi.getAxis(side)
+            ax.setPen(pg.mkPen(pal['grid']))
+            ax.setTextPen(pg.mkPen(pal['fg']))
+        pi.showGrid(x=True, y=True, alpha=0.25)
+
+    def _set_chart_status(self, plot, base_title, status):
+        """Render a ChartStatus as a colored plot title — every empty/stale
+        /error chart state is visible, never a silently blank chart."""
+        pal = getattr(self, '_chart_pal', None) or _chart_palette()
+        suffix = status.title_suffix(time.time())
+        if status.status == 'ok' and not status.note:
+            color = pal['fg']
+        elif status.status == 'error':
+            color = pal['title_err']
+        else:
+            color = pal['title_warn']
+        pi = plot.getPlotItem() if hasattr(plot, 'getPlotItem') else plot
+        pi.setTitle(base_title + suffix, color=color, size='10pt')
+
+    def _refresh_chart_staleness(self):
+        """Re-title charts whose data hasn't refreshed recently — data stays
+        visible, the title just warns. Does not re-fetch or re-plot data."""
+        now = time.time()
+        perf_last = self._chart_last_ok.get('perf')
+        if perf_last is not None and (now - perf_last) > 900:
+            status = chart_core.ChartStatus(status=chart_core.PARTIAL,
+                                             message='stale', updated_at=perf_last)
+            self._set_chart_status(self._equity_plot, 'Equity Curve', status)
+        price_last = self._chart_last_ok.get('price')
+        if price_last is not None and (now - price_last) > 600:
+            sym = self._stock_symbol_combo.currentText()
+            status = chart_core.ChartStatus(status=chart_core.PARTIAL,
+                                             message='stale', updated_at=price_last)
+            self._set_chart_status(self._stock_chart, f'{sym} ({self._stock_zoom})', status)
 
     # ---- Tab 1: Dashboard ------------------------------------------------
     def _build_dashboard_tab(self):
@@ -2326,7 +2554,13 @@ class TradingDashboard(QMainWindow):
         self._equity_plot = pg.PlotWidget(axisItems={'bottom': eq_axis})
         self._equity_plot.showGrid(x=True, y=True, alpha=0.3)
         self._equity_plot.setLabel("left", "Equity ($)")
-        self._equity_curve = self._equity_plot.plot(pen=pg.mkPen(width=2))
+        self._equity_plot.addLegend(offset=(8, 8))
+        self._equity_hwm = self._equity_plot.plot(pen=pg.mkPen(width=1), name='High-water')
+        self._equity_curve = self._equity_plot.plot(pen=pg.mkPen(width=2), name='Equity')
+        self._equity_dd_fill = pg.FillBetweenItem(
+            self._equity_hwm, self._equity_curve, brush=pg.mkBrush(0, 0, 0, 0))
+        self._equity_plot.addItem(self._equity_dd_fill)
+        self._equity_xhair = ChartCrosshair(self._equity_plot.getPlotItem(), _chart_palette())
         self._equity_plot.setMouseEnabled(x=False, y=False)
         layout.addWidget(self._equity_plot, stretch=1)
 
@@ -2334,6 +2568,11 @@ class TradingDashboard(QMainWindow):
         self._pnl_plot = pg.PlotWidget(axisItems={'bottom': pnl_axis})
         self._pnl_plot.showGrid(x=True, y=True, alpha=0.3)
         self._pnl_plot.setLabel("left", "P&L ($)")
+        self._pnl_bars_pos = pg.BarGraphItem(x=[], height=[], width=1)
+        self._pnl_bars_neg = pg.BarGraphItem(x=[], height=[], width=1)
+        self._pnl_plot.addItem(self._pnl_bars_pos)
+        self._pnl_plot.addItem(self._pnl_bars_neg)
+        self._pnl_plot.setXLink(self._equity_plot.getPlotItem())
         self._pnl_plot.setMouseEnabled(x=False, y=False)
         layout.addWidget(self._pnl_plot, stretch=1)
 
@@ -2508,7 +2747,11 @@ class TradingDashboard(QMainWindow):
 
     # ---- Tab 5: Markets --------------------------------------------------
     def _build_stocks_tab(self):
-        from stock_config import load_stock_universe, save_stock_universe
+        try:
+            from stock_config import load_stock_universe, save_stock_universe
+        except Exception:
+            load_stock_universe = lambda: []
+            save_stock_universe = lambda s: None
         tab = QWidget()
         main_layout = QVBoxLayout(tab)
 
@@ -2563,15 +2806,44 @@ class TradingDashboard(QMainWindow):
         # --- Middle: chart (left) + heatmap (right) via splitter ---
         splitter = QSplitter(Qt.Horizontal)
 
-        # Price chart with date axis
-        date_axis = pg.DateAxisItem(orientation='bottom')
-        self._stock_chart = pg.PlotWidget(axisItems={'bottom': date_axis})
+        # Price chart with date axis (GraphicsLayoutWidget: price + volume panes)
+        self._stock_chart_widget = pg.GraphicsLayoutWidget()
+        self._stock_chart = self._stock_chart_widget.addPlot(
+            row=0, col=0, axisItems={'bottom': pg.DateAxisItem(orientation='bottom')})
+        self._stock_chart.getAxis('bottom').setStyle(showValues=False)
         self._stock_chart.showGrid(x=True, y=True, alpha=0.3)
         self._stock_chart.setLabel("left", "Price ($)")
-        self._stock_chart_line = self._stock_chart.plot(pen=pg.mkPen(width=2))
         self._stock_chart.setMouseEnabled(x=False, y=False)  # zoom via buttons only
-        self._stock_chart_data = {}  # resolution -> {closes, timestamps}
-        splitter.addWidget(self._stock_chart)
+        self._stock_chart_line = self._stock_chart.plot(pen=pg.mkPen(width=2))
+        self._candle_item = CandlestickItem()
+        self._stock_chart.addItem(self._candle_item)
+        chart_pal = _chart_palette()
+        # Surface-colored ring separates markers from candles beneath them;
+        # re-themed in _restyle alongside every other chart pen.
+        self._entry_scatter = pg.ScatterPlotItem(
+            symbol='t1', size=11, pen=pg.mkPen(chart_pal['bg'], width=2))
+        self._exit_scatter = pg.ScatterPlotItem(
+            symbol='t', size=11, pen=pg.mkPen(chart_pal['bg'], width=2))
+        self._stock_chart.addItem(self._entry_scatter)
+        self._stock_chart.addItem(self._exit_scatter)
+        leg = self._stock_chart.addLegend(offset=(8, 8))
+        leg.addItem(self._entry_scatter, 'Entry')
+        leg.addItem(self._exit_scatter, 'Exit')
+        self._stock_xhair = ChartCrosshair(self._stock_chart, chart_pal)
+
+        self._stock_vol_plot = self._stock_chart_widget.addPlot(
+            row=1, col=0, axisItems={'bottom': pg.DateAxisItem(orientation='bottom')})
+        self._stock_vol_plot.setXLink(self._stock_chart)
+        self._stock_vol_plot.setLabel("left", "Vol")
+        self._stock_vol_plot.setMouseEnabled(x=False, y=False)
+        self._vol_bars = pg.BarGraphItem(x=[], height=[], width=1)
+        self._stock_vol_plot.addItem(self._vol_bars)
+
+        self._stock_chart_widget.ci.layout.setRowStretchFactor(0, 3)
+        self._stock_chart_widget.ci.layout.setRowStretchFactor(1, 1)
+
+        self._stock_chart_data = {}  # resolution -> fetch_chart payload
+        splitter.addWidget(self._stock_chart_widget)
 
         # Heatmap panel
         heatmap_container = QWidget()
@@ -2652,6 +2924,7 @@ class TradingDashboard(QMainWindow):
         self._stock_data_cache = {}  # latest data from fetch_stocks
         self._llm_analysis_cache = {}  # latest llm analysis
         self.tabs.addTab(tab, "Markets")
+        self._markets_tab_index = self.tabs.indexOf(tab)
 
     def _on_stock_add(self):
         from stock_config import load_stock_universe, save_stock_universe
@@ -2695,7 +2968,17 @@ class TradingDashboard(QMainWindow):
         """Symbol changed — clear old data and fetch for current zoom."""
         self._stock_chart_data = {}
         self._stock_chart_line.clear()
+        self._clear_price_items()
+        self._chart_fp.pop('price', None)
         self._request_chart()
+
+    def _clear_price_items(self):
+        """Clear candle/volume/marker items (symbol switch or empty state)."""
+        self._candle_item.set_data([], [], [], [], [], [], [], self._chart_pal['up'],
+                                    self._chart_pal['down'])
+        self._vol_bars.setOpts(x=[], height=[], width=1, brushes=None)
+        self._entry_scatter.setData(x=[], y=[])
+        self._exit_scatter.setData(x=[], y=[])
 
     def _zoom_resolution(self, zoom=None):
         """Map zoom level to the API resolution needed."""
@@ -3019,81 +3302,92 @@ class TradingDashboard(QMainWindow):
             Q_ARG(str, sym), Q_ARG(str, res),
         )
 
+    def _auto_refresh_chart(self):
+        """120s TTL-bounded auto-refresh — only while Markets tab is visible."""
+        if self.tabs.currentIndex() == self._markets_tab_index:
+            self._request_chart()
+
     def _apply_chart_zoom(self):
-        """Slice cached data to the zoom window and autoscale."""
+        """Slice cached data to the zoom window (via chart_core) and paint."""
         res = self._zoom_resolution()
         data = self._stock_chart_data.get(res)
-        if not data:
-            return
-        closes = data.get('closes', [])
-        timestamps = data.get('timestamps', [])
-        if not closes or not timestamps:
-            return
-
-        import datetime as _dt
-        now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
-        zoom_days = {"1Y": 365, "3M": 90, "1M": 30, "1W": 7, "1D": 1}
-        cutoff = now_ts - zoom_days.get(self._stock_zoom, 30) * 86400
-
-        # Find first index >= cutoff
-        start_idx = None
-        for i, ts in enumerate(timestamps):
-            if ts >= cutoff:
-                start_idx = i
-                break
-        if start_idx is None:
-            # Cached series ends before the zoom window — don't render
-            # stale bars under a current-window title
-            self._stock_chart_line.clear()
-            self._stock_chart.setTitle(
-                f"{self._stock_symbol_combo.currentText()} "
-                f"({self._stock_zoom}) — no data in window")
-            return
-
-        vis_ts = timestamps[start_idx:]
-        vis_closes = closes[start_idx:]
-
-        if vis_closes:
-            self._stock_chart_line.setData(vis_ts, vis_closes)
-            y_min = min(vis_closes)
-            y_max = max(vis_closes)
-            pad = (y_max - y_min) * 0.05 if y_max > y_min else y_max * 0.02
-            self._stock_chart.setXRange(vis_ts[0], vis_ts[-1], padding=0.02)
-            self._stock_chart.setYRange(y_min - pad, y_max + pad, padding=0)
-        else:
-            self._stock_chart_line.clear()
-
         sym = self._stock_symbol_combo.currentText()
-        self._stock_chart.setTitle(f"{sym} ({self._stock_zoom})")
+        if not data:
+            return  # _request_chart already set the "Loading..." title
+
+        view = chart_core.build_price_view(data, self._stock_zoom)
+        if self._chart_fp.get('price') == view.fingerprint:
+            if view.status.status == 'ok':
+                self._chart_last_ok['price'] = view.status.updated_at
+            self._set_chart_status(self._stock_chart, f'{sym} ({self._stock_zoom})', view.status)
+            return
+        self._chart_fp['price'] = view.fingerprint
+
+        pal = self._chart_pal
+        if view.mode == 'candles':
+            self._candle_item.set_data(view.t, view.o, view.h, view.l, view.c, view.w,
+                                        view.up, pal['up'], pal['down'],
+                                        bg_color=pal['bg'])
+            self._stock_chart_line.setData([], [])
+        elif view.mode == 'line':
+            self._stock_chart_line.setData(view.line_t, view.line_c)
+            self._candle_item.set_data([], [], [], [], [], [], [], pal['up'], pal['down'])
+        else:
+            self._stock_chart_line.setData([], [])
+            self._candle_item.set_data([], [], [], [], [], [], [], pal['up'], pal['down'])
+
+        if view.has_volume:
+            # Volume is a magnitude, not a direction: one recessive hue.
+            # Direction already lives on the candles — repeating it here
+            # would double-encode (and reintroduce the green/red CVD trap).
+            vol_color = QColor(pal['grid'])
+            vol_color.setAlpha(110)
+            self._vol_bars.setOpts(x=view.vol_t, height=view.vol_v,
+                                    width=view.vol_w, brushes=None,
+                                    brush=vol_color, pen=pg.mkPen(None))
+        else:
+            self._vol_bars.setOpts(x=[], height=[], width=1, brushes=None)
+        if view.vol_y_range is not None:
+            self._stock_vol_plot.setYRange(*view.vol_y_range, padding=0)
+
+        mk = view.markers  # empty dict on mode-'none' views — .get, not []
+        self._entry_scatter.setData(x=mk.get('entry_t', []), y=mk.get('entry_p', []),
+                                     brush=pal['marker_entry'])
+        self._exit_scatter.setData(x=mk.get('exit_t', []), y=mk.get('exit_p', []),
+                                    brush=pal['marker_exit'])
+
+        if view.x_range is not None:
+            self._stock_chart.setXRange(*view.x_range, padding=0.02)
+        if view.y_range is not None:
+            self._stock_chart.setYRange(*view.y_range, padding=0)
+
+        if view.mode == 'candles':
+            self._stock_xhair.set_series(view.t, view.c)
+        elif view.mode == 'line':
+            self._stock_xhair.set_series(view.line_t, view.line_c)
+        else:
+            self._stock_xhair.set_series([], [])
+
+        if view.status.status == 'ok':
+            self._chart_last_ok['price'] = view.status.updated_at
+
+        self._set_chart_status(self._stock_chart, f'{sym} ({self._stock_zoom})', view.status)
 
     @Slot(dict)
     def on_chart(self, data):
-        """Handle chart_updated signal — store into resolution slot, apply zoom."""
+        """Handle chart_updated signal — store full payload, apply zoom.
+        build_price_view (inside _apply_chart_zoom) turns error/empty
+        payloads into a ChartStatus, so no branching happens here."""
         sym = data.get('symbol', '')
         res = data.get('resolution', 'daily')
-        closes = data.get('closes', [])
-        timestamps = data.get('timestamps', [])
-        error = data.get('error')
 
-        # Only update if this symbol is still selected
+        # Only update if this symbol is still selected (mid-flight drop)
         if self._stock_symbol_combo.currentText() != sym:
             return
 
-        if error:
-            self._stock_chart_line.clear()
-            self._stock_chart.setTitle(f"{sym} — Error: {error}")
-            return
-
-        if closes and timestamps:
-            self._stock_chart_data[res] = {
-                'closes': closes, 'timestamps': timestamps,
-            }
-            # Only apply if this resolution matches current zoom
-            if self._zoom_resolution() == res:
-                self._apply_chart_zoom()
-        else:
-            self._stock_chart_line.clear()
-            self._stock_chart.setTitle(f"{sym} — No data")
+        self._stock_chart_data[res] = data
+        if self._zoom_resolution() == res:
+            self._apply_chart_zoom()
 
     @Slot(dict)
     def on_stocks(self, data):
@@ -3122,24 +3416,14 @@ class TradingDashboard(QMainWindow):
                 self._heatmap_layout.addWidget(lbl, r, c)
 
             lbl = self._heatmap_labels[sym]
-            # Color intensity scales with magnitude (max ±5%)
-            intensity = min(abs(chg) / 5.0, 1.0)
-            if chg > 0:
-                r_val = int(20 + 20 * (1 - intensity))
-                g_val = int(80 + 175 * intensity)
-                b_val = int(20 + 20 * (1 - intensity))
-            elif chg < 0:
-                r_val = int(80 + 175 * intensity)
-                g_val = int(20 + 20 * (1 - intensity))
-                b_val = int(20 + 20 * (1 - intensity))
-            else:
-                r_val, g_val, b_val = 60, 60, 60
+            pal = self._chart_pal or _chart_palette()
+            bg_hex, text_hex = chart_core.heatmap_style(chg, pal)
 
             short = sym.split('/')[0] if '/' in sym else sym
             lbl.setText(f"{short}\n{chg:+.1f}%")
             lbl.setStyleSheet(
-                f"background-color: rgb({r_val},{g_val},{b_val});"
-                f" color: white; font-size: 10px; font-weight: bold;"
+                f"background-color: {bg_hex}; color: {text_hex};"
+                f" font-size: 10px; font-weight: bold;"
                 f" border-radius: 4px; padding: 2px;"
             )
 
@@ -4036,55 +4320,52 @@ class TradingDashboard(QMainWindow):
             self._apply_perf_data(data)
 
     def _apply_perf_data(self, data):
-        equities = data.get("equity", [])
-        timestamps = data.get("timestamp", [])
-        pnl = data.get("profit_loss", [])
+        view = chart_core.build_equity_view(data)
 
-        if equities and timestamps:
-            ts_arr = [float(t) for t in timestamps]
-            self._equity_curve.setData(ts_arr, equities)
-            y_min = min(equities)
-            y_max = max(equities)
-            pad = (y_max - y_min) * 0.05 if y_max > y_min else y_max * 0.02
-            self._equity_plot.setXRange(ts_arr[0], ts_arr[-1], padding=0.02)
-            self._equity_plot.setYRange(y_min - pad, y_max + pad, padding=0)
+        if view.status.status in ('ok', 'partial'):
+            if self._chart_fp.get('perf') == view.fingerprint:
+                if view.status.status == 'ok':
+                    self._chart_last_ok['perf'] = view.status.updated_at
+                self._set_chart_status(self._equity_plot, 'Equity Curve', view.status)
+                return
+            self._chart_fp['perf'] = view.fingerprint
 
-        if pnl and timestamps and len(timestamps) == len(pnl):
-            self._pnl_plot.clear()
-            ts_arr = [float(t) for t in timestamps]
-            # Bar width ~80% of interval between points
-            bar_w = (ts_arr[1] - ts_arr[0]) * 0.8 if len(ts_arr) > 1 else 86400 * 0.8
-            pos_x = [ts_arr[i] for i, v in enumerate(pnl) if v >= 0]
-            pos_h = [v for v in pnl if v >= 0]
-            neg_x = [ts_arr[i] for i, v in enumerate(pnl) if v < 0]
-            neg_h = [v for v in pnl if v < 0]
-            if pos_x:
-                self._pnl_plot.addItem(pg.BarGraphItem(
-                    x=pos_x, height=pos_h, width=bar_w, brush=T["green"].name()))
-            if neg_x:
-                self._pnl_plot.addItem(pg.BarGraphItem(
-                    x=neg_x, height=neg_h, width=bar_w, brush=T["red"].name()))
-            self._pnl_plot.setXRange(ts_arr[0], ts_arr[-1], padding=0.02)
+            self._equity_curve.setData(view.ts, view.equity)
+            self._equity_hwm.setData(view.ts, view.hwm)
+            if view.x_range is not None:
+                self._equity_plot.setXRange(*view.x_range, padding=0.02)
+            if view.y_range is not None:
+                self._equity_plot.setYRange(*view.y_range, padding=0)
 
-            total_return = sum(pnl)
-            best_day = max(pnl) if pnl else 0
-            worst_day = min(pnl) if pnl else 0
+            pos = view.pnl >= 0
+            neg = ~pos
+            self._pnl_bars_pos.setOpts(
+                x=view.pnl_ts[pos], height=view.pnl[pos],
+                width=view.pnl_widths[pos], brush=self._chart_pal['up'])
+            self._pnl_bars_neg.setOpts(
+                x=view.pnl_ts[neg], height=view.pnl[neg],
+                width=view.pnl_widths[neg], brush=self._chart_pal['down'])
 
-            self._set_card(self._stat_return, fmt_money(total_return), pnl_color(total_return))
-            self._set_card(self._stat_best, fmt_money(best_day), T["green"])
-            self._set_card(self._stat_worst, fmt_money(worst_day), T["red"])
+            s = view.stats or {}
+            self._set_card(self._stat_return, fmt_money(s.get('total_return', 0)),
+                            pnl_color(s.get('total_return', 0)))
+            self._set_card(self._stat_best, fmt_money(s.get('best_day', 0)), T["green"])
+            self._set_card(self._stat_worst, fmt_money(s.get('worst_day', 0)), T["red"])
+            max_dd = s.get('max_dd_pct', 0)
+            self._set_card(self._stat_drawdown, f"-{max_dd:.2f}%",
+                           T["red"] if max_dd > 0 else T["white"])
 
-            if equities:
-                peak = equities[0]
-                max_dd = 0
-                for eq in equities:
-                    if eq > peak:
-                        peak = eq
-                    dd = (peak - eq) / peak * 100 if peak else 0
-                    if dd > max_dd:
-                        max_dd = dd
-                self._set_card(self._stat_drawdown, f"-{max_dd:.2f}%",
-                               T["red"] if max_dd > 0 else T["white"])
+            self._equity_xhair.set_series(view.ts, view.equity)
+            self._chart_last_ok['perf'] = view.status.updated_at
+        else:
+            if not self._chart_fp.get('perf'):
+                self._equity_curve.clear()
+                self._equity_hwm.clear()
+                self._pnl_bars_pos.setOpts(x=[], height=[], width=1)
+                self._pnl_bars_neg.setOpts(x=[], height=[], width=1)
+
+        self._set_chart_status(self._equity_plot, 'Equity Curve', view.status)
+        self._set_chart_status(self._pnl_plot, 'Daily P&L', view.status)
 
     @Slot(dict)
     def on_hw(self, data):

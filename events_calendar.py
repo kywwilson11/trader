@@ -129,6 +129,27 @@ def _dates_for(symbol: str) -> list[dict]:
     return _load_cache().get('by_symbol', {}).get(symbol.upper(), [])
 
 
+def next_earnings_date(symbol: str) -> str | None:
+    """Nearest upcoming earnings date (ISO 'YYYY-MM-DD'), or None.
+
+    Cache-READ ONLY — deliberately does NOT call refresh_if_stale() (that
+    path can fetch). This is called from the hot LLM-candidate-building
+    path (llm_analyst.build_compact_evidence), where a network call would
+    be a hidden hot-loop fetch; the calendar is refreshed elsewhere on its
+    own 24h cadence, and this just reads whatever's already on disk.
+    """
+    today = datetime.date.today()
+    best = None
+    for e in _dates_for(symbol):
+        try:
+            d = datetime.date.fromisoformat(e['date'])
+        except (KeyError, ValueError):
+            continue
+        if d >= today and (best is None or d < best):
+            best = d
+    return best.isoformat() if best else None
+
+
 def earnings_within_days(symbol: str, days: int = 1) -> bool:
     """True if the symbol reports within the next `days` calendar days."""
     refresh_if_stale()

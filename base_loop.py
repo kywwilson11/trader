@@ -32,7 +32,7 @@ from trading_utils import (
 from hw_monitor import get_gpu_temp
 from sentiment import sentiment_gate
 from llm_config import load_llm_config
-from llm_analyst import analyze_trades
+from llm_analyst import analyze_trades, rich_context_enabled, build_compact_evidence
 from fundamentals import get_fundamentals, format_fundamentals_for_llm
 from trade_journal import log_decision
 from trade_memory import record_trade
@@ -893,6 +893,11 @@ class BaseTradingLoop(ABC):
         except Exception:
             pass
 
+        # Stash for the LLM candidate builder's rich-context evidence block
+        # (stock_loop already does this; setting it in the base too gives
+        # the crypto loop access — harmless when rich_context_enabled=False).
+        self._last_snapshots = snapshots
+
         return preds, snapshots
 
     def _run_llm_analysis(self, preds: dict):
@@ -1017,16 +1022,33 @@ class BaseTradingLoop(ABC):
     def _build_llm_candidates(self, preds: dict) -> list[dict]:
         """Build candidate list for LLM analysis. Override for stock-specific fundamentals."""
         candidates = []
+        rich = rich_context_enabled()
         for symbol in self.get_symbol_universe():
             fund = get_fundamentals(symbol, self.get_asset_type())
             fund_text = format_fundamentals_for_llm(symbol, fund)
             headlines = self.get_fresh_headlines(symbol)
-            candidates.append({
+            candidate = {
                 'symbol': symbol,
                 'pred_return': preds.get(symbol),
                 'fundamentals_text': fund_text,
                 'news_headlines': headlines,
-            })
+            }
+            if rich:
+                # Fail-open: evidence is an optional enrichment — an error
+                # here must never abort the cycle (sells/buys run after us).
+                try:
+                    prof = build_compact_evidence(
+                        symbol,
+                        getattr(self, '_last_snapshots', {}).get(symbol),
+                        fund,
+                        position=(self.positions[symbol].to_dict()
+                                  if symbol in self.positions else None),
+                        asset_type=self.get_asset_type())
+                    if prof:
+                        candidate['profile'] = prof
+                except Exception:
+                    pass
+            candidates.append(candidate)
         return candidates
 
     def _record_confirmed_exit(self, symbol, pos, order, quote, exit_reason,

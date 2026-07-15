@@ -1,0 +1,16 @@
+feat: 2026-07 charts overhaul + LLM advisor v2/rich-context + research round
+
+- gui chart overhaul: pure-numpy chart_core (LTTB downsampling, OHLC aggregation,
+  computed palette, journal trade markers) + candle/volume panes, crosshair,
+  HWM/drawdown, staleness titles in gui.py
+- LLM rich-context + advisor-v2 dossier (both default-OFF, byte-compat pinned by
+  tests): replay capture + scripts/prompt_ab.py A/B harness, evidence-hash dedup
+  with veto-region bypass, llm_eval --advisor calibration report
+- docs: README rewritten from source + CLAUDE.md 2026-07-15 refresh — test
+  baseline 1887 passed / 21 failed / 15 skipped / 7 errors, backtest --prefix
+  {''|stock} correction ('' = crypto), 10 GUI themes, LLM stack = Gemini +
+  Anthropic/Claude + OpenAI/OpenAI-compatible (all schema-enforced)
+- research: econ + nobel/modern 2026-07 research (kill-list-screened; PEAD/SUE
+  flipped ACTIONABLE -> SKIP per wave-2 kill list)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>

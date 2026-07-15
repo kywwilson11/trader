@@ -32,6 +32,7 @@ from market_data import fetch_spy_bars_alpaca, get_live_atr
 from sentiment import sentiment_gate, get_market_sentiment, get_recent_headlines
 from stock_config import load_stock_universe
 from fundamentals import get_fundamentals, get_insider_activity, get_filing_summary, format_fundamentals_for_llm
+from llm_analyst import rich_context_enabled, build_compact_evidence
 from log_config import get_logger
 from trade_memory import record_trade
 
@@ -477,18 +478,35 @@ class StockLoop(BaseTradingLoop):
     def _build_llm_candidates(self, preds: dict) -> list[dict]:
         """Stock-specific: include insider activity and filing summaries."""
         candidates = []
+        rich = rich_context_enabled()
         for symbol in self.top_symbols:
             fund = get_fundamentals(symbol, 'stock')
             insider = get_insider_activity(symbol)
             filing_sum = get_filing_summary(symbol)
             fund_text = format_fundamentals_for_llm(symbol, fund, insider, filing_sum)
             headlines = self.get_fresh_headlines(symbol)
-            candidates.append({
+            candidate = {
                 'symbol': symbol,
                 'pred_return': preds.get(symbol),
                 'fundamentals_text': fund_text,
                 'news_headlines': headlines,
-            })
+            }
+            if rich:
+                # Fail-open: evidence is an optional enrichment — an error
+                # here must never abort the cycle (sells/buys run after us).
+                try:
+                    prof = build_compact_evidence(
+                        symbol,
+                        getattr(self, '_last_snapshots', {}).get(symbol),
+                        fund,
+                        position=(self.positions[symbol].to_dict()
+                                  if symbol in self.positions else None),
+                        asset_type='stock')
+                    if prof:
+                        candidate['profile'] = prof
+                except Exception:
+                    pass
+            candidates.append(candidate)
         return candidates
 
     def _get_predictions(self, benchmark_close):

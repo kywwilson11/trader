@@ -7,9 +7,9 @@ One **RegressionLSTM + LightGBM blend per book** (the old dual bear/bull ensembl
 cost-aware gating, and a policy backtester that replays *real* exits before any model is promoted. Runs in production on an **NVIDIA Jetson
 Orin Nano (8 GB)**. Research is organized into numbered "waves" (see `research/waveN_research.json`).
 
-> **The README is stale** — it describes old internals. Trust the code and this file, not `README.md`.
-> Deep architecture invariants live in the `trader-architecture-truth` memory; current rolling
-> state (what's uncommitted, what's next) lives in the `session-state` memory. **Read those two first.**
+> **This file is the operational source of truth.** The README (rewritten 2026-07-15) is a human
+> overview — if it and the code disagree, trust the code. Deep architecture invariants live in the
+> `trader-architecture-truth` memory; current rolling state lives in `session-state`. **Read those two first.**
 
 ---
 
@@ -35,24 +35,25 @@ do not invent ssh/rsync steps.
 
 ## Running tests
 
-**Canonical dev-Mac command** (12 modules can't import their heavy deps, so always continue past
+**Canonical dev-Mac command** (some test modules can't import their heavy deps, so always continue past
 collection errors):
 
 ```bash
 python3 -m pytest tests/ --continue-on-collection-errors -q
 ```
 
-**Current baseline (verified 2026-07-02): `780 passed, 34 failed, 1 skipped, 14 errors`.**
-The 34 failures + 14 errors are **ALL pre-existing missing-dependency failures** (dotenv / torch /
+**Current baseline (verified 2026-07-15): `1887 passed, 21 failed, 15 skipped, 7 errors`.**
+The 21 failures + 7 errors are **ALL pre-existing missing-dependency failures** (dotenv / torch /
 lightgbm / optuna / joblib / numba / sklearn), **not regressions**. On the full Jetson stack the
 suite is green.
 
 **Verify a change introduced no regressions (the standard method):** A/B with `git stash` —
 run the command above, `git stash`, run again, compare the failed/errored set. Identical set ⇒
-zero regressions. Never treat the 34/14 baseline as "broken."
+zero regressions. Never treat the 21/7 baseline as "broken."
+The `/regression-ab` skill runs this ritual end-to-end and diffs failure *names*, not counts.
 
-- `pytest tests/ --collect-only -q` reports **653 collected, 12 collection errors** (the collected
-  count counts tests inside modules that then error at import).
+- `pytest tests/ --collect-only -q` still reports collection errors for the heavy-dep test modules (the
+  collected count includes tests inside modules that then error at import).
 - `tests/test_sentiment_headlines.py` is a **standalone runner** (~1060 assertions), not a pytest
   module — run it with `python tests/test_sentiment_headlines.py` (needs deps → Jetson/CI).
 - CI (`.github/workflows/ci.yml`): Ubuntu, py3.10+3.12, full deps, `py_compile` syntax check →
@@ -68,21 +69,21 @@ for reference (exact flags verified from the source):
 | Command | What it does |
 |---|---|
 | `python run_pipeline.py` | Orchestrator: harvest → train → gate → launch bots → weekly retrain (hot-reload, bots never stop). Flags: `--no-retrain`, `--bot-only`, `--skip-harvest`, `--combined-bots`, `--crypto-only`, `--stock-only`, `--trials N`, `--retrain-trials N` |
-| `python run_bots.py [--combined-bots\|--crypto-only\|--stock-only]` | Live bots only (combined = both loops in one process, saves ~0.5–0.8 GB RAM on Jetson) |
+| `python run_bots.py [--crypto-only\|--stock-only]` | Live bots only — default runs BOTH loops in one process (saves ~0.5–0.8 GB RAM on Jetson) |
 | `python scripts/harvest_crypto_data.py` / `harvest_stock_data.py` | 1Y hourly OHLCV + features → `*training_data.{csv,parquet}` |
 | `python scripts/hypersearch_v2.py --trials N [--prefix stock] [--data F] [--fresh] [--shadow] [--preset stationary]` | Optuna TPE search (LSTM + LightGBM leg), holdout DSR gate |
-| `python backtest.py --prefix {crypto\|stock} --days N [--gate]` | Policy replay (real entries/exits/fees); `--gate` rolls back to `.prev` on Sharpe/DSR fail |
+| `python backtest.py --prefix {''\|stock} --days N [--gate]` | Policy replay (real entries/exits/fees; `''` = crypto); `--gate` rolls back to `.prev` on Sharpe/DSR fail |
 | `python decision_report.py --days N` | Per-trade gate attribution + conviction calibration (Stage-0 measurement) |
 | `python beta_ledger.py --days N` | Realized-beta ledger: daily equity vs SPY+BTC (lagged AKL betas, HAC alpha t-stat, up/down + trend-conditional betas). Measurement-only |
 | `python indicator_leadlag.py --data F [--preset P]` | Per-feature leading/lagging diagnostic: predictive IC vs reactive coupling at 1–48h (overlap-adjusted, FDR), redundancy clusters + exact dupes. Measurement-only |
-| `python gui.py` | PySide6 dashboard (8 tabs, 9 themes); reads `pipeline_status.json` + logs |
+| `python gui.py` | PySide6 dashboard (8 tabs, 10 themes); reads `pipeline_status.json` + logs |
 
 ---
 
 ## Architecture in brief
 
-**Pipeline:** data → features → dual LSTM (bear/bull) → cost gate → meta-label gate → sentiment/LLM
-gate → order → ATR-based exits → cross-book risk cap.
+**Pipeline:** data → features → RegressionLSTM+LightGBM blend → cost gate → meta-label gate →
+sentiment/LLM gate → order → ATR-based exits → cross-book risk cap.
 
 **Single source of truth — `strategy_config.py`.** `CRYPTO_POLICY`/`STOCK_POLICY` (ATR mults, stop
 floors, TP RR, cooldowns), `RISK_PCT_PER_TRADE=0.005`, `MAX_BOOK_RISK_PCT=0.025`, `KELLY_CAP=0.25`,
@@ -106,9 +107,10 @@ gate), `meta_label.py` (secondary classifier; veto p<0.30).
 execution → `order_utils.py`, `execution_policy.py`, `liquidity.py`; costs/risk → `fees.py`,
 `short_cost.py`, `borrow_proxy.py`, `cost_regime.py`, `risk_budget.py`, `portfolio*.py`; models →
 `model_v2.py` (LSTM), `model_lgb.py`, `predict_now.py`; LLM → `llm_client.py`/`llm_analyst.py`
-(Gemini + Anthropic/Claude, both schema-enforced — Gemini responseSchema, Claude forced tool use;
-provider switch + per-role overrides + pricing corrections in `llm_config.json`; cross-provider
-fallback; `ANTHROPIC_API_KEY` env accepted; backfill role stays Gemini — Batch API);
+(Gemini + Anthropic/Claude + OpenAI/OpenAI-compatible endpoints, all schema-enforced — Gemini
+responseSchema, Claude forced tool use, OpenAI strict structured outputs; provider switch +
+per-role overrides + pricing corrections in `llm_config.json`; cross-provider fallback;
+`ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env accepted; backfill role stays Gemini — Batch API);
 ops → `gui.py`, `gpu_lock.py`, `hw_monitor.py`, `monitor_drift.py`.
 For full detail see the `trader-architecture-truth` memory.
 
@@ -119,8 +121,8 @@ to publication date; borrow cost regime-dated; universe membership as-of (no sur
 
 ## Conventions
 
-- **Commit/push ONLY when the user explicitly asks.** Currently a large body of work is uncommitted
-  — see `session-state`. The user reviews before anything is committed.
+- **Commit/push ONLY when the user explicitly asks.** The user reviews everything first; check
+  `session-state` for what is currently in flight/uncommitted.
 - **Commit style:** conventional prefixes seen in history — `feat:`, `fix:`, `docs:`, `test:`,
   imperative mood, often `feat: wave-N <scope> — <detail>`. Branch is `master`; remote `origin`.
 - **Deployment gate:** every **model-facing** change ships only through the
@@ -129,6 +131,10 @@ to publication date; borrow cost regime-dated; universe membership as-of (no sur
 - **Research → ship:** completed wave research is saved to `research/waveN_research.json` (committed).
   Implement `mac_now` items on the Mac, defer `jetson_later` items. Each wave's memory file holds the
   survivors + **kill list** (things research rejected — do NOT rebuild them).
+- **2026-07 module review is DONE** (69 modules, 600 fns): the 90-item owner decision queue (1 P0/21 P1/68 P2)
+  lives in `research/module_review_2026-07.json` — render with `/decision-queue`; queue items are owner decisions, do NOT auto-fix.
+- **Claude Code assets** (`.claude/`, currently gitignored → local-only): skills `/regression-ab`, `/decision-queue`,
+  `/improve`; workflow `group-improve-v2` (the standard campaign pipeline); blocking py-syntax PostToolUse hook.
 - **Effort:** the user wants real max-effort, literature-grounded, multi-agent work and accepts long
   runs. Priorities, in order: **Jetson 8 GB memory/perf › financial soundness › LLM utilization ›
   trading strategy.** See `user-working-style` memory.
@@ -159,7 +165,7 @@ So: code + research + policy config are versioned; all data/models/runtime state
 
 ## Gotchas
 
-1. **README is stale.** Verify against code.
+1. **Docs drift.** README rewritten 2026-07-15 from this file + source; when any doc and code disagree, trust the code.
 2. **First Jetson retrain after objective/feature changes:** delete `v2_study.db` + `stock_v2_study.db`
    (old Optuna scores incomparable) and reset the adaptive `best_score`.
 3. **numpy pin:** `requirements.txt` says `numpy<2` but this Mac has 2.4.6 (py3.13 forces it). Fine for

@@ -11,80 +11,98 @@
 </p>
 
 <p align="center">
-  Autonomous paper trading system for stocks and crypto, powered by dual bear/bull LSTM models with Numba-accelerated technical indicators and sentiment-gated risk management.
+  Autonomous paper-trading system for US stocks (market hours) and crypto (24/7). One RegressionLSTM
+  + LightGBM blend per book, meta-labeling veto, cost-aware gates, honest validation (purged
+  walk-forward + Deflated Sharpe), and a policy backtester that replays real exits before any model
+  is promoted. Runs in production on an NVIDIA Jetson Orin Nano (8 GB); trades via the
+  <a href="https://alpaca.markets/">Alpaca</a> paper API.
 </p>
 
-<p align="center">
-  Runs on an NVIDIA Jetson Orin Nano. Trades via the <a href="https://alpaca.markets/">Alpaca</a> paper trading API.
-</p>
+> **`CLAUDE.md` is the operational source of truth** (how to run/test, the two-machine reality,
+> conventions). This README is orientation, rewritten 2026-07-15 from `CLAUDE.md` + source. If this
+> file and the code disagree, trust the code.
+
+## What it is
+
+- Two independent books — crypto and stocks — sharing one Template-Method engine (`base_loop.py`).
+- **One** `RegressionLSTM` (`model_v2.py`) + LightGBM (`model_lgb.py`) blend per book, producing
+  multi-horizon hourly return forecasts. The old dual bear/bull 3-class ensemble is **retired** —
+  "bear/bull" survives only as regime diagnostics and as the champion/challenger shadow-slot names.
+- A meta-label veto (`meta_label.py`, secondary classifier, vetoes trades with p < 0.30).
+- A shared cost model (`fees.py` + `liquidity.py`, `bidask` EDGE per-name spread) every gate uses.
+- Honest validation: purged walk-forward with embargo, an untouched holdout, Deflated Sharpe
+  (`DSR_MIN=0.60`), CSCV-PBO, label-overlap effective-n (`sample_weights.py`).
+- A policy-replay promotion gate (`backtest.py`) that rolls a bad promotion back to `.prev`.
+- Every **model-facing** change ships only through challenger → shadow → DM-HLN deployment.
+- Fail-closed execution and strict point-in-time (PIT) discipline throughout.
 
 ## Architecture
 
 ```
-run_pipeline.py                   Orchestrator (harvest -> train -> gate -> trade -> weekly retrain)
-|-- scripts/harvest_crypto_data.py   Crypto training data (Alpaca primary, hourly, multi-year)
-|-- scripts/harvest_stock_data.py    Stock training data (adjusted bars, lagged sentiment)
-|-- scripts/hypersearch_v2.py        Optuna search: regression LSTM, purged time-split walk-forward,
-|                                    cost-aware Sharpe objective, holdout + DSR gate, LightGBM leg
-|-- backtest.py                      Policy backtest gate (real entries/exits/fees; rolls back bad promotions)
-|-- sentiment_history.py             Historical sentiment cache (FnG + Finnhub) + Gemini Batch backfill
-|-- crypto_loop.py                   24/7 crypto trading (10 symbols)
-|-- stock_loop.py                    Market-hours stock trading (top 10, entry windows, overnight sleeve)
-+-- run_bots.py                      Optional combined runner (both loops, one process; --combined-bots)
-
-gui.py                            PySide6 dashboard (positions, P&L, news, markets, models, logs)
-strategy_config.py                Single source of truth for policy params (loops AND backtester)
-fees.py                           Transaction-cost model (Alpaca crypto 25bps taker/side + spread)
-validation.py                     Deflated Sharpe Ratio + PBO promotion gates
-stock_config.py                   Market universe config (stocks + crypto -> stock_universe.json)
-indicator_config.py               Feature preset management (minimal / standard / full)
-llm_client.py                     Gemini client: schema-enforced JSON, tiered routing, cost ledger
-llm_analyst.py                    Pre-trade LLM risk overlay (consequence-aware prompt, veto/sizing)
-llm_eval.py                       Measures whether the LLM gate predicts returns (s-decile report)
-llm_config.py                     LLM provider/key configuration
-fundamentals.py                   Fundamental data (yfinance + FMP + real EDGAR filing text)
-alpaca_compat.py                  alpaca-py adapter behind the legacy REST interface
-order_stream.py                   Optional trade_updates websocket cache (TRADER_ORDER_STREAM=1)
-trade_journal.py                  JSONL decision logging (per-day journals)
+run_pipeline.py                    Orchestrator: harvest -> train -> gate -> launch bots -> weekly
+                                    retrain (hot-reload; bots never stop)
+|-- scripts/harvest_crypto_data.py    1Y hourly OHLCV + features -> training_data.{csv,parquet}
+|-- scripts/harvest_stock_data.py     1Y hourly OHLCV + features -> stock_training_data.{csv,parquet}
+|-- scripts/hypersearch_v2.py         Optuna TPE search: RegressionLSTM + LightGBM leg, holdout DSR gate
+|-- backtest.py                       Policy-replay promotion gate (real entries/exits/fees)
+|-- crypto_loop.py                    24/7 crypto trading
+|-- stock_loop.py                     Market-hours stock trading
++-- run_bots.py                       Live bots only — default runs BOTH loops in one process
+                                       (saves ~0.5-0.8 GB RAM on the Jetson)
 ```
 
-## Features
+Shared kernels and support modules:
 
-- **Regression LSTM + LightGBM ensemble** -- multi-horizon (12-48h) return forecasts, hot-reloadable via atomic save manifests
-- **Honest validation** -- purged time-split walk-forward (embargo >= max horizon), untouched final holdout, Deflated Sharpe Ratio gate, coarse PBO report
-- **Policy backtest gate** -- every retrain replays the REAL entry/exit stack with real fees; promotions that lose money are rolled back automatically
-- **Cost-aware trading** -- entries must clear 2x the true round trip (crypto: 25bps taker/side + spread; stocks: regulatory + slippage)
-- **Risk-based sizing** -- equity-at-risk-to-the-stop base, fractional Kelly (<=0.25) from confirmed fills, GARCH vol targeting calibrated to annualized targets, bounded advisory tilt
-- **ATR-based adaptive risk** -- stops/trailing/take-profit scaled to volatility (floors only guard degenerate cases; ATR does the work)
-- **Stock book structured around the evidence** -- entries in the open/close windows (Gao et al. 2018), capped overnight sleeve with GTC stops (Lou-Polk-Skouras 2019), SPY 200d trend filter (Faber)
-- **LLM risk overlay** -- schema-enforced Gemini scoring with veto + bounded sizing tilt, consequence-aware prompts, actual-responder journaling, and `llm_eval.py` to prove (or disprove) its value
-- **Sentiment** -- FnG + Finnhub keyword scores, point-in-time correct (UTC bucketing, 1-day lag for stocks), Gemini **Batch API** backfill at 50% price on a separate quota
-- **Fail-closed execution** -- missing predictions/quotes never buy or force-sell; circuit breaker halts entries until the daily baseline resets; account-state errors suspend buys
-- **Crash-safe state** -- scoped startup cleanup, protective stops re-placed after restart, persisted high-water marks and cooldowns, per-cycle exception guard
-- **Numba JIT indicators** -- RSI, MACD, ATR, Bollinger Bands, Stochastic, OBV (~1.8x speedup, cache=True)
-- **Cross-asset features** -- BTC prices for crypto correlations, SPY for stock relative strength
-- **Weekly auto-retrain** -- Saturday 2 AM: re-harvest fresh data, retrain, holdout + policy gates, bots hot-reload
-- **Trade journal + measurement** -- every decision and every scored LLM candidate journaled; Kelly excludes unconfirmed fills
-- **PySide6 dashboard** -- live positions, P&L, orders, news, markets heatmap/chart, model status, hardware gauges, 9 themes
+- `base_loop.py` — Template-Method base both trading loops are built on.
+- `strategy_config.py` — **single source of truth** for policy (ATR mults, stop floors, TP RR,
+  risk sizing, entry windows, execution tactics). Both the live loops **and** the backtester read
+  it — drift here means the backtest validates a different policy than what trades.
+- `policy_exits.py` — shared Numba exit-stack kernel (hard/trailing/TP/signal/EOD/vertical). Used
+  by `backtest.py`, the harvest triple-barrier labels, and `meta_label.py`, guaranteeing label
+  semantics == backtest == live.
+- `model_v2.py` / `model_lgb.py` / `predict_now.py` — model definitions and live inference.
+- `meta_label.py` / `validation.py` / `sample_weights.py` — meta-label veto, validation, and
+  sample-weighting.
+- `fees.py` + `liquidity.py` — the cost model every gate shares.
+- `llm_client.py` / `llm_analyst.py` — multi-provider LLM client (Gemini / Claude / OpenAI, all
+  schema-enforced) used for pre-trade risk overlay.
+- `gui.py` — PySide6 dashboard, 8 tabs, 10 themes.
 
----
+## How a trade happens
 
-## Quick Start
+data → features → RegressionLSTM+LightGBM blend → cost gate → meta-label gate → sentiment/LLM
+gate → order → ATR-based exits → cross-book risk cap.
+
+Sizing uses `RISK_PCT_PER_TRADE=0.005`, `KELLY_CAP=0.25`, `MAX_BOOK_RISK_PCT=0.025` as of this
+writing — **current values live in `strategy_config.py`; trust it, not this paragraph.**
+
+## Two-machine reality
+
+Work happens across two machines with **different installed dependencies**:
+
+| | **This dev Mac** | **Jetson Orin Nano (prod)** |
+|---|---|---|
+| Python | 3.13.5, framework `python3` (no venv) | 3.10, `/home/kyle/miniforge3/envs/jetson/bin/python` |
+| Installed | numpy, pandas, scipy, statsmodels, bidask, yfinance, bs4, yaml, **pytest** | full stack incl. torch, lightgbm, optuna, joblib, numba, sklearn, dotenv, CUDA |
+| **NOT installed** | **torch, lightgbm, optuna, joblib, numba, sklearn, dotenv, finnhub, alpaca, PySide6** | — |
+| Can do | pure-algorithm code, synthetic-data unit tests, web research | training, harvest, Stage-0 measurement, live trading, GUI |
+| **Cannot do** | model training, data harvest, anything importing the heavy deps, run the bots/GUI | — |
+
+The Mac↔Jetson sync is user-driven and **not encoded in the repo**.
+
+## Quick start
 
 ### 1. Install
 
-**Ubuntu / Desktop:**
 ```bash
 git clone git@github.com:kywwilson11/trader.git
 cd trader
-./setup.sh
-```
 
-**Jetson Orin Nano (JetPack 6.x):**
-```bash
-git clone git@github.com:kywwilson11/trader.git
-cd trader
-./setup.sh --jetson
+# Desktop
+./scripts/setup.sh
+
+# Jetson Orin Nano (JetPack 6.x)
+./scripts/setup.sh --jetson
 ```
 
 Or install manually:
@@ -103,7 +121,7 @@ pip install -r requirements-jetson.txt
 
 ### 2. Configure
 
-Create a `.env` file (or let `setup.sh` create the template):
+Create a `.env` file (or let `scripts/setup.sh` create the template):
 ```
 ALPACA_API_KEY=your_key
 ALPACA_API_SECRET=your_secret
@@ -111,485 +129,93 @@ ALPACA_BASE_URL=https://paper-api.alpaca.markets
 FINNHUB_API_KEY=your_finnhub_key
 ```
 
-- **Alpaca** -- sign up at [alpaca.markets](https://alpaca.markets/) for a free paper trading account
-- **Finnhub** -- sign up at [finnhub.io](https://finnhub.io/) for a free API key (optional, used for stock news sentiment)
-- **LLM analysis** (optional) -- configure via GUI Settings tab or edit `llm_config.json` with your Gemini/Claude/OpenAI key
+- **Alpaca** — sign up at [alpaca.markets](https://alpaca.markets/) for a free paper trading account.
+- **Finnhub** — sign up at [finnhub.io](https://finnhub.io/) for a free API key (optional, stock
+  news sentiment).
+- **LLM analysis** (optional) — configure via the GUI Settings tab, or edit `llm_config.json`
+  directly (gitignored — it holds API keys).
 
-### 3. Verify Connectivity
+### 3. Verify connectivity
 ```bash
-python connection_test.py
+python scripts/connection_test.py
 ```
 
-### 4. Run the Full System
-```bash
-# Full pipeline: harvest -> train -> trade -> weekly retrain
-python run_pipeline.py
+### 4. Run
 
-# GUI dashboard (separate terminal)
-python gui.py
+```bash
+python run_pipeline.py     # full pipeline: harvest -> train -> trade -> weekly retrain
+python gui.py               # dashboard, separate terminal
 ```
 
-**Jetson Orin Nano** -- run the one-time system setup (headless, NVMe swap,
-cuDSS/cuSPARSELt installed system-wide via ldconfig so `LD_LIBRARY_PATH`
-exports are no longer needed — shell exports never survived systemd/cron):
+**Jetson one-time system setup** (headless, NVMe swap, cuDSS/cuSPARSELt installed system-wide):
 ```bash
-sudo bash scripts/setup_jetson_system.sh   # see --skip-headless / --skip-swap
+sudo bash scripts/setup_jetson_system.sh   # flags: --skip-headless / --skip-swap
 sudo reboot
 python run_pipeline.py --combined-bots
 ```
 
-### 5. Pipeline Flags
-```
---trials N          Trials per model, initial training (default: 200)
---retrain-trials N  Trials per model, weekly retrain (default: 100)
---retrain-day N     Day of week 0=Mon..6=Sun (default: 5=Saturday)
---retrain-hour N    Hour 0-23 (default: 2)
---bot-only          Skip training, start bots immediately
---skip-harvest      Use existing data files
---crypto-only       Crypto models + bot only
---stock-only        Stock models + bot only
---no-retrain        Train once, run bots forever
---combined-bots     Run both loops as threads in ONE process
-                    (saves ~0.5-0.8GB RAM on the Jetson)
-```
+## Entry points
 
-### 6. Manual Steps (if not using pipeline)
+| Command | What it does |
+|---|---|
+| `python run_pipeline.py` | Orchestrator: harvest → train → gate → launch bots → weekly retrain (hot-reload, bots never stop). Flags: `--no-retrain`, `--bot-only`, `--skip-harvest`, `--combined-bots`, `--crypto-only`, `--stock-only`, `--trials N` (default 200), `--retrain-trials N` (default 100), `--retrain-day N` (default 5), `--retrain-hour N` (default 2) |
+| `python run_bots.py [--crypto-only\|--stock-only]` | Live bots only — default runs BOTH loops in one process (saves ~0.5–0.8 GB RAM on Jetson) |
+| `python scripts/harvest_crypto_data.py` / `scripts/harvest_stock_data.py` | 1Y hourly OHLCV + features → `*training_data.{csv,parquet}` |
+| `python scripts/hypersearch_v2.py --trials N [--prefix stock] [--data F] [--fresh] [--shadow] [--preset P] [--max-rows N]` | Optuna TPE search (RegressionLSTM + LightGBM leg), holdout DSR gate |
+| `python backtest.py --prefix {''\|stock} --days N [--gate] [--min-sharpe X] [--min-dsr X]` | Policy replay (real entries/exits/fees); `--gate` rolls back to `.prev` on Sharpe/DSR fail |
+| `python decision_report.py --days N` | Per-trade gate attribution + conviction calibration (Stage-0 measurement) |
+| `python beta_ledger.py --days N [--json F]` | Realized-beta ledger: daily equity vs SPY+BTC (lagged AKL betas, HAC alpha t-stat, up/down + trend-conditional betas). Measurement-only |
+| `python indicator_leadlag.py --data F [--preset P] [--json F]` | Per-feature leading/lagging diagnostic: predictive IC vs reactive coupling at 1–48h (overlap-adjusted, FDR), redundancy clusters + exact dupes. Measurement-only |
+| `python llm_eval.py --days N [--asset {crypto,stock}]` | Measures whether the LLM gate predicts returns |
+| `python gui.py` | PySide6 dashboard (8 tabs, 10 themes); reads `pipeline_status.json` + logs |
+
+## Testing & CI
+
+Canonical dev-Mac command (some test modules can't import their heavy deps, so always continue
+past collection errors):
 ```bash
-# Harvest training data
-python scripts/harvest_crypto_data.py    # -> training_data.parquet/csv
-python scripts/harvest_stock_data.py     # -> stock_training_data.parquet/csv
-
-# Train models (regression LSTM + LightGBM leg; holdout + DSR gated)
-python scripts/hypersearch_v2.py --trials 200 --preset stationary
-python scripts/hypersearch_v2.py --trials 200 --prefix stock --data stock_training_data.csv
-
-# Backtest the ACTUAL policy with real fees (also runs as a retrain gate)
-python backtest.py --days 60
-python backtest.py --prefix stock --days 60
-
-# Measure whether the LLM gate predicts returns
-python llm_eval.py --days 14
-
-# Run bots individually (or combined: python run_bots.py)
-python crypto_loop.py
-python stock_loop.py
+python3 -m pytest tests/ --continue-on-collection-errors -q
 ```
 
----
+Baseline (verified 2026-07-15): `1887 passed, 21 failed, 15 skipped, 7 errors` — the failures + errors are
+**all** pre-existing missing-dependency noise (no torch/lightgbm/optuna/joblib/numba/sklearn/dotenv
+on the Mac); the suite is green on the full Jetson stack. The standard regression check is a
+git-stash A/B, diffing failure **names** (not counts) — see `CLAUDE.md` and the `/regression-ab`
+skill.
 
-## Module Reference
+`tests/test_sentiment_headlines.py` is a standalone runner (~1060 assertions), not a pytest module —
+run it with `python tests/test_sentiment_headlines.py` (needs deps → Jetson/CI).
 
-### Trading Loops
+CI (`.github/workflows/ci.yml`, Ubuntu, Python 3.10 + 3.12): `py_compile` of all top-level and
+`scripts/` `.py` files → the sentiment runner → `pytest tests/ -v --tb=short -x`.
 
-#### `crypto_loop.py` -- Crypto Trading Bot
+The suite is 133 test files / ~1890 passing tests and moving — trust `python3 -m pytest --collect-only`
+over any number quoted here.
 
-24/7 cryptocurrency trading loop for 10 symbols.
+## Repo map
 
-| Parameter | Value |
-|---|---|
-| Schedule | 24/7, 30-second cycle |
-| Universe | BTC, ETH, XRP, SOL, DOGE, LINK, AVAX, DOT, LTC, BCH |
-| Position size | $250/trade, confidence-scaled |
-| Stop-loss | ATR x 2.0 (fallback: 4%) |
-| Trailing stop | ATR x 1.5 (fallback: 3%) |
-| Take-profit | 2:1 risk-reward (fallback: 12% cap) |
-| Cooldown | 30 min per symbol |
+Signals/features → `indicators.py`, `sentiment*.py`, `fundamentals.py`, `volatility.py`,
+`squeeze_features.py`, `*_archive.py` (funding/oi/basis); execution → `order_utils.py`,
+`execution_policy.py`, `liquidity.py`; costs/risk → `fees.py`, `short_cost.py`, `borrow_proxy.py`,
+`cost_regime.py`, `risk_budget.py`, `portfolio*.py`; models → `model_v2.py` (LSTM), `model_lgb.py`,
+`predict_now.py`; LLM → `llm_client.py` / `llm_analyst.py` (Gemini + Anthropic/Claude, both
+schema-enforced, cross-provider fallback); ops → `gui.py`, `gpu_lock.py`, `hw_monitor.py`,
+`monitor_drift.py`.
 
-- Loads dual bear/bull models, runs parallel predictions via `ThreadPoolExecutor` (5 workers)
-- Writes `crypto_predictions.json` each cycle for GUI Markets tab (bear/bull/score/signal per symbol)
-- Sentiment multiplier (0.3x-1.3x) gates all trades based on Fear & Greed + symbol-specific news
-- Optional LLM pre-trade analysis provides per-symbol position multipliers and reasoning
-- Circuit breaker: 5% daily equity drawdown flattens all positions + 1-hour halt
-- Hot-reload: detects `.pth` file changes and reloads models without stopping
+~80 top-level modules, 133 test files. Per-function documentation lives in the code, not here.
 
-#### `stock_loop.py` -- Stock Trading Bot
+## Generated / local files
 
-Market-hours stock trading loop with dynamic top-N selection.
+Models (`*.pth`/`*.pkl`), Optuna `*_study.db`, training CSV/parquet, `journals/`,
+`pipeline_status.json`, `*_predictions.json`, `sentiment_cache.db*`, `llm_config.json` (holds API
+keys), `indicator_config.json`, and logs are all **gitignored** — generated or secret, local only.
 
-| Parameter | Value |
-|---|---|
-| Schedule | 9:30 AM - 4:00 PM ET, weekdays only |
-| Universe | ~47 high-beta stocks -> top 10 by bull signal |
-| Position size | $2,500/position, $25k max exposure |
-| Stop-loss | ATR x 2.0 (fallback: 3%) |
-| Trailing stop | ATR x 1.5, upgrades at 1.5% profit (fallback: 2%) |
-| Take-profit | 2:1 risk-reward (fallback: 10%, cap: 15%) |
-| Flatten time | 3:50 PM ET (avoid overnight gap risk) |
+Committed: source `.py`, `tests/`, `research/*.json`, `requirements*.txt`, `stock_universe.json`,
+and `strategy_config.py` & friends.
 
-- Scores all ~47 stocks with both models, trades only the top 10 by bull confidence
-- Writes `stock_predictions.json` each cycle for GUI Markets tab
-- Dynamic stock universe: reloads `stock_universe.json` each cycle so GUI edits take effect live
-- Bracket orders: buy with stop-loss + take-profit children
-- End-of-day: cancels all stop orders and market-sells all positions at 3:50 PM ET
-- SPY relative strength features for cross-market context
+## Research process
 
-### Pipeline & Training
-
-#### `run_pipeline.py` -- Pipeline Orchestrator
-
-End-to-end system: initial training -> bot startup -> weekly retrain with hot-reload.
-
-**Phases:**
-1. **Harvest** -- download 1-year hourly bars (skips if data < 24h old)
-2. **Background sentiment** -- starts Finnhub stock news fetch in parallel with training
-3. **Train** -- Optuna hypersearch for bear + bull models (crypto and/or stock)
-4. **Launch bots** -- start crypto and stock loops as background processes
-5. **LLM backfill** -- background worker scores historical articles with LLM
-6. **Weekly retrain** -- Saturday 2 AM: re-harvest, retrain with fewer trials, bots hot-reload
-
-Bots are never interrupted for retraining. They run continuously and detect new model files via mtime checking. If a retrain produces a better model, the `.pth` file is overwritten and bots pick it up automatically.
-
-Writes `pipeline_status.json` every 2 seconds for GUI monitoring (phase, trial count, best scores, bot health, next retrain time).
-
-#### `hypersearch_dual.py` -- Hyperparameter Search
-
-Optuna TPE sampler with MedianPruner for efficient bear/bull model optimization.
-
-**Search space:**
-
-| Parameter | Range |
-|---|---|
-| seq_len | 12, 18, 24 |
-| hidden_dim | 64, 96, 128 |
-| num_layers | 1-2 |
-| dropout | 0.05-0.45 (step 0.05) |
-| learning_rate | 1e-4 - 3e-3 (log scale) |
-| batch_size | 128, 256 |
-| bull_threshold | 0.10-0.35 (step 0.01) |
-| weight_decay | 0 - 1e-3 |
-| scheduler | cosine, plateau, none |
-
-**Objective function:** `composite_score = target_F1 x 0.5 + balanced_accuracy x 0.2 - catastrophic_rate x 0.3`
-
-- **Target F1**: precision x recall for the target class (bear or bull)
-- **Balanced accuracy**: mean per-class recall across bear/neutral/bull
-- **Catastrophic rate**: bear<->bull confusion (the expensive mistakes in trading)
-
-**Performance optimizations:**
-- Pre-allocates full sequence tensors on GPU -- eliminates per-batch CPU->GPU transfers
-- `cudnn.benchmark = True` -- cuDNN auto-tunes LSTM kernels for fixed input shapes
-- Saves best-epoch predictions to skip redundant final validation pass
-- `optimizer.zero_grad(set_to_none=True)` -- deallocates gradients instead of zeroing
-
-**Safety mechanisms:**
-- MedianPruner reports `composite_score` each epoch (same metric as final objective), 20-epoch warmup, 15-trial startup matching TPE
-- Early stopping with patience=15 epochs
-- Hard timeout of 600 seconds per trial
-- Rejects degenerate models: any class accuracy below 10% returns score 0
-- Persistent SQLite storage: studies survive restarts, Bayesian memory accumulates
-
-#### `harvest_crypto_data.py` -- Crypto Data Pipeline
-
-Downloads 1 year of hourly OHLCV bars for 10 cryptocurrencies via yfinance, computes 30-40 technical features, and saves to `training_data.csv`.
-
-- BTC-USD used as benchmark for cross-asset features (BTC return, correlation, RSI divergence)
-- Adds historical Daily_Sentiment from Fear & Greed Index (cached, instant)
-- Target: next-bar return as percentage
-- Output sorted chronologically for proper time-series split during training
-
-#### `harvest_stock_data.py` -- Stock Data Pipeline
-
-Downloads 1 year of hourly OHLCV bars for ~47 stocks via yfinance, computes stock-specific features, and saves to `stock_training_data.csv`.
-
-- Stock universe loaded dynamically from `stock_universe.json` (editable via GUI Markets tab)
-- Crypto symbols in universe are automatically filtered out for harvest
-- SPY used as benchmark for relative strength features (ratio, correlation, RSI divergence)
-- Uses cached stock sentiment from SQLite (non-blocking); background fetch populates for next cycle
-
-### ML & Inference
-
-#### `model.py` -- CryptoLSTM Architecture
-
-3-class market regime classifier (bear / neutral / bull).
-
-```
-Input: (batch, seq_len, input_dim)
-  -> LSTM (hidden_dim, num_layers, dropout, batch_first)
-  -> Final hidden state
-  -> FC: hidden_dim -> 64 -> ReLU -> num_classes
-Output: logits -> softmax probabilities
-```
-
-JIT-traceable via `torch.jit.trace` for ~30% faster inference on Jetson GPU.
-
-#### `predict_now.py` -- Live Inference Engine
-
-Loads dual bear/bull models, fetches live bars, computes features, and returns a prediction score.
-
-- `load_dual_models()` -- loads both bear and bull models (falls back to single if one missing)
-- `get_live_prediction()` -- end-to-end: bars -> features -> scale -> model -> score
-- Score = `(bull_prob - bear_prob) x bull_threshold` -- positive = bullish, negative = bearish
-- JIT trace attempted on load for faster repeated inference
-- Handles prefixed models: `stock_bear_model.pth`, `stock_scaler_X.pkl`, etc.
-
-### Technical Indicators
-
-#### `indicators.py` -- Numba JIT Indicators
-
-30-40 features computed with Numba `@njit` acceleration (~1.8x speedup over pure pandas).
-
-**Indicators:**
-- RSI (14), MACD (12/26/9), ATR (14), Bollinger Bands (20/2sigma), Stochastic (14/3/3)
-- OBV, Rate of Change (12), Rolling Percentile (100), Linear Regression Slope (5)
-
-**Derived features:**
-- Trend: SMA 20/50/100, EMA 12, price-to-SMA ratios
-- Volume: volume ratio (20-bar), OBV, ROC
-- Time: hour/day cyclical encoding (sin/cos)
-- Advanced: ATR percentile, RSI divergence, volume-price confirmation
-- Cross-asset: BTC return 1h + correlation + RSI divergence (crypto), SPY relative strength (stocks)
-
-Two entry points:
-- `compute_features(df, btc_close)` -- crypto feature set
-- `compute_stock_features(df, spy_close)` -- stock feature set with SPY relative strength
-
-Falls back to pure pandas if Numba is unavailable.
-
-#### `indicator_config.py` -- Feature Preset Manager
-
-Configurable feature subsets for training: minimal (20 core features, fastest), standard (35 with Bollinger Bands, recommended), or full (all indicators). Saved to `indicator_config.json`. Includes crypto-only and stock-only column filters.
-
-### Sentiment & Analysis
-
-#### `sentiment.py` -- Sentiment Analysis & Trade Gating
-
-Rule-based NLP sentiment scoring with Fear & Greed Index integration.
-
-**Data sources:**
-- [Fear & Greed Index](https://alternative.me/crypto/fear-and-greed-index/) -- free API, 5-min cache
-- [Finnhub](https://finnhub.io/) -- symbol-specific + market news (optional, 30 calls/min free tier)
-- Full article scraping via BeautifulSoup (30-min cache)
-
-**Scoring:**
-- 150+ positive/negative keywords with phrase matching and word boundaries
-- Negation-aware: flips sentiment within 3 words ("not bullish" -> bearish)
-- Article weighting: headline 25% + summary 25% + full text 50%
-- Tanh smoothing scaled by sqrt(word_count)
-
-**Trade multiplier (`sentiment_gate`):**
-
-| Condition | Multiplier |
-|---|---|
-| Extreme fear (FnG <= 10) | 0.3x |
-| Fear (FnG <= 25) | 0.5x |
-| Cautious (FnG <= 40) | 0.8x |
-| Normal (40-75) | 1.0x |
-| Greed (FnG >= 75) | 0.85x |
-| Extreme greed (FnG >= 90) | 0.6x |
-| Symbol news <= -0.3 | 0.0x (block) |
-| Symbol news >= 0.3 | 1.2x (boost) |
-
-Final multiplier clamped to [0.0, 1.5].
-
-#### `sentiment_history.py` -- Historical Sentiment Cache
-
-SQLite-backed sentiment cache providing `Daily_Sentiment` as a training feature for LSTM models.
-
-**Architecture:**
-1. **Crypto:** Fear & Greed Index history (free `alternative.me` API, single call)
-2. **Stocks:** Finnhub `company_news` in 30-day windows, keyword-scored, rate-limited (25 calls/min)
-3. **Background LLM backfill:** re-scores cached articles with LLM for improved accuracy
-4. **Aggregation:** per-symbol daily scores blending keyword + LLM scores
-
-Features:
-- `cached_only` mode for non-blocking harvest (uses DB only, no network)
-- Exponential backoff on 429 rate limits (62s -> 124s -> 248s)
-- Per-ticker error isolation -- one failure doesn't stop the batch
-- Background `--fetch-stocks` CLI for pipeline integration
-
-#### `llm_client.py` -- Unified LLM Client
-
-Multi-provider REST client supporting Gemini, Claude, and OpenAI via urllib (no SDK dependencies).
-
-- `call_llm(prompt, system, max_tokens)` -- returns text or None
-- Automatic fallback chain: on billing/rate-limit/auth errors (402, 403, 429, 5xx), falls back to Gemini free tier (`gemini-2.5-flash-lite`)
-- Configurable via `llm_config.json` or GUI Settings tab
-
-#### `llm_analyst.py` -- Pre-Trade LLM Analysis
-
-Batch analysis of trade candidates via LLM. Evaluates all candidates in a single API call and returns per-symbol position multipliers (0.0-1.5) with reasoning.
-
-- `analyze_trades(candidates)` -- returns `{symbol: {m: multiplier, r: reasoning}}`
-- Candidates include model predictions, sentiment scores, and fundamental data
-- Fails gracefully -- empty dict means no LLM gating applied
-
-#### `fundamentals.py` -- Fundamental Data
-
-Multi-source fundamental data with aggressive caching.
-
-| Source | Data | Cache TTL |
-|---|---|---|
-| yfinance | PE, PB, EPS, market cap, sector, beta, 52wk range | 4 hours |
-| Financial Modeling Prep | Insider trading (buys/sells) | 24 hours |
-| SEC EDGAR | 10-K, 10-Q, 8-K filings | 7 days |
-
-- `get_fundamentals(symbol)` -- returns dict of metrics
-- `get_insider_activity(symbol)` -- insider buy/sell counts
-- `get_sec_filings(symbol)` -- recent SEC filings
-- `format_fundamentals_for_llm(symbol)` -- text summary for LLM prompts
-
-### Market Data & Utilities
-
-#### `market_data.py` -- Bar Fetching & ATR
-
-Fetches hourly OHLCV bars from Alpaca or yfinance with ATR computation for adaptive stops.
-
-- `fetch_bars_alpaca()` -- crypto bars via Alpaca (6-day, 120 bars)
-- `fetch_stock_bars_alpaca()` -- stock bars via Alpaca
-- `fetch_bars_yfinance()` -- fallback yfinance download
-- `get_live_atr()` -- latest ATR value for stop-loss distance
-- `flatten_yfinance_columns()` -- handles yfinance MultiIndex columns
-
-#### `trading_utils.py` -- Shared Trading Utilities
-
-Common code shared between crypto and stock loops.
-
-- `get_api()` -- constructs Alpaca REST client from `.env` credentials
-- `get_model_mtime()` -- file modification time for hot-reload detection
-- `choose_inference_device()` -- GPU with CPU fallback on OOM
-- `cooldown_ok()` -- 30-minute per-symbol trade cooldown
-- `predict_symbol()` -- wrapper running both bear/bull predictions
-
-#### `order_utils.py` -- Order Lifecycle & Risk Management
-
-Complete order management: quoting, placement, fill polling, circuit breaker.
-
-- `get_quote()` / `get_crypto_quote()` / `get_stock_quote()` -- bid/ask/spread/midpoint
-- `place_limit_order()` / `place_stock_limit_order()` -- limit orders with notional-to-qty conversion
-- `manage_order_lifecycle()` -- polls fill status, cancels stale orders, optional market fallback
-- `reconstruct_positions()` -- rebuilds position state from API (survive crashes)
-- `check_circuit_breaker()` -- 5% daily equity drawdown detection
-- `emergency_flatten()` -- market-sells everything immediately
-
-#### `stock_config.py` -- Market Universe
-
-Load/save the list of traded symbols from `stock_universe.json`. Supports both stocks (TSLA) and crypto pairs (BTC/USD). GUI-editable via the Markets tab.
-
-#### `trade_journal.py` -- Decision Logger
-
-Append-only JSONL trade decision log (one file per day in `journals/`).
-
-- `log_decision(entry)` -- writes timestamped decision to `journals/YYYY-MM-DD.jsonl`
-- `get_journal_summary(date)` -- aggregates buy/sell/skip/llm_block counts, average multiplier
-- Respects `journal_enabled` flag from LLM config
-
-### Monitoring & Operations
-
-#### `gui.py` -- PySide6 Dashboard
-
-Desktop monitoring app with live updates and clean shutdown handling.
-
-**Tabs:**
-- **Positions** -- open positions, P&L, exposure, recent fills
-- **Performance** -- equity curve, daily P&L, drawdown, MinTax lot-matched tax estimation
-- **News** -- Fear & Greed Index, Finnhub headlines (My Universe / All News / Global Macro filters)
-- **Markets** -- combined stocks + crypto universe with heatmap, price chart (1Y/3M/1M/1W/1D zoom), metrics table with live model predictions, add/remove symbols
-- **Models** -- model scores (C-Bear, C-Bull, S-Bear, S-Bull), trial progress, pipeline phase, next retrain time
-- **Hardware** -- GPU temp, RAM usage, CUDA status
-- **Logs** -- tailing pipeline, crypto bot, and stock bot log files
-- **Settings** -- LLM provider/keys, fundamental data, journal toggle, indicator presets
-
-**Themes:** Bubblegum Goth, Batman, Joker, Harley Quinn, Dark, Space, Money, Two-Face, Black Metal
-
-#### `watchdog.py` -- Process Supervisor (Alternative)
-
-Standalone process monitor for trading bots outside the pipeline.
-
-- Checks bot health every 30 seconds
-- Auto-restarts crashed processes (max 3 restarts per hour)
-- Emergency liquidation via `emergency_flatten()` on repeated failures
-- Use `run_pipeline.py` for the integrated version with auto-restart built in
-
-#### `hw_monitor.py` -- Hardware Monitor
-
-Jetson Orin Nano hardware telemetry (no sudo required).
-
-- `get_gpu_temp()` -- GPU temperature from tegrastats / thermal zones
-- `get_ram_usage()` -- used/total MB from `/proc/meminfo`
-- `is_gpu_available()` -- tests CUDA allocation (detects OOM)
-- `wait_for_cool_gpu()` -- blocks until GPU drops below threshold
-
-#### `connection_test.py` -- API Connectivity Check
-
-Verifies Alpaca API credentials, reports account equity, PDT status, and trading mode.
-
-```bash
-python connection_test.py
-```
-
-### Testing
-
-#### CI Pipeline (GitHub Actions)
-
-Automated on every push and PR to `master`. Python 3.10 + 3.12 matrix on Ubuntu.
-
-| Stage | What it checks |
-|---|---|
-| `py_compile` | Syntax check all 26+ `.py` files (catches broken imports in gui.py too) |
-| `test_sentiment.py` | Existing 1,035-headline custom test suite |
-| `pytest tests/` | 221 unit tests across 18 test files |
-
-```bash
-# Run locally
-pytest tests/ -v --tb=short
-python test_sentiment.py
-```
-
-#### `tests/` -- pytest Suite (221 tests)
-
-| File | Tests | Module Under Test |
-|---|---|---|
-| `test_imports.py` | 25 | All modules except gui.py (parametrized import check) |
-| `test_indicators.py` | 42 | RSI, MACD, ATR, BBands, Stoch, OBV, ROC, VWAP, Gap, slopes, features |
-| `test_sentiment.py` | 27 | `_score_text`, `_validate_text`, `_deduplicate_articles` |
-| `test_fundamentals.py` | 18 | `format_fundamentals_for_llm`, `_cache_get`/`_cache_set` |
-| `test_sentiment_history.py` | 13 | `_fng_value_to_score`, `_keyword_score` |
-| `test_llm_analyst.py` | 11 | `_parse_response`, `_build_prompt` |
-| `test_order_utils.py` | 10 | `compute_limit_price`, `should_trade` |
-| `test_trading_utils.py` | 9 | `cooldown_ok`, `get_model_mtime` |
-| `test_evolve.py` | 9 | `get_next_version`, `load_scores`, `save_scores` |
-| `test_indicator_config.py` | 9 | Presets, feature lists, config loading |
-| `test_pipeline.py` | 9 | `_next_retrain_time`, `_build_harvest_phases` |
-| `test_stock_config.py` | 8 | `_clean`, `load_stock_universe`, defaults |
-| `test_llm_client.py` | 7 | `call_llm`, `_dispatch`, `_call_gemini` (mocked) |
-| `test_model.py` | 5 | CryptoLSTM forward pass, softmax, JIT trace |
-| `test_predict_now.py` | 4 | `_prefixed_paths` |
-| `test_llm_config.py` | 4 | `load_llm_config` defaults |
-| `test_trade_journal.py` | 3 | `log_decision`, `get_journal_summary` |
-| `test_market_data.py` | 2 | `flatten_yfinance_columns` |
-
-All tests run CPU-only with mocked external APIs — safe to run alongside live trading bots.
-
-#### `test_sentiment.py` -- Sentiment Test Suite
-
-1,035 test cases validating `_score_text()` accuracy.
-
-- 160+ hand-written edge cases (earnings, macro, analyst, negation, mixed signals)
-- 900+ template-generated permutations (stocks x verbs x reasons x patterns)
-- Validates text preprocessing (`_validate_text`) and article scoring (`_score_articles`)
-- Target: 99%+ accuracy
-
----
-
-## Output Files
-
-| File | Source | Purpose |
-|---|---|---|
-| `training_data.csv` | harvest_crypto_data.py | Crypto training dataset |
-| `stock_training_data.csv` | harvest_stock_data.py | Stock training dataset |
-| `bear_model.pth` | hypersearch_dual.py | Crypto bear model weights |
-| `bull_model.pth` | hypersearch_dual.py | Crypto bull model weights |
-| `stock_bear_model.pth` | hypersearch_dual.py | Stock bear model weights |
-| `stock_bull_model.pth` | hypersearch_dual.py | Stock bull model weights |
-| `*_config.pkl` | hypersearch_dual.py | Model hyperparameters |
-| `*scaler_X.pkl` | hypersearch_dual.py | Feature scaler (MinMaxScaler) |
-| `*_study.db` | hypersearch_dual.py | Optuna SQLite study (Bayesian memory) |
-| `sentiment_cache.db` | sentiment_history.py | Historical news articles + daily scores |
-| `stock_universe.json` | stock_config.py / GUI | Market universe (stocks + crypto symbols) |
-| `llm_config.json` | llm_config.py / GUI | LLM provider keys and settings |
-| `pipeline_status.json` | run_pipeline.py | Live pipeline state for GUI |
-| `journals/*.jsonl` | trade_journal.py | Daily trade decision logs |
-| `pipeline_output.log` | run_pipeline.py | Pipeline log |
-| `crypto_bot_output.log` | run_pipeline.py | Crypto bot log |
-| `stock_bot_output.log` | run_pipeline.py | Stock bot log |
-| `sentiment_fetch.log` | run_pipeline.py | Background sentiment fetch log |
+Completed research is organized into numbered "waves" and saved to `research/waveN_research.json`
+(committed). The 2026-07 function-by-function module review (69 modules, 600 functions) applied
+280 safe fixes directly and left a 90-item owner decision queue in
+`research/module_review_2026-07.json` — render it with the `/decision-queue` skill.

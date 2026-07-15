@@ -109,6 +109,42 @@ Config keys (see _DEFAULTS below for the exact defaults):
                             reasons).
   max_llm_latency_sec         Per-call timeout budget in seconds.
   journal_enabled              Whether LLM call journaling is on.
+  rich_context_enabled         Attach a compact quant evidence block (price/
+                            momentum/valuation/earnings/position) to live
+                            LLM candidates via the existing `profile` prompt
+                            slot. Default OFF — this changes gate behavior
+                            (any prompt change moves `s`); enable only after
+                            a prompt_ab.py ADOPT verdict (see PART B #3).
+  replay_capture_enabled        Journal full candidate-cycle inputs (incl.
+                            snapshot/fundamentals/positions) to
+                            journals/llm_replay/ for the offline prompt A/B
+                            harness (scripts/prompt_ab.py). Measurement-
+                            only — never touches gate behavior. Default ON.
+  advisor_v2_enabled           Default False. Master switch for the
+                            structured decision dossier (llm_analyst.py):
+                            extended prompt addendum (computed event
+                            lines), extended response schema (p_up,
+                            conviction, abstain, key_risks, event_flags),
+                            and a per-cycle 'llm_advisor_v2' shadow journal
+                            row. SHADOW-ONLY — these fields never gate or
+                            size a live trade; the s->veto/multiplier path
+                            is unchanged either way. With this False (the
+                            shipped default) the prompt/schema/journal
+                            traffic is byte-identical to pre-change.
+  analyst_dedup_ttl_sec         Default 0 (disabled). Evidence-hash
+                            call-dedup TTL in seconds for analyze_trades:
+                            when the qualitative evidence (headlines,
+                            fundamentals, held-set, ML pred SIGN, F&G
+                            bucket, computed events) is unchanged within
+                            the TTL, the cached result is reused instead of
+                            spending another LLM call. Consumers clamp the
+                            configured value to [0, 7000] — kept below the
+                            7200s staleness force in base_loop so an
+                            expired cache always precedes a forced refresh.
+                            Any cached score within 0.05 of
+                            LLM_VETO_THRESHOLD bypasses the cache (the
+                            2-consecutive-strike liquidation guard requires
+                            two INDEPENDENT analyses near the veto line).
 """
 
 import json
@@ -147,6 +183,15 @@ _DEFAULTS = {
     # runs every 600s, so a 30-45s budget costs nothing
     "max_llm_latency_sec": 30,
     "journal_enabled": True,
+    "rich_context_enabled": False,   # attach compact quant evidence block to live candidates (gate-behavior-changing — enable only after prompt_ab verdict)
+    "replay_capture_enabled": True,  # journal full candidate cycles for offline prompt A/B (measurement-only)
+    # Structured decision dossier (llm_analyst.py) — opt-in, shadow-only
+    # journal fields; default off keeps the prompt/schema/journal byte-
+    # identical to pre-change (see module docstring above).
+    "advisor_v2_enabled": False,
+    # Evidence-hash call-dedup TTL (seconds); 0 = disabled. Clamped to
+    # [0, 7000] by consumers — see module docstring above.
+    "analyst_dedup_ttl_sec": 0,
 }
 
 # Keys migrated from old format to new
