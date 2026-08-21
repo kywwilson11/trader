@@ -1,0 +1,37 @@
+{
+  "campaign_title": "feat: panel-review improvement pass — measurement/reporting layer",
+  "baseline_note": "1887+ passed / 21 failed / 15 skipped / 7 errors — ALL pre-existing missing-dep noise; scripts/ab_check.sh is the authority (diffs failure NAMES, not counts)",
+  "tree_note": "Tree carries the uncommitted 2026-07 GUI campaign (gui.py, chart_core.py, the loops, llm_analyst.py, run_pipeline.py, shadow.py + new pure modules). Do NOT touch, revert, or judge those files — they are under separate owner review. Ignore that dirty state entirely.",
+  "modules": [
+    {
+      "id": "decision_report",
+      "mods": "decision_report.py",
+      "test": "tests/test_decision_report_v3.py",
+      "seed": "Stage-0 gate attribution. The GUI now PARSES decision_report.json directly (gates/conviction/admitted_k/signal_exit nesting + the stale marker), so its output schema is a consumer contract — schema drift is now a breaking change, not a cosmetic one. Safe: robustness, arg validation, stale-input refusal, report formatting, docs. Anything altering how a gate is attributed = model-facing, defer."
+    },
+    {
+      "id": "llm_eval",
+      "mods": "llm_eval.py",
+      "test": "tests/test_llm_eval_v3.py",
+      "seed": "The keep/kill-LLM-spend verdict (echo-gap b2 significance at n>=60) plus --advisor scoring of advisor-v2 dossiers. llm_analyst now persists p_up/conviction/abstain/key_risks/event_flags — check whether the advisor scorer reads what is actually written. Measurement-only: safe to improve directly. Statistical DEFINITION changes = defer."
+    },
+    {
+      "id": "beta_ledger",
+      "mods": "beta_ledger.py",
+      "test": "tests/test_beta_ledger_v3.py",
+      "seed": "Realized-beta ledger (lagged AKL betas, HAC alpha t-stat, up/down + trend-conditional). THE alpha-vs-beta number for the rev-07-01 low-beta roadmap. The GUI now runs it with --json and parses the report, so the JSON schema is a consumer contract. Safe: numerical hardening, empty/short-window guards, schema stability. Estimator changes = defer."
+    },
+    {
+      "id": "execution_report",
+      "mods": "execution_report.py",
+      "test": "tests/test_execution_report_v3.py",
+      "seed": "Slippage/maker-share attribution by asset/action/reason. Produces execution_report.json, which nothing currently surfaces — a GUI consumer is a live proposal, so treat its schema as about to become public. Safe: percentile math edge cases, small-n guards, formatting."
+    },
+    {
+      "id": "gap_audit",
+      "mods": "gap_audit.py",
+      "test": "tests/test_gap_audit_v3.py",
+      "seed": "Overnight-gap stats (t_df, excess kurtosis, forfeited drift vs gap-through-cost) for the overnight sleeve. The GUI now has a Gap Audit button passing --symbols/--json. Safe: distribution-fit guards, missing-data paths, CLI validation. Sleeve activation thresholds = model-facing, defer."
+    }
+  ]
+}

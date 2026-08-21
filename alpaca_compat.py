@@ -35,6 +35,14 @@ def _shim_order(o):
         side=getattr(getattr(o, 'side', None), 'value', str(getattr(o, 'side', ''))),
         type=getattr(getattr(o, 'order_type', None), 'value',
                      str(getattr(o, 'order_type', ''))),
+        # c26 T6: stop_price/limit_price were dropped by the shim, which
+        # left server-stop classification (base_loop._classify_server_stop)
+        # blind under the adapter. Values arrive as str/Decimal — float()
+        # in the same guarded style as filled_avg_price.
+        stop_price=(float(o.stop_price)
+                    if getattr(o, 'stop_price', None) is not None else None),
+        limit_price=(float(o.limit_price)
+                     if getattr(o, 'limit_price', None) is not None else None),
         status=getattr(status, 'value', str(status) if status else None),
         filled_qty=float(o.filled_qty) if getattr(o, 'filled_qty', None) is not None else 0.0,
         filled_avg_price=(float(o.filled_avg_price)
@@ -63,6 +71,17 @@ def _shim_position(p):
         unrealized_plpc=(float(p.unrealized_plpc)
                          if getattr(p, 'unrealized_plpc', None) is not None else 0.0),
     )
+
+
+def _shim_quote(q):
+    """bp/ap + t (feed timestamp). t=None was silently disabling
+    order_utils.get_quote's 180s staleness rejection under this adapter
+    (the legacy SDK exposes q.t) — a frozen feed meant stops silently
+    compared against a price that stopped updating. Failure-path-safety
+    parity restoration (the staleness check already runs under the legacy
+    SDK; only >180s-stale quotes change outcome) — ships DIRECT."""
+    return SimpleNamespace(bp=q.bid_price, ap=q.ask_price,
+                           t=getattr(q, 'timestamp', None))
 
 
 def _shim_bar(b):
@@ -338,12 +357,10 @@ class CompatREST:
     def get_latest_quote(self, symbol):
         from alpaca.data.requests import StockLatestQuoteRequest
         req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-        q = self._stock_data.get_stock_latest_quote(req)[symbol]
-        return SimpleNamespace(bp=q.bid_price, ap=q.ask_price)
+        return _shim_quote(self._stock_data.get_stock_latest_quote(req)[symbol])
 
     def get_latest_crypto_quotes(self, symbols):
         from alpaca.data.requests import CryptoLatestQuoteRequest
         req = CryptoLatestQuoteRequest(symbol_or_symbols=list(symbols))
         quotes = self._crypto_data.get_crypto_latest_quote(req)
-        return {sym: SimpleNamespace(bp=q.bid_price, ap=q.ask_price)
-                for sym, q in quotes.items()}
+        return {sym: _shim_quote(q) for sym, q in quotes.items()}

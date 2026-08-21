@@ -14,18 +14,37 @@ Promotion gates in this repo:
 Also provides a coarse CSCV-style probability-of-backtest-overfitting
 estimate from per-trial fold scores, a proper Combinatorially-Symmetric
 Cross-Validation PBO when a finer per-subperiod performance matrix is
-available, and a Lo (2002) serial-correlation effective-sample correction.
+available, and a Lo (2002) serial-correlation effective-sample correction,
+and a stationary-bootstrap Sharpe p-value cross-check (Politis-Romano) with
+Politis-White automatic block length.
 """
 
 import itertools
 import math
+from collections import Counter
 
 import numpy as np
 
 EULER_GAMMA = 0.5772156649015329
 
-# Minimum deflated-Sharpe probability for a model to be promoted
+# Minimum deflated-Sharpe probability for a model to be promoted.
+# 0.60 sits well below Bailey & Lopez de Prado's conventional 0.95
+# evidence bar: it is a challenger-screen threshold on a ~12% holdout
+# with tens of trades, not a publication-grade skill test. Changing it
+# moves the promotion bar for BOTH books at once — owner decision only.
+# Anti-stacking (2026-08 B03.2): cumulative-pool deflation (adaptive_state
+# cum_trials / overlap-weighted n_trials_eff) and any ad-hoc DSR_MIN
+# "freshness bump" price the SAME holdout-reuse pressure — adopt EXACTLY
+# ONE. With the cumulative pools shipped under PROMOTION_GATE_V2, DSR_MIN
+# stays 0.60. Companion to gotcha #4 (never stack non-IID n_eff
+# corrections either).
 DSR_MIN = 0.60
+
+# pbo_cscv evaluates C(n_groups, n_groups/2) symmetric splits (8 -> 70,
+# 16 -> 12,870, 20 -> 184,756, 30 -> 155M). Above this cap it returns
+# None (fail-open) instead of grinding for hours / OOMing the shared
+# 8 GB Jetson. 200_000 admits every reachable configuration today.
+MAX_CSCV_SPLITS = 200_000
 
 
 def _norm_cdf(x: float) -> float:
@@ -65,12 +84,46 @@ def expected_max_sharpe(n_trials: int, sr_std_across_trials: float,
 
     Bailey & Lopez de Prado (2014), eq. for the expected maximum of N
     gaussian draws: mean + std * ((1-gamma)*Z^-1(1-1/N) + gamma*Z^-1(1-1/(N*e))).
+
+    n_trials below 2 is clamped to 2 — which is very nearly NO deflation:
+    a missing/zero pool size must be validated by the CALLER, not passed
+    here. n_trials is also capped at 1e15 so 1 - 1/n stays below 1.0 in
+    float64 (_norm_ppf would raise). sr_std_across_trials must be a
+    non-negative finite standard deviation; a negative width flips the
+    sign of the deflation term (dsr_from_trade_returns sanitizes its own
+    input before calling here).
     """
-    n = max(int(n_trials), 2)
+    n = min(max(int(n_trials), 2), 10 ** 15)  # cap: keep 1 - 1/n < 1.0
     z1 = _norm_ppf(1.0 - 1.0 / n)
     z2 = _norm_ppf(1.0 - 1.0 / (n * math.e))
     return sr_mean_across_trials + sr_std_across_trials * (
         (1.0 - EULER_GAMMA) * z1 + EULER_GAMMA * z2)
+
+
+def min_track_record_length(sr: float, sr0: float, skew: float = 0.0,
+                            kurt: float = 3.0, alpha: float = 0.95) -> float:
+    """Minimum Track Record Length (Bailey & Lopez de Prado 2014).
+
+    MinTRL = 1 + (1 - skew*sr + ((kurt-1)/4)*sr**2)
+                 * (z_alpha / (sr - sr0))**2
+    denominated in EFFECTIVE trades: the number of independent observations
+    needed before the observed per-trade Sharpe `sr` clears the benchmark
+    `sr0` (usually the expected_max_sharpe deflation bar) at confidence
+    `alpha`. Pure instrumentation for "need ~X more effective trades at
+    this SR" reporting on failed gates.
+
+    Guards: sr <= sr0 (the bar can never be cleared at this SR) or any
+    non-finite input -> float('inf'); the non-normality moment term is
+    floored at 0.0 before multiplying (inconsistent sample moments must
+    not produce a negative length).
+    """
+    vals = (sr, sr0, skew, kurt, alpha)
+    if any(not math.isfinite(float(v)) for v in vals):
+        return float('inf')
+    if sr <= sr0:
+        return float('inf')
+    moment = max(1.0 - skew * sr + ((kurt - 1.0) / 4.0) * sr ** 2, 0.0)
+    return 1.0 + moment * (_norm_ppf(alpha) / (sr - sr0)) ** 2
 
 
 def deflated_sharpe_ratio(observed_sr: float, benchmark_sr: float,
@@ -90,6 +143,19 @@ def deflated_sharpe_ratio(observed_sr: float, benchmark_sr: float,
         effective count n_eff = sum(average-uniqueness) is < n_obs (see
         sample_weights.py), so the z-statistic's sqrt(n-1) scaling must use
         n_eff. Defaults to n_obs (IID assumption) for backward compatibility.
+
+        Supply EXACTLY ONE effective-n correction — either label-overlap
+        uniqueness (sample_weights.effective_n / clustered_effective_n) OR
+        the Lo(2002) serial factor (serial_correlation_factor), never both
+        or their product (CLAUDE.md gotcha #4). A supplied n_eff below 10
+        is silently RAISED to the 10-sample floor by the clamp below.
+
+    kurt is the NON-excess (Pearson) fourth standardized moment — 3.0 for
+    a normal, NOT scipy.stats.kurtosis's default Fisher excess. skew and
+    kurt must be sample moments of the SAME series as observed_sr (any
+    real sample satisfies kurt >= 1 + skew**2, which keeps the variance
+    term positive); inconsistent moments can drive the denominator to the
+    1e-12 floor and saturate the result at exactly 0.0 or 1.0.
     """
     if n_obs < 10:
         return 0.0
@@ -109,14 +175,26 @@ def deflated_sharpe_ratio(observed_sr: float, benchmark_sr: float,
 
 def dsr_from_trade_returns(trade_returns, n_trials: int,
                            sr_std_across_trials: float | None = None,
-                           n_eff: float | None = None) -> dict:
+                           n_eff: float | None = None,
+                           n_eff_source: str | None = None,
+                           fail_closed_floor: bool = False) -> dict:
     """End-to-end DSR for a sequence of per-trade returns.
 
     Args:
         trade_returns: realized per-trade returns (percent or fraction —
-            unit cancels in the Sharpe).
+            unit cancels in the Sharpe). Input is coerced to float64 and
+            FLATTENED if not 1-D; non-finite entries are dropped before the
+            n >= 10 check (the drop count is returned as n_dropped). The
+            degeneracy guards (std < 1e-12, |per-trade SR| > 1e3) are
+            absolute-scale — keep inputs in percent or fraction units.
         n_trials: number of configurations evaluated during the search
-            (the selection pool the winner was picked from).
+            (the selection pool the winner was picked from). Must be the
+            ACTUAL selection pool the winner was picked from — including
+            pruned/failed trials and trials inherited from a resumed
+            study; undercounting silently lowers the bar. Values < 2 are
+            clamped to 2, and an un-coercible pool size (NaN/None/str) falls
+            back to that same minimum — near-zero deflation, so validate the
+            pool upstream; the value used is echoed back as n_trials.
         sr_std_across_trials: PER-TRADE-period std of trial Sharpe
             estimates. If None (the usual case — trial scores are
             annualized and not commensurate), uses the null sampling std
@@ -125,36 +203,125 @@ def dsr_from_trade_returns(trade_returns, n_trials: int,
             with exactly that width (Lopez de Prado's "False Strategy"
             setup). Using n_eff (not raw n) makes the expected-max null
             WIDER when labels overlap, raising the bar the winner must clear.
+            Non-finite or non-positive supplied values are sanitized to
+            None (the 1/sqrt(n_eff) null): a negative width would make the
+            deflation bar negative and saturate DSR at 1.0.
         n_eff: effective (independent) sample size from average-uniqueness
             (sample_weights.effective_n). Defaults to the raw finite count
             (IID assumption) — supply the measured value to de-bias the gate.
+            Supply EXACTLY ONE correction — uniqueness OR the Lo(2002)
+            serial factor, never both (CLAUDE.md gotcha #4). Values below
+            10 are silently RAISED to the 10-sample floor before use; the
+            pre-clamp value is echoed as n_eff_requested.
+        n_eff_source: optional provenance label (e.g. "uniqueness",
+            "clustered", "calendar_uniqueness", "lo2002") echoed verbatim
+            into the result so persisted artifacts record WHICH single
+            correction was applied.
+        fail_closed_floor: False (default) keeps today's numerics — a
+            supplied n_eff below 10 is silently RAISED to the 10-sample
+            floor (with a loud warning print). True (PROMOTION_GATE_V2)
+            fails CLOSED instead: a measured n_eff < 10 returns dsr 0.0
+            with status 'insufficient_effective_n' and echoes the
+            pre-floor value; on the surviving path only the upper clamp
+            (n_eff <= n) is retained.
 
-    Returns dict: {sr, expected_max_sr, dsr, n, n_eff}
+    Returns dict: {sr, expected_max_sr, dsr, n, n_eff, n_trials,
+        n_eff_requested, n_eff_source, n_dropped, sr_std_null, skew, kurt,
+        status, min_trl}. status is 'ok' | 'insufficient_n' | 'degenerate'
+        | 'insufficient_effective_n'; min_trl is the Bailey-LdP Minimum
+        Track Record Length in effective trades ('ok' branch only, None
+        elsewhere). The degenerate/fail-closed paths return the same keys
+        with sr_std_null/skew/kurt = None.
     """
     r = np.asarray(trade_returns, dtype=np.float64)
+    n_raw = int(r.size)
     r = r[np.isfinite(r)]
     n = len(r)
-    if n < 10 or r.std() < 1e-12:
-        return {'sr': 0.0, 'expected_max_sr': 0.0, 'dsr': 0.0, 'n': n,
-                'n_eff': float(n)}
+    try:
+        nt_used = min(max(int(n_trials), 2), 10 ** 15)
+    except (TypeError, ValueError, OverflowError):
+        nt_used = 2  # unusable pool size: echo the minimum the math uses
     if n_eff is not None and not math.isfinite(float(n_eff)):
         n_eff = None  # NaN survives the clamps and yields dsr=nan (a
         #               confusing spurious gate fail); fall back to IID
-    ne = float(n) if n_eff is None else min(max(float(n_eff), 10.0), float(n))
+    n_eff_requested = None if n_eff is None else float(n_eff)
+    if n < 10 or r.std() < 1e-12:
+        return {'sr': 0.0, 'expected_max_sr': 0.0, 'dsr': 0.0, 'n': n,
+                'n_eff': float(n), 'n_trials': nt_used,
+                'n_eff_requested': n_eff_requested,
+                'n_eff_source': n_eff_source, 'n_dropped': n_raw - n,
+                'sr_std_null': None, 'skew': None, 'kurt': None,
+                'status': 'insufficient_n', 'min_trl': None}
+    if (fail_closed_floor and n_eff_requested is not None
+            and n_eff_requested < 10.0):
+        # PROMOTION_GATE_V2: a measured effective count below the floor
+        # means the gate has fewer independent observations than the null
+        # assumes — refuse to judge instead of silently raising it to 10.
+        # n_eff echoes the PRE-floor value for audit.
+        return {'sr': 0.0, 'expected_max_sr': 0.0, 'dsr': 0.0, 'n': n,
+                'n_eff': float(n_eff_requested), 'n_trials': nt_used,
+                'n_eff_requested': n_eff_requested,
+                'n_eff_source': n_eff_source, 'n_dropped': n_raw - n,
+                'sr_std_null': None, 'skew': None, 'kurt': None,
+                'status': 'insufficient_effective_n', 'min_trl': None}
+    if n_eff is None:
+        ne = float(n)
+    elif fail_closed_floor:
+        ne = min(float(n_eff), float(n))  # upper clamp only; floor is closed
+    else:
+        ne = min(max(float(n_eff), 10.0), float(n))
     sr = float(r.mean() / r.std())
+    if not math.isfinite(sr) or abs(sr) > 1e3:
+        # A per-trade Sharpe beyond 1000 is degenerate/broken input (e.g.
+        # near-constant returns just above the std floor) that would
+        # saturate DSR at exactly 1.0 — an unconditional pass. Refuse to
+        # judge instead (fail closed, matching the n < 10 branch).
+        return {'sr': 0.0, 'expected_max_sr': 0.0, 'dsr': 0.0, 'n': n,
+                'n_eff': float(n), 'n_trials': nt_used,
+                'n_eff_requested': n_eff_requested,
+                'n_eff_source': n_eff_source, 'n_dropped': n_raw - n,
+                'sr_std_null': None, 'skew': None, 'kurt': None,
+                'status': 'degenerate', 'min_trl': None}
     centered = r - r.mean()
     m2 = float((centered ** 2).mean())
     skew = float((centered ** 3).mean() / (m2 ** 1.5 + 1e-18))
     kurt = float((centered ** 4).mean() / (m2 ** 2 + 1e-18))
+    if sr_std_across_trials is not None:
+        s = float(sr_std_across_trials)
+        if not math.isfinite(s) or s <= 0.0:
+            # A negative/NaN/zero trial-score scatter would invert or
+            # disable the deflation (DSR=1.0 for a losing book); fall
+            # back to the 1/sqrt(n_eff) null width.
+            sr_std_across_trials = None
     if sr_std_across_trials is None:
         sr_std_across_trials = 1.0 / math.sqrt(ne)
-    sr0 = expected_max_sharpe(n_trials, sr_std_across_trials)
+    # Use nt_used, not the raw n_trials: for every int-coercible input the
+    # two are equivalent (expected_max_sharpe applies the identical clamp),
+    # and for an un-coercible one this makes the echoed value the value the
+    # math actually used instead of raising mid-gate.
+    sr0 = expected_max_sharpe(nt_used, sr_std_across_trials)
+    if (not fail_closed_floor and n_eff_requested is not None
+            and n_eff_requested < 10.0):
+        # Legacy clamp engaged — numerics unchanged, but say so LOUDLY.
+        print(f"[DSR] WARNING: measured n_eff {n_eff_requested:.2f} < 10 "
+              f"was silently RAISED to the 10-sample floor (legacy clamp) "
+              f"— the gate is judging on fewer independent observations "
+              f"than the null assumes; PROMOTION_GATE_V2 fails this closed")
     return {
         'sr': sr,
         'expected_max_sr': sr0,
         'dsr': deflated_sharpe_ratio(sr, sr0, n, skew, kurt, n_eff=ne),
         'n': n,
         'n_eff': round(ne, 2),
+        'n_trials': nt_used,
+        'n_eff_requested': n_eff_requested,
+        'n_eff_source': n_eff_source,
+        'n_dropped': n_raw - n,
+        'sr_std_null': float(sr_std_across_trials),
+        'skew': round(skew, 4),
+        'kurt': round(kurt, 4),
+        'status': 'ok',
+        'min_trl': min_track_record_length(sr, sr0, skew, kurt),
     }
 
 
@@ -170,6 +337,17 @@ def pbo_from_fold_scores(fold_score_rows) -> float | None:
     fold ranks in the bottom half. PBO = fraction of combinations where the
     IS winner is a below-median OOS performer. With only 3 folds this is a
     coarse screen, not a substitute for the holdout gate.
+
+    Rows must be FOLD-ALIGNED: only rows of the MODAL length are kept (a
+    trial that skipped a thin walk-forward fold records fewer scores;
+    truncating everyone to the minimum would misalign fold columns across
+    trials). Returns None when fewer than 8 usable rows share the modal
+    length. Under the no-skill null the IS winner's OOS rank is uniform,
+    so PBO centres near ~0.5 and with n_folds folds only takes the values
+    k/n_folds — judge it against 0.5 (Bailey et al.), never a small
+    threshold. It also assumes selection by plain IS fold MEAN; if the
+    search optimized a penalized objective, this screen describes a
+    different selection rule than the one that ran.
     """
     rows = []
     for r in fold_score_rows:
@@ -185,8 +363,11 @@ def pbo_from_fold_scores(fold_score_rows) -> float | None:
             rows.append(a)
     if len(rows) < 8:
         return None
-    n_folds = min(len(r) for r in rows)
-    mat = np.stack([r[:n_folds] for r in rows])  # trials x folds
+    n_folds = Counter(r.size for r in rows).most_common(1)[0][0]  # modal
+    rows = [r for r in rows if r.size == n_folds]
+    if len(rows) < 8:
+        return None
+    mat = np.stack(rows)  # trials x folds
 
     below_median = 0
     combos = 0
@@ -229,8 +410,9 @@ def pbo_cscv(perf_matrix, n_groups: int = 8, perf_fn=None) -> dict | None:
         n_groups: S, the number of equal column groups (even). All C(S, S/2)
             ways of choosing the IS half are evaluated; the OOS half is the
             complement — symmetric, so every block serves as both IS and OOS.
-        perf_fn: optional (submatrix)->per-trial score; default in-sample and
-            out-of-sample Sharpe via mean/std.
+        perf_fn: optional (matrix, col_indices) -> length-n_trials score
+            vector, called as perf_fn(m, cols) on the row-filtered matrix;
+            default _sharpe_cols (mean/std Sharpe over the column subset).
 
     Method: for each split, pick the IS-best trial, find its OOS performance
     RANK omega in (0,1), take the logit lambda = ln(omega/(1-omega)). PBO is
@@ -239,15 +421,27 @@ def pbo_cscv(perf_matrix, n_groups: int = 8, perf_fn=None) -> dict | None:
 
     Rows containing non-finite entries are DROPPED (matching
     pbo_from_oos_blocks) — zero-filling them would silently mutate trial
-    performance and shift the OOS ranks.
+    performance and shift the OOS ranks. Rows that are CONSTANT across all
+    columns (e.g. a never-trading config's all-zero return stream) are
+    dropped too — a zero-variance subset scores Sharpe 0.0, which outranks
+    every losing config and wins argmax, inverting the verdict (matches
+    pbo_from_oos_blocks' zero-variance filter).
 
-    Returns {pbo, n_splits, median_logit, mean_oos_rank} or None if the matrix
-    is too small / degenerate.
+    Returns {pbo, n_splits, n_trials, median_logit, mean_oos_rank} or None
+    if the matrix is too small / degenerate, if an IS/OOS half would be a
+    single column (every subset Sharpe 0.0 -> deterministic pbo=1.0), or
+    if C(n_groups, n_groups/2) exceeds MAX_CSCV_SPLITS. The trailing
+    t % n_groups columns — the MOST RECENT subperiods of a time-ordered
+    stream — are silently dropped to balance the groups.
     """
     m = np.asarray(perf_matrix, dtype=np.float64)
     if m.ndim != 2:
         return None
     m = m[np.all(np.isfinite(m), axis=1)]
+    if m.shape[0] and m.shape[1]:
+        # Constant rows (never-trading configs) score 0.0 on every subset
+        # and win argmax over any losing config — drop them (see docstring).
+        m = m[m.std(axis=1) > 1e-12]
     n_trials, t = m.shape
     if n_trials < 2 or n_groups < 2 or n_groups % 2 != 0 or t < n_groups:
         return None
@@ -257,6 +451,12 @@ def pbo_cscv(perf_matrix, n_groups: int = 8, perf_fn=None) -> dict | None:
     gsz = t // n_groups
     groups = [np.arange(g * gsz, (g + 1) * gsz) for g in range(n_groups)]
     half = n_groups // 2
+    if gsz * half < 2:
+        # Single-column IS/OOS halves make every subset std 0 -> all
+        # scores 0.0 -> argmax degenerates -> deterministic pbo=1.0.
+        return None
+    if math.comb(n_groups, half) > MAX_CSCV_SPLITS:
+        return None  # combinatorial blow-up: fail open, do not hang the Jetson
 
     logits = []
     oos_ranks = []
@@ -287,6 +487,7 @@ def pbo_cscv(perf_matrix, n_groups: int = 8, perf_fn=None) -> dict | None:
     return {
         'pbo': below / n_splits,
         'n_splits': n_splits,
+        'n_trials': int(n_trials),
         'median_logit': float(np.median(logits)),
         'mean_oos_rank': float(np.mean(oos_ranks)),
     }
@@ -304,21 +505,35 @@ def serial_correlation_factor(returns, max_lag: int | None = None) -> dict:
     annualized-Sharpe scaling shrinks by 1/sqrt(f) when f > 1 (positive
     autocorrelation, the usual overlap case).
 
+    When f < 1 (negative autocorrelation / mean reversion) sharpe_scale
+    EXCEEDS 1 — it is the raw, UNCLAMPED Lo quantity and would INFLATE a
+    Sharpe, so never apply it to anything feeding a promotion gate; only
+    n_eff is clamped (to <= n). max_lag < 1 means "no correction" and
+    returns the identity factor.
+
     IMPORTANT: this is a SEPARATE effect from label-overlap uniqueness
     (sample_weights.effective_n). Do NOT stack both n_eff reductions on the
     same DSR — they double-count variance and the sign of rho_k matters. This
     is provided OFF by default; opt in deliberately when serial correlation is
     the dominant non-IID source (e.g. a single contiguous return stream).
 
-    Returns {factor, n_eff, n, max_lag, sharpe_scale} where sharpe_scale =
-    1/sqrt(max(factor, eps)) is the multiplier on an IID Sharpe.
+    Returns {factor, n_eff, n_eff_serial, n, max_lag, sharpe_scale} where
+    sharpe_scale = 1/sqrt(max(factor, eps)) is the multiplier on an IID
+    Sharpe. n_eff_serial duplicates n_eff — read THAT key at a DSR call
+    site so which correction is applied (Lo, not uniqueness) is explicit
+    (CLAUDE.md gotcha #4).
     """
     r = np.asarray(returns, dtype=np.float64)
     r = r[np.isfinite(r)]
     n = len(r)
     if n < 12 or r.std() < 1e-12:
-        return {'factor': 1.0, 'n_eff': float(n), 'n': n, 'max_lag': 0,
-                'sharpe_scale': 1.0}
+        return {'factor': 1.0, 'n_eff': float(n), 'n_eff_serial': float(n),
+                'n': n, 'max_lag': 0, 'sharpe_scale': 1.0}
+    if max_lag is not None and max_lag < 1:
+        # max_lag=0 (or a negative off-by-one) means "no correction" —
+        # previously it was silently promoted to lag 1 and applied one.
+        return {'factor': 1.0, 'n_eff': float(n), 'n_eff_serial': float(n),
+                'n': n, 'max_lag': 0, 'sharpe_scale': 1.0}
     q = max_lag if max_lag is not None else min(n // 4, int(round(n ** (1 / 3))) + 2)
     q = max(1, min(q, n - 1))
     x = r - r.mean()
@@ -327,28 +542,47 @@ def serial_correlation_factor(returns, max_lag: int | None = None) -> dict:
     for k in range(1, q + 1):
         rho_k = float(np.sum(x[k:] * x[:-k]) / denom)
         f += 2.0 * (1.0 - k / (q + 1.0)) * rho_k
-    # A negative factor (strong negative autocorrelation) would imply more
-    # independent info than n; floor at a small positive so n_eff stays finite
-    # and we never INFLATE n beyond the raw count.
+    # With Bartlett/Newey-West weights the estimator is positive
+    # semi-definite, so f cannot go negative — but strong negative
+    # autocorrelation drives it toward 0 (implying more independent info
+    # than n). Floor at a small positive so n_eff stays finite, and clamp
+    # n_eff so we never INFLATE it beyond the raw count. NOTE:
+    # sharpe_scale is NOT clamped — it exceeds 1 when f < 1 (docstring).
     f = max(f, 1e-6)
     n_eff = min(float(n), n / f)
-    return {'factor': f, 'n_eff': n_eff, 'n': n, 'max_lag': q,
-            'sharpe_scale': 1.0 / math.sqrt(f)}
+    return {'factor': f, 'n_eff': n_eff, 'n_eff_serial': n_eff, 'n': n,
+            'max_lag': q, 'sharpe_scale': 1.0 / math.sqrt(f)}
 
 
 def build_oos_blocks(trade_returns, n_blocks: int = 8):
-    """Bin a 1-D net-return stream into n_blocks contiguous equal-count block means.
+    """Bin a 1-D net-return stream into n_blocks contiguous near-equal-count block means.
 
     pbo_cscv needs a rectangular [n_trials, T] matrix, but different
     configurations produce different numbers of trades. This normalizes one
     configuration's variable-length per-trade (or per-bar) return series into a
     FIXED-length vector — each element is the mean net return of a contiguous
-    equal-count block — so heterogeneous trials stack into one matrix.
+    block (np.array_split: the first r.size % n_blocks blocks carry one extra
+    element, so the mean of block means equals the overall mean only when
+    n_blocks divides the length) — so heterogeneous trials stack into one matrix.
 
-    Returns None when there are fewer finite returns than blocks (a block would
-    be empty) — the caller treats None as "cannot judge" and falls back to DSR.
+    INPUT MUST BE IN CHRONOLOGICAL ORDER — blocks are sliced by position.
+    A ticker-major panel stream (e.g. trades pooled per name, the storage
+    order of backtest.py's all_trades and hypersearch's holdout rows) yields
+    per-NAME blocks, so the CSCV split would measure cross-sectional rather
+    than temporal generalization. Blocks are trade-ORDINAL, not calendar
+    bins: columns of trials with very different trade counts span different
+    periods, so PBO from this path is approximate.
+
+    Returns None when the input cannot be coerced to a 1-D float array or
+    there are fewer finite returns than blocks (a block would be empty) —
+    the caller treats None as "cannot judge" and falls back to DSR.
     """
-    r = np.asarray(trade_returns, dtype=np.float64)
+    try:
+        r = np.asarray(trade_returns, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None  # un-coercible input: honor the fail-open contract
+    if r.ndim != 1:
+        return None  # a matrix/scalar here is a caller mix-up, not a stream
     r = r[np.isfinite(r)]
     if n_blocks < 2 or r.size < n_blocks:
         return None
@@ -358,7 +592,8 @@ def build_oos_blocks(trade_returns, n_blocks: int = 8):
 def pbo_from_oos_blocks(block_rows, n_groups: int = 8) -> dict | None:
     """Fail-open CSCV-PBO over per-trial block vectors (from build_oos_blocks).
 
-    Filters None / wrong-length / non-finite / zero-variance rows, stacks the
+    Filters None / un-coercible (non-numeric, ragged, wrong-type) / wrong-length /
+    non-finite / zero-variance rows, stacks the
     rest into a [n_valid_trials, n_blocks] matrix and runs pbo_cscv. Returns None
     — leaving the promotion decision governed by the DSR gate — whenever there is
     too little to judge honestly: fewer than 2 valid trials, fewer block-columns
@@ -368,10 +603,21 @@ def pbo_from_oos_blocks(block_rows, n_groups: int = 8) -> dict | None:
     STRICTER, never looser, so this never blocks an honest model on a thin/early
     run.
     """
-    from collections import Counter
-    rows = [np.asarray(r, dtype=np.float64) for r in block_rows if r is not None]
-    rows = [r for r in rows
-            if r.ndim == 1 and r.size >= 2 and np.all(np.isfinite(r)) and r.std() > 1e-12]
+    rows = []
+    for r in block_rows:
+        if r is None:
+            continue
+        try:
+            # Coerce first: np.isfinite on a raw row holding a non-numeric
+            # entry raises TypeError instead of filtering it; a ragged or
+            # non-numeric row must be DROPPED per the fail-open contract,
+            # not allowed to abort the audit (mirrors pbo_from_fold_scores).
+            a = np.asarray(r, dtype=np.float64)
+        except (TypeError, ValueError):
+            continue
+        if (a.ndim == 1 and a.size >= 2 and np.all(np.isfinite(a))
+                and a.std() > 1e-12):
+            rows.append(a)
     if len(rows) < 2:
         return None
     width = Counter(r.size for r in rows).most_common(1)[0][0]  # modal length
@@ -379,3 +625,172 @@ def pbo_from_oos_blocks(block_rows, n_groups: int = 8) -> dict | None:
     if len(rows) < 2 or width < n_groups or width % n_groups != 0:
         return None
     return pbo_cscv(np.stack(rows), n_groups=n_groups)
+
+
+def politis_white_block_length(x) -> float:
+    """Automatic stationary-bootstrap block length (Politis & White 2004).
+
+    Politis & White (2004, Econometric Reviews) automatic block-length
+    selection for the stationary bootstrap, with the Patton-Politis-White
+    (2009) correction D_SB = 2*ghat(0)^2 (the 2004 paper's D_SB constant
+    was wrong), following the flat-top lag-window recipe of Patton's
+    reference opt_block_length code. Each formula is documented inline.
+
+    Returns the EXPECTED (mean) block length b >= 1.0 for the stationary
+    bootstrap's geometric blocks (restart probability p = 1/b); 1.0 means
+    effectively-iid resampling. Fail-open: any degenerate input (fewer
+    than 20 finite observations, a constant series, or a non-finite /
+    vanishing D_SB) returns 1.0, never raises.
+    """
+    r = np.asarray(x, dtype=np.float64).ravel()
+    r = r[np.isfinite(r)]
+    n = int(r.size)
+    if n < 20 or r.std() < 1e-12:
+        return 1.0
+    xc = r - r.mean()
+    K = max(5, int(math.ceil(math.log10(n))))  # PW bandwidth constant K_n
+    mmax = min(int(math.ceil(math.sqrt(n))) + K, n - 1)
+    # Biased autocovariances R(k) = (1/n) * sum(xc[k:] * xc[:-k]), k=0..mmax.
+    R = np.empty(mmax + 1)
+    R[0] = float(np.dot(xc, xc)) / n
+    for k in range(1, mmax + 1):
+        R[k] = float(np.dot(xc[k:], xc[:-k])) / n
+    rho = R / R[0]  # sample autocorrelations
+    # PW implicit significance rule (c = 2): |rho_k| < 2*sqrt(log10(n)/n).
+    thresh = 2.0 * math.sqrt(math.log10(n) / n)
+    insig = np.abs(rho) < thresh  # rho_0 = 1 is never insignificant
+    # mhat: smallest m whose NEXT K autocorrelations are all insignificant
+    # (lags beyond mmax count as insignificant).
+    mhat = None
+    for m in range(0, mmax + 1):
+        if all(insig[j] for j in range(m + 1, min(m + K, mmax) + 1)):
+            mhat = m
+            break
+    if mhat is None:
+        sig = np.nonzero(~insig[1:])[0]  # fallback: largest significant lag
+        mhat = int(sig[-1]) + 1 if sig.size else 0
+    mhat = max(mhat, 1)
+    M = max(min(2 * mhat, mmax), 1)
+    # Flat-top lag window: lam(t) = 1 for |t| <= 0.5, 2*(1-|t|) for
+    # 0.5 < |t| <= 1, else 0.
+    ks = np.arange(1, M + 1, dtype=np.float64)
+    t = ks / M
+    lam = np.where(t <= 0.5, 1.0, np.where(t <= 1.0, 2.0 * (1.0 - t), 0.0))
+    ghat = R[0] + 2.0 * float(np.sum(lam * R[1:M + 1]))  # long-run var g(0)
+    Ghat = 2.0 * float(np.sum(lam * ks * R[1:M + 1]))
+    D_SB = 2.0 * ghat ** 2  # PPW (2009) corrected D_SB — NOT the 2004 constant
+    if not math.isfinite(D_SB) or D_SB <= 1e-18:
+        return 1.0
+    b = ((2.0 * Ghat ** 2) / D_SB) ** (1.0 / 3.0) * n ** (1.0 / 3.0)
+    # Cap per Patton's reference code; iid data has Ghat = 0 -> b floors to 1.
+    cap = math.ceil(min(3.0 * math.sqrt(n), n / 3.0))
+    return float(min(max(b, 1.0), cap))
+
+
+def stationary_bootstrap_sharpe_pvalue(returns, n_boot: int = 1000,
+                                       seed: int = 0,
+                                       block_len: float | None = None) -> dict:
+    """Stationary-bootstrap p-value for H0: per-period Sharpe <= 0.
+
+    Politis & Romano (1994, JASA) stationary bootstrap: resampled blocks
+    have GEOMETRIC lengths — at each step the index either continues the
+    current block or restarts at a uniform position with restart
+    probability p = 1/b — with circular index wrap-around, which preserves
+    the stationarity of the resample. b defaults to the Politis-White
+    (2004) automatic block length (politis_white_block_length above).
+
+    P-value choice: a one-sided test of H0: per-period Sharpe <= 0. The
+    bootstrap distribution of Sharpes is CENTERED at the sample Sharpe
+    (subtracting sr_hat imposes the null), then
+        p = (1 + #{sr_b - sr_hat >= sr_hat}) / (B_used + 1)
+    — the standard shift-method bootstrap test, equivalent to inverting
+    the basic (reverse-percentile) interval; smoothed by +1 so p is never
+    exactly 0. This is NOT the Ledoit-Wolf (2008) studentized test — a
+    deliberate simplification for a shadow diagnostic (studentization
+    needs a per-replicate HAC variance estimate); LW-2008 studentization
+    is the upgrade path if this ever feeds a gate.
+
+    DIAGNOSTIC ONLY: logged NEXT TO the analytic DSR (research/
+    campaign_2026-08 idea #3); it feeds no promotion verdict, and every
+    failure path is fail-open — a degenerate input returns a status dict
+    with p_value None, never an exception.
+
+    KILL-SCREEN NOTE: this is validation-INFERENCE tooling, explicitly
+    distinct from the killed "Sequential bootstrap for LGB bagging"
+    (research/KILL_LIST.md:103) — that kill is a training-WEIGHTING
+    substitute; the adjacency is deliberate and screened clean
+    (02_research.md new_build_ideas #3).
+
+    INPUT MUST BE CHRONOLOGICAL (mirroring build_oos_blocks' warning): on
+    a ticker-major pooled trade stream the blocks preserve within-name,
+    not temporal, adjacency — approximate until an hourly mark-to-market
+    equity series exists (B02). The n >= 20 floor is stricter than the
+    module's usual 10 because the Politis-White bandwidth needs
+    autocovariance lags up to ~sqrt(n) + 5.
+
+    Deterministic under `seed` via np.random.default_rng(seed) — the
+    global numpy RNG state is never touched. ci90 is the plain
+    (uncentered) 5%-95% percentile band of the bootstrap Sharpe
+    distribution — descriptive scatter, not a test-inverted interval.
+
+    Returns dict {p_value, sharpe, block_len, n_boot, n_boot_used, ci90,
+    n, n_dropped, status}; status is 'ok' | 'insufficient_n' |
+    'degenerate', and every branch returns the same keys.
+    """
+    r = np.asarray(returns, dtype=np.float64).ravel()
+    n_raw = int(r.size)
+    r = r[np.isfinite(r)]
+    n = int(r.size)
+    n_dropped = n_raw - n
+    B = max(int(n_boot), 1)
+
+    def _skeleton(status: str, blk=None) -> dict:
+        return {'p_value': None, 'sharpe': 0.0, 'block_len': blk,
+                'n_boot': B, 'n_boot_used': 0, 'ci90': None,
+                'n': n, 'n_dropped': n_dropped, 'status': status}
+
+    if n < 20:
+        return _skeleton('insufficient_n')
+    if r.std() < 1e-12:
+        return _skeleton('degenerate')
+    if block_len is None:
+        b = politis_white_block_length(r)
+    else:
+        try:
+            b = float(block_len)
+        except (TypeError, ValueError):
+            b = float('nan')
+        if not math.isfinite(b):
+            # Sanitize-to-fallback, matching the module's style for
+            # sr_std_across_trials: an unusable override -> the auto value.
+            b = politis_white_block_length(r)
+        else:
+            b = min(max(b, 1.0), float(n))
+    p_restart = 1.0 / b
+    rng = np.random.default_rng(seed)
+    # Draw ALL randomness up front so determinism is independent of the
+    # data values (and of which replicates later prove degenerate).
+    restart = rng.random((B, n)) < p_restart
+    restart[:, 0] = True
+    starts = rng.integers(0, n, size=(B, n))
+    idx = np.empty((B, n), dtype=np.int64)
+    idx[:, 0] = starts[:, 0]
+    # Python loop over n of vectorized ops over B — n~1e3 x B=1000 is
+    # trivially cheap; circular wrap preserves stationarity (Politis-Romano).
+    for t in range(1, n):
+        idx[:, t] = np.where(restart[:, t], starts[:, t], (idx[:, t - 1] + 1) % n)
+    samp = r[idx]
+    mu = samp.mean(axis=1)
+    sd = samp.std(axis=1)
+    ok = sd > 1e-12
+    sr_b = mu[ok] / sd[ok]
+    n_used = int(ok.sum())
+    if n_used == 0:
+        return _skeleton('degenerate', blk=float(b))
+    # Population std (ddof=0), matching dsr_from_trade_returns.
+    sr_hat = float(r.mean() / r.std())
+    p = float((1.0 + np.sum((sr_b - sr_hat) >= sr_hat)) / (n_used + 1.0))
+    ci90 = [float(np.quantile(sr_b, 0.05)), float(np.quantile(sr_b, 0.95))]
+    return {'p_value': p, 'sharpe': sr_hat, 'block_len': float(b),
+            'n_boot': B, 'n_boot_used': n_used, 'ci90': ci90,
+            'n': n, 'n_dropped': n_dropped, 'status': 'ok'}

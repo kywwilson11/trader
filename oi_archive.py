@@ -260,7 +260,9 @@ def oi_features_for_index(alpaca_symbol: str, index):
     s = get_oi_series(alpaca_symbol)
     if s is None or len(s) < 200:
         return None
-    chg = s.pct_change(24) * 100
+    # pandas pin (c26-T3/B21): explicit ffill + fill_method=None ==
+    # pandas-2 pad semantics, pandas-3-proof
+    chg = s.ffill().pct_change(24, fill_method=None) * 100
     roll = s.rolling(720, min_periods=168)
     mu, sd = roll.mean(), roll.std()
     z = ((s - mu) / sd).replace([np.inf, -np.inf], np.nan)

@@ -71,10 +71,12 @@ class TestLiveParity:
     the harvest would produce on the same cross-section."""
 
     def _mk_live(self, monkeypatch, panel_vals, top_k=60):
+        # Deterministic regardless of shell env (mirrors test_c26_T2)
+        monkeypatch.delenv('TRADER_CLOSED_BARS_V2', raising=False)
         idx = pd.date_range('2026-06-08 14:30', periods=80, freq='h',
                             tz='UTC')
 
-        def fake_bars(api, sym):
+        def fake_bars(api, sym, **k):
             base = pd.DataFrame({
                 'Open': 100.0, 'High': 101.0, 'Low': 99.0,
                 'Close': 100.0, 'Volume': panel_vals[sym]['dv'] / 100.0 / 7,
@@ -121,8 +123,9 @@ class TestLiveParity:
 
     def test_live_failure_returns_empty(self, monkeypatch):
         import market_data
+        monkeypatch.delenv('TRADER_CLOSED_BARS_V2', raising=False)
 
-        def boom(api, sym):
+        def boom(api, sym, **k):
             raise OSError('feed down')
 
         monkeypatch.setattr(market_data, 'fetch_stock_bars_alpaca', boom)

@@ -286,9 +286,11 @@ class TestRankGradientBucketsCLI:
 
 class TestRankGradientDocs:
     def test_producer_warning_present(self):
-        # Same warning as ic_by_name: the frame producer does not exist yet.
-        assert 'NOT yet authored' in rgr.__doc__
-        assert 'from backtest.py over the universe' not in rgr.__doc__
+        # Modernized (c26 final review F14): the frame producer now exists —
+        # backtest.py ships B02 stage0_preds.json (default ON); the doc must
+        # name it instead of the stale "NOT yet authored" warning.
+        assert 'NOT yet authored' not in rgr.__doc__
+        assert 'stage0_preds.json' in rgr.__doc__
 
     def test_units_contract_stated(self):
         assert 'PERCENT' in rgr.__doc__

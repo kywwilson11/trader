@@ -1,0 +1,31 @@
+{
+  "campaign_title": "feat: panel-review batch B5 — model artifacts (LSTM / LightGBM / blend)",
+  "reviewers": 5,
+  "workers": 3,
+  "report_path": "research/module_improve_v3_batchB5.md",
+  "effort_opus": "max",
+  "effort_fable": "xhigh",
+  "effort_sonnet": "max",
+  "baseline_note": "tests/baseline_failures.txt pins the known dev-Mac failure NAMES (all pre-existing missing-dep: dotenv/torch/lightgbm/optuna/joblib/numba/sklearn). scripts/ab_check.sh is the authority — it diffs NAMES, never counts — and was verified PASS immediately before this batch started.",
+  "tree_note": "The tree carries SEVEN uncommitted campaigns under separate owner review: GUI (gui.py, chart_core.py, crypto_loop.py, stock_loop.py, llm_analyst.py, run_pipeline.py, shadow.py + tax_lots.py, journal_stats.py, design_tokens.py + fonts/, logos/96/); batch 0 (decision_report.py, llm_eval.py, beta_ledger.py); A (base_loop.py, order_utils.py, execution_policy.py, risk_budget.py, bet_sizing.py); B1 (validation.py, sample_weights.py, calibration.py); B2 (meta_label.py, backtest.py, policy_exits.py); B3 (fees.py, liquidity.py, cost_regime.py); B4 (portfolio.py, portfolio_backtest.py). Plus all their tests/test_*_v3.py. Do NOT edit, revert, stash, or judge ANY of those files — read them freely for context (sample_weights.py, meta_label.py and shadow.py are ESSENTIAL context here), but read the WORKING-TREE version, never `git show HEAD:` (HEAD is stale for them). Ignore that dirty state when assessing your own diff.",
+  "modules": [
+    {
+      "id": "model_v2",
+      "mods": "model_v2.py",
+      "test": "tests/test_model_v2_v3.py",
+      "seed": "The RegressionLSTM definition — small file, enormous leverage: every artifact the promotion path ships is built from it. HEAVY-DEP: torch is NOT installed on this dev Mac. READ the code, never import it; any test you add MUST use module-level pytest.importorskip('torch') so it SKIPS rather than ERRORS (a collection error is a NEW failure name and fails the gate). CROSS-BATCH FROM PANEL B1 — a confound the owner will hit on the very next activation: the wave-8 plan is to swap the LSTM's sample weighting for sample_weights' uniqueness weights, but B1 established the two are on DIFFERENT SCALES — the LSTM's clamp(|y|+1, max=50) weights are UN-normalized (mean ~1+E|y|) while sample_weights' are mean-1. Swapping therefore also rescales the loss and changes how often clip_grad_norm_(1.0) binds, so the A/B would confound the uniqueness effect with an effective-learning-rate change unless the new weights are re-normalized or lr/clip are re-tuned. Verify that scale claim from THIS side and document it precisely at the weighting site. Review targets: architecture/shape correctness, determinism and seeding, dtype/device handling, whether the forward path can emit NaN without detection, checkpoint save/load round-trip fidelity, and docstring accuracy vs what hypersearch actually constructs. Safe to ship: documentation truth, guards that cannot change a trained artifact, importorskip-guarded tests. Any change to architecture, initialization, loss, or weighting = model-facing, defer with a sketch (and note gotcha #2: an objective change requires deleting v2_study.db + stock_v2_study.db)."
+    },
+    {
+      "id": "model_lgb",
+      "mods": "model_lgb.py",
+      "test": "tests/test_model_lgb_v3.py",
+      "seed": "The LightGBM leg of the per-book blend. HEAVY-DEP: lightgbm is NOT installed here — READ only, and gate any test with module-level pytest.importorskip('lightgbm'). LEDGER P1 ON RECORD: save-ordering versus the hot-reload key — the live bots hot-reload artifacts without stopping, so if the model file and its key/manifest are written in the wrong order (or non-atomically), a reloading bot can pick up a half-written pair. Verify the exact write sequence and whether an interrupted save can leave an inconsistent on-disk state; this is a real operational hazard on the Jetson, where a weekly retrain runs beside live trading on 8 GB. RELATED CROSS-BATCH CONTEXT: batch B2 found that every `train_meta` failure path leaves stale meta artifacts live against a possibly-new primary, and that .prev rotation cadences differ across writers — check whether this module's artifact writing has the same class of pairing hazard. Review targets: atomicity of writes, artifact/key consistency, hot-reload safety, feature-name ordering stability between train and serve (a silent column reorder is a train/serve parity break), and NaN/inf handling at predict time. Safe to ship: write-atomicity hardening that provably cannot change a trained artifact's contents, guards, documentation of the artifact contract, importorskip-guarded tests. Changing hyperparameters, feature handling, or the artifact FORMAT = model-facing, defer."
+    },
+    {
+      "id": "blend_fit",
+      "mods": "blend_fit.py",
+      "test": "tests/test_blend_fit_v3.py",
+      "seed": "Fits the LSTM/LightGBM blend weights. EXPLICIT SCOPE FENCE, on record in the module ledger: the blend WIRING is a Jetson-gated item — DO NOT attempt to wire it, activate it, or change how the blend is consumed. Treat this module as read-mostly: your value is in verifying the fitting math is correct and honestly documented, and in pinning it with tests. HEAVY-DEP: read only; importorskip-guard any test that needs the heavy stack. Review targets: is the weight-fitting objective what the docstring claims; can the fitted weights escape their intended simplex/bounds; what happens with degenerate input (one leg constant, perfectly correlated legs, n below any sane floor, NaN predictions from one leg); is there any look-ahead in how the fitting sample is selected; and does the module state clearly which artifact consumes its output. CROSS-BATCH PATTERN WORTH CHECKING: three separate panels have now found the same class of defect — a fitted/estimated quantity whose PRODUCTION path differs from its TESTED path (B4 found production runs pairwise LedoitWolf while every test exercises np.corrcoef). Ask explicitly whether this module's tested path is the path that runs. Safe to ship: guards, degenerate-input handling, documentation truth, tests. Changing the blend objective or its weights = model-facing, defer."
+    }
+  ]
+}

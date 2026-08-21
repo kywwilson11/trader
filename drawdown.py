@@ -17,6 +17,9 @@ be well-defined.
 """
 
 # (drawdown threshold, size multiplier), richest drawdown first.
+# Under strategy_config.DERISK_STACK_V2 this ladder deliberately stays OUTSIDE
+# the regime-family MIN and keeps composing as a product — it measures the
+# ACCOUNT's own state (Grossman-Zhou 1993), not market vol (02_research B06).
 DRAWDOWN_LADDER = ((0.20, 0.25), (0.15, 0.50), (0.10, 0.75))
 
 PEAK_SEED = 100_000.0

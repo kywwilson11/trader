@@ -11,6 +11,7 @@ Bar-fetching and ATR logic live in market_data.py.
 # SQLite library overriding the system one (breaks yfinance's cache).
 import joblib
 import os
+import time
 import torch
 
 # Tiny-LSTM CPU inference is fastest with 1-2 threads; the default 6-thread
@@ -21,10 +22,13 @@ if os.environ.get('CUDA_VISIBLE_DEVICES', None) == '':
 from model_v2 import RegressionLSTM
 from indicators import (
     compute_features, compute_stock_features, fill_warmup_features,
+    apply_daily_restore, count_warmup_constant_columns,
 )
 from market_data import (
     fetch_bars_alpaca, fetch_bars_yfinance,
     fetch_stock_bars_alpaca, drop_forming_bar,
+    daily_feature_restore_enabled, har_daily_feed_enabled,
+    refresh_daily_bars, load_daily_bars, daily_bars_fetched_at,
 )
 
 # Lazy-load with retry: try once per cycle, stop spamming after first failure log
@@ -172,6 +176,15 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
     if asset_type == 'stock':
         if api is not None:
             df = fetch_stock_bars_alpaca(api, symbol)
+            # Daily-bars cache refresh (D11/D30): throttled to 1/24h/symbol
+            # inside refresh_daily_bars. This is the ONLY refresh trigger —
+            # volatility.get_sigma reads the cache but has no api, by design.
+            if daily_feature_restore_enabled() or har_daily_feed_enabled():
+                try:
+                    refresh_daily_bars(api, symbol)
+                    refresh_daily_bars(api, 'SPY')
+                except Exception:
+                    pass
         else:
             df = fetch_bars_yfinance(symbol)
     else:
@@ -219,13 +232,41 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
     # --- Compute technical features ---
     if asset_type == 'stock':
         df = compute_stock_features(df, spy_close=spy_close, symbol=symbol)
+        # ALWAYS-ON diagnostic (D11 Jetson evidence): count the daily-window
+        # columns about to be served as warmup-fill constants, BEFORE any
+        # fill or restore.
+        n_const_before, n_present = count_warmup_constant_columns(df)
+        n_restored = 0
+        _restore_on = daily_feature_restore_enabled()
+        if _restore_on:
+            # D11 restore (default OFF): assign REAL values to
+            # indicators.DAILY_RESTORE_COLUMNS from the daily-bars cache
+            # (fresh within 4 days — tolerates long weekends; refresh still
+            # attempts every 24h). Any failure fails open to the warmup fill.
+            try:
+                _fetched = daily_bars_fetched_at(symbol)
+                if _fetched is not None and (time.time() - _fetched) < 4 * 86400:
+                    _daily = load_daily_bars(symbol)
+                    if _daily is not None:
+                        _spy_daily_df = load_daily_bars('SPY')
+                        _spy_daily = (_spy_daily_df['Close']
+                                      if _spy_daily_df is not None else None)
+                        df, n_restored, _ = apply_daily_restore(
+                            df, _daily, _spy_daily, symbol)
+            except Exception:
+                pass
         # Mirror the harvest's neutral warmup fill (0.0 / 0.5): on a live
         # ~45-day frame the long-window daily features (RM_252_21,
         # MA_Dist_200d, ...) are all-NaN by construction. Training kept its
         # warmup rows with these same neutral values, so live serves them
         # identically — without this fill the dropna below deleted EVERY row
-        # and stock predictions returned None each cycle.
+        # and stock predictions returned None each cycle. (Restored columns
+        # are non-NaN, so this fill no-ops on them; flag OFF this call is
+        # byte-identical to before the restore existed.)
         df = fill_warmup_features(df)
+        print(f"  [DAILY-FEATURES] {symbol}: {n_const_before}/{n_present} "
+              f"daily-window cols warmup-filled constants"
+              + (f" — restored {n_restored}" if _restore_on else ""))
     else:
         df = compute_features(df, btc_close=btc_close)
     # Drop only rows NaN in columns the model actually consumes — an unused
@@ -395,6 +436,7 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
 
     predicted_return = lstm_pred
     flat = None
+    lgb_pred = None
     if lgb_model is not None:
         try:
             from model_lgb import flatten_sequence, predict_lgb, ensemble_predict
@@ -474,6 +516,16 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         if q10_pred is not None and _q10_floor is not None:
             snapshot['Q10'] = q10_pred
             snapshot['Q10_Floor'] = _q10_floor
+        # Blend legs (B02, measurement-only): persisted into the snapshot so
+        # the cached payload and downstream journals can answer the
+        # static-vs-online blend-weight question from live data. Fail-soft:
+        # instrumentation must never affect the returned prediction.
+        try:
+            snapshot['LSTM_Pred'] = float(lstm_pred)
+            if lgb_pred is not None:
+                snapshot['LGB_Pred'] = float(lgb_pred)
+        except Exception:
+            pass
         # Volume — only include if real data exists (Alpaca crypto bars
         # occasionally report zero volume even on closed bars)
         last_vol = last_row.get('Volume', 0) if 'Volume' in last_row.index else 0

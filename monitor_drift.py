@@ -11,7 +11,11 @@ standard early-warning metric (credit-risk practice):
 with ref_b = 0.1 per decile bin. Conventional levels: < 0.10 stable,
 0.10-0.25 moderate shift (warn), > 0.25 major shift (action). Two
 CONSECUTIVE action days (one bad day is often just a news regime) write
-{prefix}retrain_requested.flag and send a notification.
+{prefix}retrain_requested.flag and send a notification. The flag is
+(re)written only on a day whose OWN level is action (a consumed trigger must
+not be re-created by a later warn day), and a model deploy (manifest content
+change) fences pred_history and resets the streak — post-retrain PSI must not
+score the old model's predictions against the new manifest's deciles.
 
 Wiring:
   - hypersearch saves holdout pred deciles in the model manifest
@@ -25,6 +29,7 @@ Wiring:
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import sys
@@ -61,6 +66,17 @@ def history_file(prefix: str) -> Path:
 
 def retrain_flag_file(prefix: str) -> Path:
     return BASE_DIR / f'{_p(prefix)}retrain_requested.flag'
+
+
+def _manifest_hash(prefix: str) -> str | None:
+    """Content hash of the deployed model manifest, or None when unreadable.
+    Identity for the model-deploy fence: a changed manifest means new holdout
+    deciles, and pred_history still holds the OLD model's predictions."""
+    path = BASE_DIR / f'{_p(prefix)}model_v2.manifest.json'
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return None
 
 
 @contextmanager
@@ -168,6 +184,23 @@ def prune_history(prefix: str, keep_days: int = HISTORY_KEEP_DAYS) -> None:
             tmp = str(path) + '.tmp'
             with open(tmp, 'w') as f:
                 f.writelines(kept)
+            os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def clear_history(prefix: str) -> None:
+    """Truncate the prediction history (model-deploy fence). Same lock
+    discipline as prune_history: the bot's concurrent append must not race
+    the replace."""
+    path = history_file(prefix)
+    if not path.exists():
+        return
+    try:
+        with _history_lock(prefix):
+            tmp = str(path) + '.tmp'
+            with open(tmp, 'w'):
+                pass
             os.replace(tmp, path)
     except OSError:
         pass
@@ -347,6 +380,28 @@ def run_cusum(prefix: str, label: str) -> dict | None:
 
 def run_check(prefix: str, label: str) -> dict | None:
     """Daily entry: check, update consecutive-day state, fire trigger."""
+    # Model-deploy fence (D32): stamp the manifest identity per label; on a
+    # change, truncate pred_history and reset the action streak so the first
+    # post-retrain check measures market drift, not model-vs-model.
+    mh = _manifest_hash(prefix)
+    if mh is not None:
+        state = _load_state()
+        st = state.get(label, {})
+        prev_mh = st.get('manifest_hash')
+        if prev_mh is None:
+            st['manifest_hash'] = mh          # bootstrap stamp — no fence
+            state[label] = st
+            _save_state(state)
+        elif prev_mh != mh:
+            clear_history(prefix)
+            st['manifest_hash'] = mh
+            st['action_days'] = 0
+            st.pop('last_action_date', None)
+            state[label] = st
+            _save_state(state)
+            print(f"[DRIFT] {label}: model manifest changed — pred history "
+                  f"fenced, action streak reset")
+
     result = check_drift(prefix)
 
     # CUSUM + pruning run even when PSI is not checkable (legacy manifest
@@ -395,7 +450,10 @@ def run_check(prefix: str, label: str) -> dict | None:
     state[label] = st
     _save_state(state)
 
-    if st.get('action_days', 0) >= CONSECUTIVE_ACTION_DAYS:
+    # A warn day must not re-create a trigger run_pipeline already consumed:
+    # only a day that is itself at action level may (re)write the flag.
+    if (result['level'] == 'action'
+            and st.get('action_days', 0) >= CONSECUTIVE_ACTION_DAYS):
         flag = retrain_flag_file(prefix)
         if not flag.exists():
             flag.write_text(json.dumps({

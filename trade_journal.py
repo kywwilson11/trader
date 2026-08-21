@@ -29,10 +29,18 @@ Consumers (read-only; break on a rename):
                       scores{s,pred}, ts.
   fees.py             action=="buy": symbol, entry_tactic (maker-share feedback).
   execution_report.py action, symbol, entry_tactic, exit_reason, slippage_bps.
+
+Retention (c26 T7): TRADER_JOURNAL_ROTATE_DAYS=N (default 0 = OFF) gzips day
+files older than N days to journals/YYYY-MM-DD.jsonl.gz via rotate_old_journals.
+iter_journal_rows / get_journal_summary read rotated .gz files transparently
+through open_journal.
 """
 
 import datetime
+import gzip
 import json
+import os
+import threading
 from pathlib import Path
 
 from llm_config import load_llm_config
@@ -41,6 +49,23 @@ from log_config import get_logger
 logger = get_logger(__name__)
 
 JOURNAL_DIR = Path(__file__).resolve().parent / "journals"
+
+# --- Journal retention (c26 T7 / B19 Jetson small-disk protection) ---
+# Rotation RENAMES day files to .jsonl.gz => changes data-store contents in
+# normal operation => default OFF per campaign classification. Several
+# OUT-OF-SCOPE readers (fees.py, llm_eval.py, decision_report.py,
+# chart_core.py, gui.py staleness glob, llm_analyst.py, scripts/prompt_ab.py,
+# scripts/sizing_cofire_report.py) open the plain .jsonl paths directly and
+# would go blind past the rotation horizon — activate only after they gain
+# the same .gz fallback (see campaign handoff), via TRADER_JOURNAL_ROTATE_DAYS=N
+# (N>=7, recommended 30+) on the Jetson.
+try:
+    JOURNAL_ROTATE_DAYS = int(os.environ.get('TRADER_JOURNAL_ROTATE_DAYS', '0') or '0')
+except ValueError:
+    JOURNAL_ROTATE_DAYS = 0
+_ROTATE_MAX_PER_CALL = 30          # bound worst-case inline latency
+_rotate_lock = threading.Lock()    # combined-mode: two loop threads share the process
+_rotate_done_date = None
 
 _disabled_warned = False
 
@@ -71,13 +96,22 @@ def log_decision(entry: dict):
 
         JOURNAL_DIR.mkdir(exist_ok=True)
 
-        # One clock read for both the ts field and the filename (a row
-        # stamped 23:59:59.9 must not land in the next day's file), and
+        # One clock read for the ts field, the filename, AND the rotation
+        # date (a row stamped 23:59:59.9 must not land in the next day's
+        # file, and the rotation guard must agree with it), and
         # offset-aware so the two Stage-0 consumers agree on the epoch:
         # decision_report's pd.Timestamp tz-localizes naive ts as UTC while
         # llm_eval's fromisoformat().timestamp() reads it as local time —
         # with an explicit offset both are exact regardless of box timezone.
         now = datetime.datetime.now().astimezone()
+
+        # Once-daily retention pass (no-op unless TRADER_JOURNAL_ROTATE_DAYS>0)
+        global _rotate_done_date
+        _today = now.date()
+        if JOURNAL_ROTATE_DAYS > 0 and _rotate_done_date != _today:
+            _rotate_done_date = _today
+            rotate_old_journals()
+
         record = {**entry, "ts": now.isoformat()}
         filepath = JOURNAL_DIR / f"{now.date().isoformat()}.jsonl"
 
@@ -87,6 +121,99 @@ def log_decision(entry: dict):
             f.flush()
     except Exception as e:
         logger.warning("[JOURNAL] Error writing: %s", e)
+
+
+def open_journal(path):
+    """Text-mode handle for a day file: the plain .jsonl if present, else its
+    .jsonl.gz sibling (transparent gzip reading for every consumer). Raises
+    FileNotFoundError when neither exists. When BOTH exist (rotation crash
+    window between os.replace and unlink) the plain file wins — it is the
+    original; the next rotation pass re-verifies and finishes the unlink."""
+    path = Path(path)
+    if path.exists():
+        return open(path)
+    gz = Path(f'{path}.gz')
+    if gz.exists():
+        return gzip.open(gz, 'rt')
+    raise FileNotFoundError(path)
+
+
+def rotate_old_journals(now=None) -> int:
+    """Gzip day files older than JOURNAL_ROTATE_DAYS (journals/D.jsonl ->
+    journals/D.jsonl.gz). Returns the number of files rotated this call
+    (capped at _ROTATE_MAX_PER_CALL — a backlog drains across calls).
+
+    No-op (0, before ANY filesystem access) when TRADER_JOURNAL_ROTATE_DAYS
+    is unset/0. Crash-safe per file: compress to a .gz.tmp, fsync, verify the
+    round-trip against the original bytes, os.replace to .gz, only then
+    unlink the plain file — the original is never removed until a verified
+    copy exists. Never raises; never touches today's file.
+    """
+    if JOURNAL_ROTATE_DAYS <= 0:
+        return 0
+    if not _rotate_lock.acquire(blocking=False):
+        return 0
+    count = 0
+    try:
+        today = now or datetime.date.today()
+        cutoff = today - datetime.timedelta(days=JOURNAL_ROTATE_DAYS)
+        now_ts = datetime.datetime.now().timestamp()
+        # Stale tmp files from a crashed prior pass: best-effort cleanup.
+        try:
+            for tmp in JOURNAL_DIR.glob('*.gz.tmp'):
+                try:
+                    if now_ts - tmp.stat().st_mtime > 86400:
+                        tmp.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        for p in sorted(JOURNAL_DIR.glob('*.jsonl')):
+            if count >= _ROTATE_MAX_PER_CALL:
+                break
+            try:
+                file_date = datetime.date.fromisoformat(p.stem)
+            except ValueError:
+                continue  # not a date-named journal file
+            if file_date >= cutoff:
+                continue  # inside the retention window (never today's file)
+            try:
+                raw = p.read_bytes()
+                gz = Path(f'{p}.gz')
+                tmp = Path(f'{p}.gz.tmp')
+                if gz.exists():
+                    # Crash leftover between os.replace and unlink: verify,
+                    # then just finish the unlink; a mismatch is rebuilt.
+                    try:
+                        with gzip.open(gz, 'rb') as gf:
+                            existing = gf.read()
+                    except (OSError, EOFError):
+                        existing = None
+                    if existing == raw:
+                        p.unlink()
+                        count += 1
+                        continue
+                    gz.unlink()
+                with gzip.open(tmp, 'wb') as gf:
+                    gf.write(raw)
+                    gf.flush()
+                    os.fsync(gf.fileno())
+                with gzip.open(tmp, 'rb') as gf:
+                    ok = gf.read() == raw
+                if not ok:
+                    tmp.unlink()   # original untouched — never lose rows
+                    continue
+                os.replace(tmp, gz)
+                p.unlink()
+                count += 1
+            except OSError as e:
+                logger.warning("[JOURNAL] rotation failed for %s: %s", p, e)
+                continue
+    except Exception as e:
+        logger.warning("[JOURNAL] rotation error: %s", e)
+    finally:
+        _rotate_lock.release()
+    return count
 
 
 def iter_journal_rows(days: int = 30):
@@ -101,10 +228,15 @@ def iter_journal_rows(days: int = 30):
     for offset in range(days, -1, -1):
         day = today - datetime.timedelta(days=offset)
         filepath = JOURNAL_DIR / f"{day.isoformat()}.jsonl"
-        if not filepath.exists():
+        try:
+            f = open_journal(filepath)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            logger.warning("[JOURNAL] Error reading %s: %s", filepath, e)
             continue
         try:
-            with open(filepath) as f:
+            with f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -113,7 +245,8 @@ def iter_journal_rows(days: int = 30):
                         yield json.loads(line)
                     except json.JSONDecodeError:
                         continue
-        except OSError as e:
+        except (OSError, EOFError) as e:
+            # A corrupt/truncated .gz surfaces here from the gzip stream.
             logger.warning("[JOURNAL] Error reading %s: %s", filepath, e)
 
 
@@ -135,15 +268,17 @@ def get_journal_summary(date: str = None) -> dict:
         date = datetime.date.today().isoformat()
 
     filepath = JOURNAL_DIR / f"{date}.jsonl"
-    if not filepath.exists():
-        return {"total": 0, "buys": 0, "sells": 0, "skips": 0,
-                "llm_blocks": 0, "avg_multiplier": 1.0,
-                "skipped_lines": 0, "entries": []}
 
     entries = []
     skipped_lines = 0
     try:
-        with open(filepath) as f:
+        try:
+            f = open_journal(filepath)
+        except FileNotFoundError:
+            return {"total": 0, "buys": 0, "sells": 0, "skips": 0,
+                    "llm_blocks": 0, "avg_multiplier": 1.0,
+                    "skipped_lines": 0, "entries": []}
+        with f:
             for line in f:
                 line = line.strip()
                 if not line:

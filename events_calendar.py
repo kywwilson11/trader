@@ -34,6 +34,57 @@ _lock = threading.Lock()
 _mem: dict | None = None
 _last_attempt = 0.0
 
+# --- Trading-day windows (D07, flag strategy_config.EVENTS_TRADING_DAY_WINDOWS) ---
+# Static NYSE full-closure days, current + next year, refreshed annually by
+# hand (no API dependency). Failure directions are both safe: a MISSING
+# holiday degrades to weekend-only skipping (window still >= calendar mode);
+# an EXTRA/stale date only ever WIDENS a block window.
+_NYSE_HOLIDAYS = frozenset({
+    # 2026
+    '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25',
+    '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
+    # 2027 (Juneteenth obs Fri 6/18; July-4 obs Mon 7/5; Christmas obs Fri 12/24;
+    # Jan 1 2028 is a Saturday -> NYSE does NOT close Fri 2027-12-31)
+    '2027-01-01', '2027-01-18', '2027-02-15', '2027-03-26', '2027-05-31',
+    '2027-06-18', '2027-07-05', '2027-09-06', '2027-11-25', '2027-12-24',
+})
+
+
+def _trading_day_mode() -> bool:
+    """Read the default-OFF flag; any failure -> calendar mode (current behavior)."""
+    try:
+        import strategy_config
+        return bool(getattr(strategy_config, 'EVENTS_TRADING_DAY_WINDOWS', False))
+    except Exception:
+        return False
+
+
+def _is_trading_day(d: datetime.date) -> bool:
+    return d.weekday() < 5 and d.isoformat() not in _NYSE_HOLIDAYS
+
+
+def _add_trading_days(start: datetime.date, n: int) -> datetime.date:
+    """Date n trading days after start (weekend/NYSE-holiday aware).
+
+    Always >= start + n calendar days for n >= 0, so trading-day windows
+    can only ever block MORE than calendar windows — never fewer.
+    """
+    d = start
+    steps = 0
+    while steps < n:
+        d += datetime.timedelta(days=1)
+        if _is_trading_day(d):
+            steps += 1
+    return d
+
+
+def _prev_trading_day(d: datetime.date) -> datetime.date:
+    """Nearest trading day strictly before d (always <= d - 1 day)."""
+    p = d - datetime.timedelta(days=1)
+    while not _is_trading_day(p):
+        p -= datetime.timedelta(days=1)
+    return p
+
 
 def _load_cache() -> dict:
     global _mem
@@ -151,10 +202,17 @@ def next_earnings_date(symbol: str) -> str | None:
 
 
 def earnings_within_days(symbol: str, days: int = 1) -> bool:
-    """True if the symbol reports within the next `days` calendar days."""
+    """True if the symbol reports within the next `days` days.
+
+    Calendar days by default; TRADING days (weekend/NYSE-holiday aware,
+    strictly wider) when strategy_config.EVENTS_TRADING_DAY_WINDOWS is on.
+    """
     refresh_if_stale()
     today = datetime.date.today()
-    horizon = today + datetime.timedelta(days=days)
+    if _trading_day_mode():
+        horizon = _add_trading_days(today, days)
+    else:
+        horizon = today + datetime.timedelta(days=days)
     for e in _dates_for(symbol):
         try:
             d = datetime.date.fromisoformat(e['date'])
@@ -171,15 +229,22 @@ def blocks_overnight_hold(symbol: str) -> bool:
     Covers: reports after today's close (amc/unknown today) and any report
     tomorrow or the day after (bmo prints gap at the next open; the buffer
     absorbs date ambiguity in the feed).
+
+    With EVENTS_TRADING_DAY_WINDOWS on, the +2 buffer walks trading days
+    (Friday covers through Tuesday).
     """
     refresh_if_stale()
     today = datetime.date.today()
+    if _trading_day_mode():
+        end = _add_trading_days(today, 2)   # Friday -> Tuesday; wider, never narrower
+    else:
+        end = today + datetime.timedelta(days=2)
     for e in _dates_for(symbol):
         try:
             d = datetime.date.fromisoformat(e['date'])
         except (KeyError, ValueError):
             continue
-        if today <= d <= today + datetime.timedelta(days=2):
+        if today <= d <= end:
             return True
     return False
 
@@ -188,12 +253,16 @@ def reported_recently(symbol: str) -> bool:
     """True on the first trading day(s) after a report (post-print vol)."""
     refresh_if_stale()
     today = datetime.date.today()
+    if _trading_day_mode():
+        start = _prev_trading_day(today)    # Monday reaches back to Friday
+    else:
+        start = today - datetime.timedelta(days=1)
     for e in _dates_for(symbol):
         try:
             d = datetime.date.fromisoformat(e['date'])
         except (KeyError, ValueError):
             continue
-        if today - datetime.timedelta(days=1) <= d <= today:
+        if start <= d <= today:
             # Reported yesterday (any time) or this morning (bmo) — the
             # report date itself counts because amc prints affect TOMORROW,
             # which blocks_overnight_hold handles

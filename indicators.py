@@ -1,3 +1,5 @@
+import threading
+
 import pandas as pd
 import numpy as np
 
@@ -531,9 +533,11 @@ def compute_features(df, btc_close=None):
     df['Day_cos'] = np.cos(2 * np.pi * day / 7)
 
     # --- Return-based features ---
-    df['Return_4h'] = df['Close'].pct_change(4) * 100
-    df['Return_12h'] = df['Close'].pct_change(12) * 100
-    df['Volatility_12h'] = df['Close'].pct_change(1).rolling(12).std() * 100
+    # pandas pin (c26-T3/B21): explicit ffill + fill_method=None == pandas-2
+    # pad semantics, pandas-3-proof
+    df['Return_4h'] = df['Close'].ffill().pct_change(4, fill_method=None) * 100
+    df['Return_12h'] = df['Close'].ffill().pct_change(12, fill_method=None) * 100
+    df['Volatility_12h'] = df['Close'].ffill().pct_change(1, fill_method=None).rolling(12).std() * 100
 
     # --- New indicators (Phase C) ---
 
@@ -569,7 +573,8 @@ def compute_features(df, btc_close=None):
     if HURST_ON_RETURNS:
         # fillna(0.0): the leading pct_change NaN would otherwise poison the
         # first R/S window (the kernels emit 0.5 on any NaN-bearing window)
-        df['Hurst'] = compute_hurst(df['Close'].pct_change().fillna(0.0),
+        df['Hurst'] = compute_hurst(df['Close'].ffill()
+                                    .pct_change(fill_method=None).fillna(0.0),
                                     window=100)
     else:
         df['Hurst'] = compute_hurst(df['Close'], window=100)
@@ -586,7 +591,7 @@ def compute_features(df, btc_close=None):
     # BTC cross-asset features (crypto only)
     if btc_close is not None:
         btc_aligned = btc_close.reindex(df.index).ffill()
-        df['BTC_Return_1h'] = btc_aligned.pct_change(1)
+        df['BTC_Return_1h'] = btc_aligned.pct_change(1, fill_method=None)
         btc_sma20 = btc_aligned.rolling(window=20).mean()
         df['BTC_SMA_Ratio'] = btc_aligned / btc_sma20
         df['BTC_RSI'] = compute_rsi(btc_aligned, length=14)
@@ -628,8 +633,8 @@ def compute_relative_strength(close, benchmark_close):
     RS = stock ROC / benchmark ROC over a rolling window.
     Returns ratio > 1 means outperforming, < 1 means underperforming.
     """
-    stock_roc = close.pct_change(12)
-    bench_roc = benchmark_close.pct_change(12)
+    stock_roc = close.ffill().pct_change(12, fill_method=None)
+    bench_roc = benchmark_close.ffill().pct_change(12, fill_method=None)
     # Avoid division by zero
     rs = stock_roc / bench_roc.replace(0, np.nan)
     return rs
@@ -683,7 +688,7 @@ def _rod_and_same_hour(df):
     prev_close_aligned = pd.Series(dates, index=df.index).map(prev_close)
     rod_ret = (df['Close'] / prev_close_aligned - 1.0) * 100
 
-    bar_ret = df['Close'].pct_change() * 100
+    bar_ret = df['Close'].ffill().pct_change(fill_method=None) * 100
     same_hour_mean_40d = (
         bar_ret.groupby(df.index.hour)
         .transform(lambda s: s.rolling(40, min_periods=10).mean().shift(1)))
@@ -702,22 +707,30 @@ def _map_daily_to_hourly(daily_series, daily_dates):
     return daily_dates.map(daily_series.shift(1)).values
 
 
-def _daily_residual_block(df, daily_close, daily_dates, spy_close, symbol):
+def _daily_residual_block(df, daily_close, daily_dates, spy_close, symbol,
+                          spy_daily=None):
     """Residual momentum (RM_252_21), plain 21-day return (Ret_21d), and
     residual short-term reversal (RR_5/RR_21) — all built on daily-close
     returns market-stripped against SPY. `r_d`/`resid` are each computed
     ONCE here and reused by both RM_252_21 and RR_5/RR_21.
+
+    `spy_daily` (D11 restore path): an already-DAILY SPY close Series used
+    in place of resampling hourly `spy_close`. The harvest never passes it
+    (byte-identical path); expressions are otherwise unchanged.
     """
-    r_d = daily_close.pct_change()
+    r_d = daily_close.ffill().pct_change(fill_method=None)
 
     # Residual momentum rm_252_21 (Blitz-Huij-Martens JEmpFin 2011):
     # 12-1-month momentum on MARKET-STRIPPED daily residuals, scaled by
     # residual vol — momentum without the beta payload that crashes in
     # high-vol rebounds. ETFs are hard-zeroed (an index fund's residual
     # vs the index is degenerate noise).
-    if spy_close is not None:
-        spy_d = spy_close.resample('1D').last().reindex(daily_close.index).ffill()
-        rs_d = spy_d.pct_change()
+    if spy_close is not None or spy_daily is not None:
+        if spy_daily is not None:
+            spy_d = spy_daily.reindex(daily_close.index).ffill()
+        else:
+            spy_d = spy_close.resample('1D').last().reindex(daily_close.index).ffill()
+        rs_d = spy_d.pct_change(fill_method=None)
         cov = r_d.rolling(252, min_periods=126).cov(rs_d)
         var = rs_d.rolling(252, min_periods=126).var()
         beta = (cov / var).clip(-3, 5)
@@ -736,7 +749,7 @@ def _daily_residual_block(df, daily_close, daily_dates, spy_close, symbol):
     # base: it is MOMENTUM in low-turnover names and REVERSAL in
     # high-turnover names; the panel layer crosses it with the
     # dollar-volume rank so the model can learn both regimes
-    ret21 = daily_close.pct_change(21) * 100
+    ret21 = daily_close.ffill().pct_change(21, fill_method=None) * 100
 
     feats = {
         'RM_252_21': _map_daily_to_hourly(rm, daily_dates),
@@ -748,7 +761,7 @@ def _daily_residual_block(df, daily_close, daily_dates, spy_close, symbol):
     # are constrained). Uses the same market-stripped residuals as RM.
     # rr > 0 = recent idiosyncratic pop (reversal-DOWN candidate);
     # rr < 0 = idiosyncratic dip (the peer-reviewed core of dip-buying).
-    if spy_close is not None:
+    if spy_close is not None or spy_daily is not None:
         rr5 = resid.rolling(5, min_periods=5).sum() * 100
         rr21 = resid.rolling(21, min_periods=21).sum() * 100
     else:
@@ -773,13 +786,19 @@ def _ma_distances(daily_close, daily_dates):
     return feats
 
 
-def _session_momentum(df, daily_close, daily_dates):
+def _session_momentum(df, daily_close, daily_dates, daily_open=None):
     """Session-decomposed momentum (Lou-Polk-Skouras tug of war): the
     momentum premium accrues OVERNIGHT (institutions trade intraday,
     retail at the open; overnight financing/lending frictions keep the
     two from being arbitraged together).
+
+    `daily_open` (D11 restore path): an already-DAILY open Series used in
+    place of resampling df's hourly opens. The harvest never passes it.
     """
-    daily_open = df['Open'].resample('1D').first().reindex(daily_close.index)
+    if daily_open is None:
+        daily_open = df['Open'].resample('1D').first().reindex(daily_close.index)
+    else:
+        daily_open = daily_open.reindex(daily_close.index)
     on_ret = (daily_open / daily_close.shift(1) - 1.0) * 100
     id_ret = (daily_close / daily_open - 1.0) * 100
     on_mom_21 = on_ret.rolling(21, min_periods=15).mean()
@@ -792,13 +811,17 @@ def _session_momentum(df, daily_close, daily_dates):
     }
 
 
-def _jkx_ranges(df, daily_close, daily_dates):
+def _jkx_ranges(df, daily_close, daily_dates, d_hi=None, d_lo=None):
     """JKX image-scale distillation (Jiang-Kelly-Xiu JF 2023): the CNN's
     edge comes largely from the IMAGE SCALING — every chart renormalizes
     price by the window's high-low range, putting all names on a common
     'pattern scale'. Distilled: position-in-range and midrange gap at the
     paper's window lengths (hourly 20h/60h, daily 20d/60d), no CNN
     required.
+
+    `d_hi`/`d_lo` (D11 restore path): already-DAILY High/Low Series used
+    in place of resampling df's hourly bars. The harvest never passes
+    them; the hourly 20h/60h part is untouched either way.
     """
     feats = {}
     for label, win_hi, win_lo, win_cl in (
@@ -810,8 +833,14 @@ def _jkx_ranges(df, daily_close, daily_dates):
         feats[f'Pos_Range_{label}'] = ((win_cl - win_lo) / rng).clip(0, 1)
         feats[f'MidRange_Gap_{label}'] = ((0.5 * (win_hi + win_lo) - win_cl)
                                           / rng).clip(-1, 1)
-    d_hi = df['High'].resample('1D').max().reindex(daily_close.index)
-    d_lo = df['Low'].resample('1D').min().reindex(daily_close.index)
+    if d_hi is None:
+        d_hi = df['High'].resample('1D').max().reindex(daily_close.index)
+    else:
+        d_hi = d_hi.reindex(daily_close.index)
+    if d_lo is None:
+        d_lo = df['Low'].resample('1D').min().reindex(daily_close.index)
+    else:
+        d_lo = d_lo.reindex(daily_close.index)
     for k in (20, 60):
         hi_k = d_hi.rolling(k, min_periods=k).max()
         lo_k = d_lo.rolling(k, min_periods=k).min()
@@ -886,6 +915,11 @@ def compute_stock_features(df, spy_close=None, symbol=None):
 # FILLED here — this is cross-file coupling. Renaming or dropping them in
 # short_flow.py silently turns this into a no-op fill for those two columns
 # (fillna on a column that no longer exists is a no-op, not an error).
+#
+# D11: live restoration under TRADER_DAILY_FEATURE_RESTORE assigns real
+# values to DAILY_RESTORE_COLUMNS before this fill; the fill then no-ops on
+# them (fillna touches only NaN — pinned by
+# tests/test_live_feature_parity.py::test_fill_only_touches_nans).
 WARMUP_FEATURES_ZERO = [
     'RM_252_21', 'Ret_21d', 'RR_5', 'RR_21', 'Same_Hour_Mean_40d',
     'ROD_Ret', 'ON_Mom_21', 'ON_Mom_252', 'TugOfWar_252',
@@ -906,6 +940,145 @@ def fill_warmup_features(df):
         if col in df.columns:
             df[col] = df[col].fillna(0.5)
     return df
+
+
+# --- D11: live restoration of the daily-window features (default OFF) ---
+# On a ~45-day live frame these columns can NEVER warm up, so they are
+# served as warmup-fill constants (0.0 / 0.5) every cycle — the model sees
+# 9 of its trained inputs frozen at neutral. Fed a cache of COMPLETE daily
+# bars (market_data.load_daily_bars, ~320 trading days), the SAME helper
+# functions above compute their real values; nothing is reimplemented, so
+# harvest output stays bit-identical (the helpers' resample expressions run
+# only when no daily input is supplied). Gated by
+# market_data.daily_feature_restore_enabled (TRADER_DAILY_FEATURE_RESTORE,
+# default OFF) in predict_now; enabling requires the Jetson bit-parity
+# runbook check documented at that flag reader.
+#
+# EXACTLY the verified constant-at-inference set (13 total incl. the 4 CS
+# ranks handled in panel_ranks — see the wave report): short-window daily
+# features (Ret_21d, ON_Mom_21, MA_Dist_10d/20d, Pos_Range_20d, ROD_Ret,
+# the 20h/60h hourly ranges, Same_Hour_Mean_40d) carry REAL values on the
+# live frame already and MUST NOT be overwritten — their 45d-frame values
+# match harvest, and cache-daily inputs would ADD divergence.
+DAILY_RESTORE_COLUMNS = ('RM_252_21', 'RR_5', 'RR_21', 'MA_Dist_50d',
+                         'MA_Dist_100d', 'MA_Dist_200d', 'ON_Mom_252',
+                         'TugOfWar_252', 'Pos_Range_60d')
+
+# Serializes build_daily_restore_features' temporary _map_daily_to_hourly
+# rebind (see its docstring).
+_map_rebind_lock = threading.Lock()
+
+
+def build_daily_restore_features(df, daily_bars, spy_daily_close=None,
+                                 symbol=None):
+    """Compute DAILY_RESTORE_COLUMNS on the hourly frame `df` from a frame
+    of COMPLETE daily bars (Open/High/Low/Close/Volume). Pure; returns
+    {col: np.ndarray aligned to df.index}.
+
+    Tail-extension for the mapping: the harvest's daily index includes the
+    current (partial) day, so _map_daily_to_hourly's shift(1) hands today's
+    hourly rows YESTERDAY's completed value. The cache index ends at
+    yesterday, so each daily series is reindexed to the union with the
+    frame's dates beyond the cache tail BEFORE the shift — the first
+    missing date then reads the last complete day's value, deeper staleness
+    reads NaN (correctly degrades to the warmup fill).
+    _map_daily_to_hourly itself is NOT modified (harvest parity); it is
+    temporarily rebound to a reindexing wrapper for the duration of this
+    call (the harvest is a separate process). The rebind is guarded two
+    ways for the combined-bots one-process reality: a lock serializes
+    concurrent builds, and the wrapper applies the extension only on the
+    building thread — any other thread computing stock features mid-build
+    (e.g. panel ranks) gets the original mapping, byte-identical.
+    """
+    global _map_daily_to_hourly
+    daily_bars = daily_bars.sort_index()
+    # Align tz-ness with df's index so reindex/union/compare work.
+    df_tz = getattr(df.index, 'tz', None)
+    db_tz = getattr(daily_bars.index, 'tz', None)
+    if df_tz is None and db_tz is not None:
+        daily_bars = daily_bars.tz_localize(None)
+    elif df_tz is not None and db_tz is None:
+        daily_bars = daily_bars.tz_localize('UTC').tz_convert(df_tz)
+    elif df_tz is not None and db_tz is not None:
+        daily_bars = daily_bars.tz_convert(df_tz)
+    if spy_daily_close is not None:
+        spy_tz = getattr(spy_daily_close.index, 'tz', None)
+        if df_tz is None and spy_tz is not None:
+            spy_daily_close = spy_daily_close.tz_localize(None)
+        elif df_tz is not None and spy_tz is None:
+            spy_daily_close = spy_daily_close.tz_localize('UTC').tz_convert(df_tz)
+        elif df_tz is not None and spy_tz is not None:
+            spy_daily_close = spy_daily_close.tz_convert(df_tz)
+
+    daily_close = daily_bars['Close']
+    daily_dates = pd.Series(df.index.normalize(), index=df.index)
+
+    uniq_dates = pd.DatetimeIndex(daily_dates.unique()).sort_values()
+    beyond_tail = uniq_dates[uniq_dates > daily_close.index[-1]]
+    ext_index = daily_close.index.union(beyond_tail)
+
+    with _map_rebind_lock:
+        orig_map = _map_daily_to_hourly
+        me = threading.get_ident()
+
+        def _map_extended(daily_series, dd):
+            if threading.get_ident() != me:
+                return orig_map(daily_series, dd)   # foreign thread: untouched
+            return orig_map(daily_series.reindex(ext_index), dd)
+
+        _map_daily_to_hourly = _map_extended
+        try:
+            feats = {}
+            feats.update(_daily_residual_block(
+                df, daily_close, daily_dates, spy_close=None, symbol=symbol,
+                spy_daily=spy_daily_close))
+            feats.update(_ma_distances(daily_close, daily_dates))
+            feats.update(_session_momentum(df, daily_close, daily_dates,
+                                           daily_open=daily_bars['Open']))
+            feats.update(_jkx_ranges(df, daily_close, daily_dates,
+                                     d_hi=daily_bars['High'],
+                                     d_lo=daily_bars['Low']))
+        finally:
+            _map_daily_to_hourly = orig_map
+    return {col: feats[col] for col in DAILY_RESTORE_COLUMNS if col in feats}
+
+
+def apply_daily_restore(df, daily_bars, spy_daily_close=None, symbol=None):
+    """Assign restored daily-window values onto `df` for each restore
+    column whose LAST value is finite (a column the builder could not warm
+    — e.g. no SPY daily -> RM/RR stay NaN — is skipped and the warmup fill
+    picks it up). Returns (df, n_restored, n_still_filled). Never raises.
+    """
+    try:
+        feats = build_daily_restore_features(df, daily_bars, spy_daily_close,
+                                             symbol)
+        n_restored = 0
+        for col in DAILY_RESTORE_COLUMNS:
+            vals = feats.get(col)
+            if vals is None:
+                continue
+            arr = np.asarray(vals, dtype=float)
+            if len(arr) == len(df) and np.isfinite(arr[-1]):
+                df[col] = arr
+                n_restored += 1
+        return df, n_restored, len(DAILY_RESTORE_COLUMNS) - n_restored
+    except Exception:
+        return df, 0, len(DAILY_RESTORE_COLUMNS)
+
+
+def count_warmup_constant_columns(df):
+    """(n_constant, n_present) over the warmup-fill columns present in df:
+    how many are entirely NaN, i.e. about to be served as constants by
+    fill_warmup_features. Diagnostic only — call BEFORE any fill (the
+    always-on [DAILY-FEATURES] evidence line in predict_now)."""
+    n_constant = 0
+    n_present = 0
+    for col in list(WARMUP_FEATURES_ZERO) + list(WARMUP_FEATURES_HALF):
+        if col in df.columns:
+            n_present += 1
+            if df[col].isna().all():
+                n_constant += 1
+    return n_constant, n_present
 
 
 def _is_etf(symbol: str) -> bool:

@@ -1,9 +1,9 @@
 """Per-name IC diagnostic — the universe-promotion gate (wave-9 #3 activation).
 
 INPUT: per-(symbol, bar) rows {symbol, pred, fwd_return}[, ts] as JSON or CSV.
-The dump step is NOT yet authored — backtest.py emits only its metrics+trades
-report JSON, no per-bar prediction rows — so the producer must be written on
-the Jetson before this gate can run. Preconditions the math relies on:
+The dump is produced by backtest.py (B02, default ON): {prefix}stage0_preds.json,
+PERCENT units, non-overlapping (pass --time-key ts).
+Preconditions the math relies on:
 
   * rows must be bar-ordered per name — the sub-period ICs and
     positive_consistency are meaningless on unordered rows. If the dump is

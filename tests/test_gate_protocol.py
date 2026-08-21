@@ -37,7 +37,8 @@ import run_pipeline as rp
 # ---------------------------------------------------------------------------
 
 class TestGateExitCodes:
-    def test_gate_failure_returns_3(self, monkeypatch):
+    def test_gate_failure_returns_3(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(backtest, 'BASE_DIR', tmp_path)
         monkeypatch.setattr(
             backtest, 'run_backtest',
             lambda prefix, days, trials: {'n_trades': 20, 'sharpe': -0.5, 'dsr': 0.1})
@@ -45,7 +46,8 @@ class TestGateExitCodes:
         monkeypatch.setattr(sys, 'argv', ['backtest.py', '--gate'])
         assert backtest.main() == 3
 
-    def test_gate_pass_returns_0(self, monkeypatch):
+    def test_gate_pass_returns_0(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(backtest, 'BASE_DIR', tmp_path)
         monkeypatch.setattr(
             backtest, 'run_backtest',
             lambda prefix, days, trials: {'n_trades': 20, 'sharpe': 1.0, 'dsr': 0.9})
@@ -59,7 +61,8 @@ class TestGateExitCodes:
         monkeypatch.setattr(sys, 'argv', ['backtest.py'])
         assert backtest.main() == 0
 
-    def test_missing_artifact_returns_0(self, monkeypatch):
+    def test_missing_artifact_returns_0(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(backtest, 'BASE_DIR', tmp_path)
         def raise_fnf(prefix, days, trials):
             raise FileNotFoundError('no model')
         monkeypatch.setattr(backtest, 'run_backtest', raise_fnf)

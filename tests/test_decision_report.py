@@ -70,7 +70,7 @@ class TestGateAttribution:
 
         import market_data
         monkeypatch.setattr(market_data, 'fetch_bars_alpaca',
-                            lambda api, s: crash if s == 'BAD/USD' else moon)
+                            lambda api, s, **k: crash if s == 'BAD/USD' else moon)
         rows = [
             {'action': 'skip', 'skip_reason': 'meta_veto', 'symbol': 'BAD/USD',
              'ts': str(crash.index[8])},
@@ -138,7 +138,7 @@ class TestReplayGrouped:
 
         import market_data
 
-        def fetcher(api, sym):
+        def fetcher(api, sym, **k):
             if sym == 'RAISE/USD':
                 raise RuntimeError('api outage')
             if sym == 'SHORT/USD':
@@ -153,11 +153,12 @@ class TestReplayGrouped:
             # resolve yet (replay_entry's own edge guard returns None)
             {'symbol': 'OK/USD', 'ts': str(good.index[-2])},
         ]
-        samples, n_fetch_failed, n_horizon_pending = decision_report._replay_grouped(
-            rows, api=object())
+        (samples, n_fetch_failed, n_horizon_pending,
+         n_out_of_window) = decision_report._replay_grouped(rows, api=object())
         assert n_fetch_failed == 2      # RAISE/USD (raised) + SHORT/USD (too short)
         assert n_horizon_pending == 1   # OK/USD
         assert samples == []
+        assert n_out_of_window == 0
 
 
 class TestDedup:
@@ -189,7 +190,7 @@ class TestDedup:
     def test_gate_attribution_dedups_before_replay(self, monkeypatch):
         bars = _bars([0.002] * 200)
         import market_data
-        monkeypatch.setattr(market_data, 'fetch_bars_alpaca', lambda api, s: bars)
+        monkeypatch.setattr(market_data, 'fetch_bars_alpaca', lambda api, s, **k: bars)
         day1 = bars.index[5]
         # same symbol/reason skipped every hour of the same day -> one episode
         rows = [{'action': 'skip', 'skip_reason': 'meta_veto', 'symbol': 'AAA/USD',
@@ -222,7 +223,7 @@ class TestQtyZero:
     def test_qty_zero_rows_now_priced(self, monkeypatch):
         bars = _bars([0.002] * 60)
         import market_data
-        monkeypatch.setattr(market_data, 'fetch_bars_alpaca', lambda api, s: bars)
+        monkeypatch.setattr(market_data, 'fetch_bars_alpaca', lambda api, s, **k: bars)
         rows = [{'action': 'skip', 'skip_reason': 'qty_zero', 'symbol': 'AAA/USD',
                  'ts': str(bars.index[5])}]
         out = gate_attribution(rows, api=object())
@@ -300,8 +301,8 @@ class TestCostFloorCaveat:
         monkeypatch.setattr(decision_report, 'BASE_DIR', tmp_path)
 
         import market_data
-        monkeypatch.setattr(market_data, 'fetch_bars_alpaca', lambda api, s: bars)
-        monkeypatch.setattr(market_data, 'fetch_stock_bars_alpaca', lambda api, s: bars)
+        monkeypatch.setattr(market_data, 'fetch_bars_alpaca', lambda api, s, **k: bars)
+        monkeypatch.setattr(market_data, 'fetch_stock_bars_alpaca', lambda api, s, **k: bars)
 
         with _isolated_trading_utils(monkeypatch) as trading_utils:
             monkeypatch.setattr(trading_utils, 'get_api', lambda: object())

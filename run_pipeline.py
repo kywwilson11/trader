@@ -44,6 +44,7 @@ STOCK_BOT_LOG = os.path.join(BASE_DIR, 'stock_bot_output.log')
 PYTHON = '/home/kyle/miniforge3/envs/jetson/bin/python'
 RETRAIN_TRIGGER = os.path.join(BASE_DIR, 'retrain_trigger.json')
 PIPELINE_COMMAND = os.path.join(BASE_DIR, 'pipeline_command.json')
+COMMAND_RESULT_FILE = os.path.join(BASE_DIR, 'command_result.json')
 # Skip stdout writes when redirected to same log file (avoids doubled lines)
 _STDOUT_IS_TTY = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
 
@@ -113,6 +114,12 @@ def _check_telegram_commands(log_fh, status):
 
 
 _last_drift_check_date = None
+_last_digest_date = None
+EOD_DIGEST_ENABLED = os.environ.get('TRADER_EOD_DIGEST', '1').strip().lower() not in ('0', 'false', 'no')
+try:
+    EOD_DIGEST_HOUR = int(os.environ.get('TRADER_EOD_DIGEST_HOUR', '16') or '16')
+except ValueError:
+    EOD_DIGEST_HOUR = 16
 
 
 def _maybe_run_drift_check(log_fh):
@@ -151,6 +158,48 @@ def _maybe_run_drift_check(log_fh):
     except Exception as e:
         try:
             log_fh.write(f"[SHADOW] daily eval failed: {e}\n")
+            log_fh.flush()
+        except Exception:
+            pass
+
+
+def _maybe_send_eod_digest(log_fh):
+    """Once-daily EOD digest via notify, after EOD_DIGEST_HOUR local
+    (c26 T7 / B19). Crypto trades 24/7, so "EOD" is a 16:00-local
+    convention covering the stock close. Measurement-only, ships direct:
+    never raises, positions fetch fail-open to n/a, and the date guard is
+    set BEFORE building so a failing build never retries in a hot loop.
+    Rides the existing 60s wait-loop cycles — no scheduling added."""
+    global _last_digest_date
+    try:
+        if not EOD_DIGEST_ENABLED:
+            return
+        now = datetime.datetime.now()
+        if now.hour < EOD_DIGEST_HOUR:
+            return
+        today = now.date().isoformat()
+        if _last_digest_date == today:
+            return
+        _last_digest_date = today
+        positions = None
+        try:
+            from trading_utils import get_api
+            positions = [{'symbol': p.symbol,
+                          'unrealized_pl': float(p.unrealized_pl)}
+                         for p in get_api().list_positions()]
+        except Exception:
+            positions = None
+        from journal_stats import build_eod_digest
+        digest = build_eod_digest(os.path.join(BASE_DIR, 'journals'),
+                                  positions=positions)
+        from notify import notify
+        notify(digest, level='info',
+               dedupe_key=f'eod-digest-{now.date().isoformat()}')
+        log_fh.write("[DIGEST] sent\n")
+        log_fh.flush()
+    except Exception as e:
+        try:
+            log_fh.write(f"[DIGEST] failed: {e}\n")
             log_fh.flush()
         except Exception:
             pass
@@ -344,6 +393,32 @@ def write_status(status, force=False):
         pass  # Non-fatal — status file is informational only
 
 
+def _write_command_result(command, crypto, stock, result, reason=''):
+    """Echo a just-consumed GUI command's outcome to command_result.json.
+
+    Pure instrumentation (2026-07 GUI review, IPC gap: "no command
+    acknowledgement" — write-and-forget left the GUI's "Starting..." text
+    optimistic with no way to learn of a silent rejection). Same atomic
+    tmp-then-os.replace pattern as write_status(); wrapped so a write
+    failure can NEVER affect command handling. Schema is frozen — the GUI
+    reads it verbatim: {command, crypto, stock, result, reason, ts}.
+    """
+    try:
+        tmp = COMMAND_RESULT_FILE + f'.tmp.{os.getpid()}'
+        with open(tmp, 'w') as f:
+            json.dump({
+                'command': command,
+                'crypto': bool(crypto),
+                'stock': bool(stock),
+                'result': result,
+                'reason': reason,
+                'ts': time.time(),
+            }, f)
+        os.replace(tmp, COMMAND_RESULT_FILE)
+    except Exception:
+        pass  # Non-fatal — ack file is informational only, must never break dispatch
+
+
 def run_phase(phase, log_fh, status):
     """Run a single pipeline phase as a subprocess, parsing output in real-time."""
     phase_idx = phase['idx']
@@ -433,12 +508,27 @@ def run_phase(phase, log_fh, status):
             global _suspend_requested
             if not _suspend_requested:
                 scmd = _check_pipeline_command()
-                if scmd and scmd.get('command') == 'suspend_and_start_bot':
-                    _suspend_requested = True
-                    status['_pending_bot_start'] = {
-                        'crypto': scmd.get('crypto', False),
-                        'stock': scmd.get('stock', False),
-                    }
+                if scmd:
+                    if scmd.get('command') == 'suspend_and_start_bot':
+                        _suspend_requested = True
+                        status['_pending_bot_start'] = {
+                            'crypto': scmd.get('crypto', False),
+                            'stock': scmd.get('stock', False),
+                        }
+                        _write_command_result(
+                            scmd.get('command', ''), scmd.get('crypto', False),
+                            scmd.get('stock', False), 'accepted')
+                    else:
+                        # Any other command landing while a phase is running
+                        # is consumed here (rename-then-read) and dropped —
+                        # only suspend_and_start_bot is honored mid-phase.
+                        # Echo the rejection so it isn't silently swallowed.
+                        _write_command_result(
+                            scmd.get('command', ''), scmd.get('crypto', False),
+                            scmd.get('stock', False), 'rejected',
+                            'command consumed mid-phase; only '
+                            'suspend_and_start_bot is honored during an '
+                            'active training phase')
             if _suspend_requested:
                 msg = "\n[SUSPEND] Training suspended by GUI command\n"
                 log_fh.write(msg)
@@ -711,6 +801,7 @@ def _handle_command(cmd, bots, log_fh, status):
                 _manually_stopped.add('Stock')
         _update_per_bot_status(bots, status)
         write_status(status, force=True)
+        _write_command_result(command, want_crypto, want_stock, 'accepted')
 
     elif command == 'start_bot':
         phase = status.get('phase', '')
@@ -718,7 +809,10 @@ def _handle_command(cmd, bots, log_fh, status):
             msg = "  Cannot start bot: training in progress\n"
             log_fh.write(msg)
             log_fh.flush()
+            _write_command_result(command, want_crypto, want_stock,
+                                  'rejected', 'training in progress')
             return
+        result, reason = 'accepted', ''
         if _COMBINED_BOTS:
             combined_alive = any(n == 'Bots' and p.poll() is None
                                  for n, p, _ in bots)
@@ -730,6 +824,8 @@ def _handle_command(cmd, bots, log_fh, status):
                 log_fh.write(msg)
                 log_fh.flush()
                 _print(msg, end='')
+                result, reason = ('rejected',
+                                  "combined 'Bots' process is already running")
             else:
                 run_crypto, run_stock = _BOT_SCOPE
                 _manually_stopped.discard('Crypto')
@@ -744,6 +840,7 @@ def _handle_command(cmd, bots, log_fh, status):
                 _start_single_bot(bots, 'Stock', log_fh)
         _update_per_bot_status(bots, status)
         write_status(status, force=True)
+        _write_command_result(command, want_crypto, want_stock, result, reason)
 
     elif command == 'suspend_and_start_bot':
         _suspend_requested = True
@@ -758,6 +855,14 @@ def _handle_command(cmd, bots, log_fh, status):
         log_fh.write(msg)
         log_fh.flush()
         write_status(status, force=True)
+        _write_command_result(command, want_crypto, want_stock, 'accepted')
+
+    else:
+        # Unrecognized command — the GUI today only ever writes start_bot /
+        # stop_bot / suspend_and_start_bot, but a stale GUI build or a
+        # hand-written command file must not vanish silently.
+        _write_command_result(command, want_crypto, want_stock,
+                              'rejected', f'unknown command: {command}')
 
 
 def _check_restart_bots(bots, log_fh):
@@ -873,6 +978,27 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock, force=False):
     return phases
 
 
+def _gate_model_prefix(book_prefix, shadow_active, flag_on):
+    """--model-prefix value for a book's weekly backtest gate, or None for
+    the legacy champion-slot gate. Challenger targeting requires BOTH shadow
+    mode (that is where hypersearch saves to the challenger slot) and
+    strategy_config.GATE_TARGETS_CHALLENGER. Naming mirrors
+    shadow.challenger_prefix (pinned equal by tests/test_c26_Q2.py)."""
+    if not (shadow_active and flag_on):
+        return None
+    return f'{book_prefix}_challenger' if book_prefix else 'challenger'
+
+
+def _gate_reject_outcome(phase):
+    """phase_results outcome for a *_backtest_gate rc==3 (deterministic
+    policy rejection). Legacy target: backtest already rolled the champion
+    back to .prev. Challenger target (GATE_TARGETS_CHALLENGER): the champion
+    was never touched and the challenger is HELD, not discarded."""
+    if phase.get('gate_target') == 'challenger':
+        return 'challenger_gate_held'
+    return 'gate_failed_rolled_back'
+
+
 def _build_training_phases(trials, train_crypto, train_stock, mode='',
                            shadow=False):
     """Build model training phases with adaptive mode support.
@@ -888,6 +1014,18 @@ def _build_training_phases(trials, train_crypto, train_stock, mode='',
     # model must beat the champion on LIVE data before deployment.
     # TRADER_SHADOW_MODE=0 restores immediate promotion.
     shadow = shadow and os.getenv('TRADER_SHADOW_MODE', '1') != '0'
+    try:
+        import strategy_config as _sc
+        gate_chall = bool(getattr(_sc, 'GATE_TARGETS_CHALLENGER', False))
+        gate_v2 = bool(getattr(_sc, 'PROMOTION_GATE_V2', False))
+    except Exception:
+        gate_chall = False
+        gate_v2 = False
+    if shadow and not gate_chall and (train_crypto or train_stock):
+        _print("[GATE] D03: shadow mode is ON but GATE_TARGETS_CHALLENGER is "
+               "OFF — the weekly policy gate will replay the CHAMPION while "
+               "the freshly-trained model deploys from the challenger slot "
+               "UNGATED, and a gate failure would roll back the live champion")
 
     if train_crypto:
         cmd = [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
@@ -907,7 +1045,15 @@ def _build_training_phases(trials, train_crypto, train_stock, mode='',
             'label': 'Training Crypto Meta-Labeler',
             'cmd': [PYTHON, '-u', 'meta_label.py'],
         })
-        phases.append({
+        # B03.2 under PROMOTION_GATE_V2: OMIT --trials so backtest resolves the
+        # persisted cumulative pool (adaptive_state cum_trials) — passing this
+        # run's budget would deflate against ~trials instead of the cumulative
+        # selection pool and silently lower the bar. Flag OFF: byte-identical.
+        gate_cmd = [PYTHON, '-u', 'backtest.py', '--days', '44', '--gate'] \
+            if gate_v2 else \
+            [PYTHON, '-u', 'backtest.py', '--days', '44',
+             '--trials', str(max(trials, 10)), '--gate']
+        gate_phase = {
             'id': 'crypto_backtest_gate',
             'label': 'Crypto Policy Backtest Gate',
             # 44 days, not 60: the crypto training file spans ~1y, so the
@@ -917,9 +1063,13 @@ def _build_training_phases(trials, train_crypto, train_stock, mode='',
             # of the gate was in-sample and biased toward passing. The stock
             # gate keeps 60d: its file spans 2021->now, so a 60d window sits
             # entirely inside that book's ~8-month holdout.
-            'cmd': [PYTHON, '-u', 'backtest.py', '--days', '44',
-                    '--trials', str(max(trials, 10)), '--gate'],
-        })
+            'cmd': gate_cmd,
+        }
+        mp = _gate_model_prefix('', shadow, gate_chall)
+        if mp:
+            gate_cmd += ['--model-prefix', mp]
+            gate_phase['gate_target'] = 'challenger'
+        phases.append(gate_phase)
     if train_stock:
         cmd = [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
                '--trials', str(trials),
@@ -940,12 +1090,23 @@ def _build_training_phases(trials, train_crypto, train_stock, mode='',
             'label': 'Training Stock Meta-Labeler',
             'cmd': [PYTHON, '-u', 'meta_label.py', '--prefix', 'stock'],
         })
-        phases.append({
+        # B03.2 under PROMOTION_GATE_V2: same --trials omission as the crypto
+        # gate above (cumulative pool resolution). Flag OFF: byte-identical.
+        gate_cmd = [PYTHON, '-u', 'backtest.py', '--prefix', 'stock',
+                    '--days', '60', '--gate'] \
+            if gate_v2 else \
+            [PYTHON, '-u', 'backtest.py', '--prefix', 'stock',
+             '--days', '60', '--trials', str(max(trials, 10)), '--gate']
+        gate_phase = {
             'id': 'stock_backtest_gate',
             'label': 'Stock Policy Backtest Gate',
-            'cmd': [PYTHON, '-u', 'backtest.py', '--prefix', 'stock',
-                    '--days', '60', '--trials', str(max(trials, 10)), '--gate'],
-        })
+            'cmd': gate_cmd,
+        }
+        mp = _gate_model_prefix('stock', shadow, gate_chall)
+        if mp:
+            gate_cmd += ['--model-prefix', mp]
+            gate_phase['gate_target'] = 'challenger'
+        phases.append(gate_phase)
 
     return phases
 
@@ -1016,6 +1177,8 @@ def _run_training(phases, log_fh, status, is_retrain):
     A *_backtest_gate phase returning 3 (deterministic policy rejection,
     model already rolled back — see backtest.py) is FINAL immediately: no
     retry, and the book counts as completed-with-rollback, not failed.
+    With GATE_TARGETS_CHALLENGER the rejected model is the HELD challenger
+    (champion untouched) and the outcome label is 'challenger_gate_held'.
 
     Returns 'suspended' if a GUI suspend request landed mid-phase, else a
     dict {book: bool} of per-book success (a rc==3 gate verdict counts as
@@ -1082,7 +1245,7 @@ def _run_training(phases, log_fh, status, is_retrain):
                                            if rc == 0 else None)
 
         if gate_rejected:
-            outcome = 'gate_failed_rolled_back'
+            outcome = _gate_reject_outcome(phase)
         elif rc == 0:
             outcome = 'ok'
         else:
@@ -1398,6 +1561,7 @@ def main():
                 # --no-retrain mode.
                 _maybe_run_drift_check(log_fh)
                 _check_telegram_commands(log_fh, status)
+                _maybe_send_eod_digest(log_fh)
                 trigger = _check_retrain_trigger()
                 if trigger:
                     manual_cycle += 1
@@ -1518,6 +1682,7 @@ def main():
                 write_status(status)
                 _maybe_run_drift_check(log_fh)
                 _check_telegram_commands(log_fh, status)
+                _maybe_send_eod_digest(log_fh)
                 manual_trigger = _check_retrain_trigger()
                 if manual_trigger:
                     msg = (f"\n[MANUAL RETRAIN] Triggered from GUI: "

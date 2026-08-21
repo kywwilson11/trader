@@ -40,14 +40,12 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
-# Single-sourced from trading_utils, same fail-soft pattern as llm_eval.py —
-# this harness's veto-rate stat can never drift from the live gate threshold.
-try:
-    from trading_utils import LLM_VETO_THRESHOLD as VETO_THRESHOLD
-except Exception:  # standalone use without the trading stack
-    VETO_THRESHOLD = 0.15
+# Single-sourced from llm_eval (which itself single-sources the veto
+# threshold from trading_utils with the same fail-soft fallback) — one
+# import chain instead of the previous three-way manual sync (c26 S1).
+from llm_eval import VETO_THRESHOLD, MIN_POWER_N
 
-MIN_POWER_N_DEFAULT = 60  # mirrors llm_eval.MIN_POWER_N
+MIN_POWER_N_DEFAULT = MIN_POWER_N   # CLI default for --min-n (name kept for arg default)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPLAY_DIR = REPO_ROOT / "journals" / "llm_replay"
@@ -407,6 +405,11 @@ def decide_adopt(report_a: dict, report_b: dict,
     Otherwise: KEEP A / collect more cycles. Below the power floor:
     insufficient_power — refuse a verdict (same abstain discipline as
     llm_eval.compute_incremental_report).
+
+    Consumes the corrected Driscoll-Kraay 'encompassing' estimator and
+    inherits llm_eval's hard power gates (MIN_POWER_T0 / MIN_EFFECTIVE_N)
+    through each report's insufficient_power flag — the three floors are
+    mirrored here by construction, not by copied literals.
     """
     n = min(report_a.get('n', 0), report_b.get('n', 0))
     if (report_a.get('insufficient_power') or report_b.get('insufficient_power')

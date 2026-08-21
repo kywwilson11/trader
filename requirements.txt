@@ -21,6 +21,7 @@ finnhub-python>=2.4
 beautifulsoup4>=4.12
 requests>=2.31
 PyYAML>=6.0
+bidask>=2.1
 lightgbm>=4.0
 
 # GUI (optional — only needed for gui.py)

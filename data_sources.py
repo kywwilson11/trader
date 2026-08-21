@@ -6,12 +6,19 @@ production until revived with a key; see fetch_cryptocompare_hourly) and
 a unified fetch_with_fallback() that tries Alpaca -> yfinance -> CryptoCompare.
 """
 
+import os
 import time
 import json
 import urllib.request
 import urllib.error
 
 import pandas as pd
+
+
+def _yf_window_slice_enabled() -> bool:
+    """TRADER_YF_WINDOW_SLICE flag, read at CALL time (default OFF)."""
+    return os.environ.get('TRADER_YF_WINDOW_SLICE',
+                          '0').strip().lower() in ('1', 'true', 'yes')
 
 
 # --- CryptoCompare ---
@@ -149,7 +156,9 @@ def fetch_with_fallback(ticker: str, start_date: str, api=None,
             alpaca_df = fetch_historical_bars(api, alpaca_sym, start_date,
                                               asset_type=asset_type)
             if alpaca_df is not None and not alpaca_df.empty:
-                frames.append(_to_utc(alpaca_df))
+                a = _to_utc(alpaca_df)
+                a['Src'] = 'alpaca'   # D08 provenance stamp
+                frames.append(a)
                 source_names.append('Alpaca')
                 alpaca_ok = True
         except Exception as e:
@@ -163,15 +172,18 @@ def fetch_with_fallback(ticker: str, start_date: str, api=None,
     # meant different wall-clock spans across the dataset. For stocks,
     # yfinance is used ONLY when Alpaca returned nothing.
     # Crypto: yfinance 1h bars are :00-aligned 24/7, so a true merge is safe.
-    # KNOWN HAZARD (deferred, model-facing — do NOT fix here):
+    # KNOWN HAZARD (model-facing):
     #  (a) yf.download(period='max') IGNORES start_date and returns ~730d of
     #      bars; in incremental harvests (fetch_start = latest-48h) the in-call
     #      keep='first' merge protects only the 48h Alpaca covered, so the
     #      store-level append_ticker_data(keep='last') then overwrites Alpaca
     #      rows with yfinance prices/volume for the trailing 730d.
+    #      FIX exists behind TRADER_YF_WINDOW_SLICE (default OFF): slice the
+    #      yfinance frame to index >= start_date. Activation requires a full
+    #      re-harvest + retrain (gotcha #2) — flip alongside TRADER_RAW_SIDECAR.
     #  (b) the stock :30/:00 grid guard below holds only WITHIN one call — a
     #      full-Alpaca-outage harvest still interleaves grids across runs.
-    #  Fixing either changes training-data composition -> owner + reharvest.
+    #  Fixing (b) changes training-data composition -> owner + reharvest.
     if asset_type != 'stock' or not alpaca_ok:
         try:
             print(f"  [YF] Fetching {ticker}...")
@@ -180,8 +192,17 @@ def fetch_with_fallback(ticker: str, start_date: str, api=None,
                                 prepost=False)
             yf_df = flatten_yfinance_columns(yf_df)
             if yf_df is not None and not yf_df.empty:
-                frames.append(_to_utc(yf_df))
-                source_names.append('yfinance')
+                y = _to_utc(yf_df)
+                if _yf_window_slice_enabled():
+                    # D08 flag fix: honor start_date that period='max'
+                    # ignores, so an incremental harvest can no longer feed
+                    # ~730d of Yahoo composite into the store-level
+                    # keep='last' merge. Needs full re-harvest.
+                    y = y[y.index >= pd.Timestamp(start_date, tz='UTC')]
+                if not y.empty:
+                    y['Src'] = 'yfinance'   # D08 provenance stamp
+                    frames.append(y)
+                    source_names.append('yfinance')
         except Exception as e:
             print(f"  [YF] {ticker}: {e}")
 
@@ -192,7 +213,9 @@ def fetch_with_fallback(ticker: str, start_date: str, api=None,
         try:
             cc_df = fetch_cryptocompare_hourly(ticker, start_date)
             if cc_df is not None and not cc_df.empty:
-                frames.append(_to_utc(cc_df))
+                cc = _to_utc(cc_df)
+                cc['Src'] = 'cryptocompare'   # D08 provenance stamp
+                frames.append(cc)
                 source_names.append('CryptoCompare')
         except Exception as e:
             print(f"  [CC] {ticker}: {e}")
@@ -208,6 +231,14 @@ def fetch_with_fallback(ticker: str, start_date: str, api=None,
     combined = combined.sort_index()
 
     sources = ' + '.join(source_names)
+    # Surviving-row composition by provenance (D08): which source's bars
+    # actually won the keep='first' collisions.
+    comp = ''
+    if 'Src' in combined.columns:
+        counts = combined['Src'].value_counts().to_dict()
+        comp = ' src={' + ', '.join(
+            f'{k}:{v}' for k, v in counts.items()) + '}'
     print(f"  [MERGED] {ticker}: {len(combined)} bars from {sources} "
-          f"({combined.index.min().date()} to {combined.index.max().date()})")
+          f"({combined.index.min().date()} to {combined.index.max().date()})"
+          f"{comp}")
     return combined

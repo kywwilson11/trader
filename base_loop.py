@@ -1,11 +1,15 @@
 """Template Method base class for trading loops.
 
 Extracts the shared skeleton of crypto_loop.py and stock_loop.py into a
-reusable base class. Subclasses override only asset-specific behavior:
-symbol universe, market hours, order types, and flatten logic.
+reusable base class: the cycle skeleton, stop management, sizing, the
+meta/LLM gating, journaling and restart persistence.
 
-This eliminates ~400 lines of duplicated code and ensures both loops
-stay in sync as new features are added.
+NOTE (2026-07): the two loops do NOT stay in sync automatically.
+stock_loop reimplements _execute_buys/_execute_sells with no super()
+call and keeps its own buy/bracket path in sync with
+_place_and_track_buy BY HAND; the entry-anchored stop arithmetic is
+hand-duplicated at 7 sites (see the STOP-MATH SYNC CONTRACT in
+_desired_stop_for). Changes on either side must be mirrored manually.
 """
 
 import json
@@ -14,7 +18,8 @@ import time
 import datetime
 import random
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
 from log_config import get_logger
 from types_mod import Position, MacroRegime
@@ -46,6 +51,35 @@ from regime_detector import get_cached_regime
 logger = get_logger(__name__)
 
 
+# c26 D17: per-book flatten flags. Writers (Telegram /flatten, GUI)
+# still write notify's legacy shared flag; each loop fans that out to
+# BOTH books and then consumes only its own flag.
+_FLATTEN_FLAG_DIR = os.path.dirname(os.path.abspath(__file__))
+FLATTEN_FLAG_STALE_SEC = 3600
+
+# c26 T6 flags (module-level env-var booleans, the funding.py/shadow.py
+# pattern; tests toggle the module attribute). Both default OFF with
+# flag-OFF behavior byte-identical (pinned by tests/test_c26_T6.py).
+# STOP_CLASSIFY_V2: 24h re-entry lockout only for server-stop fills
+# classified 'hard'/'unknown' — 'trail' (ratcheted, usually profitable)
+# exempt. The CLASSIFICATION itself always runs (measurement, DIRECT).
+STOP_CLASSIFY_V2 = os.environ.get(
+    'TRADER_STOP_CLASSIFY_V2', '0').strip().lower() in ('1', 'true', 'yes')
+# STREAM_STOP_DETECT: when the REST resting-stop probe RAISES, a cached
+# order_stream 'filled' event (terminal, monotonic-safe) recovers the fill
+# instead of retrying next cycle indefinitely. Polling stays primary and
+# authoritative. Requires TRADER_ORDER_STREAM=1 + combined-bots mode.
+STREAM_STOP_DETECT = os.environ.get(
+    'TRADER_STREAM_STOP_DETECT', '0').strip().lower() in ('1', 'true', 'yes')
+
+# c26 S3: one-time DERISK_STACK_V2 activation announcement (per process).
+_derisk_v2_logged = False
+
+
+def _flatten_flag_path(book: str) -> str:
+    return os.path.join(_FLATTEN_FLAG_DIR, f'flatten_{book}.flag')
+
+
 class BaseTradingLoop(ABC):
     """Abstract base for crypto and stock trading loops."""
 
@@ -56,7 +90,9 @@ class BaseTradingLoop(ABC):
     LOOP_INTERVAL: int = 30
     COOLDOWN_MINUTES: int = 60
     MAX_PREDICTION_WORKERS: int = 5
+    PREDICTION_TIMEOUT_SEC: int = 45  # fan-out hard deadline (c26 D01)
     LLM_INTERVAL_SEC: int = 600
+    LLM_SCORE_TTL_SEC: int = 7200  # stale scores expire (fail-open: no veto) — c26 D14
     CIRCUIT_BREAKER_PCT: float = 0.05
     MODEL_PREFIX: str = ''
 
@@ -93,6 +129,9 @@ class BaseTradingLoop(ABC):
         self._last_llm_time = 0.0
         self._last_llm_symbols: set[str] = set()
         self._last_stale_force = 0.0
+        self._llm_scores_ts: float | None = None   # last refresh (epoch)
+        self._llm_fail_count: int = 0
+        self._llm_backoff_until: float = 0.0
         self.model_mtime = 0
         self.cycle = 0
         self.macro_regime: MacroRegime | None = None
@@ -100,6 +139,7 @@ class BaseTradingLoop(ABC):
         from drawdown import PEAK_SEED
         self._equity: float = PEAK_SEED
         self._peak_equity: float = PEAK_SEED
+        self._peak_from_seed = True  # placeholder until the first REAL equity read (c26 D15)
         self._buys_allowed: bool = True
         self._halted_until: datetime.datetime | None = None
         # Per-symbol daily trade budget: caps fee bleed from signal jitter
@@ -114,6 +154,21 @@ class BaseTradingLoop(ABC):
         self._last_meta_p: dict[str, float] = {}
         # LLM veto strikes: liquidation needs 2 consecutive vetoing analyses
         self._veto_strikes: dict[str, int] = {}
+        # Freshness stamp for _last_meta_p (journal emission only): cycle
+        # number when _meta_gate last computed the probability. _conv_fields
+        # emits meta_p/conviction_tier only for same-cycle values — gates
+        # earlier in the funnel were journaling values from arbitrarily
+        # older cycles as if current (2026-07 panel). _last_meta_p itself
+        # stays float-valued: the subclass prediction-cache writers and
+        # tests pin that shape.
+        self._last_meta_p_cycle: dict[str, int] = {}
+        # 2026-07 panel instrumentation state: last successful macro
+        # refresh, last successful equity read (cycle), hot-reload failure
+        # backoff, position-state write dedup.
+        self._macro_regime_ts: float | None = None
+        self._equity_cycle: int | None = None
+        self._failed_reload: tuple = (None, 0.0)
+        self._last_state_blob: str | None = None
         # Persistent prediction pool: rebuilding an executor every cycle
         # forced fresh thread spawns + per-thread SQLite connections 2,880x/day
         self._prediction_pool = ThreadPoolExecutor(
@@ -138,7 +193,12 @@ class BaseTradingLoop(ABC):
 
     @abstractmethod
     def get_quote(self, symbol: str) -> dict | None:
-        """Get bid/ask quote for a symbol."""
+        """Get a quote dict for a symbol, or None when unavailable.
+
+        Callers hard-require at least {'midpoint', 'spread_pct'}
+        (canonical shape: types_mod.Quote). None fails closed on the buy
+        path (no entry).
+        """
 
     @abstractmethod
     def place_buy_order(self, symbol: str, notional_or_qty, quote: dict,
@@ -210,23 +270,49 @@ class BaseTradingLoop(ABC):
         """One iteration of the trading loop."""
         self.cycle += 1
 
+        # Remote /flatten first, BEFORE the market-hours gate: the stock
+        # book must be able to liquidate off-hours (day orders queue for
+        # the open) — c26 D17.
+        self._check_flatten_request()
+
         if not self.check_market_hours():
             if self.cycle == 1 or self.cycle % 20 == 0:
                 logger.info("[WAIT] Market closed. Next check in %ds...", self.LOOP_INTERVAL)
+            # Dead-man's-switch keepalive: without this the stock book's
+            # heartbeat goes silent ~17.5h/day plus weekends, forcing a
+            # watchdog grace period so wide it can't catch a real death.
+            # ping_heartbeat is self-rate-limited (1/min) and never raises.
+            try:
+                from notify import ping_heartbeat
+                ping_heartbeat(self.get_asset_type())
+            except Exception:
+                pass
             time.sleep(self.LOOP_INTERVAL)
             return
 
         logger.info("--- CYCLE %d: %s ---", self.cycle,
                     datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
-        # Remote /flatten request (Telegram kill switch or GUI)
-        self._check_flatten_request()
-
         # Pre-trade checks (also refreshes self._buys_allowed)
         self._circuit_breaker_check()
 
         self.flatten_before_close()
 
+        # Stop-loss management FIRST — before hot-reload and the hourly
+        # maintenance block (correlation rebuild alone is 11-28s serial),
+        # so protective exits are never queued behind housekeeping (c26 B08).
+        # NOTE: on the very first cycle stops now run before the first
+        # macro-regime fetch, so stop_mult tightening starts one cycle later
+        # at process start; the 2-reading breach confirmation makes that a
+        # non-event.
+        # c26 T6: per-phase time.monotonic() checkpoints (measurement,
+        # DIRECT) — no statement moved; the phase sums land in one
+        # cycle_latency journal row before the sleep.
+        _t = time.monotonic()
+        self._manage_stops()
+        stops_s = time.monotonic() - _t
+
+        _t = time.monotonic()
         # Hot-reload model
         self._hot_reload_check()
 
@@ -242,14 +328,16 @@ class BaseTradingLoop(ABC):
             temp = get_gpu_temp()
             if temp is not None:
                 logger.info("[HW] GPU temp: %.0fC", temp)
-
-        # Stop-loss management
-        self._manage_stops()
+        maint_s = time.monotonic() - _t
 
         # Predictions
+        _t = time.monotonic()
         benchmark = self.get_benchmark_close()
         if benchmark is None:
             logger.warning("[BENCHMARK] Benchmark data unavailable — predictions will lack relative strength")
+        fetch_s = time.monotonic() - _t
+
+        _t = time.monotonic()
         preds, snapshots = self._get_predictions(benchmark)
 
         # Challenger shadow predictions (hourly side-by-side log; no
@@ -259,22 +347,52 @@ class BaseTradingLoop(ABC):
             maybe_log_shadow(self, preds, benchmark)
         except Exception:
             pass
+        predict_s = time.monotonic() - _t
 
         # LLM analysis (throttled)
+        _t = time.monotonic()
         self._run_llm_analysis(preds)
+        llm_s = time.monotonic() - _t
 
+        _t = time.monotonic()
         # Sell bearish positions
         self._execute_sells(preds)
 
         # LLM veto sells
         self._execute_llm_veto_sells()
+        sells_s = time.monotonic() - _t
 
         # Buy (suppressed while halted or when risk state is unknown)
+        # NOTE: the gates-vs-orders split inside _execute_buys is
+        # deliberately folded into buys_s — the per-entry jitter sleeps
+        # (random.uniform(0,5) + 1s pacing) dominate and stock_loop
+        # reimplements _execute_buys separately. ~2880 rows/day crypto
+        # ≈ 0.4MB/day, pruned with the journals.
+        buys_s = 0.0
         if self._buys_allowed:
+            _t = time.monotonic()
             self._execute_buys(preds, snapshots)
+            buys_s = time.monotonic() - _t
+
+        self._journal_cycle_latency(stops_s=stops_s, maint_s=maint_s,
+                                    fetch_s=fetch_s, predict_s=predict_s,
+                                    llm_s=llm_s, sells_s=sells_s,
+                                    buys_s=buys_s)
 
         # Thermal throttling
         self._sleep()
+
+    def _journal_cycle_latency(self, **phases):
+        """One cycle_latency journal row per trading cycle (c26 T6,
+        measurement — DIRECT). Never raises."""
+        try:
+            row = {'action': 'cycle_latency', 'book': self.get_asset_type(),
+                   'cycle': self.cycle}
+            row.update({k: round(float(v), 3) for k, v in phases.items()})
+            row['total_s'] = round(sum(float(v) for v in phases.values()), 3)
+            log_decision(row)
+        except Exception:
+            pass
 
     # --- Shared implementations ---
 
@@ -306,6 +424,15 @@ class BaseTradingLoop(ABC):
         allowing immediate re-entries after a crash loop.
         """
         try:
+            # Prune cooldown timers past 2x the cooldown window before
+            # persisting: cooldown_ok treats absent == expired, so this
+            # provably cannot change any cooldown verdict — it only stops
+            # the dict and the state file growing monotonically across
+            # universe rotations (2,880 rewrites/day/book on flash).
+            cutoff_dt = (datetime.datetime.now()
+                         - datetime.timedelta(minutes=self.COOLDOWN_MINUTES * 2))
+            for s in [s for s, t in self.last_trade_time.items() if t < cutoff_dt]:
+                self.last_trade_time.pop(s, None)
             data = {
                 'hwm': {s: p.high_water_mark for s, p in self.positions.items()},
                 'trailing': {s: p.trailing_activated for s, p in self.positions.items()},
@@ -318,10 +445,16 @@ class BaseTradingLoop(ABC):
                 # silently disabled the ladder while underwater.
                 'peak_equity': self._peak_equity,
             }
+            # Skip the write when nothing changed (the common empty-book
+            # case previously rewrote an identical file every 30s cycle).
+            blob = json.dumps(data)
+            if blob == getattr(self, '_last_state_blob', None):
+                return
             tmp = self._position_state_file() + '.tmp'
             with open(tmp, 'w') as f:
-                json.dump(data, f)
+                f.write(blob)
             os.replace(tmp, self._position_state_file())
+            self._last_state_blob = blob
         except Exception as e:
             logger.debug("[STATE] Failed to save position state: %s", e)
 
@@ -337,6 +470,7 @@ class BaseTradingLoop(ABC):
 
     def _reconstruct_positions(self):
         """Rebuild positions from API (survive restarts)."""
+        self._update_equity()  # real equity BEFORE the peak restore (c26 D15): the restore ratchet must never run against the $100k seed
         from market_data import get_live_atr
         symbols = self.get_symbol_universe()
         raw_positions = reconstruct_positions(self.api, symbols)
@@ -347,8 +481,15 @@ class BaseTradingLoop(ABC):
         # _update_equity ratchet only moves UP, so a higher prior peak survives.
         if 'peak_equity' in saved:
             from drawdown import restore_peak_equity
-            self._peak_equity = restore_peak_equity(
-                saved.get('peak_equity'), self._equity)
+            # When the equity fetch failed, restore against 0 so a
+            # sub-seed saved peak is honored instead of inflated to the
+            # placeholder; a degenerate save keeps the seed path.
+            cur = 0.0 if getattr(self, '_peak_from_seed', False) else self._equity
+            restored = restore_peak_equity(saved.get('peak_equity'), cur,
+                                           seed=cur)
+            if restored > 0:
+                self._peak_equity = restored
+                self._peak_from_seed = False
         saved_hwm = saved.get('hwm', {})
         saved_trailing = saved.get('trailing', {})
         for sym, info in raw_positions.items():
@@ -415,14 +556,34 @@ class BaseTradingLoop(ABC):
                      self.COOLDOWN_MINUTES)
         logger.info("Risk management: GARCH + Macro regime + Correlation + Kelly")
 
-        # Pre-load cached LLM scores from disk
+        # Pre-load cached LLM scores from disk — only when the LLM gate is
+        # enabled, and only entries younger than LLM_SCORE_TTL_SEC (c26 D14:
+        # a week-old cached veto must not gate entries after a restart).
         try:
-            from llm_analyst import load_analysis
-            data = load_analysis()
-            section = data.get(self.get_asset_type(), {})
-            if section:
-                self.llm_scores = section
-                logger.info("[LLM] Loaded %d cached scores from disk", len(section))
+            if load_llm_config().get("enabled"):
+                from llm_analyst import load_analysis
+                from datetime import datetime as _dt, timezone as _tz
+                section = load_analysis().get(self.get_asset_type(), {})
+                fresh, newest = {}, None
+                for sym, entry in section.items():
+                    ts_str = (entry or {}).get('timestamp', '')
+                    try:
+                        ts = _dt.fromisoformat(ts_str)
+                    except (TypeError, ValueError):
+                        continue
+                    age = (_dt.now(_tz.utc) - ts).total_seconds()
+                    if age <= self.LLM_SCORE_TTL_SEC:
+                        fresh[sym] = entry
+                        newest = ts if newest is None or ts > newest else newest
+                if fresh:
+                    self.llm_scores = fresh
+                    self._llm_scores_ts = newest.timestamp()
+                    logger.info("[LLM] Loaded %d fresh cached score(s) from disk",
+                                len(fresh))
+                elif section:
+                    logger.info("[LLM] disk cache present but stale (> %dh)"
+                                " — starting with no scores (fail-open)",
+                                self.LLM_SCORE_TTL_SEC // 3600)
         except Exception:
             pass
 
@@ -465,19 +626,11 @@ class BaseTradingLoop(ABC):
                        dedupe_key=f'breaker-{self.get_asset_type()}')
             except Exception:
                 pass
-            # Journal the forced exits (estimated — emergency fills aren't
-            # individually confirmed here) so Kelly's sample isn't censored
-            # of exactly the worst trades
-            for sym, pos in list(self.positions.items()):
-                quote = self.get_quote(sym)
-                px = quote['midpoint'] if quote else pos.entry_price
-                pnl = ((px - pos.entry_price) / pos.entry_price * 100
-                       if pos.entry_price > 0 else 0.0)
-                record_trade(sym, 'sell', pos.entry_price, px, pnl,
-                             exit_reason='circuit_breaker', estimated=True)
+            pre_flatten = dict(self.positions)
             failures = emergency_flatten(self.api, symbols=self.get_symbol_universe())
             if failures:
-                logger.error("[CIRCUIT BREAKER] Unconfirmed flattens: %s — will retry next cycle",
+                logger.error("[CIRCUIT BREAKER] Unconfirmed flattens: %s — kept "
+                             "tracked; stops manage them while entries stay halted",
                              ', '.join(failures))
                 # Keep failed symbols tracked so stops still manage them.
                 # emergency_flatten reports BROKER-format symbols ('BTCUSD')
@@ -495,6 +648,23 @@ class BaseTradingLoop(ABC):
                                       if s.replace('/', '') in failed_norm}
             else:
                 self.positions.clear()
+            # Journal ONLY the exits the flatten actually released. The old
+            # pre-flatten loop fabricated a 'circuit_breaker' sell row for
+            # positions whose flatten then FAILED (double-counted round
+            # trip) and added N quote round-trips of latency BEFORE the
+            # liquidation. NOTE: estimated=True rows are EXCLUDED from
+            # Kelly's sample by compute_kelly_fraction — these rows feed
+            # the trade log/GUI, not sizing (the old comment claimed the
+            # opposite).
+            for sym, pos in pre_flatten.items():
+                if sym in self.positions:
+                    continue    # flatten failed/unknown — still open, no exit row
+                quote = self.get_quote(sym)
+                px = quote['midpoint'] if quote else pos.entry_price
+                pnl = ((px - pos.entry_price) / pos.entry_price * 100
+                       if pos.entry_price > 0 else 0.0)
+                record_trade(sym, 'sell', pos.entry_price, px, pnl,
+                             exit_reason='circuit_breaker', estimated=True)
             self._halted_until = self._next_baseline_reset()
             self._buys_allowed = False
             logger.info("[CIRCUIT BREAKER] Halting new entries until %s (baseline reset)",
@@ -520,6 +690,14 @@ class BaseTradingLoop(ABC):
         from trading_utils import model_reload_key
         new_mtime = model_reload_key(self.MODEL_PREFIX)
         if new_mtime != self.model_mtime:
+            # Backoff: a corrupt artifact otherwise re-runs the full
+            # torch/joblib load every 30s cycle forever (8GB Jetson). A
+            # genuinely new/repaired artifact changes the reload key and
+            # is picked up immediately; the same failed key retries at
+            # >=300s.
+            failed_key, failed_at = getattr(self, '_failed_reload', (None, 0.0))
+            if new_mtime == failed_key and time.time() - failed_at < 300:
+                return
             logger.info("[HOT-RELOAD] Model files changed, reloading...")
             try:
                 inference_device = choose_inference_device()
@@ -527,6 +705,7 @@ class BaseTradingLoop(ABC):
                     load_models(inference_device, prefix=self.MODEL_PREFIX)
                 self.trade_threshold = self.config.get('trade_threshold', 0.15)
                 self.model_mtime = new_mtime
+                self._failed_reload = (None, 0.0)
                 # New champion artifacts -> the per-prefix LGB/q10 booster
                 # caches pair with the OLD weights; drop them for reload
                 try:
@@ -537,16 +716,33 @@ class BaseTradingLoop(ABC):
                     pass
                 logger.info("[HOT-RELOAD] Reloaded (threshold=%.2f)", self.trade_threshold)
             except Exception as e:
+                self._failed_reload = (new_mtime, time.time())
                 logger.error("[HOT-RELOAD] Failed: %s", e)
 
     def _update_macro_regime(self):
         """Fetch and cache current macro regime."""
         try:
             self.macro_regime = get_macro_regime(self.api, self.get_asset_type())
+            self._macro_regime_ts = time.time()
             logger.info("[MACRO] Regime: %s (sizing=%.2fx, stops=%.2fx)",
                         self.macro_regime.regime_label,
                         self.macro_regime.sizing_mult,
                         self.macro_regime.stop_mult)
+
+            # BTC trailing-RV regime input (c26 S3 / B06): warm the state on
+            # every regime refresh (~5 min) so the v2 shadow journal — and any
+            # later DERISK_STACK_V2 flip — has history from day one. Usually a
+            # _bar_cache hit (the prediction path fetches the same bars).
+            # Measurement-only while the flag is OFF.
+            if self.get_asset_type() == 'crypto':
+                try:
+                    from market_data import fetch_bars_alpaca
+                    from volatility import update_crypto_rv_state
+                    btc_bars = fetch_bars_alpaca(self.api, 'BTC/USD')
+                    if btc_bars is not None:
+                        update_crypto_rv_state('BTC/USD', btc_bars)
+                except Exception as e:
+                    logger.debug("[DERISK-V2] BTC RV state update failed: %s", e)
 
             # Emergency stablecoin flatten for crypto
             if self.macro_regime.stablecoin_alert and self.get_asset_type() == 'crypto':
@@ -567,17 +763,44 @@ class BaseTradingLoop(ABC):
                     else:
                         self.positions.clear()
         except Exception as e:
-            logger.debug("[MACRO] Regime update failed: %s", e)
+            # Escalated from debug (2026-07 panel): a silent failure here
+            # freezes sizing_mult/stop_mult/vix at the LAST GOOD read, and
+            # the degraded-mode clamp keys on `vix is None` so it cannot
+            # see a stale-but-present regime. TTL/expiry is an owner
+            # decision; visibility ships now. Runs every 10 cycles, so
+            # this is inherently rate-limited.
+            ts = getattr(self, '_macro_regime_ts', None)
+            if ts is None:
+                logger.warning("[MACRO] Regime update failed (%s) — no regime "
+                               "available", e)
+            else:
+                logger.warning("[MACRO] Regime update failed (%s) — reusing "
+                               "regime from %.0f min ago", e,
+                               (time.time() - ts) / 60)
 
     def _update_equity(self):
         """Update cached equity."""
         try:
             acct = self.api.get_account()
             self._equity = float(acct.equity)
+            self._equity_cycle = self.cycle
+            if getattr(self, '_peak_from_seed', False):
+                # First REAL equity read: drop the $100k placeholder peak —
+                # it pinned every sub-$100k account into a permanent
+                # drawdown-ladder haircut (c26 D15).
+                self._peak_equity = self._equity
+                self._peak_from_seed = False
             from drawdown import update_peak_equity
             self._peak_equity = update_peak_equity(self._peak_equity, self._equity)
-        except Exception:
-            pass
+        except Exception as e:
+            # The only swallowed exception feeding a live sizing
+            # denominator (risk base + book-risk cap). Runs every 10
+            # cycles, so inherently rate-limited. Fail-closed handling is
+            # an owner decision; visibility ships now (2026-07 panel).
+            logger.warning("[EQUITY] account refresh failed (%s) — sizing on "
+                           "equity from cycle %s ($%.0f)", e,
+                           getattr(self, '_equity_cycle', None) or 'seed',
+                           self._equity)
 
     def _update_correlations(self):
         """Update correlation matrix for portfolio management (1h cache)."""
@@ -642,6 +865,92 @@ class BaseTradingLoop(ABC):
             desired_stop = max(desired_stop, hwm * (1 - trail_dist))
         return desired_stop, stop_dist, trail_dist, trailing_active
 
+    def _classify_server_stop(self, symbol, pos, order):
+        """('hard'|'trail'|'unknown', stop_px) for a filled server stop.
+
+        Measurement-only (c26 T6); never raises. Order of evidence:
+        (1) stock trailing upgrade — pos.trailing_activated means
+        stop_order_id IS a native trailing_stop -> 'trail'; (2) the fill's
+        stop_price (via the alpaca_compat shim / legacy SDK); (3) crypto's
+        _resting_stop_px cache via getattr (crypto_loop is out of packet
+        scope — read-only). The hard level is the entry-anchored
+        entry*(1-stop_dist) from _desired_stop_for — the ONE source of
+        stop arithmetic (STOP-MATH SYNC CONTRACT: no 8th copy). 'trail'
+        iff px >= entry or px > hard*(1+1e-3). CAVEAT: macro stop_mult
+        drift between placement and fill can misclassify near the
+        boundary; 'unknown' and boundary cases stay conservative.
+        """
+        try:
+            px = None
+            try:
+                sp = getattr(order, 'stop_price', None)
+                if sp is not None:
+                    px = float(sp)
+            except (TypeError, ValueError):
+                px = None
+            if getattr(pos, 'trailing_activated', False):
+                return 'trail', px
+            if px is None:
+                cache = getattr(self, '_resting_stop_px', None)
+                if isinstance(cache, dict):
+                    cpx = cache.get(symbol)
+                    try:
+                        px = float(cpx) if cpx is not None else None
+                    except (TypeError, ValueError):
+                        px = None
+            if px is None:
+                return 'unknown', None
+            try:
+                _, stop_dist, _, _ = self._desired_stop_for(pos)
+                hard = pos.entry_price * (1 - stop_dist)
+            except Exception:
+                return 'unknown', px
+            if px >= pos.entry_price or (hard > 0 and px > hard * (1 + 1e-3)):
+                return 'trail', px
+            return 'hard', px
+        except Exception:
+            return 'unknown', None
+
+    def _apply_server_stop_lockout(self, symbol, kind):
+        """Post-server-stop-fill lockout (c26 T6).
+
+        Flag OFF: unconditional lockout — byte-identical to today.
+        TRADER_STOP_CLASSIFY_V2: lockout ONLY for 'hard' and 'unknown'
+        ('unknown' stays conservative); a trailing (ratcheted, usually
+        profitable) exit no longer suppresses a winning name for 24h.
+        """
+        if STOP_CLASSIFY_V2 and kind == 'trail':
+            logger.info("[LOCKOUT] %s: trailing server-stop exit — no "
+                        "lockout (STOP_CLASSIFY_V2)", symbol)
+            return
+        self.hard_stop_lockout[symbol] = datetime.datetime.now()
+        self._save_hard_stop_lockout()
+
+    def _stream_stop_fallback(self, order_id):
+        """TRADER_STREAM_STOP_DETECT failure-path assist (c26 T6): when
+        the REST stop-status probe raises, a cached trade_updates 'filled'
+        event (terminal, monotonic — cannot regress) recovers the fill
+        instead of waiting out the REST outage. Only 'filled' is accepted;
+        every other/absent state returns None = today's retry-next-cycle.
+        Self-gated on the module flag (callers invoke unconditionally in
+        their except branches). Never raises.
+        """
+        if not STREAM_STOP_DETECT:
+            return None
+        try:
+            from order_stream import get_order_state
+            st = get_order_state(order_id)
+        except Exception:
+            return None
+        if st and st.get('status') == 'filled':
+            logger.warning("[STOP-CHECK] %s: REST failed but stream cache "
+                           "shows FILLED — using streamed fill", order_id)
+            return SimpleNamespace(status='filled',
+                                   filled_qty=st.get('filled_qty'),
+                                   filled_avg_price=st.get('filled_avg_price'),
+                                   stop_price=None)
+        return None
+
     def _record_account_risk(self):
         """GATE-1 measurement (wave-8 #7): journal the COMBINED cross-book
         stop-risk.
@@ -691,41 +1000,62 @@ class BaseTradingLoop(ABC):
 
     def _manage_stops(self):
         """Check stop-loss, trailing stop, and take-profit on open positions."""
+        # Exits (signal sells, LLM vetoes, server fills, flattens, breaker)
+        # drop positions without touching breach-confirmation state — prune
+        # stale entries so a re-entry can't have its 2-consecutive-reading
+        # confirmation short-circuited to ONE reading by a dead position's
+        # armed breach (2026-07 panel; mirrors crypto_loop._manage_stops'
+        # _resting_stop_px prune, which cites the same base_loop exit paths).
+        for s in list(self._pending_breach):
+            if s not in self.positions:
+                self._pending_breach.pop(s, None)
         for symbol in list(self.positions):
             pos = self.positions[symbol]
 
             # Resting protective order (crypto GTC stop_limit) — detect
             # server-side fills the loop would otherwise miss
             if pos.stop_order_id and self.get_asset_type() == 'crypto':
+                so = None
+                via_stream = False
                 try:
                     so = self.api.get_order(pos.stop_order_id)
+                except Exception as e:
+                    # Stream assist (self-gated on STREAM_STOP_DETECT
+                    # inside the method; flag OFF returns None).
+                    so = self._stream_stop_fallback(pos.stop_order_id)
+                    via_stream = so is not None
+                    if so is None:
+                        # Keep the id and retry next cycle (stock_loop logs
+                        # the same case); a transient get_order failure must
+                        # not blind server-fill detection silently.
+                        logger.debug("[STOP-CHECK] %s: resting-stop status check "
+                                     "failed (%s) — retry next cycle", symbol, e)
+                if so is not None:
                     status = getattr(so, 'status', None)
                     if status == 'filled':
                         logger.info("[STOP-FILL] %s: resting stop filled at $%s",
                                     symbol, so.filled_avg_price)
                         llm_info = self.llm_scores.get(symbol, {})
+                        # c26 T6: the resting stop may sit at the TRAILING
+                        # level (ratcheted by _maybe_update_resting_stop) —
+                        # classify hard-vs-trail (always journaled) and let
+                        # _apply_server_stop_lockout decide; flag OFF the
+                        # lockout stays unconditional as before.
+                        kind, stop_px = self._classify_server_stop(symbol, pos, so)
+                        extra = {'server_stop_kind': kind, 'stop_px': stop_px}
+                        if via_stream:
+                            extra['detect_source'] = 'stream'
                         self._record_confirmed_exit(symbol, pos, so, None,
                                                     exit_reason='server_stop',
                                                     llm_score=llm_info.get('s'),
-                                                    reasoning=llm_info.get('r', ''))
+                                                    reasoning=llm_info.get('r', ''),
+                                                    extra=extra)
                         del self.positions[symbol]
                         self.last_trade_time[symbol] = datetime.datetime.now()
-                        # KNOWN (2026-07 review P2, deferred): the resting
-                        # stop may sit at the TRAILING level (ratcheted by
-                        # _maybe_update_resting_stop), so this lockout also
-                        # fires on profitable trailing exits and the journal
-                        # conflates them with hard stops.
-                        self.hard_stop_lockout[symbol] = datetime.datetime.now()
-                        self._save_hard_stop_lockout()
+                        self._apply_server_stop_lockout(symbol, kind)
                         continue
                     if status in ('canceled', 'expired', 'rejected'):
                         pos.stop_order_id = None
-                except Exception as e:
-                    # Keep the id and retry next cycle (stock_loop logs the
-                    # same case); a transient get_order failure must not
-                    # blind server-fill detection silently.
-                    logger.debug("[STOP-CHECK] %s: resting-stop status check "
-                                 "failed (%s) — retry next cycle", symbol, e)
 
             quote = self.get_quote(symbol)
             if quote is None:
@@ -762,7 +1092,8 @@ class BaseTradingLoop(ABC):
                                 "stop_d=%.1f%%, trail_d=%.1f%%)",
                                 symbol, stop_reason, current_price, entry_price, hwm,
                                 stop_dist * 100, trail_dist * 100)
-                    self._execute_stop_exit(symbol, pos, stop_reason, current_price)
+                    self._execute_stop_exit(symbol, pos, stop_reason,
+                                            current_price, quote=quote)
                 else:
                     self._pending_breach[symbol] = stop_reason
                     logger.info("[STOP] %s: %s breach at $%.4f — awaiting "
@@ -774,15 +1105,25 @@ class BaseTradingLoop(ABC):
         # Persist HWM / cooldown state each cycle (tiny atomic JSON write)
         self._save_position_state()
 
-    def _execute_stop_exit(self, symbol, pos, stop_reason, current_price):
+    def _execute_stop_exit(self, symbol, pos, stop_reason, current_price,
+                           quote=None):
         """Sell a position for a stop/TP/trailing exit and confirm the fill.
 
         Any resting order for this symbol (bracket stop/TP leg, trailing
         stop) holds the shares — selling around it rejects with
         'insufficient qty'. Cancel symbol-scoped orders first, confirm the
         sell filled, and record the trade at the REAL fill price.
+
+        quote (c26 T6, measurement): the confirmation-cycle quote dict —
+        only its fetched_ts is read, for the quote_age_s journal key.
         """
         from order_utils import cancel_orders_for_symbol, make_client_order_id, verify_position
+
+        def _quote_age_s():
+            if quote is None:
+                return None
+            fts = quote.get('_fetched_ts') or quote.get('fetched_ts')
+            return round(time.time() - fts, 2) if fts else None
 
         entry_price = pos.entry_price
         tif = 'gtc' if self.get_asset_type() == 'crypto' else 'day'
@@ -811,12 +1152,25 @@ class BaseTradingLoop(ABC):
                 # an order we failed to cancel.
                 if verify_position(self.api, symbol) is None:
                     logger.warning("[DESYNC] %s: Position gone at broker, removing from tracking", symbol)
-                    pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                    pnl_pct = (((current_price - entry_price) / entry_price) * 100
+                               if entry_price > 0 else 0.0)
                     llm_info = self.llm_scores.get(symbol, {})
                     record_trade(symbol, 'sell', entry_price, current_price,
                                  pnl_pct, llm_score=llm_info.get('s'),
                                  reasoning='position desync — broker qty=0',
                                  exit_reason='desync', estimated=True)
+                    # Decision-journal row (2026-07 panel): desync exits
+                    # previously reached trade_memory only, invisible to
+                    # decision_report/journal_stats. log_decision never
+                    # raises (own try/except).
+                    log_decision({"symbol": symbol, "action": "sell",
+                                  "exit_reason": "desync",
+                                  "pnl_pct": round(pnl_pct, 4),
+                                  "decision_price": current_price,
+                                  "fill_price": current_price,
+                                  "slippage_bps": None,
+                                  "quote_age_s": _quote_age_s(),
+                                  "estimated": True})
                     self.positions.pop(symbol, None)
                     self.last_trade_time[symbol] = datetime.datetime.now()
                 else:
@@ -828,8 +1182,18 @@ class BaseTradingLoop(ABC):
                                         fallback_to_market=False, time_in_force=tif)
         status = getattr(result, 'status', None)
         if status == 'filled':
-            fill_price = float(result.filled_avg_price)
-            estimated = False
+            # alpaca adapters have returned None in filled_avg_price before
+            # (order_utils.reconstruct_positions ledger P1) — a crash here
+            # fires AFTER the sell filled and leaves a sold position still
+            # tracked; fall back to the estimated path instead.
+            try:
+                fill_price = float(result.filled_avg_price)
+                estimated = False
+            except (TypeError, ValueError):
+                logger.warning("[STOP] %s: filled but no usable fill price — "
+                               "recording estimate", symbol)
+                fill_price = current_price
+                estimated = True
         else:
             logger.warning("[STOP] %s: exit fill unconfirmed (status=%s) — recording estimate",
                            symbol, status)
@@ -839,12 +1203,30 @@ class BaseTradingLoop(ABC):
                 # Sell didn't go through and we still hold it — keep tracking
                 return
 
-        pnl_pct = ((fill_price - entry_price) / entry_price) * 100
+        pnl_pct = (((fill_price - entry_price) / entry_price) * 100
+                   if entry_price > 0 else 0.0)
         llm_info = self.llm_scores.get(symbol, {})
         record_trade(symbol, 'sell', entry_price, fill_price,
                      pnl_pct, llm_score=llm_info.get('s'),
                      reasoning=llm_info.get('r', ''),
                      exit_reason=stop_reason, estimated=estimated)
+        # Decision-journal row (2026-07 panel): hard_stop/take_profit/
+        # trailing were the ONLY exits never journaled (every other path
+        # goes through _record_confirmed_exit, which writes both). Same
+        # row shape and sell-side slippage sign convention as
+        # _record_confirmed_exit.
+        decision_price = current_price
+        slippage_bps = None
+        if decision_price and decision_price > 0 and not estimated:
+            slippage_bps = round((decision_price - fill_price) / decision_price * 1e4, 2)
+        log_decision({"symbol": symbol, "action": "sell",
+                      "exit_reason": stop_reason,
+                      "pnl_pct": round(pnl_pct, 4),
+                      "decision_price": decision_price,
+                      "fill_price": fill_price,
+                      "slippage_bps": slippage_bps,
+                      "quote_age_s": _quote_age_s(),
+                      "estimated": estimated})
         self.positions.pop(symbol, None)
         self.last_trade_time[symbol] = datetime.datetime.now()
         if stop_reason == 'hard_stop':
@@ -862,6 +1244,17 @@ class BaseTradingLoop(ABC):
 
         inference_device = choose_inference_device()
         symbols = self.get_symbol_universe()
+        # Prune the conviction stash for symbols that left the universe —
+        # measurement-only dict with NO control-flow reader (verified:
+        # _conv_fields + the subclass prediction-cache writers only), so
+        # this cannot change a trade. Without it a rotated-out symbol
+        # keeps a stale meta_p forever (2026-07 owner seed e).
+        # _veto_strikes is deliberately NOT pruned here: strikes gate
+        # liquidation (control flow) — owner decision.
+        uni = set(symbols)
+        for s in [s for s in self._last_meta_p if s not in uni]:
+            self._last_meta_p.pop(s, None)
+            self._last_meta_p_cycle.pop(s, None)
 
         futures = {}
         for symbol in symbols:
@@ -874,8 +1267,7 @@ class BaseTradingLoop(ABC):
             )
             futures[f] = symbol
 
-        for future in as_completed(futures):
-            symbol = futures[future]
+        def _harvest(future, symbol):
             try:
                 sym, pred, snapshot = future.result()
                 if pred is not None:
@@ -884,6 +1276,38 @@ class BaseTradingLoop(ABC):
                     snapshots[sym] = snapshot
             except Exception as e:
                 logger.error("%s: Prediction error: %s", symbol, e)
+
+        pending = set(futures)
+        try:
+            for future in as_completed(futures,
+                                       timeout=self.PREDICTION_TIMEOUT_SEC):
+                pending.discard(future)
+                _harvest(future, futures[future])
+        except (FuturesTimeoutError, TimeoutError):
+            # One half-open socket must not wedge stops/sells/breaker/
+            # flatten for the rest of the process lifetime (c26 D01).
+            # Completed-but-unyielded futures are still harvested; wedged
+            # symbols simply have no prediction this cycle — fail-closed
+            # for entries (no_pred), exits/stops unaffected.
+            for f in list(pending):
+                if f.done():
+                    pending.discard(f)
+                    _harvest(f, futures[f])
+                else:
+                    f.cancel()
+            wedged = sorted(futures[f] for f in pending)
+            logger.error("[PRED] fan-out timed out after %ds — no "
+                         "prediction for %d symbol(s): %s — rebuilding "
+                         "worker pool", self.PREDICTION_TIMEOUT_SEC,
+                         len(wedged), ', '.join(wedged))
+            self._rebuild_prediction_pool()
+            try:
+                log_decision({'action': 'pred_fanout_timeout',
+                              'asset_type': self.get_asset_type(),
+                              'timeout_s': self.PREDICTION_TIMEOUT_SEC,
+                              'wedged': wedged})
+            except Exception:
+                pass
 
         # Rolling prediction log for the PSI drift monitor (one line per
         # cycle; monitor_drift.py prunes it to 7 days)
@@ -900,9 +1324,56 @@ class BaseTradingLoop(ABC):
 
         return preds, snapshots
 
+    def _rebuild_prediction_pool(self):
+        """Drop a wedged executor and start fresh (c26 D01): with five
+        workers blocked on dead sockets the pool is bricked permanently.
+        Old threads unwind when their REST timeouts fire.
+
+        Rate-limited to one rebuild per 10 min: shutdown() cannot stop
+        threads already blocked on dead sockets, so every rebuild during a
+        persistent outage would strand another MAX_PREDICTION_WORKERS
+        threads (each with a per-thread SQLite connection) on the 8 GB
+        Jetson. While rate-limited, predictions fail closed (no entries);
+        exits/stops are unaffected."""
+        import time as _t
+        now = _t.monotonic()
+        last = getattr(self, '_pool_rebuild_ts', None)
+        if last is not None and (now - last) < 600.0:
+            try:
+                logger.warning("[PRED] pool rebuild rate-limited (%.0fs since "
+                               "last) — keeping current executor", now - last)
+            except Exception:
+                pass
+            return
+        self._pool_rebuild_ts = now
+        try:
+            self._prediction_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        self._prediction_pool = ThreadPoolExecutor(
+            max_workers=self.MAX_PREDICTION_WORKERS,
+            thread_name_prefix=f'{self.get_asset_type()}-pred')
+
+    def _expire_llm_scores(self):
+        """Fail-open expiry (c26 D14): scores older than LLM_SCORE_TTL_SEC
+        must not keep vetoing entries (or holding veto strikes) through an
+        outage. Only expires timestamped score sets — unit-test stubs that
+        set llm_scores directly are untouched."""
+        ts = getattr(self, '_llm_scores_ts', None)
+        if (self.llm_scores and ts is not None
+                and time.time() - ts > self.LLM_SCORE_TTL_SEC):
+            logger.warning("[LLM] scores %.1fh stale — expiring (fail-open:"
+                           " no LLM veto until a fresh analysis lands)",
+                           (time.time() - ts) / 3600)
+            self.llm_scores = {}
+            self._veto_strikes.clear()
+
     def _run_llm_analysis(self, preds: dict):
         """Run LLM pre-trade analysis if interval elapsed."""
+        self._expire_llm_scores()
         now_ts = time.time()
+        if now_ts < getattr(self, '_llm_backoff_until', 0.0):
+            return          # outage backoff (c26 D14) — forced-refresh cannot bypass
         if now_ts - self._last_llm_time < self.LLM_INTERVAL_SEC:
             # Even if interval hasn't elapsed, check for stale disk cache
             # and warn if scores are being used from hours-old analysis
@@ -916,6 +1387,7 @@ class BaseTradingLoop(ABC):
         candidates = self._build_llm_candidates(preds)
         if not candidates:
             return
+        self._last_llm_time = now_ts  # stamp on ATTEMPT, not success (c26 D14): an outage must not collapse the 600s cadence into a 30s retry storm
 
         fng_value = None
         try:
@@ -935,7 +1407,9 @@ class BaseTradingLoop(ABC):
         self._last_llm_symbols = {c.get('symbol') for c in candidates}
         if new_scores:
             self.llm_scores = new_scores
-            self._last_llm_time = now_ts
+            self._llm_scores_ts = now_ts
+            self._llm_fail_count = 0
+            self._llm_backoff_until = 0.0
             # Veto strikes: forced LIQUIDATION needs two consecutive
             # vetoing analyses. Headlines are untrusted text concatenated
             # into the prompt — a single injected/anomalous score must not
@@ -952,14 +1426,47 @@ class BaseTradingLoop(ABC):
             # llm_eval.py can measure whether the gate predicts returns —
             # the system previously had no way to know if the LLM helped
             preds_by_symbol = {c['symbol']: c.get('pred_return') for c in candidates}
-            log_decision({
+            row = {
                 "action": "llm_analysis",
                 "asset_type": self.get_asset_type(),
                 "forward_bars": self.config.get('forward_bars', 24) if self.config else 24,
-                "scores": {sym: {"s": v.get('s', 0.5),
+                # s journaled as null when the provider omitted it — a
+                # fabricated 0.5 pollutes llm_eval's sample (c26 D33).
+                "scores": {sym: {"s": v.get('s'),
                                  "pred": preds_by_symbol.get(sym)}
                            for sym, v in new_scores.items()},
-            })
+            }
+            try:
+                from llm_analyst import get_last_analysis_meta
+                meta = get_last_analysis_meta() or {}
+                for k in ('model', 'prompt_sha256', 'dedup_hit',
+                          'latency_ms', 'cost_usd'):
+                    if meta.get(k) is not None:
+                        row[k] = meta[k]
+            except Exception:
+                pass    # metadata is best-effort — never blocks the journal
+            log_decision(row)
+        else:
+            # Provider failure / empty parse: llm_scores are deliberately
+            # untouched (fail-open — no gate value changes while the
+            # provider is down). The throttle stamp now advances on ATTEMPT
+            # and consecutive failures back off exponentially (c26 D14).
+            logger.warning("[LLM] analyze_trades returned no scores "
+                           "(provider failure/empty parse) — keeping "
+                           "previous scores")
+            self._llm_fail_count = getattr(self, '_llm_fail_count', 0) + 1
+            backoff = min(3600.0, self.LLM_INTERVAL_SEC
+                          * (2 ** (self._llm_fail_count - 1)))
+            self._llm_backoff_until = now_ts + backoff
+            logger.warning("[LLM] consecutive failures=%d — next attempt in"
+                           " %.0fs", self._llm_fail_count, backoff)
+            try:
+                log_decision({'action': 'llm_backoff',
+                              'asset_type': self.get_asset_type(),
+                              'consecutive_failures': self._llm_fail_count,
+                              'backoff_s': round(backoff, 1)})
+            except Exception:
+                pass
 
     def _check_llm_staleness(self):
         """Force a refresh if the scores for CURRENT candidates are stale.
@@ -1052,8 +1559,13 @@ class BaseTradingLoop(ABC):
         return candidates
 
     def _record_confirmed_exit(self, symbol, pos, order, quote, exit_reason,
-                               llm_score=None, reasoning=''):
-        """Journal an exit using the order's real fill price when available."""
+                               llm_score=None, reasoning='', extra=None):
+        """Journal an exit using the order's real fill price when available.
+
+        extra (c26 T6): optional dict of ADDITIVE journal keys merged into
+        the sell row (server_stop_kind / stop_px / detect_source). Default
+        None keeps the legacy key-set (plus quote_age_s, measurement).
+        """
         fill_price = None
         try:
             fp = getattr(order, 'filled_avg_price', None)
@@ -1077,13 +1589,25 @@ class BaseTradingLoop(ABC):
         slippage_bps = None
         if decision_price and decision_price > 0 and not estimated:
             slippage_bps = round((decision_price - fill_price) / decision_price * 1e4, 2)
-        log_decision({"symbol": symbol, "action": "sell",
-                      "exit_reason": exit_reason,
-                      "pnl_pct": round(pnl_pct, 4),
-                      "decision_price": decision_price,
-                      "fill_price": fill_price,
-                      "slippage_bps": slippage_bps,
-                      "estimated": estimated})
+        # quote_age_s (c26 T6, measurement): decision-quote age at journal
+        # time — separates execution slippage from decision->fill staleness
+        # on sell rows (buy rows already carry it).
+        quote_age_s = None
+        if quote is not None:
+            fts = quote.get('_fetched_ts') or quote.get('fetched_ts')
+            if fts:
+                quote_age_s = round(time.time() - fts, 2)
+        row = {"symbol": symbol, "action": "sell",
+               "exit_reason": exit_reason,
+               "pnl_pct": round(pnl_pct, 4),
+               "decision_price": decision_price,
+               "fill_price": fill_price,
+               "slippage_bps": slippage_bps,
+               "quote_age_s": quote_age_s,
+               "estimated": estimated}
+        if extra:
+            row.update(extra)
+        log_decision(row)
 
     def _execute_sells(self, preds: dict):
         """Sell bearish positions."""
@@ -1169,6 +1693,15 @@ class BaseTradingLoop(ABC):
                                             reasoning=llm_info.get('r', ''))
                 del self.positions[symbol]
                 self.last_trade_time[symbol] = datetime.datetime.now()
+            else:
+                # stock place_sell_order returns None on a missing/stale
+                # quote — previously this announced 'LLM VETO SELL' and then
+                # silently did nothing, every cycle. Log-only: do NOT add a
+                # quote-None guard above (crypto deliberately falls back to
+                # a market sell when the quote is missing).
+                logger.warning("%s: LLM veto sell did not execute (quote=%s) "
+                               "— retrying next cycle", symbol,
+                               'unavailable' if quote is None else 'ok')
             time.sleep(1)
 
     def _meta_gate(self, symbol: str, pred_return, snapshots: dict,
@@ -1188,19 +1721,36 @@ class BaseTradingLoop(ABC):
                                       pred_return)
             if p is None:
                 self._last_meta_p.pop(symbol, None)
+                getattr(self, '_last_meta_p_cycle', {}).pop(symbol, None)
                 return True, 1.0
             self._last_meta_p[symbol] = float(p)
+            try:
+                self._last_meta_p_cycle[symbol] = self.cycle
+            except AttributeError:
+                pass    # unit-test stubs bypass __init__
             if p < META_VETO_PROB:
-                rec = {"symbol": symbol, "action": "skip",
-                       "skip_reason": "meta_veto",
-                       "pred_return": pred_return,
-                       "meta_prob": round(p, 4)}
-                if rank is not None:
-                    rec["entry_rank"] = rank
-                log_decision(rec)
+                # Routed through _journal_skip (2026-07 panel) so the row
+                # carries the full conviction context and honors the
+                # CONVICTION_JOURNAL_ENABLED switch. meta_prob kept as an
+                # extra key — decision_report falls back to it (legacy name).
+                self._journal_skip(symbol, 'meta_veto', rank=rank,
+                                   pred=pred_return,
+                                   snapshot=snapshots.get(symbol, {}) or {},
+                                   meta_prob=round(p, 4))
                 return False, 1.0
             return True, meta_size_mult(p)
-        except Exception:
+        except Exception as e:
+            # Fail-open PRESERVED (an error here must never block a trade),
+            # but no longer silent: a feature-schema mismatch after a
+            # retrain used to disable the meta veto for every trade in both
+            # books with zero log output. Pop the stash (and its freshness
+            # stamp) so a dead gate can't keep re-journaling its last good
+            # probability.
+            self._last_meta_p.pop(symbol, None)
+            getattr(self, '_last_meta_p_cycle', {}).pop(symbol, None)
+            if getattr(self, 'cycle', 1) % 10 == 1:
+                logger.warning("[META] gate unavailable for %s (%s) — "
+                               "failing open, meta veto INACTIVE", symbol, e)
             return True, 1.0
 
     # --- Conviction instrumentation (wave-5 Tier1-1, measurement-only) ---
@@ -1234,22 +1784,45 @@ class BaseTradingLoop(ABC):
         return 'C'
 
     def _conv_fields(self, symbol, pred, snapshot, rank=None) -> dict:
-        """Conviction context shared by skip and buy journal rows."""
+        """Conviction context shared by skip and buy journal rows.
+
+        meta_p/conviction_tier are emitted only when the stashed meta
+        probability was computed THIS cycle (_meta_gate stamps
+        _last_meta_p_cycle) — gates earlier in the funnel were journaling
+        a value from an arbitrarily older cycle as if current, poisoning
+        the Stage-0 substrate. Returns {} when the conviction journal is
+        disabled, and never raises: measurement code must never abort a
+        buy (the documented invariant this helper previously violated on
+        the buy path).
+        """
+        if not self._conviction_journal_on():
+            return {}
         f = {}
-        if rank is not None:
-            f['entry_rank'] = rank
-        thr = self.trade_threshold or 0.0
-        if pred is not None and thr > 0:
-            f['pred_thresh_ratio'] = round(float(pred) / thr, 3)
-        snap = snapshot or {}
-        if snap.get('Q10') is not None:
-            f['q10'] = round(float(snap['Q10']), 4)
-        if snap.get('Q10_Floor') is not None:
-            f['q10_floor'] = round(float(snap['Q10_Floor']), 4)
-        mp = self._last_meta_p.get(symbol)
-        if mp is not None:
-            f['meta_p'] = round(float(mp), 4)
-            f['conviction_tier'] = self._conviction_tier(pred, mp)
+        try:
+            if rank is not None:
+                f['entry_rank'] = rank
+            thr = self.trade_threshold or 0.0
+            if pred is not None and thr > 0:
+                f['pred_thresh_ratio'] = round(float(pred) / thr, 3)
+            snap = snapshot or {}
+            if snap.get('Q10') is not None:
+                f['q10'] = round(float(snap['Q10']), 4)
+            if snap.get('Q10_Floor') is not None:
+                f['q10_floor'] = round(float(snap['Q10_Floor']), 4)
+            # Blend legs (c26 T4 handoff): lets Stage-0 answer the
+            # static-vs-fitted blend question from live journals.
+            if snap.get('LSTM_Pred') is not None:
+                f['lstm_pred'] = round(float(snap['LSTM_Pred']), 4)
+            if snap.get('LGB_Pred') is not None:
+                f['lgb_pred'] = round(float(snap['LGB_Pred']), 4)
+            mp = self._last_meta_p.get(symbol)
+            if mp is not None:
+                stamp = getattr(self, '_last_meta_p_cycle', {}).get(symbol)
+                if stamp is None or stamp == getattr(self, 'cycle', stamp):
+                    f['meta_p'] = round(float(mp), 4)
+                    f['conviction_tier'] = self._conviction_tier(pred, mp)
+        except Exception as e:
+            logger.debug("[CONV] context build failed for %s: %s", symbol, e)
         return f
 
     def _journal_skip(self, symbol, reason, rank=None, pred=None,
@@ -1262,11 +1835,11 @@ class BaseTradingLoop(ABC):
         if not self._conviction_journal_on():
             return
         rec = {"symbol": symbol, "action": "skip", "skip_reason": reason}
-        if pred is not None:
-            rec["pred_return"] = round(float(pred), 4)
-        rec.update(self._conv_fields(symbol, pred, snapshot, rank=rank))
-        rec.update(extra)
         try:
+            if pred is not None:
+                rec["pred_return"] = round(float(pred), 4)
+            rec.update(self._conv_fields(symbol, pred, snapshot, rank=rank))
+            rec.update(extra)
             log_decision(rec)
         except Exception:
             pass
@@ -1317,9 +1890,26 @@ class BaseTradingLoop(ABC):
              says cut 75% must not be clipped).
           5. CAPS — MAX_NOTIONAL_PER_SYMBOL enforced INCLUDING the new
              order; orders below MIN_ORDER_NOTIONAL return 0 (fees eat dust).
+
+        strategy_config.DERISK_STACK_V2 (c26 S3 / 02_research B06) selects
+        between two compositions: legacy (this product) and v2 (regime family
+        {VIX tier / BTC-RV, stress, book-vol scalar} aggregated by MIN, product
+        only across families; pseudo-CAPE + HMM + per-position vol_mult
+        excluded). Both are always computed and journaled — the legacy keys
+        always describe the legacy product, detail['v2'] the v2 composition,
+        and detail['stack'] names which one was actually applied to the size.
         """
+        if (self.macro_regime is not None
+                and self.macro_regime.sizing_mult == 0.0):
+            # Emergency halt (stablecoin depeg sets sizing_mult *= 0.0):
+            # returning here means the 0.1 tilt floor below can never
+            # resurrect a 10%-size re-buy into the contagion (c26 D26).
+            logger.warning("[SIZING] %s: macro emergency (sizing_mult=0.0)"
+                           " — entry size forced to 0", symbol)
+            return 0
         from strategy_config import (RISK_PCT_PER_TRADE, KELLY_CAP,
-                                     TILT_MAX, MIN_ORDER_NOTIONAL)
+                                     TILT_MAX, MIN_ORDER_NOTIONAL,
+                                     DERISK_STACK_V2)
         from market_data import get_live_atr
 
         # --- 1. Risk base: equity at risk / stop distance ---
@@ -1347,13 +1937,18 @@ class BaseTradingLoop(ABC):
         vol_mult = 1.0
         returns = None
         try:
-            from market_data import fetch_bars_alpaca, fetch_stock_bars_alpaca
+            from market_data import (fetch_bars_alpaca, fetch_stock_bars_alpaca,
+                                     closed_bars_v2_enabled)
+            _closed = closed_bars_v2_enabled()
             if self.get_asset_type() == 'crypto':
-                df = fetch_bars_alpaca(self.api, symbol)
+                df = fetch_bars_alpaca(self.api, symbol, closed_only=_closed)
             else:
-                df = fetch_stock_bars_alpaca(self.api, symbol)
+                df = fetch_stock_bars_alpaca(self.api, symbol,
+                                             closed_only=_closed)
             if df is not None and len(df) > 100:
-                returns = df['Close'].pct_change().dropna().values * 100
+                # pandas pin (c26-T3/B21): ffill + fill_method=None ==
+                # pandas-2 pad semantics, pandas-3-proof
+                returns = df['Close'].ffill().pct_change(fill_method=None).dropna().values * 100
         except Exception:
             pass
         if returns is not None:
@@ -1484,7 +2079,79 @@ class BaseTradingLoop(ABC):
             detail['degraded_inputs'] = missing
             detail['tilt'] = round(tilt, 4)
 
-        sized = base * kelly_mult * vol_mult * tilt
+        # --- DERISK_STACK_V2 composition (c26 S3 / 02_research B06) ---
+        # ALWAYS computed; shadow-journaled while the flag is OFF so the
+        # Jetson produces before/after evidence from day one
+        # (scripts/sizing_cofire_report.py reads both). Regime family
+        # aggregates by MIN (comonotone reads of one latent risk-off state);
+        # product only ACROSS families. EXCLUDED from v2 by design:
+        # pseudo-CAPE (KILL_LIST), HMM mult (kill-recommended; inverted
+        # smoothing — see regime_detector.py), the duplicate inline VIX
+        # ladder + macro VIX tiers (macro_indicators.vix_tier_mult_v2 owns
+        # the ONE map), the 0.8 disagreement penalty (min already resolves
+        # disagreement), and the per-position vol_mult (PORTFOLIO_VOL_TARGET
+        # owner = book scalar, inside the family min). The degraded-mode
+        # missing-count definition above is shared verbatim (still counts
+        # `vix is None` even for crypto-v2 — failure-path safety).
+        v2 = {}
+        try:
+            from macro_indicators import regime_family_mults_v2
+            family = regime_family_mults_v2(self.macro_regime,
+                                            self.get_asset_type(),
+                                            announce=DERISK_STACK_V2)
+            if self.get_asset_type() == 'crypto':
+                from volatility import get_crypto_rv_mult
+                rv_mult, rv_state, rv_pct = get_crypto_rv_mult()
+                family['btc_rv'] = rv_mult
+                v2['btc_rv_state'] = rv_state
+                if rv_pct is not None:
+                    v2['btc_rv_pctile'] = round(rv_pct, 1)
+            family['bookvol'] = detail.get('book_vol_mult', 1.0)
+            f_regime = min(family.values()) if family else 1.0
+            v2['family'] = {k: round(v, 4) for k, v in family.items()}
+            v2['f_regime_min'] = round(f_regime, 4)
+            v2['min_src'] = (min(family, key=family.get) if family else None)
+            tilt_v2 = (f_regime
+                       * detail.get('signal_conf', 1.0)
+                       * detail['dd_mult']
+                       * detail.get('corr_mult', 1.0)
+                       * sentiment_mult * llm_mult * meta_mult
+                       * detail.get('extra_tilt', 1.0))
+            v2['tilt_raw'] = round(tilt_v2, 4)
+            tilt_v2 = max(0.1, min(TILT_MAX, tilt_v2))
+            if missing >= 2:
+                tilt_v2 = min(tilt_v2, 0.5)   # same degraded contract
+                v2['degraded'] = missing
+            v2['tilt'] = round(tilt_v2, 4)
+            # (g) ONE vol-target scope: book scalar (in the min) owns
+            # PORTFOLIO_VOL_TARGET; per-position ratio composes at 1.0.
+            v2['sized_pre_caps'] = round(base * kelly_mult * tilt_v2, 2)
+            if DERISK_STACK_V2:
+                global _derisk_v2_logged
+                if not _derisk_v2_logged:
+                    _derisk_v2_logged = True
+                    logger.warning(
+                        "[DERISK-V2] ACTIVE: regime family aggregated by MIN; "
+                        "pseudo-CAPE + HMM multipliers EXCLUDED (KILL_LIST); "
+                        "PORTFOLIO_VOL_TARGET owned by book scalar; legacy "
+                        "product journaled as shadow")
+        except Exception as e:
+            tilt_v2 = None
+            logger.warning("[DERISK-V2] v2 composition failed (%s) — "
+                           "legacy product retained", e)
+        detail['v2'] = v2
+        detail['stack'] = ('v2' if (DERISK_STACK_V2 and tilt_v2 is not None)
+                           else 'legacy')
+
+        # Fail-open: any v2 error falls back to the legacy product even when
+        # the flag is ON — an internal error must never zero/black-hole an
+        # entry. Fail-closed paths (emergency zero, MIN_ORDER_NOTIONAL,
+        # book-risk budget=0) are untouched and apply identically after
+        # selection.
+        if DERISK_STACK_V2 and tilt_v2 is not None:
+            sized = base * kelly_mult * 1.0 * tilt_v2
+        else:
+            sized = base * kelly_mult * vol_mult * tilt
         detail['sized_pre_caps'] = round(sized, 2)
         # Stash for the buy journal (measurement-only; see _execute_buys).
         # The dict keeps being mutated below (book-risk shrink, leverage),
@@ -1561,8 +2228,13 @@ class BaseTradingLoop(ABC):
                 logger.info("[LOCKOUT] Loaded %d lockout(s) from disk: %s",
                             len(self.hard_stop_lockout),
                             ', '.join(self.hard_stop_lockout.keys()))
-        except (FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError:
             pass
+        except json.JSONDecodeError as e:
+            # A torn/corrupt file silently discarded ALL persisted lockouts
+            # for both books — make it visible (2026-07 panel).
+            logger.warning("[LOCKOUT] lockout file corrupt (%s) — starting "
+                           "with no persisted lockouts", e)
         except Exception as e:
             logger.warning("[LOCKOUT] Failed to load lockout file: %s", e)
 
@@ -1574,7 +2246,12 @@ class BaseTradingLoop(ABC):
                 expiry_ts = (lockout_time + datetime.timedelta(
                     hours=self.HARD_STOP_LOCKOUT_HOURS)).timestamp()
                 data[symbol] = expiry_ts
-            tmp = self._lockout_file + '.tmp'
+            # Per-book tmp name: both books share the FINAL path (known
+            # deferred P2) but must not share the TEMP path — two threads
+            # interleaving open(tmp,'w')/os.replace can publish a torn file
+            # or raise FileNotFoundError (2026-07 panel). Published content
+            # is unchanged.
+            tmp = f"{self._lockout_file}.{self.MODEL_PREFIX or 'crypto'}.tmp"
             with open(tmp, 'w') as f:
                 json.dump(data, f)
             os.replace(tmp, self._lockout_file)
@@ -1615,35 +2292,94 @@ class BaseTradingLoop(ABC):
     def _check_flatten_request(self):
         """Honor a remote /flatten: liquidate this book, halt, clear flag.
 
-        The flag is cleared BEFORE flattening so a partial failure can't
-        re-trigger liquidation every 30s; failures are notified instead.
+        c26 D17: writers (Telegram /flatten, GUI) still set notify's legacy
+        SHARED flag; whichever loop sees it first fans it out into per-book
+        flag files (flatten_crypto.flag / flatten_stock.flag) and clears the
+        legacy flag, then each loop consumes ONLY its own flag — so BOTH
+        books flatten, and the stock book picks its flag up even when the
+        request landed off-hours (this check now runs before the
+        market-hours gate). A per-book flag older than
+        FLATTEN_FLAG_STALE_SEC is discarded, not actioned.
 
-        KNOWN LIMITATION (2026-07 review P1, deferred): the flag file is
-        SHARED across books and cleared by the first consumer, so in a
-        two-book deployment only one book flattens — and the stock loop
-        never sees an off-hours request (market-closed returns before this
-        check). Per-book flags queued for owner review.
+        The per-book flag is consumed BEFORE flattening so a partial
+        failure can't re-trigger liquidation every 30s; failures are
+        notified instead.
         """
+        my_flag = _flatten_flag_path(self.get_asset_type())
         try:
             from notify import (flatten_requested, clear_flatten_request,
                                 set_halt, notify)
-            if not flatten_requested():
+            if flatten_requested():
+                # Fan the shared request out to BOTH books, then clear it —
+                # previously whichever book cycled first consumed the flag
+                # and the other book stayed fully invested.
+                for book in ('crypto', 'stock'):
+                    try:
+                        with open(_flatten_flag_path(book), 'w') as fh:
+                            fh.write(str(time.time()))
+                    except Exception:
+                        pass
+                clear_flatten_request()
+            if not os.path.exists(my_flag):
+                return
+            age = time.time() - os.path.getmtime(my_flag)
+            # Consume BEFORE flattening (unchanged contract: a partial
+            # failure must not re-trigger every 30s).
+            os.remove(my_flag)
+            if age > FLATTEN_FLAG_STALE_SEC:
+                logger.warning("[FLATTEN] stale per-book flatten flag "
+                               "(%.0f min old) — discarded, not actioned",
+                               age / 60)
                 return
         except Exception:
             return
         logger.warning("[FLATTEN] remote flatten requested — liquidating %s book",
                        self.get_asset_type())
-        clear_flatten_request()
         set_halt('remote flatten')
         try:
+            pre_flatten = dict(self.positions)
             failures = emergency_flatten(self.api,
                                          symbols=self.get_symbol_universe())
-            self.positions.clear()
+            # Same failure-tracking contract as the circuit-breaker and
+            # stablecoin flatten sites (2026-07 review P1; this third site
+            # was missed): failures come back BROKER-format ('BTCUSD'),
+            # positions are keyed universe-format ('BTC/USD'), and the
+            # list-positions sentinel means broker state is UNKNOWN — keep
+            # every position tracked rather than guess.
+            if '<list_positions failed>' in failures:
+                pass  # unknown broker state — keep all positions tracked
+            elif failures:
+                failed_norm = {f.replace('/', '') for f in failures}
+                self.positions = {s: p for s, p in self.positions.items()
+                                  if s.replace('/', '') in failed_norm}
+            else:
+                self.positions.clear()
             self._save_position_state()
-            notify(f"FLATTEN {self.get_asset_type()}: done "
-                   f"({'failures: ' + ', '.join(failures) if failures else 'all positions closed'}). "
-                   f"Trading halted — /resume to re-enable entries.",
-                   level='critical', dedupe_key=f'flatten-{self.get_asset_type()}')
+            # Journal only the positions the flatten actually released
+            # (estimated fills; excluded from Kelly). A remote flatten
+            # previously produced zero trade records at all.
+            for sym, pos in pre_flatten.items():
+                if sym in self.positions:
+                    continue
+                q = self.get_quote(sym)
+                px = q['midpoint'] if q else pos.entry_price
+                pnl = ((px - pos.entry_price) / pos.entry_price * 100
+                       if pos.entry_price > 0 else 0.0)
+                record_trade(sym, 'sell', pos.entry_price, px, pnl,
+                             exit_reason='remote_flatten', estimated=True)
+            if self.positions:
+                notify(f"FLATTEN {self.get_asset_type()}: INCOMPLETE — "
+                       f"{len(self.positions)} position(s) STILL OPEN and "
+                       f"tracked ({', '.join(sorted(self.positions))}). "
+                       f"Trading halted — /resume to re-enable entries.",
+                       level='critical',
+                       dedupe_key=f'flatten-{self.get_asset_type()}')
+            else:
+                notify(f"FLATTEN {self.get_asset_type()}: done (all "
+                       f"positions closed). Trading halted — /resume to "
+                       f"re-enable entries.",
+                       level='critical',
+                       dedupe_key=f'flatten-{self.get_asset_type()}')
         except Exception as e:
             logger.error("[FLATTEN] failed: %s", e)
             try:
@@ -1697,6 +2433,15 @@ class BaseTradingLoop(ABC):
         admitted = []           # symbols that cleared every gate
         n_candidates = 0        # symbols evaluated past the mechanical gates
         symbols = self.get_symbol_universe()
+        # Pred-descending entry rank across this cycle's evaluable
+        # candidates — ANNOTATION ONLY, iteration order is unchanged.
+        # Gives the crypto book the same entry_rank instrumentation the
+        # stock book already journals (Stage-0 rank-gradient substrate;
+        # any change to actual entry ORDERING is a deferred owner
+        # decision gated on these journals).
+        ranked = sorted((s for s in symbols if preds.get(s) is not None),
+                        key=lambda s: preds[s], reverse=True)
+        rank_map = {s: i + 1 for i, s in enumerate(ranked)}
         for symbol in symbols:
             if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
                 vc['cooldown'] += 1
@@ -1729,15 +2474,24 @@ class BaseTradingLoop(ABC):
             if quote is None:
                 vc['no_quote'] += 1
                 continue
+            # Decision-quote fetch time: slippage_bps currently conflates
+            # execution slippage with decision->order staleness (full
+            # sizing + a 0-5s jitter sleep sit between this fetch and the
+            # order). quote_age_s in the buy row lets execution analysis
+            # separate the two. No decision reads this key.
+            quote['_fetched_ts'] = time.time()
             n_candidates += 1   # a real, evaluatable candidate this window
             snapshot = snapshots.get(symbol, {})
 
-            # Prediction gate (higher bar if recently hard-stopped or mean-reverting)
+            # Prediction gate (higher bar if mean-reverting). The old
+            # "recently hard-stopped -> 1.5x" bump was provably
+            # unreachable: _is_hard_stop_locked either `continue`s above
+            # or DELETES the expired key before returning False, so the
+            # membership test below it was always False (2026-07 panel;
+            # a REAL post-lockout elevated bar is an owner decision).
             effective_threshold = self.trade_threshold
-            if symbol in self.hard_stop_lockout:
-                effective_threshold = self.trade_threshold * 1.5
             # Hurst < 0.45 = mean-reverting; momentum signals less reliable
-            hurst = snapshots.get(symbol, {}).get('Hurst')
+            hurst = snapshot.get('Hurst')
             if hurst is not None and hurst < 0.45:
                 effective_threshold = max(effective_threshold,
                                           self.trade_threshold * 1.3)
@@ -1748,14 +2502,15 @@ class BaseTradingLoop(ABC):
                 # veto at the REAL reject-time spread: cost_floor fires on
                 # wide-spread names by construction, and a flat-spread
                 # counterfactual reads it as "charging admission" falsely.
-                self._journal_skip(symbol, 'cost_floor', pred=pred_return,
-                                   snapshot=snapshot,
+                self._journal_skip(symbol, 'cost_floor', rank=rank_map.get(symbol),
+                                   pred=pred_return, snapshot=snapshot,
                                    spread_pct=round(quote['spread_pct'], 4))
                 continue
             if pred_return < effective_threshold:
                 vc['below_threshold'] += 1
-                self._journal_skip(symbol, 'below_threshold', pred=pred_return,
-                                   snapshot=snapshot)
+                self._journal_skip(symbol, 'below_threshold',
+                                   rank=rank_map.get(symbol),
+                                   pred=pred_return, snapshot=snapshot)
                 continue
 
             # Winner's curse filter: if price > SMA20 + 2*ATR, require higher threshold
@@ -1768,17 +2523,21 @@ class BaseTradingLoop(ABC):
                                 symbol, required, pred_return)
                     vc['winners_curse'] += 1
                     self._journal_skip(symbol, 'winners_curse',
+                                       rank=rank_map.get(symbol),
                                        pred=pred_return, snapshot=snapshot)
                     continue
 
             # Correlation check
+            avg_corr = None
             if self.corr_matrix and self.positions:
                 allowed, avg_corr = check_portfolio_correlation(
                     list(self.positions.keys()), symbol, self.corr_matrix)
                 if not allowed:
                     vc['correlation'] += 1
-                    self._journal_skip(symbol, 'correlation', pred=pred_return,
-                                       snapshot=snapshot)
+                    self._journal_skip(symbol, 'correlation',
+                                       rank=rank_map.get(symbol),
+                                       pred=pred_return, snapshot=snapshot,
+                                       avg_corr=round(avg_corr, 4))
                     continue
 
             # Macro regime halt check
@@ -1796,13 +2555,18 @@ class BaseTradingLoop(ABC):
                     vc['vix_block'] += 1
                     continue
 
-            # Sentiment gate (veto first; multiplier folds into sizing tilt)
+            # Sentiment gate: multiplier only — sentiment.sentiment_gate
+            # clamps to [0.15, 1.5], so this veto branch is currently
+            # unreachable (verified 2026-07 panel). Kept as a defensive
+            # guard; making sentiment a REAL veto is an owner decision.
             gate, gate_reasons = sentiment_gate(symbol, self.get_asset_type())
             if gate <= 0:
                 vc['sentiment_block'] += 1
-                log_decision({"symbol": symbol, "action": "skip", "skip_reason": "sentiment_block",
-                              "pred_return": pred_return,
-                              "sentiment_gate": gate, "sentiment_reasons": gate_reasons})
+                self._journal_skip(symbol, 'sentiment_block',
+                                   rank=rank_map.get(symbol),
+                                   pred=pred_return, snapshot=snapshot,
+                                   sentiment_gate=gate,
+                                   sentiment_reasons=gate_reasons)
                 continue
 
             # LLM gate (veto first; multiplier folds into sizing tilt)
@@ -1811,14 +2575,17 @@ class BaseTradingLoop(ABC):
             llm_reason = llm_info.get('r', '')
             if llm_s < LLM_VETO_THRESHOLD:
                 vc['llm_veto'] += 1
-                log_decision({"symbol": symbol, "action": "skip", "skip_reason": "llm_veto",
-                              "pred_return": pred_return,
-                              "llm_score": llm_s, "llm_reasoning": llm_reason})
+                self._journal_skip(symbol, 'llm_veto',
+                                   rank=rank_map.get(symbol),
+                                   pred=pred_return, snapshot=snapshot,
+                                   llm_score=llm_s,
+                                   llm_reasoning=llm_reason)
                 continue
             llm_mult = 0.5 + llm_s
 
             # Meta-labeling gate (veto + bounded sizing multiplier)
-            meta_ok, meta_mult = self._meta_gate(symbol, pred_return, snapshots)
+            meta_ok, meta_mult = self._meta_gate(symbol, pred_return, snapshots,
+                                                 rank=rank_map.get(symbol))
             if not meta_ok:
                 vc['meta_veto'] += 1
                 continue
@@ -1830,11 +2597,11 @@ class BaseTradingLoop(ABC):
             q10_floor = snapshot.get('Q10_Floor')
             if q10 is not None and q10_floor is not None and q10 < q10_floor:
                 vc['q10_tail_veto'] += 1
-                log_decision({"symbol": symbol, "action": "skip",
-                              "skip_reason": "q10_tail_veto",
-                              "pred_return": pred_return,
-                              "q10": round(q10, 4),
-                              "q10_floor": round(q10_floor, 4)})
+                # q10/q10_floor arrive via _conv_fields (same snapshot
+                # source, same rounding as the old inline row)
+                self._journal_skip(symbol, 'q10_tail_veto',
+                                   rank=rank_map.get(symbol),
+                                   pred=pred_return, snapshot=snapshot)
                 continue
 
             # Single risk-based sizing call (all bounds enforced inside)
@@ -1843,8 +2610,9 @@ class BaseTradingLoop(ABC):
                 sentiment_mult=gate, llm_mult=llm_mult, meta_mult=meta_mult)
             if sized_notional <= 0:
                 vc['sizing_zero'] += 1
-                self._journal_skip(symbol, 'sizing_zero', pred=pred_return,
-                                   snapshot=snapshot)
+                self._journal_skip(symbol, 'sizing_zero',
+                                   rank=rank_map.get(symbol),
+                                   pred=pred_return, snapshot=snapshot)
                 continue
 
             # Order timing jitter (prevent pattern detection)
@@ -1854,7 +2622,10 @@ class BaseTradingLoop(ABC):
                         pred_return if pred_return else 0)
 
             admitted.append(symbol)
-            conv = self._conv_fields(symbol, pred_return, snapshot)
+            conv = self._conv_fields(symbol, pred_return, snapshot,
+                                     rank=rank_map.get(symbol))
+            if avg_corr is not None:
+                conv['avg_corr'] = round(avg_corr, 4)
             self._place_and_track_buy(symbol, sized_notional, pred_return, quote,
                                       gate, gate_reasons, llm_s, llm_mult, llm_reason,
                                       conv=conv)
@@ -1872,15 +2643,24 @@ class BaseTradingLoop(ABC):
         order = place_limit_order(self.api, symbol, 'buy', notional, quote)
         if order is None:
             return None, 'marketable'
-        result = manage_order_lifecycle(self.api, order.id,
-                                        timeout=self.ORDER_TIMEOUT,
-                                        fallback_to_market=True)
+        # ioc_fallback (c26 T6 / D21): inert flag-OFF — the kwarg is only
+        # honored when order_utils.IOC_ENTRY_CAP_ENABLED is on.
+        result = manage_order_lifecycle(
+            self.api, order.id, timeout=self.ORDER_TIMEOUT,
+            fallback_to_market=True,
+            ioc_fallback={'quote_fn': (lambda: self.get_quote(symbol)),
+                          'cap_bps': None,
+                          'asset_type': self.get_asset_type()})
         return result, 'marketable'
 
     def _place_and_track_buy(self, symbol, notional, pred_return, quote,
                              gate, gate_reasons, llm_s, llm_mult, llm_reason,
                              conv=None):
-        """Place buy order and update position tracking. Override in subclasses for bracket orders.
+        """Place buy order and update position tracking (base/crypto path).
+
+        stock_loop does NOT override this — it reimplements the whole buy
+        path inside its own _execute_buys and keeps the journal row in
+        sync with this method BY HAND (see stock_loop.py ~line 1003).
 
         conv: optional conviction-context dict (wave-5 Tier1-1) merged
         into the buy journal row.
@@ -1916,13 +2696,21 @@ class BaseTradingLoop(ABC):
                 # Compute GARCH sigma for this position
                 garch_sigma = None
                 try:
-                    from market_data import fetch_bars_alpaca, fetch_stock_bars_alpaca
+                    from market_data import (fetch_bars_alpaca,
+                                             fetch_stock_bars_alpaca,
+                                             closed_bars_v2_enabled)
+                    _closed = closed_bars_v2_enabled()
                     if self.get_asset_type() == 'crypto':
-                        df = fetch_bars_alpaca(self.api, symbol)
+                        df = fetch_bars_alpaca(self.api, symbol,
+                                               closed_only=_closed)
                     else:
-                        df = fetch_stock_bars_alpaca(self.api, symbol)
+                        df = fetch_stock_bars_alpaca(self.api, symbol,
+                                                     closed_only=_closed)
                     if df is not None and len(df) > 100:
-                        returns = df['Close'].pct_change().dropna().values * 100
+                        # pandas pin (c26-T3/B21): ffill + fill_method=None ==
+                        # pandas-2 pad semantics, pandas-3-proof
+                        returns = df['Close'].ffill().pct_change(
+                            fill_method=None).dropna().values * 100
                         from volatility import get_sigma
                         garch_sigma = get_sigma(symbol, returns, bars=df,
                                                 asset_type=self.get_asset_type())
@@ -1956,6 +2744,8 @@ class BaseTradingLoop(ABC):
                            "decision_price": decision_price,
                            "fill_price": fill_price,
                            "slippage_bps": round(slippage_bps, 2) if slippage_bps is not None else None,
+                           "quote_age_s": (round(time.time() - quote['_fetched_ts'], 2)
+                                           if quote.get('_fetched_ts') else None),
                            "entry_tactic": entry_tactic,
                            "maker": entry_tactic.startswith('maker'),
                            "skip_reason": None}

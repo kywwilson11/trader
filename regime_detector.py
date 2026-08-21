@@ -197,6 +197,18 @@ def get_cached_regime(symbol: str, returns: np.ndarray) -> dict:
     return _default_regime()
 
 
+# KNOWN-INVERTED (c26 S3 / 02_research B06) — deliberately NOT fixed here:
+# this "smoothing" (a) allows a switch after ONE observation of the NEW label
+# whenever the OLD label had persisted >= _REGIME_PERSISTENCE, and (b) returns
+# the NEUTRAL default instead of HOLDING the previous regime when persistence
+# is short — the exact opposite of "require N consecutive observations of the
+# new label before switching" (the stated intent). The layer is
+# kill-recommended (research/KILL_LIST.md "HMM regime layer", owner decision
+# pending) and its sizing multiplier is EXCLUDED from composition under
+# strategy_config.DERISK_STACK_V2; current behavior is pinned by
+# tests/test_review_b07.py::TestRegimeSmoothing, so correcting the state
+# machine is an owner decision tied to the layer's fate — do not "fix" it
+# in passing.
 def _smooth_regime(symbol: str, regime: dict) -> dict:
     """Require N consecutive bars in new regime before switching (reduces whipsaw)."""
     label = regime['label']

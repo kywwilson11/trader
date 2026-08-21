@@ -1275,9 +1275,9 @@
     {
       "severity": "P0",
       "module": "events_calendar.py",
-      "where": "events_calendar.py:153 blocks_overnight_hold (consumed by stock_loop.py:256 _select_overnight_keepers)",
-      "desc": "PLACEHOLDER-SEE-NEXT",
-      "fix_sketch": "placeholder"
+      "where": "events_calendar.py:157 earnings_within_days, :182 blocks_overnight_hold (consumed by stock_loop.py:259 _select_overnight_keepers), :196 reported_recently",
+      "desc": "Earnings proximity windows use CALENDAR days (today + timedelta(days=N)): a Friday entry with days=1 is checked only through Saturday and a Friday overnight-sleeve hold only through Sunday, so Monday reporters — a large, negatively-selected fraction (bad news is strategically shifted to Fridays/after-hours: deHaan-Shevlin-Thornock 2015) — are unprotected; Monday also gets no post-print 0.5x tilt after a Friday-AMC/weekend report. The single largest tail in the stock book: GTC stops do not protect against earnings gaps.",
+      "fix_sketch": "Shipped 2026-08 campaign P4 behind default-OFF strategy_config.EVENTS_TRADING_DAY_WINDOWS: earnings_within_days/blocks_overnight_hold/reported_recently walk trading days (weekend + static NYSE holiday list for 2026-27), which only ever blocks MORE than calendar mode; OFF = current behavior, pinned by tests/test_c26_P4.py. Owner decision remaining: flip the flag on the Jetson."
     },
     {
       "severity": "P1",

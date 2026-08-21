@@ -147,7 +147,9 @@ def compute_live_panel_ranks(api, spy_close=None,
         return _live_cache[1]
 
     from stock_config import AS_OF_TOP_K
-    from market_data import fetch_stock_bars_alpaca
+    from market_data import (fetch_stock_bars_alpaca, closed_bars_v2_enabled,
+                             daily_feature_restore_enabled, load_daily_bars,
+                             daily_bars_fetched_at)
     from indicators import compute_stock_features
     if top_k is None:
         top_k = AS_OF_TOP_K
@@ -155,13 +157,45 @@ def compute_live_panel_ranks(api, spy_close=None,
     rows = {}
     dvs = {}
     panel_syms = _panel_symbols()
+    # D38: flag ON draws feats.iloc[-1] and dv30(bars).iloc[-1] from the
+    # last CLOSED bar — train/serve parity with add_panel_ranks, and dv30
+    # membership stops counting partial-bar volume. Flag OFF the call is
+    # byte-identical to the pre-flag form (kwarg omitted entirely).
+    _fetch_kw = {'closed_only': True} if closed_bars_v2_enabled() else {}
+    # Wave C-3 (under TRADER_DAILY_FEATURE_RESTORE, same flag as D11): the
+    # 4 daily-window CS rank bases (RM_252_21, ON_Mom_252, RR_5,
+    # MA_Dist_50d) are all-NaN on the ~45d live frame, so every member ties
+    # at neutral 0.0 — restore REAL values from the daily-bars cache so
+    # these ranks carry cross-sectional information. Fail-open per symbol:
+    # any cache/restore problem leaves that symbol's bases NaN -> the
+    # existing pd.notna -> 0.0 neutral path (flag OFF: zero extra calls,
+    # byte-identical).
+    _restore_on = daily_feature_restore_enabled()
+    _spy_daily = None
+    if _restore_on:
+        try:
+            _spy_df = load_daily_bars('SPY')
+            _spy_daily = _spy_df['Close'] if _spy_df is not None else None
+        except Exception:
+            _spy_daily = None
     for sym in panel_syms:
         try:
-            bars = fetch_stock_bars_alpaca(api, sym)
+            bars = fetch_stock_bars_alpaca(api, sym, **_fetch_kw)
             if bars is None or len(bars) < 60:
                 continue
             feats = compute_stock_features(bars, spy_close=spy_close,
                                            symbol=sym)
+            if _restore_on:
+                try:
+                    _f = daily_bars_fetched_at(sym)
+                    if _f is not None and (time.time() - _f) < 4 * 86400:
+                        _daily = load_daily_bars(sym)
+                        if _daily is not None:
+                            from indicators import apply_daily_restore
+                            feats, _, _ = apply_daily_restore(
+                                feats, _daily, _spy_daily, sym)
+                except Exception:
+                    pass    # fail-open: unrestored bases stay NaN -> neutral 0.0
             dv = dv30(bars).iloc[-1]
             if not np.isfinite(dv) or dv <= 0:
                 continue

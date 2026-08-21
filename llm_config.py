@@ -92,6 +92,18 @@ Config keys (see _DEFAULTS below for the exact defaults):
                               ollama     — base_url
                                 "http://localhost:11434/v1", no api_key
                                 needed (local), free: true
+                            Qualified-free-first runbook: flipping
+                            selection_mode to 'free-only'/'best-free' is an
+                            OWNER action, taken only after
+                            scripts/llm_qualify.py reports verdict
+                            'qualified' for the target endpoint AND ~a week
+                            of --shadow score-agreement vs the production
+                            analyst. The qualify report's config_patch
+                            block carries the exact endpoint entries +
+                            pricing [0,0] rows to paste here (an unknown
+                            model otherwise bills at llm_client's $1.25/$10
+                            fallback into the $1/day cap). See
+                            FREE_CANDIDATE_PRESETS below.
   analyst_model_override    None = use smart routing; accepts any model
                             name in llm_client.KNOWN_MODELS (Gemini,
                             Claude, or OpenAI).
@@ -102,6 +114,27 @@ Config keys (see _DEFAULTS below for the exact defaults):
                             table so price changes never need a code
                             change. Same mechanism covers Gemini, Claude,
                             and OpenAI model pricing.
+  pricing_cache_multipliers  Cache-billing multipliers vs a model's INPUT
+                            price: {"provider": [write_mult, read_mult]}.
+                            Used by llm_client._record_cost for provider-
+                            reported cache token counts. Anthropic cache
+                            write/read tokens are reported SEPARATELY from
+                            input_tokens (added to the bill at ~1.25x /
+                            ~0.10x); Gemini cachedContentTokenCount is
+                            INCLUDED in promptTokenCount (the ledger
+                            credits back (1 - read_mult) of it, ~0.25x
+                            billing). Saved-config values win over the
+                            built-in defaults.
+  anthropic_cache_system_ttl  Anthropic prompt-cache breakpoint on the
+                            STATIC system prompt. Default "" (OFF —
+                            request body byte-identical to pre-change).
+                            Per research B07.2 do NOT enable under the
+                            claude-haiku-4-5 default (4096-token minimum
+                            cacheable prefix vs a <1000-token static
+                            system prompt = silent no-op; the per-symbol
+                            tool schema precedes system in the cache
+                            prefix). Accepted: "" (off), "5m", "1h";
+                            anything else treated as off.
   detected_tier              Auto-detected: 'free' or 'paid' (Gemini only).
   tier_override               Manual override: 'free', 'paid', or None (auto).
   fmp_api_key                 Financial Modeling Prep key (unrelated to LLM
@@ -145,6 +178,9 @@ Config keys (see _DEFAULTS below for the exact defaults):
                             LLM_VETO_THRESHOLD bypasses the cache (the
                             2-consecutive-strike liquidation guard requires
                             two INDEPENDENT analyses near the veto line).
+                            Recommended activation value when the owner
+                            enables dedup: 1800-3600 s (research B07.2);
+                            largest savings in static overnight hours.
 """
 
 import json
@@ -176,6 +212,32 @@ _DEFAULTS = {
     # Per-MTok price corrections: {"model": [input, output]} — wins over
     # llm_client's built-in table so price changes never need a code change
     "pricing": {},
+    # Cache-billing multipliers relative to a model's INPUT price, applied by
+    # llm_client._record_cost to provider-reported cache token counts. Same
+    # correction mechanism as "pricing": a saved-config value wins over these
+    # defaults so billing changes never need a code change.
+    #   anthropic: [write_mult, read_mult] — cache_creation_input_tokens bill
+    #     at ~1.25x input, cache_read_input_tokens at ~0.10x (input_tokens
+    #     EXCLUDES both, so they are ADDED to the bill).
+    #   gemini: [write_mult, read_mult] — implicit caching is default-on for
+    #     2.5 models; cachedContentTokenCount is already INCLUDED in
+    #     promptTokenCount but bills at ~0.25x input, so the ledger credits
+    #     back (1 - read_mult) of it. write_mult unused (kept for shape).
+    "pricing_cache_multipliers": {
+        "anthropic": [1.25, 0.10],
+        "gemini": [1.00, 0.25],
+    },
+    # Anthropic prompt-cache breakpoint on the STATIC system prompt.
+    # DEFAULT OFF ("") — request body byte-identical to pre-change. Per
+    # research B07.2, do NOT enable under the claude-haiku-4-5 default:
+    # Haiku's minimum cacheable prefix is 4096 tokens and the analyst's
+    # static system prompt is <1000, so a marker silently no-ops (and the
+    # per-symbol tool schema precedes system in the cache prefix, so a
+    # varying candidate set invalidates it anyway). Enable ("1h") only if
+    # the analyst moves to a Sonnet-class model AND the prefix exceeds the
+    # model minimum; then verify cache_read tokens > 0 in the ledger.
+    # Accepted values: "" (off), "5m", "1h"; anything else treated as off.
+    "anthropic_cache_system_ttl": "",
     "detected_tier": None,              # Auto-detected: 'free' or 'paid'
     "tier_override": None,              # Manual override: 'free', 'paid', or None (auto)
     "fmp_api_key": "",
@@ -193,6 +255,27 @@ _DEFAULTS = {
     # [0, 7000] by consumers — see module docstring above.
     "analyst_dedup_ttl_sec": 0,
 }
+
+# Candidate free endpoints for the analyst-role qualification harness
+# (scripts/llm_qualify.py). REGISTRY METADATA ONLY — nothing at runtime
+# reads this: it is NOT merged into _DEFAULTS, never touches
+# resolve_provider_chain, and every entry ships enabled=False. Model ids
+# are 2026-08 suggestions; override per run with llm_qualify --models.
+# API keys follow llm_client._endpoint_api_key's '<NAME>_API_KEY' env
+# convention (ollama is keyless/local). "pricing" is the [in, out]
+# per-MTok row the qualify report's config_patch tells the owner to
+# paste into llm_config.json's "pricing" table before any flip.
+FREE_CANDIDATE_PRESETS = (
+    {"name": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+     "model": "meta-llama/llama-3.3-70b-instruct:free", "free": True,
+     "enabled": False, "pricing": [0.0, 0.0]},
+    {"name": "groq", "base_url": "https://api.groq.com/openai/v1",
+     "model": "llama-3.3-70b-versatile", "free": True,
+     "enabled": False, "pricing": [0.0, 0.0]},
+    {"name": "ollama", "base_url": "http://localhost:11434/v1",
+     "model": "llama3.1:8b", "free": True,
+     "enabled": False, "pricing": [0.0, 0.0]},
+)
 
 # Keys migrated from old format to new
 _MIGRATE_KEYS = {

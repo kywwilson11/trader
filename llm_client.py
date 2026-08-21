@@ -133,6 +133,13 @@ _FREE_TIER_BUDGETS = {
     # identical in both tables (the $ daily cost cap is the real governor).
     "claude-haiku-4-5": 5000,
     "claude-sonnet-5": 2000,
+    # OpenAI has no free tier either; without these rows get_budget falls
+    # back to 50 RPD, which silences an OpenAI-primary analyst mid-day
+    # (~288 calls/day cadence). Conservative caps — the $ daily cost cap
+    # is the real governor (registry hole flagged by Phase-1/B07.2).
+    "gpt-5.4-nano": 5000,
+    "gpt-5.4-mini": 2000,
+    "gpt-5.4": 1000,
 }
 _PAID_TIER_BUDGETS = {
     "gemini-2.5-pro": 1000,
@@ -140,6 +147,11 @@ _PAID_TIER_BUDGETS = {
     "gemini-2.5-flash-lite": 5000,
     "claude-haiku-4-5": 5000,
     "claude-sonnet-5": 2000,
+    # OpenAI rows: same rationale as the free-tier table above — avoid the
+    # 50-RPD unknown-model default silencing an OpenAI-primary analyst.
+    "gpt-5.4-nano": 5000,
+    "gpt-5.4-mini": 2000,
+    "gpt-5.4": 1000,
 }
 
 # Actual responder of the most recent successful call (for journaling —
@@ -221,6 +233,11 @@ _PRICING = {
     "gpt-5.4-nano":          (0.25, 1.00),
 }
 
+# Models already warned about this process (one loud line per unknown model,
+# not one per call) — billing an unknown model at the conservative pro-tier
+# fallback silently distorts the $1/day cap either direction.
+_unknown_price_warned: set = set()
+
 
 def _pricing(model: str) -> tuple[float, float]:
     """Per-MTok (input, output) price: config override > table > pro-tier."""
@@ -230,7 +247,28 @@ def _pricing(model: str) -> tuple[float, float]:
             return (float(override[0]), float(override[1]))
     except Exception:
         pass
+    if model not in _PRICING and model not in _unknown_price_warned:
+        _unknown_price_warned.add(model)
+        print(f"[LLM-COST] WARNING: no pricing entry for model '{model}' — "
+              f"billing at conservative fallback ($1.25/$10.00 per MTok). "
+              f"Add a config['pricing'] entry in llm_config.json.")
     return _PRICING.get(model, (1.25, 10.0))
+
+
+_CACHE_MULT_DEFAULTS = {"anthropic": (1.25, 0.10), "gemini": (1.00, 0.25)}
+
+
+def _cache_multipliers(provider: str) -> tuple[float, float]:
+    """(write_mult, read_mult) vs input price for cache-billed tokens:
+    config['pricing_cache_multipliers'] override > built-in defaults.
+    Unknown provider -> (1.0, 0.0) (cache tokens priced as no-ops)."""
+    try:
+        m = load_llm_config().get("pricing_cache_multipliers", {}).get(provider)
+        if m and len(m) == 2:
+            return (float(m[0]), float(m[1]))
+    except Exception:
+        pass
+    return _CACHE_MULT_DEFAULTS.get(provider, (1.0, 0.0))
 
 # --- Smart model routing ---
 # Cost brackets: {max_daily_cost: {role: model}}
@@ -699,25 +737,59 @@ def _estimate_cost(model: str, prompt_chars: int, response_chars: int) -> float:
 
 def _record_cost(model: str, prompt_chars: int, response_chars: int,
                  usage: dict | None = None):
-    """Record cost (from API usageMetadata when available) to the shared file."""
+    """Record cost (from API usageMetadata when available) to the shared file.
+
+    Cache-aware (B07.2): Anthropic cache_creation/cache_read tokens are
+    reported SEPARATELY from input_tokens and are added at the registry
+    write/read multipliers; Gemini's cachedContentTokenCount is INCLUDED in
+    promptTokenCount and is credited back to the read-multiplier rate.
+    With no cache activity both formulas reduce exactly to the pre-change
+    arithmetic. NEVER raises: a costing failure must not discard an
+    already-received LLM result (every transport call site invokes this
+    inside its own try block) — degrade to the char estimate, then to $0.
+    """
     global _daily_cost
-    if usage and usage.get('promptTokenCount') is not None:
-        price_in, price_out = _pricing(model)
-        in_tok = usage.get('promptTokenCount', 0)
-        # candidatesTokenCount excludes thinking tokens; thoughtsTokenCount
-        # is billed as output too
-        out_tok = (usage.get('candidatesTokenCount', 0)
-                   + usage.get('thoughtsTokenCount', 0))
-        cost = (in_tok * price_in + out_tok * price_out) / 1_000_000
-    else:
-        cost = _estimate_cost(model, prompt_chars, response_chars)
-    with _quota_lock:
-        with _cost_file_lock():
-            # Re-read under the FILE lock so a concurrent process's spend
-            # cannot be lost in this read-modify-write
-            _load_shared_cost()
-            _daily_cost += cost
-            _save_shared_cost()
+    try:
+        if usage and usage.get('promptTokenCount') is not None:
+            price_in, price_out = _pricing(model)
+            in_tok = usage.get('promptTokenCount', 0) or 0
+            # candidatesTokenCount excludes thinking tokens; thoughtsTokenCount
+            # is billed as output too
+            out_tok = ((usage.get('candidatesTokenCount', 0) or 0)
+                       + (usage.get('thoughtsTokenCount', 0) or 0))
+            cost = (in_tok * price_in + out_tok * price_out) / 1_000_000
+            provider = _provider_for(model)
+            if provider == "anthropic":
+                cw = usage.get('cacheWriteTokenCount', 0) or 0
+                cr = usage.get('cacheReadTokenCount', 0) or 0
+                if cw or cr:
+                    wm, rm = _cache_multipliers("anthropic")
+                    cost += (cw * wm + cr * rm) * price_in / 1_000_000
+            elif provider == "gemini":
+                cached = usage.get('cachedContentTokenCount', 0) or 0
+                if cached:
+                    _wm, rm = _cache_multipliers("gemini")
+                    cost -= cached * (1.0 - rm) * price_in / 1_000_000
+        else:
+            cost = _estimate_cost(model, prompt_chars, response_chars)
+    except Exception as e:
+        print(f"[LLM-COST] cost computation failed for {model}: {e} — "
+              f"falling back to char estimate")
+        try:
+            cost = _estimate_cost(model, prompt_chars, response_chars)
+        except Exception:
+            cost = 0.0
+    try:
+        with _quota_lock:
+            with _cost_file_lock():
+                # Re-read under the FILE lock so a concurrent process's spend
+                # cannot be lost in this read-modify-write
+                _load_shared_cost()
+                _daily_cost += cost
+                _save_shared_cost()
+    except Exception as e:
+        print(f"[LLM-COST] ledger write failed: {e} "
+              f"(${cost:.6f} may be unrecorded)")
 
 
 def _cost_ok() -> bool:
@@ -1074,8 +1146,25 @@ def _call_anthropic(prompt, system, api_key, model, max_tokens, timeout,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }
+    cache_ttl = ""
     if system:
-        body["system"] = system
+        # Default-OFF prompt-cache breakpoint (config
+        # 'anthropic_cache_system_ttl'; see llm_config.py — B07.2 forbids
+        # enabling under the Haiku default). OFF or any config error ->
+        # plain-string system, byte-identical to pre-change.
+        try:
+            cache_ttl = str(load_llm_config().get(
+                "anthropic_cache_system_ttl") or "")
+        except Exception:
+            cache_ttl = ""
+        if cache_ttl in ("5m", "1h"):
+            cc = {"type": "ephemeral"}
+            if cache_ttl == "1h":
+                cc["ttl"] = "1h"
+            body["system"] = [{"type": "text", "text": system,
+                               "cache_control": cc}]
+        else:
+            body["system"] = system
     if temperature is not None:
         body["temperature"] = temperature
     if json_schema is not None:
@@ -1104,6 +1193,21 @@ def _call_anthropic(prompt, system, api_key, model, max_tokens, timeout,
         "candidatesTokenCount": u.get("output_tokens", 0),
         "thoughtsTokenCount": 0,
     }
+    # Cache accounting fields — added ONLY when present-and-nonzero so the
+    # normalized dict stays exactly {prompt,candidates,thoughts} on the
+    # default no-cache path (exact-equality pins in test_llm_claude.py).
+    cw = u.get("cache_creation_input_tokens") or 0
+    cr = u.get("cache_read_input_tokens") or 0
+    if cw:
+        usage["cacheWriteTokenCount"] = cw
+    if cr:
+        usage["cacheReadTokenCount"] = cr
+    if cache_ttl in ("5m", "1h") and not cw and not cr:
+        # Flag is ON but the API reported no cache tokens — the prefix is
+        # below the model's minimum cacheable length or was invalidated
+        # (per-symbol tool schema changed). Loud so the owner sees it.
+        print(f"[LLM] Claude {model}: cache_control active but no cache "
+              f"tokens reported (prefix below model minimum?)")
     stop = data.get("stop_reason", "unknown")
     text_parts = []
     for block in data.get("content", []) or []:

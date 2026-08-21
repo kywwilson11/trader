@@ -26,7 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
 import gc
+import hashlib
 import json
+import math
 import os
 import time
 from datetime import datetime
@@ -50,6 +52,8 @@ from model_v2 import RegressionLSTM
 from gpu_lock import acquire_for_training
 from adaptive_config import (load_adaptive_state, get_search_space_for_trial,
                               update_after_search, get_trial_count)
+from objective_utils import (simulate_trades_core, ticker_block_ids,
+                             v3_trade_threshold_range, refit_epoch_budget)
 
 _STATUS_FILE = Path(__file__).resolve().parent.parent / 'pipeline_status.json'
 
@@ -318,7 +322,8 @@ def get_holdout_indices(all_times, tickers, ticker_boundaries, seq_len):
 
 
 def get_walk_forward_folds(all_times, all_label_times, tickers,
-                           ticker_boundaries, seq_len, n_folds=NUM_FOLDS):
+                           ticker_boundaries, seq_len, n_folds=NUM_FOLDS,
+                           purge_val_labels=False):
     """Expanding-window walk-forward folds split by CALENDAR TIME.
 
     The old implementation sliced the index array POSITIONALLY — but rows
@@ -362,6 +367,12 @@ def get_walk_forward_folds(all_times, all_label_times, tickers,
         val_mask = (search_mask
                     & (t >= t_train_end + embargo_seconds)
                     & (t < t_val_end))
+        if purge_val_labels:
+            # OBJECTIVE_V3: val rows whose label windows cross into the
+            # holdout previously leaked holdout returns into checkpoint /
+            # threshold selection (confirmed T1 sub-defect).
+            val_mask = val_mask & (all_label_times[valid]
+                                   <= get_holdout_boundary(all_times))
 
         train_indices = valid[train_mask]
         val_indices = valid[val_mask]
@@ -392,8 +403,27 @@ def _objective_long_only():
         return False
 
 
+def _hypersearch_v3():
+    """Read strategy_config.HYPERSEARCH_V3 (default False = legacy)."""
+    try:
+        from strategy_config import HYPERSEARCH_V3
+        return bool(HYPERSEARCH_V3)
+    except Exception:
+        return False
+
+
+def _objective_v3():
+    """Read strategy_config.OBJECTIVE_V3 (default False = legacy)."""
+    try:
+        from strategy_config import OBJECTIVE_V3
+        return bool(OBJECTIVE_V3)
+    except Exception:
+        return False
+
+
 def simulate_trades(predictions, actual_returns, threshold, forward_bars,
-                    txn_cost_pct, return_entries=False, long_only=None):
+                    txn_cost_pct, return_entries=False, long_only=None,
+                    block_ids=None, long_veto=None):
     """Non-overlapping hold simulation. Returns per-trade net returns.
 
     The model predicts the fb-bar forward return, so once a position is
@@ -414,36 +444,27 @@ def simulate_trades(predictions, actual_returns, threshold, forward_bars,
         input arrays) each trade was entered at — lets the holdout gate map
         a trade back to its label span for the effective-n / uniqueness
         deflation (sample_weights.py).
+
+    block_ids / long_veto (both None = legacy, byte-identical): per-row
+        ticker-block ids (a hold never spans a block boundary, OBJECTIVE_V3)
+        and a boolean long-entry veto mask (q10 tail veto mirror,
+        HYPERSEARCH_V3 blend certificate). Delegated to the pure
+        objective_utils.simulate_trades_core (Mac-testable).
     """
     if long_only is None:
         long_only = _objective_long_only()
-    n = len(predictions)
-    trade_returns = []
-    entries = []
-    i = 0
-    while i < n:
-        p = predictions[i]
-        r = actual_returns[i]
-        if p > threshold and np.isfinite(r):
-            trade_returns.append(r - txn_cost_pct)
-            entries.append(i)
-            i += forward_bars
-        elif (not long_only) and p < -threshold and np.isfinite(r):
-            # Short side: realize the negated move (long-only live, but the
-            # signal's bear accuracy still matters for exits)
-            trade_returns.append(-r - txn_cost_pct)
-            entries.append(i)
-            i += forward_bars
-        else:
-            i += 1
-    ret = np.asarray(trade_returns, dtype=np.float64)
+    ret, entries = simulate_trades_core(predictions, actual_returns, threshold,
+                                        forward_bars, txn_cost_pct,
+                                        long_only=long_only,
+                                        block_ids=block_ids,
+                                        long_veto=long_veto)
     if return_entries:
-        return ret, np.asarray(entries, dtype=np.int64)
+        return ret, entries
     return ret
 
 
 def compute_sharpe(predictions, actual_returns, threshold, forward_bars=24,
-                   asset_type='crypto'):
+                   asset_type='crypto', block_ids=None, long_veto=None):
     """Annualized Sharpe of the non-overlapping hold policy, net of costs.
 
     Annualization uses the asset class's actual bar count (8760 hourly
@@ -451,7 +472,8 @@ def compute_sharpe(predictions, actual_returns, threshold, forward_bars=24,
     stock constant to 24/7 crypto).
     """
     trade_returns = simulate_trades(predictions, actual_returns, threshold,
-                                    forward_bars, TXN_COST_PCT.get(asset_type, 0.6))
+                                    forward_bars, TXN_COST_PCT.get(asset_type, 0.6),
+                                    block_ids=block_ids, long_veto=long_veto)
     if len(trade_returns) < 10:
         return 0.0
     std = trade_returns.std()
@@ -466,7 +488,8 @@ def compute_sharpe(predictions, actual_returns, threshold, forward_bars=24,
 
 
 def compute_regime_sharpes(predictions, actual_returns, threshold,
-                           forward_bars=24, asset_type='crypto'):
+                           forward_bars=24, asset_type='crypto',
+                           block_ids=None):
     """Compute Sharpe in bull/bear/sideways regimes separately.
 
     Regime labels approximate the trailing 50-bar cumulative return from
@@ -495,8 +518,13 @@ def compute_regime_sharpes(predictions, actual_returns, threshold,
         if mask.sum() < 10:
             result[name] = 0.0
             continue
+        # Per-row block ids survive boolean subsetting; the core recomputes
+        # change-points on the subset.
         result[name] = compute_sharpe(predictions[mask], actual_returns[mask],
-                                      threshold, forward_bars, asset_type)
+                                      threshold, forward_bars, asset_type,
+                                      block_ids=(block_ids[mask]
+                                                 if block_ids is not None
+                                                 else None))
 
     result['min'] = min(result.values())
     return result
@@ -619,6 +647,12 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
         hd_range = _space.get('huber_delta', [0.5, 2.0])
         huber_delta = trial.suggest_float('huber_delta', hd_range[0], hd_range[1], step=0.1)
         tt_range = _space.get('trade_threshold', [0.05, 1.0])
+        if _objective_v3():
+            # D05-threshold: floor-anchored to the book's deployment edge;
+            # the adaptive state's own range/edge-expansion is overridden
+            # while the flag is ON (runtime-only — DEFAULT_SEARCH_SPACE
+            # stays untouched).
+            tt_range = v3_trade_threshold_range(asset_type)
         trade_threshold = trial.suggest_float('trade_threshold', tt_range[0], tt_range[1], step=0.01)
         scheduler = trial.suggest_categorical('scheduler', ['cosine', 'plateau'])
 
@@ -685,12 +719,15 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
         scheduler_type = cfg['scheduler']
 
         folds = get_walk_forward_folds(all_times, all_label_times, tickers,
-                                       ticker_boundaries, seq_len)
+                                       ticker_boundaries, seq_len,
+                                       purge_val_labels=_objective_v3())
         if not folds:
             return 0.0
 
         offsets = np.arange(-seq_len, 0)
         fold_sharpes = []
+        fold_best_epochs = []  # per-fold best-val-loss epoch (instrumentation)
+        oof_fold_rows, oof_fold_preds, oof_fold_ids = [], [], []
         best_fold_state = None
         best_fold_scaler = None
         best_fold_val = None  # (val_indices, scaler) of the winning fold
@@ -703,6 +740,10 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
             val_indices = val_indices[~np.isnan(trial_returns[val_indices])]
             if len(train_indices) < 500 or len(val_indices) < 100:
                 continue
+            # OBJECTIVE_V3: per-row ticker-block ids so a simulated hold
+            # never spans a ticker boundary (None = legacy scoring).
+            vb = (ticker_block_ids(val_indices, ticker_boundaries)
+                  if _objective_v3() else None)
 
             all_scaled, scaler = seq_cache.get(fold_idx, train_indices)
             n_train = len(train_indices)
@@ -773,6 +814,7 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                       f"(was {batch_size})")
 
             best_val_loss = float('inf')
+            best_epoch = -1
             best_state = None
             top_states: list[tuple[float, dict]] = []  # K-best checkpoint soup
             counter = 0
@@ -832,7 +874,8 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                 # for later folds.
                 epoch_sharpe = compute_sharpe(val_preds_np, y_val, trade_threshold,
                                               forward_bars=cfg['forward_bars'],
-                                              asset_type=asset_type)
+                                              asset_type=asset_type,
+                                              block_ids=vb)
                 trial.report(epoch_sharpe, fold_idx * MAX_EPOCHS + epoch)
 
                 if epoch >= PRUNE_WARMUP_EPOCHS and trial.should_prune():
@@ -860,6 +903,7 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    best_epoch = epoch
                     counter = 0
                 else:
                     counter += 1
@@ -891,9 +935,18 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                 final_preds_np = np.concatenate(final_preds)
                 fold_sharpe = compute_sharpe(final_preds_np, y_val, trade_threshold,
                                              forward_bars=cfg['forward_bars'],
-                                             asset_type=asset_type)
+                                             asset_type=asset_type,
+                                             block_ids=vb)
+                # D12/B04.1: keep this fold's honest val predictions (souped
+                # model, its own purged val slice) so the winner's OOF preds
+                # can be persisted at save time.
+                oof_fold_rows.append(val_indices.copy())
+                oof_fold_preds.append(final_preds_np.astype(np.float32))
+                oof_fold_ids.append(fold_idx)
+                fold_best_epochs.append(max(best_epoch, 0))
             else:
                 fold_sharpe = 0.0
+                fold_best_epochs.append(max(best_epoch, 0))
 
             fold_sharpes.append(fold_sharpe)
 
@@ -942,7 +995,10 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                 all_preds_np = np.concatenate(all_preds)
                 regime_sharpes = compute_regime_sharpes(
                     all_preds_np, rg_y_val, trade_threshold,
-                    forward_bars=cfg['forward_bars'], asset_type=asset_type)
+                    forward_bars=cfg['forward_bars'], asset_type=asset_type,
+                    block_ids=(ticker_block_ids(rg_val_indices,
+                                                ticker_boundaries)
+                               if _objective_v3() else None))
                 trial.set_user_attr('regime_sharpes', regime_sharpes)
                 # Penalize if any regime has negative Sharpe
                 if regime_sharpes['min'] < -0.5:
@@ -964,6 +1020,14 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
             _state_cache[trial.number] = {
                 'state': best_fold_state,
                 'scaler': best_fold_scaler,
+                # D12: fold-val OOF preds for the save-time npz (~3 fold
+                # arrays for the single current-best trial; the clear()
+                # above bounds the memory).
+                'oof_rows': oof_fold_rows,
+                'oof_preds': oof_fold_preds,
+                'oof_fold_ids': oof_fold_ids,
+                # T1: per-fold best epochs — the final refit's fixed budget
+                'fold_best_epochs': fold_best_epochs,
             }
 
         return score
@@ -988,7 +1052,7 @@ LGB_X_BYTE_BUDGET = 600_000_000
 
 def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
                        all_times, all_label_times, tickers, ticker_boundaries,
-                       all_tb_bars_by_fb=None):
+                       all_tb_bars_by_fb=None, save=True):
     """Train the LightGBM leg of the ensemble on the winning config.
 
     Tree ensembles are the stronger learner at this data size (Grinsztajn
@@ -997,6 +1061,13 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
     fell back to LSTM-only. Trains on the same scaled features, same
     horizon, same time split (holdout excluded); predict_now's
     flatten_sequence ordering == windows.reshape(-1).
+
+    save=True (legacy, byte-identical): write the boosters to disk and
+    return the mean booster. save=False (HYPERSEARCH_V3 pre-gate path):
+    write NOTHING and return (booster, q10, q10_floor, n_q10_val) — the
+    caller routes the writes through save_model_atomically's
+    extra_artifacts AFTER the holdout gate passes. Total failure returns
+    None regardless of save.
     """
     try:
         from model_lgb import train_lgb, save_lgb_model
@@ -1015,7 +1086,8 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
                            if not isinstance(k, tuple))
 
         folds = get_walk_forward_folds(all_times, all_label_times, tickers,
-                                       ticker_boundaries, seq_len)
+                                       ticker_boundaries, seq_len,
+                                       purge_val_labels=_objective_v3())
         if not folds:
             return None
         train_idx, val_idx = folds[-1]  # largest train window, latest val
@@ -1057,19 +1129,24 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
                 w_train = fold_train_weights(tb_spans, train_idx, ticker_boundaries)
                 w_val = fold_train_weights(tb_spans, val_idx, ticker_boundaries)
                 print(f"[LGB] uniqueness weighting ON "
-                      f"(train mean-1 over {int(np.isfinite(w_train).sum())} rows)")
+                      f"(train mean-1 over {int((w_train > 0).sum())} of "
+                      f"{len(w_train)} rows)")
 
         print(f"[LGB] Training on {X_train.shape[0]} rows x {X_train.shape[1]} "
               f"flattened features (fb={fb})")
         booster = train_lgb(X_train, y_train, X_val, y_val,
                             sample_weight=w_train, sample_weight_val=w_val)
-        save_lgb_model(booster, prefix=prefix.rstrip('_'))
+        if save:
+            save_lgb_model(booster, prefix=prefix.rstrip('_'))
 
         # Left-tail (q10) quantile model for the entry tail veto: a
         # bullish MEAN prediction can coexist with a fat left tail; the
         # 10th-percentile regression flags those states. The veto floor
         # is self-calibrating — the 15th percentile of q10 over the
         # validation slice (worst ~15% of tail states get vetoed).
+        q10 = None
+        q10_floor_val = None
+        n_q10_val = None
         try:
             q10 = train_lgb(X_train, y_train, X_val, y_val,
                             params={'objective': 'quantile', 'alpha': 0.10,
@@ -1077,19 +1154,177 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
                             sample_weight=w_train, sample_weight_val=w_val)
             q10_val = q10.predict(X_val)
             floor = float(np.percentile(q10_val, 15))
-            q10.save_model(f'{prefix}lgb_q10.txt')
-            with open(f'{prefix}lgb_q10_meta.json', 'w') as f:
-                json.dump({'alpha': 0.10, 'floor': round(floor, 6),
-                           'val_rows': int(len(q10_val))}, f)
-            print(f"[LGB-Q10] tail model saved (veto floor {floor:+.4f}%)")
+            q10_floor_val = floor
+            n_q10_val = int(len(q10_val))
+            if save:
+                q10.save_model(f'{prefix}lgb_q10.txt')
+                with open(f'{prefix}lgb_q10_meta.json', 'w') as f:
+                    json.dump({'alpha': 0.10, 'floor': round(floor, 6),
+                               'val_rows': int(len(q10_val))}, f)
+                print(f"[LGB-Q10] tail model saved (veto floor {floor:+.4f}%)")
+            else:
+                print(f"[LGB-Q10] tail model trained, save deferred to the "
+                      f"gated atomic save (veto floor {floor:+.4f}%)")
         except Exception as e:
             print(f"[LGB-Q10] quantile training failed (non-fatal): {e}")
 
         del X_train, X_val, all_scaled
         gc.collect()
-        return booster
+        if save:
+            return booster
+        return (booster, q10, q10_floor_val, n_q10_val)
     except Exception as e:
         print(f"[LGB] Ensemble training failed (non-fatal): {e}")
+        return None
+
+
+def final_refit(cfg, returns, all_features, all_times, all_label_times,
+                tickers, ticker_boundaries, input_dim, fold_best_epochs,
+                fold_sharpes):
+    """HYPERSEARCH_V3 (D22 / B12.1): ONE final refit of the winning config
+    on ALL pre-holdout data.
+
+    The legacy artifact is the best FOLD's checkpoint — trained on a
+    truncated window and selected by fold-max (winner's curse). The refit
+    trains on the full purged pre-holdout region with a FIXED epoch budget
+    (median of the winning trial's per-fold best epochs — "collective
+    early stopping", no validation pass, no early stopping) and ships an
+    SWA tail soup (uniform average of the LAST SOUP_K epoch checkpoints).
+    Returns (state, scaler, info) or None — the caller falls back loudly
+    to the fold-max checkpoint; a refit failure must NEVER kill the run.
+    """
+    try:
+        epochs = refit_epoch_budget(fold_best_epochs, MAX_EPOCHS)
+        if epochs is None:
+            print('[REFIT] no per-fold epoch record — skipping refit')
+            return None
+        # Regime tripwire FIRST (warn, never block)
+        tripwire = bool(fold_sharpes and fold_sharpes[-1] < 0
+                        and np.mean(fold_sharpes) > 0)
+        if tripwire:
+            print(f"[REFIT] TRIPWIRE: newest fold Sharpe "
+                  f"{fold_sharpes[-1]:.2f} < 0 while trial mean "
+                  f"{np.mean(fold_sharpes):.2f} > 0 — refit-on-all may "
+                  f"bake in a stale-regime model; flagging for owner "
+                  f"review (proceeding)")
+
+        seq_len = cfg['seq_len']
+        valid = _valid_indices(tickers, ticker_boundaries, seq_len)
+        boundary = get_holdout_boundary(all_times)
+        # PURGE: label windows must complete before the holdout starts
+        train_idx = valid[all_label_times[valid] <= boundary]
+        train_idx = train_idx[~np.isnan(returns[train_idx])]
+        if len(train_idx) < 500:
+            print(f'[REFIT] only {len(train_idx)} usable rows — skipping')
+            return None
+
+        scaler = RobustScaler().fit(all_features[train_idx])
+        all_scaled = scaler.transform(all_features).astype(np.float32)
+        y_train = returns[train_idx]
+        n_train = len(train_idx)
+        offsets = np.arange(-seq_len, 0)
+
+        use_amp = device.type == 'cuda'
+        eff_batch_size = cfg['batch_size']
+        while True:
+            try:
+                model = RegressionLSTM(input_dim, cfg['hidden_dim'],
+                                       cfg['num_layers'], cfg['dropout'],
+                                       cfg['n_heads']).to(device)
+                criterion = nn.HuberLoss(delta=cfg['huber_delta'],
+                                         reduction='none')
+                optimizer = optim.Adam(model.parameters(),
+                                       lr=cfg['learning_rate'],
+                                       weight_decay=cfg['weight_decay'])
+                if cfg.get('scheduler') == 'cosine':
+                    sched = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                        optimizer, T_0=20, T_mult=2)
+                else:
+                    # 'plateau' steps on val loss — no validation pass
+                    # exists here, so the refit runs at constant LR.
+                    sched = None
+                grad_scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+                # One probe batch to test if this config fits in memory
+                # (same pattern as the fold loop's first-batch probe)
+                model.train()
+                test_idx = train_idx[:min(eff_batch_size, n_train)]
+                xb = torch.from_numpy(
+                    gather_windows(all_scaled, test_idx, offsets)).to(device)
+                yb = torch.from_numpy(y_train[:len(test_idx)]).to(device)
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    pred = model(xb)
+                    raw_loss = criterion(pred, yb)
+                    weights = torch.clamp(torch.abs(yb) + 1.0, max=50.0)
+                    loss = (raw_loss * weights).mean()
+                optimizer.zero_grad(set_to_none=True)
+                grad_scaler.scale(loss).backward()
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+                del xb, yb, pred, raw_loss, weights, loss
+                break  # fits in memory
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                try:
+                    del model, criterion, optimizer
+                except NameError:
+                    pass
+                gc.collect()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                eff_batch_size //= 2
+                if eff_batch_size < 128:
+                    raise  # let the outer handler report and fall back
+                print(f"  [REFIT] OOM-RETRY: batch "
+                      f"{eff_batch_size * 2}→{eff_batch_size} "
+                      f"({str(e)[:60]})")
+
+        snaps: list[dict] = []
+        for epoch in range(epochs):
+            model.train()
+            perm = np.random.permutation(n_train)
+            for i in range(0, n_train, eff_batch_size):
+                bi = perm[i:i + eff_batch_size]
+                xb = torch.from_numpy(
+                    gather_windows(all_scaled, train_idx[bi],
+                                   offsets)).to(device)
+                yb = torch.from_numpy(y_train[bi]).to(device)
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    pred = model(xb)
+                    raw_loss = criterion(pred, yb)
+                    weights = torch.clamp(torch.abs(yb) + 1.0, max=50.0)
+                    loss = (raw_loss * weights).mean()
+                optimizer.zero_grad(set_to_none=True)
+                grad_scaler.scale(loss).backward()
+                grad_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                               max_norm=1.0)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            if cfg.get('scheduler') == 'cosine' and sched:
+                sched.step()
+            # SWA tail soup: keep only the LAST SOUP_K epoch snapshots.
+            # clone() is load-bearing: on CPU training, .cpu() returns a
+            # VIEW of the live weights and later epochs would mutate the
+            # "snapshot" in place.
+            snaps.append({k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()})
+            del snaps[:-SOUP_K]
+        state = average_states(snaps)
+
+        del model, all_scaled
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"[REFIT] final refit: {n_train} rows, {epochs} fixed epochs "
+              f"(SWA tail soup K={SOUP_K})")
+        return state, scaler, {'epochs': int(epochs),
+                               'n_rows': int(len(train_idx)),
+                               'tripwire': bool(tripwire)}
+    except Exception as e:
+        print(f"[REFIT] final refit failed ({e}) — caller falls back to the "
+              f"fold-max checkpoint")
         return None
 
 
@@ -1100,10 +1335,20 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
 def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                         all_times, tickers, ticker_boundaries,
                         input_dim, asset_type, n_trials,
-                        all_tb_bars_by_fb=None):
+                        all_tb_bars_by_fb=None, lgb_booster=None,
+                        q10_booster=None, q10_floor=None, lstm_weight=None):
     """Score the winning config ONCE on the untouched final time slice.
 
     Returns {'sharpe', 'dsr', 'dsr_min', 'n_trades', 'n_rows'} or None.
+
+    lgb_booster/q10_booster/q10_floor/lstm_weight (all None = legacy raw-
+    LSTM gate, byte-identical): under HYPERSEARCH_V3 the certificate is
+    issued against the DEPLOYED predictor — w*LSTM + (1-w)*LGB with the
+    q10 tail veto applied to long entries (exact predict_now/backtest
+    semantics); the report then carries 'certified'/'lstm_weight'/
+    'q10_vetoed' and pred_deciles/hit_rate/trade_returns become
+    blend-based (the live PSI drift monitor compares live BLENDED preds —
+    the certificate now matches).
     """
     from validation import dsr_from_trade_returns, DSR_MIN
     try:
@@ -1143,11 +1388,50 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
         preds = np.concatenate(preds)
         y = returns[holdout_idx]
 
+        # D25 (HYPERSEARCH_V3): certify the DEPLOYED blend. Fail-safe: any
+        # leg-scoring failure degrades loudly to the raw-LSTM certificate.
+        blended = False
+        long_veto = None
+        n_vetoed = 0
+        if lgb_booster is not None and lstm_weight is not None:
+            try:
+                n_h = len(holdout_idx)
+                lgb_preds = np.empty(n_h, dtype=np.float64)
+                do_q10 = (q10_booster is not None and q10_floor is not None
+                          and np.isfinite(q10_floor))
+                q10_preds = np.empty(n_h, dtype=np.float64) if do_q10 else None
+                for i in range(0, n_h, 1024):
+                    vidx = holdout_idx[i:i + 1024]
+                    # predict_now's flatten_sequence contract:
+                    # == windows.reshape(-1) (pinned in train_lgb_ensemble)
+                    X = gather_windows(scaled, vidx,
+                                       offsets).reshape(len(vidx), -1)
+                    lgb_preds[i:i + len(vidx)] = lgb_booster.predict(X)
+                    if do_q10:
+                        q10_preds[i:i + len(vidx)] = q10_booster.predict(X)
+                # Exact ensemble_predict arithmetic
+                blend_preds = (float(lstm_weight) * preds
+                               + (1.0 - float(lstm_weight)) * lgb_preds)
+                if do_q10:
+                    long_veto = q10_preds < q10_floor
+                    n_vetoed = int(long_veto.sum())
+                preds = blend_preds
+                blended = True
+            except Exception as e:
+                print(f"  [HOLDOUT] blend leg scoring failed ({e}) — gating "
+                      f"raw LSTM (certificate degraded)")
+                long_veto = None
+                n_vetoed = 0
+                blended = False
+
+        hb = (ticker_block_ids(holdout_idx, ticker_boundaries)
+              if _objective_v3() else None)
         sharpe = compute_sharpe(preds, y, threshold, forward_bars=fb,
-                                asset_type=asset_type)
+                                asset_type=asset_type, block_ids=hb,
+                                long_veto=long_veto)
         trade_returns, entry_pos = simulate_trades(
             preds, y, threshold, fb, TXN_COST_PCT.get(asset_type, 0.6),
-            return_entries=True)
+            return_entries=True, block_ids=hb, long_veto=long_veto)
 
         # Effective-n deflation: the DSR null assumes n INDEPENDENT trade-SR
         # draws. With overlapping forward-window labels the effective count
@@ -1155,70 +1439,155 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
         # actually higher. Measure n_eff from the realized trades' label
         # spans (TB_Bars) instead of assuming IID. Falls back to IID (n_eff
         # = n) when spans were not harvested — the gate is never loosened.
+        # PROMOTION_GATE_V2 (2026-08 Q1): OFF = legacy uniqueness->clustered
+        # numerics byte-identical (plus side-by-side instrumentation); ON =
+        # calendar-concurrency average uniqueness as the ONE non-IID
+        # correction, failing closed below the 10-effective-trade floor.
+        try:
+            from strategy_config import (PROMOTION_GATE_V2 as _gate_v2,
+                                         KISH_NEFF_ENABLED as _kish,
+                                         KISH_RHO_FLOOR as _rho_floor)
+        except ImportError:
+            _gate_v2, _kish, _rho_floor = False, False, {}
         n_eff = None
         u_bar_traded = None
+        entry_t = exit_t = None
+        n_eff_v2 = None
         if all_tb_bars_by_fb and fb in all_tb_bars_by_fb and len(entry_pos):
+            tb = all_tb_bars_by_fb[fb]
+            global_rows = holdout_idx[entry_pos]
+            # Hoisted [entry, exit] calendar-time reconstruction — shared by
+            # the legacy clustering, the v2 estimator, and the side-by-side
+            # instrumentation (identical math to the pre-hoist version).
             try:
-                from sample_weights import average_uniqueness, effective_n
-                # Concurrency is computed among the TRADED labels ONLY — a
-                # trade's independence is measured against the other trades
-                # the gate counts, not against every (non-traded) panel bar.
-                # Mask: only traded rows carry their span; all else is NaN
-                # (NaN rows neither hold nor count concurrency). Because
-                # simulate_trades skips fb bars after each entry and a label
-                # span is <= fb, holdout trades are near-non-overlapping, so
-                # n_eff ~ n_trades here by construction — the correction bites
-                # only if a model's realized entries crowd inside their holds.
-                tb = all_tb_bars_by_fb[fb]
-                global_rows = holdout_idx[entry_pos]
-                masked = np.full(len(tb), np.nan, dtype=np.float64)
-                masked[global_rows] = tb[global_rows]
-                u_all = average_uniqueness(masked, ticker_boundaries)
-                u_bar_traded = u_all[global_rows]
-                n_eff = effective_n(u_bar_traded)
+                if isinstance(ticker_boundaries, dict):
+                    _blocks = sorted(ticker_boundaries.values())
+                else:
+                    _blocks = sorted(ticker_boundaries)
+                _starts = np.asarray([b[0] for b in _blocks])
+                _ends = np.asarray([b[1] for b in _blocks])
+                entry_t = all_times[global_rows]
+                exit_rows = np.empty(len(global_rows), dtype=np.int64)
+                for _k, _row in enumerate(global_rows):
+                    _bi = int(np.searchsorted(_starts, _row,
+                                              side='right') - 1)
+                    _block_last = int(_ends[_bi]) - 1
+                    _span = tb[_row]
+                    _span = int(_span) if np.isfinite(_span) else 0
+                    exit_rows[_k] = min(_row + max(_span, 0), _block_last)
+                exit_t = all_times[exit_rows]
+            except Exception as te:
+                print(f"  [HOLDOUT] entry/exit time reconstruction failed "
+                      f"({te})")
+                entry_t = exit_t = None
 
-                # Cross-sectional clustering (2026-07 review): the per-ticker
-                # uniqueness above counts same-hour trades on N correlated
-                # names as N independent draws — on the 6-coin crypto panel
-                # (pairwise rho 0.7-0.9) that overstates the DSR's sqrt(n)
-                # breadth 2-4x, raising a zero-edge model's false-pass rate
-                # from ~0.2% to 5-9% per attempt. Collapse trades whose
-                # [entry, exit] CALENDAR windows overlap across names (rho=1
-                # worst case) and take the harsher of the two counts.
+            if _gate_v2:
+                # Exactly ONE non-IID correction: calendar-concurrency
+                # average uniqueness across ALL names (supersedes both the
+                # per-ticker uniqueness and the cluster count; never stacked
+                # with Lo-2002 — CLAUDE.md gotcha #4).
                 try:
-                    from sample_weights import clustered_effective_n
-                    if isinstance(ticker_boundaries, dict):
-                        _blocks = sorted(ticker_boundaries.values())
-                    else:
-                        _blocks = sorted(ticker_boundaries)
-                    _starts = np.asarray([b[0] for b in _blocks])
-                    _ends = np.asarray([b[1] for b in _blocks])
-                    entry_t = all_times[global_rows]
-                    exit_rows = np.empty(len(global_rows), dtype=np.int64)
-                    for _k, _row in enumerate(global_rows):
-                        _bi = int(np.searchsorted(_starts, _row,
-                                                  side='right') - 1)
-                        _block_last = int(_ends[_bi]) - 1
-                        _span = tb[_row]
-                        _span = int(_span) if np.isfinite(_span) else 0
-                        exit_rows[_k] = min(_row + max(_span, 0), _block_last)
-                    exit_t = all_times[exit_rows]
-                    n_x = clustered_effective_n(entry_t, exit_t)
-                    if 0 < n_x < (n_eff if n_eff else len(global_rows)):
-                        print(f"  [HOLDOUT] cross-sectional clustering: "
-                              f"{len(global_rows)} trades -> {n_x} disjoint "
-                              f"calendar clusters (n_eff {n_eff:.1f} -> {n_x})")
-                        n_eff = float(n_x)
-                except Exception as ce:
-                    print(f"  [HOLDOUT] cross-sectional n_eff unavailable "
-                          f"({ce}) — keeping per-ticker n_eff")
-            except Exception as ue:
-                print(f"  [HOLDOUT] uniqueness n_eff unavailable ({ue}) — "
-                      f"falling back to IID null")
-                n_eff = None
+                    from sample_weights import calendar_effective_n
+                    if entry_t is None:
+                        raise RuntimeError(
+                            'entry/exit time reconstruction failed')
+                    _rho = None
+                    if _kish and asset_type in _rho_floor:
+                        _rho = _rho_floor[asset_type]
+                    _cal = calendar_effective_n(entry_t, exit_t,
+                                                rho_bar=_rho)
+                    n_eff = float(_cal['n_eff'])
+                    n_eff_v2 = float(_cal['n_eff'])
+                    print(f"  [HOLDOUT] v2 calendar n_eff="
+                          f"{_cal['n_eff']:.1f} (max_concurrency="
+                          f"{_cal['max_concurrency']}, rho_bar={_rho})")
+                except Exception as ve:
+                    print(f"  [HOLDOUT] v2 calendar n_eff unavailable "
+                          f"({ve}) — falling back to IID null")
+                    n_eff = None
+            else:
+                try:
+                    from sample_weights import average_uniqueness, effective_n
+                    # Concurrency is computed among the TRADED labels ONLY — a
+                    # trade's independence is measured against the other trades
+                    # the gate counts, not against every (non-traded) panel bar.
+                    # Mask: only traded rows carry their span; all else is NaN
+                    # (NaN rows neither hold nor count concurrency). Because
+                    # simulate_trades skips fb bars after each entry and a label
+                    # span is <= fb, holdout trades are near-non-overlapping, so
+                    # n_eff ~ n_trades here by construction — the correction bites
+                    # only if a model's realized entries crowd inside their holds.
+                    masked = np.full(len(tb), np.nan, dtype=np.float64)
+                    masked[global_rows] = tb[global_rows]
+                    u_all = average_uniqueness(masked, ticker_boundaries)
+                    u_bar_traded = u_all[global_rows]
+                    n_eff = effective_n(u_bar_traded)
+                    if n_eff == 0.0:
+                        print("  [HOLDOUT] WARNING: effective_n returned the "
+                              "0.0 unmeasurable sentinel UNGUARDED — the DSR "
+                              "clamp will fabricate a 10-observation floor "
+                              "(known defect D02; PROMOTION_GATE_V2 fails "
+                              "this closed)")
 
-        dsr = dsr_from_trade_returns(trade_returns, n_trials=n_trials,
-                                     n_eff=n_eff)
+                    # Cross-sectional clustering (2026-07 review): the per-ticker
+                    # uniqueness above counts same-hour trades on N correlated
+                    # names as N independent draws — on the 6-coin crypto panel
+                    # (pairwise rho 0.7-0.9) that overstates the DSR's sqrt(n)
+                    # breadth 2-4x, raising a zero-edge model's false-pass rate
+                    # from ~0.2% to 5-9% per attempt. Collapse trades whose
+                    # [entry, exit] CALENDAR windows overlap across names (rho=1
+                    # worst case) and take the harsher of the two counts.
+                    try:
+                        from sample_weights import clustered_effective_n
+                        if entry_t is None:
+                            raise RuntimeError(
+                                'entry/exit time reconstruction failed')
+                        n_x = clustered_effective_n(entry_t, exit_t)
+                        if 0 < n_x < (n_eff if n_eff else len(global_rows)):
+                            print(f"  [HOLDOUT] cross-sectional clustering: "
+                                  f"{len(global_rows)} trades -> {n_x} disjoint "
+                                  f"calendar clusters (n_eff {n_eff:.1f} -> {n_x})")
+                            n_eff = float(n_x)
+                    except Exception as ce:
+                        print(f"  [HOLDOUT] cross-sectional n_eff unavailable "
+                              f"({ce}) — keeping per-ticker n_eff")
+                except Exception as ue:
+                    print(f"  [HOLDOUT] uniqueness n_eff unavailable ({ue}) — "
+                          f"falling back to IID null")
+                    n_eff = None
+                # Known-defect crowding warning (mirror of backtest.py's) +
+                # legacy-vs-v2 side-by-side line. Instrumentation only.
+                if (n_eff is not None and len(trade_returns)
+                        and n_eff < len(trade_returns) / 5):
+                    print(f"  [HOLDOUT] WARNING: cross-sectional clustering "
+                          f"collapsed {len(trade_returns)} trades to "
+                          f"{int(n_eff)} clusters "
+                          f"({n_eff / len(trade_returns):.1%}) — the DSR null "
+                          f"is being set by trade crowding, not by the model")
+                try:
+                    from sample_weights import calendar_effective_n
+                    if entry_t is not None:
+                        _cal = calendar_effective_n(entry_t, exit_t)
+                        n_eff_v2 = float(_cal['n_eff'])
+                        print(f"  [HOLDOUT] n_eff legacy={n_eff} "
+                              f"(uniqueness->clustered) vs v2 calendar="
+                              f"{_cal['n_eff']:.1f} (max_concurrency="
+                              f"{_cal['max_concurrency']})")
+                except Exception:
+                    pass
+
+        if _gate_v2:
+            # n_eff_source labels provenance honestly: None when the
+            # calendar estimator was unavailable and the IID null applies.
+            dsr = dsr_from_trade_returns(trade_returns, n_trials=n_trials,
+                                         n_eff=n_eff,
+                                         n_eff_source=('calendar_uniqueness'
+                                                       if n_eff is not None
+                                                       else None),
+                                         fail_closed_floor=True)
+        else:
+            dsr = dsr_from_trade_returns(trade_returns, n_trials=n_trials,
+                                         n_eff=n_eff)
         del mdl, scaled
         gc.collect()
         if torch.cuda.is_available():
@@ -1226,37 +1595,65 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
         u_bar_mean = (round(float(np.nanmean(u_bar_traded)), 4)
                       if u_bar_traded is not None and len(u_bar_traded)
                       else None)
-        return {'sharpe': round(float(sharpe), 4),
-                'dsr': round(float(dsr['dsr']), 4),
-                'dsr_min': DSR_MIN,
-                'n_trades': int(dsr['n']),
-                'n_eff': dsr.get('n_eff'),
-                'u_bar_mean': u_bar_mean,
-                # Persist the realized holdout trade returns so a champion's
-                # DSR is re-checkable later without a full re-inference pass
-                # (closes the gap where save_artifacts kept only the summary).
-                'trade_returns': [round(float(x), 6) for x in trade_returns],
-                'n_rows': int(len(holdout_idx)),
-                # Net-of-cost hit rate — the CUSUM live monitor's baseline
-                'hit_rate': (round(float(np.mean(trade_returns > 0)), 4)
-                             if len(trade_returns) else None),
-                # Reference distribution for the live PSI drift monitor:
-                # deciles of the holdout predictions (monitor_drift.py)
-                'pred_deciles': [round(float(x), 6) for x in
-                                 np.percentile(preds, np.arange(0, 101, 10))]}
+        # MinTRL on a failed gate (instrumentation, both modes): how many
+        # more EFFECTIVE trades this SR needs to clear the deflation bar.
+        _min_trl = dsr.get('min_trl')
+        if (_min_trl is not None and math.isfinite(_min_trl)
+                and (sharpe <= 0 or dsr['dsr'] < DSR_MIN)):
+            print(f"  [HOLDOUT] MinTRL: need "
+                  f"~{max(0.0, _min_trl - dsr['n_eff']):.0f} more effective "
+                  f"trades at this SR (min_trl={_min_trl:.0f}, "
+                  f"n_eff={dsr['n_eff']})")
+        report = {'sharpe': round(float(sharpe), 4),
+                  'dsr': round(float(dsr['dsr']), 4),
+                  'dsr_min': DSR_MIN,
+                  'n_trades': int(dsr['n']),
+                  'n_eff': dsr.get('n_eff'),
+                  'n_eff_v2': n_eff_v2,
+                  'status': dsr.get('status'),
+                  'min_trl': _min_trl,
+                  'n_trials_pool': dsr['n_trials'],
+                  'u_bar_mean': u_bar_mean,
+                  # Persist the realized holdout trade returns so a champion's
+                  # DSR is re-checkable later without a full re-inference pass
+                  # (closes the gap where save_artifacts kept only the summary).
+                  'trade_returns': [round(float(x), 6) for x in trade_returns],
+                  'n_rows': int(len(holdout_idx)),
+                  # Net-of-cost hit rate — the CUSUM live monitor's baseline
+                  'hit_rate': (round(float(np.mean(trade_returns > 0)), 4)
+                               if len(trade_returns) else None),
+                  # Reference distribution for the live PSI drift monitor:
+                  # deciles of the holdout predictions (monitor_drift.py)
+                  'pred_deciles': [round(float(x), 6) for x in
+                                   np.percentile(preds, np.arange(0, 101, 10))]}
+        # ONLY when blended (flag-OFF report stays key-for-key identical)
+        if blended:
+            report['certified'] = 'blend'
+            report['lstm_weight'] = round(float(lstm_weight), 4)
+            report['q10_vetoed'] = n_vetoed
+        return report
     except Exception as e:
         print(f"  [HOLDOUT] evaluation failed: {e} — gate fails closed")
         return None
 
 
 def save_model_atomically(prefix, state, best_cfg, input_dim, config, scaler,
-                          feature_cols, score=0.0):
+                          feature_cols, score=0.0, oof_pack=None,
+                          extra_artifacts=None):
     """Write all four artifacts via tmp+rename, then a manifest LAST.
 
     The four files were previously written non-atomically while bots
     hot-reload on the .pth mtime alone — a reload mid-save could pair new
     weights with an old scaler. Bots now key reloads on the manifest,
     which only appears after every artifact is fully on disk.
+
+    extra_artifacts (T1/HYPERSEARCH_V3): optional {path: writer(path)}
+    written tmp+rename alongside the core four — BEFORE the OOF npz and
+    the manifest, so under the flag ALL artifacts (LGB boosters included)
+    are on disk before the manifest appears (manifest-LAST invariant
+    preserved and strengthened). The .prev backup loop already names the
+    lgb files, so the OLD boosters are backed up before new bytes land.
+    None (default) = legacy flow, byte-identical.
     """
     mdl = RegressionLSTM(input_dim, best_cfg['hidden_dim'],
                          best_cfg['num_layers'], best_cfg['dropout'],
@@ -1276,19 +1673,40 @@ def save_model_atomically(prefix, state, best_cfg, input_dim, config, scaler,
     for path in list(artifacts) + [f'{prefix}model_v2.manifest.json',
                                    f'{prefix}lgb_model.txt',
                                    f'{prefix}lgb_q10.txt',
-                                   f'{prefix}lgb_q10_meta.json']:
+                                   f'{prefix}lgb_q10_meta.json',
+                                   f'{prefix}oof_preds.npz']:
         if os.path.exists(path):
             try:
                 shutil.copy2(path, f'{path}.prev')
             except OSError:
                 pass
-    for path, writer in artifacts.items():
+    # Single timestamp so the OOF npz and the manifest carry the SAME
+    # fingerprint (behavior-identical hoist of the manifest's saved_at).
+    saved_at = datetime.now().isoformat()
+    for path, writer in {**artifacts, **(extra_artifacts or {})}.items():
         tmp = f'{path}.tmp.{os.getpid()}'
         writer(tmp)
         os.replace(tmp, path)
 
+    # D12/B04.1: persist the winner's purged walk-forward val predictions
+    # BEFORE the manifest (manifest-LAST invariant: the npz is on disk before
+    # the manifest that fingerprints it appears). Fail-soft — an OOF persist
+    # failure must NEVER block a model save.
+    if oof_pack is not None:
+        try:
+            from meta_label import write_oof_npz
+            write_oof_npz(f'{prefix}oof_preds.npz', oof_pack, saved_at,
+                          round(float(score), 4))
+            print(f"Saved: {prefix}oof_preds.npz ({len(oof_pack['ts_ns'])} OOF rows)")
+        except Exception as e:
+            print(f"[OOF] npz persist failed (non-fatal — meta will fall back "
+                  f"loudly to in-sample): {e}")
+    else:
+        print("[OOF] no OOF pack for this save — any existing "
+              f"{prefix}oof_preds.npz is now fingerprint-stale (meta falls back loudly)")
+
     manifest = {
-        'saved_at': datetime.now().isoformat(),
+        'saved_at': saved_at,
         'score': round(float(score), 4),
         'files': list(artifacts.keys()),
         'config': {k: v for k, v in config.items() if k != 'holdout'},
@@ -1300,7 +1718,7 @@ def save_model_atomically(prefix, state, best_cfg, input_dim, config, scaler,
         json.dump(manifest, f, indent=2)
     os.replace(tmp, mpath)
 
-    for path in artifacts:
+    for path in {**artifacts, **(extra_artifacts or {})}:
         print(f"Saved: {path}")
     print(f"Manifest: {mpath}")
 
@@ -1347,6 +1765,10 @@ def main():
     study_name = f'{prefix}v2_search'
 
     if args.fresh and os.path.exists(db_path):
+        # Instrumentation (B03.2): persist the deletion event — the trials
+        # erased here still count as selection pressure in cum_trials.
+        from adaptive_config import record_db_deletion
+        record_db_deletion(asset_type, db_path, reason='--fresh')
         os.remove(db_path)
         print(f"Deleted existing study DB: {db_path}")
 
@@ -1358,7 +1780,10 @@ def main():
      has_multi_horizon, all_tb_bars_by_fb) = load_data(
          args.data, preset_override=args.preset, max_rows=args.max_rows)
 
-    best_state_holder = {'state': None, 'scaler': None, 'score': 0.0, 'cfg': None}
+    best_state_holder = {'state': None, 'scaler': None, 'score': 0.0,
+                         'cfg': None, 'fold_sharpes': [],
+                         'oof_rows': None, 'oof_preds': None,
+                         'oof_fold_ids': None, 'fold_best_epochs': None}
     _state_cache = {}
 
     phase_id = f'{asset_type}_search'
@@ -1401,6 +1826,15 @@ def main():
                 best_state_holder['scaler'] = cached['scaler']
                 best_state_holder['score'] = score
                 best_state_holder['cfg'] = cfg
+                # Winner's own fold scores — the noisy ratchet's sigma source
+                best_state_holder['fold_sharpes'] = fold_sharpes
+                # D12: the winner's fold-val OOF predictions travel with it
+                best_state_holder['oof_rows'] = cached.get('oof_rows')
+                best_state_holder['oof_preds'] = cached.get('oof_preds')
+                best_state_holder['oof_fold_ids'] = cached.get('oof_fold_ids')
+                # T1: the winner's per-fold best epochs feed final_refit
+                best_state_holder['fold_best_epochs'] = \
+                    cached.get('fold_best_epochs')
                 trials_since_improvement = 0
                 tag = " ** BEST **"
 
@@ -1450,6 +1884,11 @@ def main():
     )
 
     prior_trials = len(study.trials)
+    # COMPLETE-with-value count BEFORE this run: lets the post-search code
+    # attribute exactly the trials THIS run added to the selection pool.
+    prior_completed = len([t for t in study.trials
+                           if t.state == optuna.trial.TrialState.COMPLETE
+                           and t.value is not None])
     print(f"\n{'='*70}")
     print(f"OPTUNA V2 REGRESSION SEARCH: {num_trials} new trials (TPE + pruning)")
     print(f"Adaptive mode: {mode}")
@@ -1494,24 +1933,209 @@ def main():
     holdout_report = None
     model_saved = False
 
-    if best_state_holder['state'] is not None and new_score > existing_score:
+    # --- Selection-pressure pool (B03.2) ----------------------------------
+    # Deflate against the CUMULATIVE trials ever run against this holdout
+    # family, not just this study's visible count (Harvey & Liu 2015: the
+    # pool is judgment-inclusive; DB deletions do not erase the pressure).
+    try:
+        from strategy_config import PROMOTION_GATE_V2 as _GATE_V2
+    except ImportError:
+        _GATE_V2 = False
+    completed_trials = [t for t in study.trials
+                        if t.state == optuna.trial.TrialState.COMPLETE
+                        and t.value is not None]
+    n_new_completed = max(len(completed_trials) - prior_completed, 0)
+    cum_prev = int(adaptive_state.get('cum_trials', 0))
+    cum_now = cum_prev + n_new_completed
+    print(f"[GATE] deflating against {cum_now} cumulative trials "
+          f"({len(completed_trials)} this study, this run "
+          f"+{n_new_completed})")
+    if _GATE_V2:
+        _hist = list(adaptive_state.get('trial_history') or [])
+        if _hist:
+            from adaptive_config import overlap_weighted_trials
+            _hist = _hist + [{'date': datetime.now().isoformat(),
+                              'n': n_new_completed}]
+            _pool = overlap_weighted_trials(_hist)
+        else:
+            _pool = float(cum_now)
+        n_trials_pool = max(int(round(_pool)), len(completed_trials), 2)
+    else:
+        n_trials_pool = max(len(completed_trials), 2)  # legacy, byte-identical
+
+    # --- Thresholdout-shaped noisy ratchet (B03.2) ------------------------
+    # Seeded from study name + date so the draw is reproducible/loggable.
+    from adaptive_config import noisy_ratchet
+    _seed = int.from_bytes(hashlib.sha256(
+        f"{study_name}|{datetime.now().date().isoformat()}".encode()
+    ).digest()[:8], 'big')
+    rat = noisy_ratchet(new_score, existing_score,
+                        best_state_holder.get('fold_sharpes') or [],
+                        seed=_seed)
+    if _GATE_V2:
+        accept_new = rat['accept']
+        print(f"[RATCHET] v2 {'ACCEPT' if rat['accept'] else 'REJECT'}: "
+              f"new={new_score:.3f} vs stored+2sigma+eta="
+              f"{rat['threshold']:.3f} (sigma={rat['sigma']:.3f}, "
+              f"eta={rat['noise']:.4f}, seed={_seed})")
+    else:
+        accept_new = new_score > existing_score  # legacy strict comparison
+        print(f"[RATCHET] v2 would "
+              f"{'ACCEPT' if rat['accept'] else 'REJECT'}: "
+              f"new={new_score:.3f} vs stored+2sigma+eta="
+              f"{rat['threshold']:.3f} (sigma={rat['sigma']:.3f})")
+
+    if best_state_holder['state'] is not None and accept_new:
         best_cfg = best_state_holder['cfg']
         best_scaler = best_state_holder['scaler']
+
+        # --- HYPERSEARCH_V3 (T1, D22/D23/D25): final refit + pre-gate LGB
+        # legs + blend-weight fit. Flag OFF: every local below is inert
+        # (ship_state/ship_scaler == the legacy fold-max checkpoint pair,
+        # all new evaluate_on_holdout kwargs None).
+        _v3 = _hypersearch_v3()
+        ship_state, ship_scaler = best_state_holder['state'], best_scaler
+        refit_info = None
+        lgb_pack = None
+        lstm_weight = None
+        blend_diag = None
+        if _v3:
+            # (a) the winning config's returns array — SAME key logic as
+            # evaluate_on_holdout
+            _fb = best_cfg.get('forward_bars', 24)
+            _rkey = (('tb', _fb) if best_cfg.get('target_kind') == 'tb'
+                     else _fb)
+            returns = all_returns_by_fb.get(_rkey)
+            if returns is None:
+                returns = all_returns_by_fb.get(_fb)
+            if returns is None:
+                returns = next(v for k, v in all_returns_by_fb.items()
+                               if not isinstance(k, tuple))
+            # (b) ONE final refit on all purged pre-holdout data (D22)
+            _refit = final_refit(
+                best_cfg, returns, all_features, all_times, all_label_times,
+                tickers, ticker_boundaries, input_dim,
+                best_state_holder.get('fold_best_epochs') or [],
+                best_state_holder.get('fold_sharpes') or [])
+            if _refit:
+                ship_state, ship_scaler, refit_info = _refit
+            else:
+                print('[REFIT] final refit unavailable — falling back to '
+                      'fold-max checkpoint (legacy artifact)')
+            # (c) LGB legs BEFORE the gate, on the SHIPPING scaler
+            # (predict_now feeds both legs one scaler — train/serve
+            # parity); nothing touches disk until the gate passes.
+            lgb_pack = train_lgb_ensemble(prefix, ship_scaler, best_cfg,
+                                          all_features, all_returns_by_fb,
+                                          all_times, all_label_times,
+                                          tickers, ticker_boundaries,
+                                          all_tb_bars_by_fb=all_tb_bars_by_fb,
+                                          save=False)
+            # (d) Blend fit (D23) on the winning trial's LAST fold's val
+            # slice — the only slice out-of-sample for BOTH legs (the LGB
+            # booster trains on folds[-1] train; earlier folds' val rows
+            # sit inside it). Deliberate B12 simplification: a full 3-fold
+            # LGB OOF pass would cost 3 extra LGB trainings; both legs
+            # here carry symmetric val-selection optimism — the
+            # OOF-symmetry requirement's actual point.
+            try:
+                if (lgb_pack and lgb_pack[0] is not None
+                        and best_state_holder.get('oof_rows')
+                        and best_state_holder.get('oof_preds')):
+                    from blend_fit import (fit_blend_weight,
+                                           fit_blend_weight_v2,
+                                           smooth_across_retrains)
+                    _booster = lgb_pack[0]
+                    rows = best_state_holder['oof_rows'][-1]
+                    lstm_oof = best_state_holder['oof_preds'][-1]
+                    y_fit = returns[rows]
+                    _sl = best_cfg['seq_len']
+                    _off = np.arange(-_sl, 0)
+                    # ship_scaler transform computed once here and freed
+                    _scaled_fit = ship_scaler.transform(
+                        all_features).astype(np.float32)
+                    lgb_oof = np.empty(len(rows), dtype=np.float64)
+                    for i in range(0, len(rows), 1024):
+                        _ri = rows[i:i + 1024]
+                        _X = gather_windows(_scaled_fit, _ri,
+                                            _off).reshape(len(_ri), -1)
+                        lgb_oof[i:i + len(_ri)] = _booster.predict(_X)
+                    del _scaled_fit
+                    gc.collect()
+                    # B12 BINDING: shrink_to=0.5, shrink_lambda=0.5 defaults
+                    fit = fit_blend_weight_v2(
+                        lstm_oof, lgb_oof, y_fit,
+                        forward_bars=best_cfg.get('forward_bars', 24))
+                    # Sharpe-grid DIAGNOSTIC (logged only, never deployed)
+                    w_grid = fit_blend_weight(
+                        lstm_oof, lgb_oof, y_fit, objective='sharpe',
+                        threshold=best_cfg['trade_threshold'],
+                        shrink_lambda=0.0)
+                    # Champion slot's persisted weight = cross-retrain memory
+                    try:
+                        w_prev = joblib.load(
+                            f'{prefix}config_v2.pkl').get('lstm_weight')
+                    except Exception:
+                        w_prev = None
+                    lstm_weight = smooth_across_retrains(fit['w'], w_prev)
+                    blend_diag = {
+                        'w_raw': (round(float(fit['w_raw']), 4)
+                                  if fit['w_raw'] is not None else None),
+                        'se': (round(float(fit['se']), 4)
+                               if fit['se'] is not None else None),
+                        'significant': bool(fit['significant']),
+                        'n_fit': int(fit['n']),
+                        'w_fit': round(float(fit['w']), 4),
+                        'w_prev': (round(float(w_prev), 4)
+                                   if w_prev is not None else None),
+                        'w_sharpe_grid': round(float(w_grid), 4),
+                    }
+                    print(f"[BLEND] w_raw={blend_diag['w_raw']} "
+                          f"se={blend_diag['se']} "
+                          f"significant={blend_diag['significant']} -> "
+                          f"w_fit={blend_diag['w_fit']} smoothed "
+                          f"w={round(float(lstm_weight), 4)} "
+                          f"(prev={blend_diag['w_prev']}, "
+                          f"grid diag={blend_diag['w_sharpe_grid']})")
+                    # Forecast-encompassing flag (B12)
+                    if (fit['w_raw'] is not None
+                            and fit['w_raw'] < 0.15):
+                        print(f"[BLEND] OWNER FLAG: unshrunk NNLS "
+                              f"w={fit['w_raw']:.3f} < 0.15 — LSTM leg "
+                              f"near-encompassed; if this repeats on BOTH "
+                              f"books, dropping torch from the live loops "
+                              f"is the prize (do not auto-drop)")
+                else:
+                    print('[BLEND] LGB leg or OOF arrays unavailable — no '
+                          'blend certificate (raw-LSTM gate)')
+            except Exception as e:
+                lstm_weight = None
+                print(f"[BLEND] blend fit failed ({e}) — no blend "
+                      f"certificate (raw-LSTM gate)")
+
+        # Winner's-curse instrumentation (B12, direct-ship)
+        _fs = best_state_holder.get('fold_sharpes') or []
+        if _fs:
+            print(f"[CURSE] deployable-edge point estimate = avg fold "
+                  f"Sharpe {np.mean(_fs):.2f} (best-fold max "
+                  f"{np.max(_fs):.2f} inflates by ~0.85*std="
+                  f"{0.85 * np.std(_fs):.2f} over correlated folds)")
 
         # --- FINAL HOLDOUT GATE -------------------------------------------
         # The winner was selected, early-stopped, AND scored on the same
         # validation slices across hundreds of trials. Before deployment it
         # must clear a time slice Optuna NEVER saw, deflated for the size
         # of the selection pool (Bailey & Lopez de Prado DSR).
-        completed_trials = [t for t in study.trials
-                            if t.state == optuna.trial.TrialState.COMPLETE
-                            and t.value is not None]
         holdout_report = evaluate_on_holdout(
-            best_state_holder['state'], best_scaler, best_cfg,
+            ship_state, ship_scaler, best_cfg,
             all_features, all_returns_by_fb, all_times,
             tickers, ticker_boundaries, input_dim, asset_type,
-            n_trials=max(len(completed_trials), 2),
+            n_trials=n_trials_pool,
             all_tb_bars_by_fb=all_tb_bars_by_fb,
+            lgb_booster=(lgb_pack[0] if _v3 and lgb_pack else None),
+            q10_booster=(lgb_pack[1] if _v3 and lgb_pack else None),
+            q10_floor=(lgb_pack[2] if _v3 and lgb_pack else None),
+            lstm_weight=lstm_weight,
         )
         gate_ok = (holdout_report is not None
                    and holdout_report['sharpe'] > 0
@@ -1547,6 +2171,13 @@ def main():
                 'indicator_preset': preset_name,
                 'holdout': holdout_report,
             }
+            # T1: the fitted blend weight ships in the config — the key
+            # predict_now.py / backtest.py already read (default 0.6).
+            if _v3 and lstm_weight is not None:
+                config['lstm_weight'] = round(float(lstm_weight), 4)
+                config['blend_diag'] = blend_diag
+            if refit_info:
+                config['refit'] = refit_info
             # Shadow mode: with a champion already deployed, the gated
             # new model enters the CHALLENGER slot. It earns promotion
             # only by beating the champion on LIVE predictions (DM-HLN
@@ -1565,17 +2196,62 @@ def main():
                 except Exception as e:
                     print(f"[SHADOW] slot check failed ({e}) — saving as champion")
 
-            save_model_atomically(save_prefix, best_state_holder['state'], best_cfg,
-                                  input_dim, config, best_scaler, feature_cols,
-                                  score=new_score)
+            # D12/B04.1: assemble the winner's OOF-prediction pack (fail-soft
+            # — a pack-build failure never blocks the save; the npz simply
+            # goes stale/absent and meta falls back loudly to in-sample).
+            oof_pack = None
+            try:
+                if best_state_holder.get('oof_rows'):
+                    from meta_label import oof_pack_from_folds
+                    oof_pack = oof_pack_from_folds(
+                        best_state_holder['oof_rows'],
+                        best_state_holder['oof_preds'],
+                        best_state_holder.get('oof_fold_ids'),
+                        all_times, tickers, ticker_boundaries,
+                        get_holdout_boundary(all_times))
+            except Exception as e:
+                print(f"[OOF] pack build failed (non-fatal): {e}")
+                oof_pack = None
+
+            # T1: under HYPERSEARCH_V3 the pre-gate LGB boosters ride the
+            # atomic save (old boosters .prev-backed-up, ALL artifacts on
+            # disk before the manifest). lgb_pack None -> nothing extra is
+            # written and live falls back LSTM-only, exactly as a failed
+            # legacy LGB training does today.
+            extra_artifacts = None
+            if _v3 and lgb_pack and lgb_pack[0] is not None:
+                _booster, _q10b, _q10f, _n_q10 = lgb_pack
+                extra_artifacts = {
+                    f'{save_prefix}lgb_model.txt':
+                        (lambda p, b=_booster: b.save_model(p)),
+                }
+                if _q10b is not None and _q10f is not None:
+                    extra_artifacts[f'{save_prefix}lgb_q10.txt'] = \
+                        (lambda p, b=_q10b: b.save_model(p))
+
+                    def _write_q10_meta(p, fl=_q10f, nv=_n_q10):
+                        with open(p, 'w') as f:
+                            json.dump({'alpha': 0.10,
+                                       'floor': round(fl, 6),
+                                       'val_rows': int(nv or 0)}, f)
+                    extra_artifacts[f'{save_prefix}lgb_q10_meta.json'] = \
+                        _write_q10_meta
+
+            save_model_atomically(save_prefix, ship_state, best_cfg,
+                                  input_dim, config, ship_scaler, feature_cols,
+                                  score=new_score, oof_pack=oof_pack,
+                                  extra_artifacts=extra_artifacts)
             model_saved = True
 
             # Train the LightGBM ensemble leg on the winning config
-            train_lgb_ensemble(save_prefix, best_scaler, best_cfg,
-                               all_features, all_returns_by_fb,
-                               all_times, all_label_times,
-                               tickers, ticker_boundaries,
-                               all_tb_bars_by_fb=all_tb_bars_by_fb)
+            # (legacy post-save path; under _v3 the legs were trained
+            # pre-gate and saved atomically above)
+            if not _v3:
+                train_lgb_ensemble(save_prefix, best_scaler, best_cfg,
+                                   all_features, all_returns_by_fb,
+                                   all_times, all_label_times,
+                                   tickers, ticker_boundaries,
+                                   all_tb_bars_by_fb=all_tb_bars_by_fb)
     elif best_state_holder['state'] is not None:
         print(f"\nModel NOT saved: new best {new_score:.3f} <= existing {existing_score:.3f}")
         print("Existing model preserved (higher score).")
@@ -1641,7 +2317,10 @@ def main():
     final_params = best_state_holder.get('cfg', {})
     if final_score > 0 and final_params:
         adaptive_state = update_after_search(adaptive_state, final_score, final_params,
-                                                   study_db_path=db_path)
+            study_db_path=db_path,
+            new_trials_completed=n_new_completed,
+            store_score=(rat['store_value']
+                         if (_GATE_V2 and model_saved) else None))
         print(f"\n[ADAPTIVE] Updated state: mode={adaptive_state['mode']}, "
               f"cycles_without_improvement={adaptive_state['cycles_without_improvement']}")
         if adaptive_state.get('expansion_history'):
@@ -1655,6 +2334,18 @@ def main():
             adaptive_state['best_score'] = final_score
             from adaptive_config import save_adaptive_state
             save_adaptive_state(adaptive_state)
+        # Losing run: update_after_search is skipped but the trials still
+        # accrued selection pressure against the holdout — persist them
+        # (AFTER the save above: record_trials reloads from disk and saves).
+        if n_new_completed > 0:
+            from adaptive_config import record_trials
+            record_trials(asset_type, n_new_completed,
+                          event='search_no_update')
+    elif n_new_completed > 0:
+        # No params at all (every trial failed/pruned to nothing) — the
+        # completed trials still count as selection pressure.
+        from adaptive_config import record_trials
+        record_trials(asset_type, n_new_completed, event='search_no_update')
 
     # Final pipeline status
     _pipeline_status['phase'] = 'complete'

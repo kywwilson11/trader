@@ -25,7 +25,23 @@ logger = get_logger(__name__)
 _HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              'funding_history.json')
 _CACHE_TTL = 900  # 15 min — funding updates on 8h cycles; this is plenty
-_MAX_SAMPLES = 270  # ~90 days of 8h fundings
+_MAX_SAMPLES = 270  # ~90 days at one sample/8h — TRUE only with time
+                    # thinning ON; the default value-change guard admits
+                    # ~96 samples/day, spanning ~2.8 days (D28)
+# D28 (c26-P5): the value-change append guard admits the continuously
+# drifting OKX predicted rate nearly every 15-min poll, so the z baseline
+# spans ~2.8 days and the 0.6x/0.25x crowding tilts fire on 3-day noise.
+# Time-thinned appends (one sample per ~7.5h, oi_archive's pattern) +
+# archive-preferred z baseline fix this but CHANGE TILT FREQUENCY ->
+# default OFF. Activate on the Jetson with TRADER_FUNDING_Z_TIME_THINNING=1
+# (recommended; on activation consider deleting funding_history.json so the
+# old dense 3-day history does not linger in the window for ~84 days).
+FUNDING_Z_TIME_THINNING = os.getenv(
+    'TRADER_FUNDING_Z_TIME_THINNING', '0').strip().lower() in ('1', 'true', 'yes')
+_THIN_SEC = 27000.0          # ~7.5h: just under the 8h funding cycle
+_TS_KEY = '_last_append_ts'  # reserved history-file key: {symbol: epoch};
+                             # safe — real keys look like 'BTC/USD' and the
+                             # only readers .get() exact symbols
 
 # Alpaca spot symbol -> OKX perp instrument
 OKX_INSTRUMENTS = {
@@ -44,8 +60,11 @@ EXTREME_Z = 3.0
 
 _lock = threading.Lock()
 _cache: dict[str, tuple[float, float]] = {}   # symbol -> (ts, 8h rate)
-_history: dict[str, list[float]] | None = None
+# {symbol: [rates...]}; under FUNDING_Z_TIME_THINNING also the _TS_KEY
+# sidecar dict — never iterate .items() assuming list values
+_history: dict | None = None
 _save_warned = False
+_thin_advice_logged = False  # once-per-process activation recommendation
 _stale_warned: set[str] = set()   # symbols warned once about a stale archive baseline
 _ARCHIVE_STALE_H = 48.0           # warn if archive tail older than ~2 funding cycles
 
@@ -95,15 +114,41 @@ def get_funding_rate(symbol: str) -> float | None:
     except Exception as e:
         logger.debug('[FUNDING] %s: fetch failed: %s', symbol, e)
         return None
+    global _thin_advice_logged
     with _lock:
         _cache[symbol] = (now, rate)
-        hist = _load_history().setdefault(symbol, [])
-        # One sample per ~8h cycle: only append if meaningfully spaced
-        if not hist or abs(hist[-1] - rate) > 1e-9 or len(hist) < 3:
-            hist.append(rate)
-            if len(hist) > _MAX_SAMPLES:
-                del hist[:len(hist) - _MAX_SAMPLES]
-            _save_history()
+        hist_all = _load_history()
+        hist = hist_all.setdefault(symbol, [])
+        if FUNDING_Z_TIME_THINNING:
+            # One sample per ~7.5h WALL CLOCK (oi_archive pattern): the
+            # baseline then really spans ~_MAX_SAMPLES * 7.5h ≈ 84 days.
+            ts_map = hist_all.setdefault(_TS_KEY, {})
+            wall = time.time()
+            last = ts_map.get(symbol)
+            if last is None or (wall - last) >= _THIN_SEC:
+                hist.append(rate)
+                if len(hist) > _MAX_SAMPLES:
+                    del hist[:len(hist) - _MAX_SAMPLES]
+                ts_map[symbol] = wall
+                _save_history()
+        else:
+            # One sample per ~8h cycle: only append if meaningfully spaced
+            # (D28: the predicted rate drifts every poll, so this appends
+            # ~96x/day and the window spans ~2.8 days — flag above fixes it)
+            if not hist or abs(hist[-1] - rate) > 1e-9 or len(hist) < 3:
+                hist.append(rate)
+                if len(hist) > _MAX_SAMPLES:
+                    del hist[:len(hist) - _MAX_SAMPLES]
+                _save_history()
+                if not _thin_advice_logged and len(hist) >= 30:
+                    _thin_advice_logged = True
+                    logger.warning(
+                        '[FUNDING] z-baseline history is value-thinned: at '
+                        '15-min polls the %d-sample window spans ~2.8 days, '
+                        'not ~90 — crowding tilts fire on short-term noise. '
+                        'RECOMMENDED: set TRADER_FUNDING_Z_TIME_THINNING=1 '
+                        '(and delete funding_history.json once) to enable '
+                        'time-thinned ~7.5h sampling.', _MAX_SAMPLES)
     return rate
 
 
@@ -177,10 +222,28 @@ def funding_tilt(symbol: str) -> float:
 
     hist = _load_history().get(symbol, [])
     z = None
-    if len(hist) >= 30:
+    samples = None
+    if FUNDING_Z_TIME_THINNING:
+        # Prefer the harvest-synced archive baseline — the same trailing
+        # distribution live_funding_features already uses — falling back
+        # to the (time-thinned) local history.
+        try:
+            from funding_archive import get_funding_series
+            s = get_funding_series(symbol)
+        except Exception as e:
+            logger.debug('[FUNDING] %s: tilt archive unavailable, using '
+                         'local history: %s', symbol, e)
+            s = None
+        if s is not None and len(s) >= 33:
+            samples = list(s.values[-90:])
+        elif len(hist) >= 30:
+            samples = hist[-90:]
+    elif len(hist) >= 30:
+        samples = hist
+    if samples is not None:
         import statistics
-        mu = statistics.fmean(hist)
-        sd = statistics.pstdev(hist)
+        mu = statistics.fmean(samples)
+        sd = statistics.pstdev(samples)
         if sd > 1e-12:
             z = (rate - mu) / sd
 

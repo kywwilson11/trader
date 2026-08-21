@@ -35,6 +35,30 @@ TEMP_LOG_EVERY_N_CYCLES = 10   # Log GPU temp every N cycles
 
 # --- API CONSTRUCTION ---
 
+def _install_rest_timeouts(api) -> None:
+    """Best-effort request timeouts on the SDK's requests.Session(s)
+    (c26 D01). Legacy alpaca-trade-api exposes api._session; the
+    alpaca-py CompatREST shim holds three inner clients each with a
+    _session. Fail-open: a shape mismatch leaves the SDK untouched but
+    is logged (hung-socket protection off)."""
+    try:
+        from order_utils import install_session_timeout
+        candidates = [
+            getattr(api, '_session', None),
+            getattr(getattr(api, '_trading', None), '_session', None),
+            getattr(getattr(api, '_stock_data', None), '_session', None),
+            getattr(getattr(api, '_crypto_data', None), '_session', None),
+        ]
+        n = sum(1 for s in candidates
+                if s is not None and install_session_timeout(s))
+        if n == 0:
+            print("[API] WARNING: could not install REST request "
+                  "timeouts (unknown SDK session shape) — a hung "
+                  "socket can wedge a worker thread")
+    except Exception as e:
+        print(f"[API] WARNING: REST timeout install failed: {e}")
+
+
 def get_api():
     """Build an Alpaca REST client from .env credentials.
 
@@ -64,12 +88,16 @@ def get_api():
     if os.environ.get('TRADER_USE_ALPACA_PY') != '1':
         try:
             import alpaca_trade_api as tradeapi
-            return tradeapi.REST(key, secret, base_url, api_version='v2')
+            api = tradeapi.REST(key, secret, base_url, api_version='v2')
+            _install_rest_timeouts(api)
+            return api
         except ImportError:
             print("[API] alpaca-trade-api unavailable — using alpaca-py adapter")
 
     from alpaca_compat import CompatREST
-    return CompatREST(key, secret, base_url)
+    api = CompatREST(key, secret, base_url)
+    _install_rest_timeouts(api)
+    return api
 
 
 # --- MODEL HOT-RELOAD HELPERS ---

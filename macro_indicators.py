@@ -39,6 +39,64 @@ def _set_cached(key: str, val):
     _cache[key] = (val, time.time())
 
 
+# --- DERISK_STACK_V2 (c26 S3 / 02_research B06): the ONE VIX tier map ---
+# Tier thresholds: enter 25/35 (strict >), exit 22/31 (strict <) — ~12% gap.
+_VIX_TIER_ENTER = (25.0, 35.0)
+_VIX_TIER_EXIT = (22.0, 31.0)
+_VIX_TIER_MULTS = (1.0, 0.5, 0.3)   # normal / defensive / crisis
+_vix_tier_state = {'tier': 0}        # VIX is global — one state for both books
+_cape_exclusion_logged = False
+
+
+def _reset_vix_tier_state():
+    _vix_tier_state['tier'] = 0
+
+
+def vix_tier_mult_v2(vix) -> float:
+    """B06 single VIX tier map with asymmetric hysteresis. None -> 1.0
+    fail-open, state untouched (base_loop's degraded clamp still guards).
+    Stateful preview also runs while DERISK_STACK_V2 is OFF (shadow journal)."""
+    if vix is None:
+        return 1.0
+    t = _vix_tier_state['tier']
+    while t < 2 and vix > _VIX_TIER_ENTER[t]:
+        t += 1                      # enter immediately, worst tier wins
+    while t > 0 and vix < _VIX_TIER_EXIT[t - 1]:
+        t -= 1                      # exit only below the hysteresis floor (cascades)
+    _vix_tier_state['tier'] = t
+    return _VIX_TIER_MULTS[t]
+
+
+def regime_family_mults_v2(regime, asset_type: str, announce: bool = False) -> dict:
+    """De-risk REGIME-family components for the DERISK_STACK_V2 MIN aggregation.
+
+    stock  -> {'vix': vix_tier_mult_v2(regime.vix), 'stress': 0.5|1.0}
+    crypto -> {'stress': 0.5|1.0}   (VIX replaced by BTC-RV state — caller adds it)
+    Pseudo-CAPE is EXCLUDED by design (KILL_LIST; announce=True logs it once,
+    loudly). The HMM multiplier and book-vol scalar are composed by the caller.
+    Never raises; regime None -> {}.
+    """
+    global _cape_exclusion_logged
+    if regime is None:
+        return {}
+    try:
+        out = {}
+        if asset_type != 'crypto':
+            out['vix'] = vix_tier_mult_v2(regime.vix)
+        # Same constant as the legacy STLFSI2 rule in get_macro_regime.
+        out['stress'] = (0.5 if (regime.stress_level is not None
+                                 and regime.stress_level > 1.0) else 1.0)
+        if announce and asset_type == 'stock' and not _cape_exclusion_logged:
+            _cape_exclusion_logged = True
+            logger.warning("[DERISK-V2] pseudo-CAPE multiplier EXCLUDED from "
+                           "sizing composition (KILL_LIST item still live in "
+                           "legacy path; code retained pending owner deletion)")
+        return out
+    except Exception as e:
+        logger.warning("[DERISK-V2] regime_family_mults_v2 failed: %s", e)
+        return {}
+
+
 # --- VIX ---
 
 def fetch_vix() -> float | None:

@@ -142,7 +142,7 @@ def test_unresolved_horizons_excluded(sandbox, monkeypatch):
 
 def _mk_full_challenger(tmp_path, prefix=''):
     cp = challenger_prefix(prefix)
-    import joblib
+    joblib = pytest.importorskip('joblib')
     for suffix in shadow._ARTIFACT_SUFFIXES:
         path = tmp_path / f'{cp}_{suffix}'
         if suffix == 'config_v2.pkl':
@@ -154,7 +154,7 @@ def _mk_full_challenger(tmp_path, prefix=''):
 
 
 def test_promote_copies_stack_and_rewrites_prefix(sandbox):
-    import joblib
+    joblib = pytest.importorskip('joblib')
     p = ''
     # Existing champion artifacts
     for suffix in shadow._ARTIFACT_SUFFIXES:

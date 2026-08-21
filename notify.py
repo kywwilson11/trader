@@ -13,6 +13,9 @@ Design rules:
     daemon thread with a short timeout.
   - Deduped: the same dedupe_key alerts at most once per 10 minutes
     (a crash-looping cycle must not send 120 messages an hour).
+  - A failed CRITICAL send is retried once after a short backoff (still on
+    the daemon thread — trading paths are never blocked); other levels are
+    one-shot.
   - No-op when no channel is configured.
 """
 
@@ -41,6 +44,31 @@ def _post(url: str, payload: dict):
         r.read()
 
 
+_CRITICAL_RETRY_DELAY_SEC = 5.0
+
+
+def _post_channel(url: str, payload: dict, level: str, channel: str):
+    """One post; for CRITICAL severity only, one bounded retry after a short
+    backoff. A transient network blip must not permanently drop the one
+    alert class that exists for emergencies — the 10-minute dedupe window
+    means the caller's identical re-notify would be suppressed anyway. Runs
+    on the daemon notify thread, so the sleep never touches a trading path."""
+    try:
+        _post(url, payload)
+        return
+    except Exception as e:
+        logger.warning('[NOTIFY] %s failed: %s', channel, e)
+        if level != 'critical':
+            return
+    time.sleep(_CRITICAL_RETRY_DELAY_SEC)
+    try:
+        _post(url, payload)
+        logger.warning('[NOTIFY] %s retry delivered the critical alert', channel)
+    except Exception as e:
+        logger.warning('[NOTIFY] %s retry failed — critical alert dropped: %s',
+                       channel, e)
+
+
 def _send(message: str, level: str):
     # Delivery failures are warnings, not debug: a misconfigured webhook
     # would otherwise swallow every CRITICAL alert invisibly at the default
@@ -48,18 +76,12 @@ def _send(message: str, level: str):
     text = f"{LEVEL_EMOJI.get(level, '')} [trader/{level}] {message}"[:1900]
     webhook = os.getenv('TRADER_WEBHOOK_URL')
     if webhook:
-        try:
-            _post(webhook, {'content': text})
-        except Exception as e:
-            logger.warning('[NOTIFY] webhook failed: %s', e)
+        _post_channel(webhook, {'content': text}, level, 'webhook')
     token = os.getenv('TRADER_TELEGRAM_BOT_TOKEN')
     chat = os.getenv('TRADER_TELEGRAM_CHAT_ID')
     if token and chat:
-        try:
-            _post(f"https://api.telegram.org/bot{token}/sendMessage",
-                  {'chat_id': chat, 'text': text})
-        except Exception as e:
-            logger.warning('[NOTIFY] telegram failed: %s', e)
+        _post_channel(f"https://api.telegram.org/bot{token}/sendMessage",
+                      {'chat_id': chat, 'text': text}, level, 'telegram')
 
 
 _hb_last: dict[str, float] = {}

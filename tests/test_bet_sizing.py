@@ -42,9 +42,15 @@ def test_kelly_zero_at_breakeven_for_2to1():
 
 def test_kelly_fraction_and_cap():
     a, b = 0.02, 0.04
-    full = kelly_edge_odds(0.9, b, a, fraction=1.0, cap=1.0)
-    half = kelly_edge_odds(0.9, b, a, fraction=0.5, cap=1.0)
-    assert half == pytest.approx(0.5 * (0.9 / a - 0.1 / b), abs=1e-9) or half <= full
+    # Un-vacuous halving check (cap high enough not to mask the fraction; the
+    # old cap=1.0 form clipped both sides to 1.0 and could never fail).
+    full = kelly_edge_odds(0.9, b, a, fraction=1.0, cap=1e9)
+    half = kelly_edge_odds(0.9, b, a, fraction=0.5, cap=1e9)
+    assert full == pytest.approx(0.9 / a - 0.1 / b)          # 42.5, not 1.0
+    assert half == pytest.approx(0.5 * full)
+    # At cap=1.0 the cap binds BOTH (the flat-top saturation, made explicit).
+    assert kelly_edge_odds(0.9, b, a, fraction=1.0, cap=1.0) == 1.0
+    assert kelly_edge_odds(0.9, b, a, fraction=0.5, cap=1.0) == 1.0
     # cap binds
     assert kelly_edge_odds(0.99, b, a, fraction=1.0, cap=0.25) == 0.25
     assert kelly_edge_odds(0.7, 0.0, 0.02) == 0.0   # degenerate odds -> 0

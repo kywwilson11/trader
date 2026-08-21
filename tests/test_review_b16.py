@@ -182,6 +182,14 @@ def _fake_env(monkeypatch, n_syms=12, fail=(), top_k=60):
 
     md = types.ModuleType('market_data')
     md.fetch_stock_bars_alpaca = fetch
+    # real market_data exports this (D38 flag, default OFF); the stub must
+    # match the surface panel_ranks imports or the import itself fails
+    md.closed_bars_v2_enabled = lambda: False
+    # Wave C-3 daily-restore surface (TRADER_DAILY_FEATURE_RESTORE,
+    # default OFF) — same stale-stub rule as closed_bars_v2_enabled above
+    md.daily_feature_restore_enabled = lambda: False
+    md.load_daily_bars = lambda sym: None
+    md.daily_bars_fetched_at = lambda sym: None
     ind = types.ModuleType('indicators')
     ind.compute_stock_features = feats
     sc = types.ModuleType('stock_config')

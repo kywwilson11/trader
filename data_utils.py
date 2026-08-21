@@ -18,6 +18,24 @@ _FILE_STEMS = {
     'stock': 'stock_training_data',
 }
 
+# Raw-OHLCV sidecar stores (D39): venue bars as fetched, BEFORE features —
+# the incremental state under TRADER_RAW_SIDECAR so feature warmups are
+# recomputed from full raw history instead of eating the store's head.
+_RAW_STEMS = {
+    'crypto': 'raw_ohlcv',
+    'stock': 'stock_raw_ohlcv',
+}
+RAW_OHLCV_COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
+# B15 merge guard: max relative Close divergence tolerated on the 48h
+# incremental overlap before the merge is refused (split/adjustment drift).
+OVERLAP_DIVERGENCE_MAX = 0.01
+
+
+def raw_sidecar_enabled() -> bool:
+    """TRADER_RAW_SIDECAR flag, read at CALL time (default OFF)."""
+    return os.environ.get('TRADER_RAW_SIDECAR',
+                          '0').strip().lower() in ('1', 'true', 'yes')
+
 # Normal saves write the CSV seconds-to-minutes after the parquet; a CSV newer
 # than the parquet by more than this means a parquet save failed and the
 # parquet on disk is a frozen stale copy.
@@ -174,6 +192,120 @@ def append_ticker_data(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.Da
     combined = combined[~combined.index.duplicated(keep='last')]
     combined = combined.sort_index()
     return combined
+
+
+# --- Raw-OHLCV sidecar (D39, behind TRADER_RAW_SIDECAR) ---
+
+def raw_sidecar_path(prefix: str) -> Path:
+    """Sidecar parquet path: crypto -> raw_ohlcv.parquet,
+    stock -> stock_raw_ohlcv.parquet."""
+    return _BASE_DIR / f"{_RAW_STEMS.get(prefix, prefix + '_raw_ohlcv')}.parquet"
+
+
+def load_raw_ohlcv(prefix: str) -> pd.DataFrame:
+    """Load the raw-OHLCV sidecar (parquet-only). Missing file or any read
+    failure returns an EMPTY frame — callers then do a FULL refetch, which
+    IS the head-rebuild mechanism (no separate CLI flag needed)."""
+    path = raw_sidecar_path(prefix)
+    if not path.exists():
+        print(f"[SIDECAR] {path.name} not found — full refetch")
+        return pd.DataFrame()
+    try:
+        df = pd.read_parquet(path)
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if 'Datetime' in df.columns:
+                df = df.set_index('Datetime')
+                df.index = pd.to_datetime(df.index)
+        print(f"[SIDECAR] Loaded {len(df)} raw rows from {path.name}")
+        return df
+    except Exception as e:
+        print(f"[SIDECAR] WARNING: {path.name} load failed ({e}) — "
+              "full refetch")
+        return pd.DataFrame()
+
+
+def save_raw_ohlcv(df: pd.DataFrame, prefix: str) -> bool:
+    """Atomically persist the raw sidecar. Failure is NON-fatal: the next
+    run refetches from the last good sidecar; a stale sidecar only widens
+    the overlap window and the keep-last merge heals it."""
+    path = raw_sidecar_path(prefix)
+    if _atomic_to_disk(df, path):
+        size_mb = path.stat().st_size / (1024 * 1024)
+        print(f"[SIDECAR] Saved {len(df)} raw rows to {path.name} "
+              f"({size_mb:.1f} MB)")
+        return True
+    print(f"[SIDECAR] WARNING: save failed for {path.name} — next run "
+          "refetches from the last good sidecar")
+    return False
+
+
+def merge_raw_ohlcv(raw_df: pd.DataFrame, new_df: pd.DataFrame,
+                    ticker: str) -> pd.DataFrame:
+    """Merge one ticker's fresh raw bars into the multi-ticker sidecar,
+    keep-last on (timestamp, Ticker)."""
+    new_t = new_df.copy()
+    new_t['Ticker'] = ticker
+    keep_cols = [c for c in RAW_OHLCV_COLS + ['Src', 'Ticker']
+                 if c in new_t.columns]
+    new_t = new_t[keep_cols]
+    if raw_df is None or raw_df.empty:
+        return new_t.sort_index()
+    combined = pd.concat([raw_df, new_t])
+    keys = pd.MultiIndex.from_arrays([combined.index, combined['Ticker']])
+    combined = combined[~keys.duplicated(keep='last')]
+    return combined.sort_index()
+
+
+def latest_raw_ts(raw_df: pd.DataFrame, ticker: str):
+    """Latest timestamp stored for ticker in the sidecar, or None."""
+    if raw_df is None or raw_df.empty or 'Ticker' not in raw_df.columns:
+        return None
+    rows = raw_df[raw_df['Ticker'] == ticker]
+    if rows.empty:
+        return None
+    return rows.index.max()
+
+
+def overlap_close_divergence(existing: pd.DataFrame,
+                             new: pd.DataFrame) -> tuple[float, int]:
+    """B15 merge-guard kernel: max relative |Close| divergence over the
+    timestamps both frames share, plus the overlap size. (0.0, 0) when
+    there is no overlap or either frame lacks Close."""
+    if existing is None or new is None or existing.empty or new.empty:
+        return (0.0, 0)
+    existing = existing[~existing.index.duplicated(keep='last')]
+    new = new[~new.index.duplicated(keep='last')]
+    common = existing.index.intersection(new.index)
+    if len(common) == 0 or 'Close' not in existing.columns \
+            or 'Close' not in new.columns:
+        return (0.0, 0)
+    e = existing.loc[common, 'Close'].astype(float)
+    n = new.loc[common, 'Close'].astype(float)
+    rel = (n - e).abs() / e.abs().clip(lower=1e-12)
+    return (float(rel.max()), int(len(common)))
+
+
+def find_interior_gaps(index: pd.DatetimeIndex, asset_type: str,
+                       max_windows: int = 5) -> list:
+    """Interior data-loss windows in a single ticker's bar index, as
+    (gap_start, gap_end) pairs — same thresholds as validate_training_data
+    (>3h crypto; stocks >16h AND spanning >=2 full weekdays). Bounded at
+    max_windows so a badly holed store can't turn repair into a full
+    refetch's worth of API calls."""
+    gaps = []
+    if index is None or len(index) < 2:
+        return gaps
+    idx = pd.DatetimeIndex(index).sort_values()
+    thr = pd.Timedelta(hours=3 if asset_type == 'crypto' else 16)
+    diffs = idx.to_series().diff().dropna()
+    for gap_ts, gap_dur in diffs[diffs > thr].items():
+        if asset_type != 'crypto' and not _stock_gap_spans_trading_days(
+                gap_ts, gap_dur):
+            continue  # calendar closure, not data loss
+        gaps.append((gap_ts - gap_dur, gap_ts))
+        if len(gaps) >= max_windows:
+            break
+    return gaps
 
 
 def migrate_csv_to_parquet(prefix: str) -> bool:

@@ -6,6 +6,15 @@ saves as Parquet + CSV. Falls back through multiple data sources.
 Data sources (in priority order):
   - Alpaca: 2016 – present (via get_bars auto-pagination)
   - yfinance: Most recent 730 days (max for hourly)
+
+RUNBOOK — TRADER_RAW_SIDECAR activation (D39/D08): set the env var on the
+Jetson with NO stock_raw_ohlcv.parquet present. Incremental state then comes
+from the raw sidecar ONLY, so the absent file forces ONE full refetch from
+ALPACA_START that rebuilds the ~112-bars-per-run warmup head the
+feature-store incremental path loses. Enable TRADER_YF_WINDOW_SLICE in the
+SAME event (kills the yfinance-730d overwrite of Alpaca rows). Both are
+model-facing (training-store contents change) — gotcha #2 applies: delete
+v2_study.db + stock_v2_study.db and reset the adaptive best_score.
 """
 import sys; from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -20,7 +29,11 @@ from stock_config import load_stock_universe
 from adaptive_config import get_forward_bars_list
 from data_sources import fetch_with_fallback
 from data_utils import (load_training_data, save_training_data,
-                         append_ticker_data, validate_training_data)
+                         append_ticker_data, validate_training_data,
+                         raw_sidecar_enabled, load_raw_ohlcv, save_raw_ohlcv,
+                         merge_raw_ohlcv, find_interior_gaps,
+                         overlap_close_divergence, OVERLAP_DIVERGENCE_MAX)
+from market_data import fetch_historical_bars
 
 load_dotenv()
 
@@ -71,6 +84,39 @@ def _get_incremental_start(existing_df, ticker):
     return str(start.date())
 
 
+# B05.1 minute-EDGE fetch window (bars are heavy: ~390/day/name). Bounded so
+# the Jetson never pulls the full 2016+ minute history.
+MINUTE_EDGE_DAYS = int(os.getenv('TRADER_MINUTE_EDGE_DAYS', '120'))
+
+
+def _minute_edge_overlay(api, ticker, df):
+    """Trailing MINUTE_EDGE_DAYS of 1-min bars -> per-day EDGE stamp
+    (liquidity.edge_spread_daily_from_minute). Only called when
+    liquidity.STOCK_MINUTE_EDGE; None on any failure (hourly stamp kept).
+    Jetson-only in practice (needs the Alpaca API + minute history).
+    NOTE (B05 prerequisite, unresolved): confirm Basic-plan minute bars are
+    SIP-sourced, not IEX-only, before trusting the levels."""
+    try:
+        if api is None:
+            return None
+        start = df.index.max() - pd.Timedelta(days=MINUTE_EDGE_DAYS)
+        bars = api.get_bars(ticker, '1Min', start=start.isoformat(),
+                            adjustment='all')
+        rows, ts = [], []
+        for b in bars:
+            rows.append({'Open': float(b.o), 'High': float(b.h),
+                         'Low': float(b.l), 'Close': float(b.c)})
+            ts.append(b.t)
+        if not rows:
+            return None
+        mdf = pd.DataFrame(rows, index=pd.DatetimeIndex(ts))
+        from liquidity import edge_spread_daily_from_minute
+        return edge_spread_daily_from_minute(mdf, df.index, symbol=ticker)
+    except Exception as e:
+        print(f"  [SPREAD-MIN] {ticker}: minute EDGE skipped ({e})")
+        return None
+
+
 def fetch_spy_close(api=None):
     """Fetch SPY hourly close from all sources for benchmark relative strength."""
     print(f"Fetching benchmark ({BENCHMARK})...")
@@ -81,7 +127,7 @@ def fetch_spy_close(api=None):
 
 
 def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
-                        start_date=None):
+                        start_date=None, src_totals=None, raw_out=None):
     """Fetch bars, merge with existing, compute features, add targets."""
     print(f"Processing {ticker}...")
 
@@ -89,13 +135,34 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     fetch_start = start_date or ALPACA_START
     new_ohlcv = fetch_with_fallback(ticker, fetch_start, api=api, asset_type='stock')
 
+    # D08 provenance accounting (newly fetched bars, pre-merge)
+    if (src_totals is not None and new_ohlcv is not None
+            and 'Src' in new_ohlcv.columns):
+        for s, n in new_ohlcv['Src'].value_counts().items():
+            src_totals[s] = src_totals.get(s, 0) + int(n)
+
     # Merge with existing OHLCV if incremental
     if existing_ohlcv is not None and not existing_ohlcv.empty:
         if new_ohlcv is not None and not new_ohlcv.empty:
-            ohlcv = append_ticker_data(existing_ohlcv, new_ohlcv)
-            new_bars = len(ohlcv) - len(existing_ohlcv)
-            print(f"  [INCREMENTAL] {ticker}: {new_bars} new bars "
-                  f"(total {len(ohlcv)})")
+            # B15 merge guard: refuse an incremental merge whose 48h
+            # overlap closes diverge >1% — split/adjustment drift would
+            # otherwise splice two adjustment regimes into one series.
+            max_div, n_overlap = overlap_close_divergence(existing_ohlcv,
+                                                          new_ohlcv)
+            if n_overlap and max_div > OVERLAP_DIVERGENCE_MAX:
+                print(f"  [MERGE-GUARD] {ticker}: overlapping closes diverge "
+                      f"{max_div:.1%} over {n_overlap} bars (>1%) — "
+                      f"split/adjustment drift.\n"
+                      f"  [MERGE-GUARD] REFUSING incremental merge; keeping "
+                      f"existing rows. Full refetch required (delete this "
+                      f"ticker's rows, or rebuild via TRADER_RAW_SIDECAR "
+                      f"with the sidecar absent).")
+                ohlcv = existing_ohlcv
+            else:
+                ohlcv = append_ticker_data(existing_ohlcv, new_ohlcv)
+                new_bars = len(ohlcv) - len(existing_ohlcv)
+                print(f"  [INCREMENTAL] {ticker}: {new_bars} new bars "
+                      f"(total {len(ohlcv)})")
         else:
             ohlcv = existing_ohlcv
             print(f"  [INCREMENTAL] {ticker}: no new bars, using existing {len(ohlcv)}")
@@ -103,6 +170,13 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
         ohlcv = new_ohlcv
     else:
         return None
+
+    # D39 sidecar capture (raw bars, provenance kept), then strip Src so
+    # it never reaches the feature computation or the saved feature store
+    # (flag OFF this drop keeps the store byte-identical).
+    if raw_out is not None:
+        raw_out[ticker] = ohlcv
+    ohlcv = ohlcv.drop(columns=['Src'], errors='ignore')
 
     if ohlcv.empty:
         return None
@@ -116,8 +190,22 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     # hypersearch cost matches the real-spread LIVE gate (wave 6). Never NaN
     # (floored), so it survives the dropna below.
     try:
-        from liquidity import edge_spread_series
-        df['Eff_Spread_Pct'] = edge_spread_series(df).values
+        from liquidity import (edge_spread_series, SPREAD_FLOOR_PCT,
+                               SPREAD_CAP_PCT, STOCK_MINUTE_EDGE)
+        sp = edge_spread_series(df, symbol=ticker)
+        if STOCK_MINUTE_EDGE:
+            # B05.1 minute-bar EDGE (DARK): overlay the per-day minute
+            # estimate where covered; hourly stamp retained elsewhere.
+            msp = _minute_edge_overlay(api, ticker, df)
+            if msp is not None and msp.notna().any():
+                n_cov = int(msp.notna().sum())
+                sp = sp.where(msp.isna(), msp)
+                print(f"  [SPREAD-MIN] {ticker}: minute EDGE overlaid on "
+                      f"{n_cov}/{len(sp)} bars")
+        df['Eff_Spread_Pct'] = sp.values
+        print(f"  [SPREAD] {ticker}: median {sp.median():.3f}% "
+              f"floor-hit {float((sp == SPREAD_FLOOR_PCT).mean()):.0%} "
+              f"cap-hit {float((sp == SPREAD_CAP_PCT).mean()):.0%}")
     except Exception as e:
         print(f"  [SPREAD] {ticker}: EDGE stamp skipped ({e}) — "
               f"flat fallback will be used downstream")
@@ -146,6 +234,15 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
                 df[col] = vals
     except Exception as e:
         print(f"  [SHORT-FLOW] {ticker}: merge skipped ({e})")
+
+    # B21 cost-regime meta features (Option B) — DARK behind
+    # TRADER_COST_REGIME_FEATURES; model-facing, rides the same bundled
+    # retrain event (gotcha #2). One memoized FRED fetch per process.
+    try:
+        from cost_regime import stamp_cost_regime_features
+        df = stamp_cost_regime_features(df, 'stock')
+    except Exception as e:
+        print(f"  [COST-REGIME] {ticker}: skipped ({e})")
 
     # Backward compat: Target_Return = shortest horizon
     df['Target_Return'] = df[f'Target_Return_{FORWARD_BARS[0]}']
@@ -243,15 +340,29 @@ def main():
     else:
         print("Alpaca API connected — fetching historical data from 2016")
 
-    # Load existing data for incremental harvesting
-    existing = load_training_data('stock')
+    # Load existing data for incremental harvesting.
+    # Under TRADER_RAW_SIDECAR (D39), incremental state comes from the RAW
+    # store ONLY: an empty/absent sidecar forces a full refetch from
+    # ALPACA_START/CANDIDATE_START — the head-rebuild runbook mechanism,
+    # no CLI flag needed.
+    use_sidecar = raw_sidecar_enabled()
+    raw = load_raw_ohlcv('stock') if use_sidecar else pd.DataFrame()
+    if use_sidecar:
+        existing = pd.DataFrame()
+        if raw.empty:
+            print("[SIDECAR] raw OHLCV store EMPTY — full refetch")
+        else:
+            print(f"[SIDECAR] raw OHLCV store: {len(raw)} rows")
+    else:
+        existing = load_training_data('stock')
     is_incremental = not existing.empty
     if is_incremental:
         print(f"Existing data: {len(existing)} rows — incremental mode")
         ohlcv_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         available_ohlcv = [c for c in ohlcv_cols if c in existing.columns]
     else:
-        print("No existing data — full harvest")
+        if not use_sidecar:
+            print("No existing data — full harvest")
         available_ohlcv = []
 
     # Sync the FINRA daily short-volume archive (newest-first, capped;
@@ -266,11 +377,36 @@ def main():
     spy_close = fetch_spy_close(api=api)
 
     all_data = []
+    src_totals = {}
+    raw_out = {}
     for t in STOCK_TICKERS:
         # For incremental: extract this ticker's existing OHLCV
         existing_ohlcv = None
         start = CANDIDATE_START if t in _CANDIDATE_ONLY else ALPACA_START
-        if is_incremental and available_ohlcv and 'Ticker' in existing.columns:
+        if use_sidecar and not raw.empty and 'Ticker' in raw.columns:
+            t_raw = raw[raw['Ticker'] == t]
+            if not t_raw.empty:
+                cols = [c for c in ['Open', 'High', 'Low', 'Close',
+                                    'Volume', 'Src'] if c in t_raw.columns]
+                existing_ohlcv = t_raw[cols]
+                start = str((t_raw.index.max()
+                             - pd.Timedelta(hours=48)).date())
+                print(f"  [SIDECAR] {t}: fetching from {start}")
+                # Interior-gap repair (F1-gated, bounded): refetch just
+                # the holes instead of a full refetch.
+                if api is not None:
+                    for g0, g1 in find_interior_gaps(t_raw.index, 'stock',
+                                                     max_windows=5):
+                        patch = fetch_historical_bars(
+                            api, t, str(g0.date()), asset_type='stock',
+                            end_date=str((g1 + pd.Timedelta(days=1)).date()))
+                        if patch is not None and not patch.empty:
+                            patch['Src'] = 'alpaca'
+                            existing_ohlcv = append_ticker_data(
+                                existing_ohlcv, patch)
+                            print(f"  [GAP-REPAIR] {t}: refilled {g0}..{g1} "
+                                  f"(+{len(patch)} bars)")
+        elif is_incremental and available_ohlcv and 'Ticker' in existing.columns:
             ticker_data = existing[existing['Ticker'] == t]
             if not ticker_data.empty:
                 existing_ohlcv = ticker_data[available_ohlcv]
@@ -279,15 +415,26 @@ def main():
 
         stock_df = prepare_stock_data(t, spy_close, api=api,
                                        existing_ohlcv=existing_ohlcv,
-                                       start_date=start)
+                                       start_date=start,
+                                       src_totals=src_totals,
+                                       raw_out=(raw_out if use_sidecar
+                                                else None))
         if stock_df is not None:
             stock_df['Ticker'] = t
             all_data.append(stock_df)
 
+    # Persist the raw sidecar (D39), then free it before the concat —
+    # peak-RSS matters on the 8GB Jetson.
+    if use_sidecar and raw_out:
+        for t, frame in raw_out.items():
+            raw = merge_raw_ohlcv(raw, frame, t)
+        save_raw_ohlcv(raw, 'stock')
+        del raw, raw_out
+
     # Combine and save
     if not all_data:
         print("ERROR: No data fetched for any ticker. Check API credentials and network.")
-        return
+        sys.exit(1)  # nonzero so run_pipeline's retry/notify machinery fires
     final_df = pd.concat(all_data)
     final_df = final_df.sort_index()
 
@@ -328,11 +475,20 @@ def main():
         final_df['Daily_Sentiment'] = 0.0
 
     # Save as Parquet + CSV
-    save_training_data(final_df, 'stock')
+    if not save_training_data(final_df, 'stock'):
+        print("ERROR: Could not save training data (both Parquet and CSV "
+              "writes failed) — data on disk is STALE")
+        sys.exit(1)
 
     # Summary
     print(f"\nDone! Saved {len(final_df)} rows of stock training data")
     print(f"Stocks harvested: {len(all_data)}/{len(STOCK_TICKERS)}")
+    if src_totals:
+        total = sum(src_totals.values())
+        comp = ', '.join(f"{s} {n} ({n / total:.0%})"
+                         for s, n in sorted(src_totals.items(),
+                                            key=lambda kv: -kv[1]))
+        print(f"Source composition (newly fetched bars): {comp}")
     feature_count, target_cols, tb_cols = _summary_feature_split(final_df.columns)
     print(f"Feature columns: {feature_count}")
     print(f"Target columns: {target_cols + tb_cols}")

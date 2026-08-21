@@ -19,7 +19,12 @@ Everything is pure numpy/scipy, unit-tested against Hull textbook values and
 put-call parity. IV is HAR-RV * an empirical IV/RV ratio and EVERY result is
 flagged proxy-dependent — refuse to size off it live until real chains
 validate the ratio.
+
+Run `python options_overlay.py` to emit the pre-registered verdict artifact
+(options_overlay_verdict.json).
 """
+
+import datetime
 
 import numpy as np
 from scipy.stats import norm
@@ -41,6 +46,14 @@ SPREAD_TIERS = {
     'A': 0.03,   # NVDA/TSLA/AMD/META/COIN — tightest listed-option markets
     'B': 0.06,   # PLTR/HOOD/SOFI/SMCI
     'C': 0.14,   # ASTS/IONQ/QBTS/RKLB/POET — spec-tech, brutally wide
+}
+# Tier membership documented in the SPREAD_TIERS comment above; the verdict
+# runner needs it as data. Unknown symbols default to 'C' (widest — the
+# conservative side of the friction gate), matching SPREAD_TIERS.get default.
+SYMBOL_TIERS = {
+    'NVDA': 'A', 'TSLA': 'A', 'AMD': 'A', 'META': 'A', 'COIN': 'A',
+    'PLTR': 'B', 'HOOD': 'B', 'SOFI': 'B', 'SMCI': 'B',
+    'ASTS': 'C', 'IONQ': 'C', 'QBTS': 'C', 'RKLB': 'C', 'POET': 'C',
 }
 TRADING_DAYS = 252.0
 
@@ -264,3 +277,116 @@ def overlay_decision(close_prices, open_prices, tier, rv_sigma_annual,
                  'carry — overnight option buyer loses on average. Do not size '
                  'live until real chains validate the IV/RV ratio.'),
     }
+
+
+# ---------------------------------------------------------------------------
+# Pre-registered GO/NO_GO verdict runner (c26 T7 / B19 — measurement-only)
+# ---------------------------------------------------------------------------
+
+def realized_vol_annual(closes, min_days=20):
+    """Annualized realized vol from daily closes (log returns, sqrt(252)).
+    OFFLINE PROXY for HAR-RV when the live vol stack is unavailable — the
+    verdict JSON flags it; iv_from_har then applies the IV/RV band on top.
+    Returns None below min_days observations."""
+    c = np.asarray(closes, dtype=float)
+    c = c[np.isfinite(c) & (c > 0)]
+    if len(c) < 2:
+        return None
+    rets = np.diff(np.log(c))
+    if len(rets) < int(min_days):
+        return None
+    return float(np.std(rets) * np.sqrt(TRADING_DAYS))
+
+
+def run_verdict(daily_by_symbol, tiers=None, dte=1, r=0.04, call=True,
+                width_frac=0.05, min_multiple=MIN_EDGE_MULTIPLE):
+    """Pre-registered GO/NO_GO verdict over per-name daily (opens, closes).
+
+    daily_by_symbol: {sym: (opens, closes)} ALIGNED daily arrays (opens[t] is
+    the open of day t). Pairs close[t] with next open[t+1]:
+    overlay_decision(closes[:-1], opens[1:], ...). rv per name from
+    realized_vol_annual(closes). Returns the verdict dict (JSON-safe).
+
+    GO on ANY name clearing the gate — the pre-registered question is
+    "could ANY positive edge clear friction". INSUFFICIENT_DATA and
+    NO_VIABLE_STRIKES both count as insufficient.
+    """
+    tier_map = tiers or SYMBOL_TIERS
+    per_name = {}
+    for sym, (opens, closes) in daily_by_symbol.items():
+        opens = np.asarray(opens, dtype=float)
+        closes = np.asarray(closes, dtype=float)
+        tier = tier_map.get(sym, 'C')
+        rv = realized_vol_annual(closes)
+        if rv is None:
+            per_name[sym] = {'verdict': 'INSUFFICIENT_DATA',
+                             'n': int(len(closes))}
+            continue
+        res = overlay_decision(closes[:-1], opens[1:], tier, rv, dte=dte,
+                               r=r, call=call, width_frac=width_frac,
+                               min_multiple=min_multiple)
+        res = dict(res)
+        res['rv_annual'] = round(rv, 4)
+        per_name[sym] = res
+
+    n_go = sum(1 for v in per_name.values() if v.get('verdict') == 'GO')
+    n_no_go = sum(1 for v in per_name.values() if v.get('verdict') == 'NO_GO')
+    n_insufficient = sum(
+        1 for v in per_name.values()
+        if v.get('verdict') in ('INSUFFICIENT_DATA', 'NO_VIABLE_STRIKES'))
+    return {
+        'generated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'pre_registered_expectation': 'NO_GO',
+        'params': {'dte': dte, 'r': r, 'call': call, 'width_frac': width_frac,
+                   'min_multiple': min_multiple},
+        'rv_proxy': 'trailing daily close-to-close realized vol * sqrt(252); '
+                    'IV = rv * IV_RV_RATIO mid — validate vs real chains before '
+                    'ANY live sizing',
+        'per_name': per_name,
+        'n_go': n_go, 'n_no_go': n_no_go, 'n_insufficient': n_insufficient,
+        'overall_verdict': ('GO' if n_go
+                            else ('NO_GO' if n_no_go else 'INSUFFICIENT_DATA')),
+    }
+
+
+def main():
+    """Produce the standing instrument's answer artifact
+    (options_overlay_verdict.json). Measurement-only: prices nothing live,
+    holds nothing. Needs network (free yfinance daily bars via
+    gap_audit.fetch_daily)."""
+    import argparse
+    import json
+    ap = argparse.ArgumentParser(
+        description='Overnight-overlay GO/NO_GO verdict runner')
+    ap.add_argument('--symbols', nargs='+', default=sorted(SYMBOL_TIERS))
+    ap.add_argument('--period', default='2y')
+    ap.add_argument('--dte', type=int, default=1)
+    ap.add_argument('--width-frac', type=float, default=0.05)
+    ap.add_argument('--puts', action='store_true',
+                    help='bear put verticals instead of bull call')
+    ap.add_argument('--out', default='options_overlay_verdict.json')
+    args = ap.parse_args()
+    from gap_audit import fetch_daily   # lazy: pure-numpy import, yf inside
+    daily = {}
+    for sym in args.symbols:
+        df = fetch_daily(sym, period=args.period)
+        if df is None or len(df) < 30:
+            print(f'{sym}: no/insufficient data')
+            continue
+        daily[sym] = (df['Open'].to_numpy(dtype=float),
+                      df['Close'].to_numpy(dtype=float))
+    verdict = run_verdict(daily, dte=args.dte, call=not args.puts,
+                          width_frac=args.width_frac)
+    with open(args.out, 'w') as f:
+        json.dump(verdict, f, indent=2)
+    for sym, v in sorted(verdict['per_name'].items()):
+        print(f"{sym:6s} {v.get('verdict'):17s} "
+              f"edge={v.get('mean_edge_frac_of_debit')} "
+              f"friction={v.get('friction_frac_of_debit')} "
+              f"req={v.get('required_edge_frac')}")
+    print(f"\nOVERALL: {verdict['overall_verdict']} "
+          f"(pre-registered expectation: NO_GO) -> {args.out}")
+
+
+if __name__ == '__main__':
+    main()

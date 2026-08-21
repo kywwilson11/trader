@@ -42,12 +42,22 @@ collection errors):
 python3 -m pytest tests/ --continue-on-collection-errors -q
 ```
 
-**Current baseline (verified 2026-07-15): `1887 passed, 21 failed, 15 skipped, 7 errors`.**
-The 21 failures + 7 errors are **ALL pre-existing missing-dependency failures** (dotenv / torch /
-lightgbm / optuna / joblib / numba / sklearn), **not regressions**. On the full Jetson stack the
-suite is green.
+**Current baseline (verified 2026-08-20, post-campaign): `3401 passed, 16 failed, 25 skipped,
+7 errors`.** The 16 failures + 7 errors are the **23-name pre-existing missing-dependency set**
+(dotenv / torch / lightgbm / optuna / joblib / numba / sklearn / pyarrow) pinned in
+`tests/baseline_failures.txt`, **not regressions**. On the full Jetson stack the suite is green.
+`ab_check.sh` is hardened (launch-sanity floor ≥1500 passed, watchdog timeout, flaky/persistent
+triage of NEW names, forced `PY_COLORS=0`); it judges by failure NAMES, never counts.
 
-**Verify a change introduced no regressions (the standard method):** A/B with `git stash` —
+**Verify a change introduced no regressions — the one-command way:** `bash scripts/ab_check.sh`.
+It reruns the canonical command above, diffs the FAILED/ERROR test *names* (never counts) against
+`tests/baseline_failures.txt`, prints NEW vs DISAPPEARED names separately, and exits 0 iff no NEW
+names appear. Regenerate the baseline after an intentional change with the command in that file's
+own header comment (`pytest ... | grep -E '^(FAILED|ERROR)' | sed 's/ - .*//' | sort -u`); the
+baseline is dev-Mac-specific (missing-dep failures only — Jetson/CI stay green).
+
+**Verify a change introduced no regressions — the from-scratch method** (use when
+`tests/baseline_failures.txt` itself might be stale, or to regenerate it): A/B with `git stash` —
 run the command above, `git stash`, run again, compare the failed/errored set. Identical set ⇒
 zero regressions. Never treat the 21/7 baseline as "broken."
 The `/regression-ab` skill runs this ritual end-to-end and diffs failure *names*, not counts.
@@ -74,9 +84,10 @@ for reference (exact flags verified from the source):
 | `python scripts/hypersearch_v2.py --trials N [--prefix stock] [--data F] [--fresh] [--shadow] [--preset stationary]` | Optuna TPE search (LSTM + LightGBM leg), holdout DSR gate |
 | `python backtest.py --prefix {''\|stock} --days N [--gate]` | Policy replay (real entries/exits/fees; `''` = crypto); `--gate` rolls back to `.prev` on Sharpe/DSR fail |
 | `python decision_report.py --days N` | Per-trade gate attribution + conviction calibration (Stage-0 measurement) |
+| `python llm_eval.py --days N [--advisor]` | LLM-gate scorecard: veto/size-tilt outcome attribution + echo-gap regression (b2 significance at n≥60 = the keep/kill-LLM-spend verdict); `--advisor` scores the shadow advisor-v2 dossiers. Measurement-only |
 | `python beta_ledger.py --days N` | Realized-beta ledger: daily equity vs SPY+BTC (lagged AKL betas, HAC alpha t-stat, up/down + trend-conditional betas). Measurement-only |
 | `python indicator_leadlag.py --data F [--preset P]` | Per-feature leading/lagging diagnostic: predictive IC vs reactive coupling at 1–48h (overlap-adjusted, FDR), redundancy clusters + exact dupes. Measurement-only |
-| `python gui.py` | PySide6 dashboard (8 tabs, 10 themes); reads `pipeline_status.json` + logs |
+| `python gui.py` | PySide6 dashboard (8 tabs, 10 themes); reads `pipeline_status.json` + logs. Chart math lives in pure-numpy `chart_core.py` — testable on this Mac |
 
 ---
 
@@ -130,11 +141,28 @@ to publication date; borrow cost regime-dated; universe membership as-of (no sur
   (journals, reports, offline research kernels) are safe to ship directly.
 - **Research → ship:** completed wave research is saved to `research/waveN_research.json` (committed).
   Implement `mac_now` items on the Mac, defer `jetson_later` items. Each wave's memory file holds the
-  survivors + **kill list** (things research rejected — do NOT rebuild them).
+  survivors + **kill list** (things research rejected — do NOT rebuild them). The consolidated,
+  canonical kill list across all waves/reviews/research lives at `research/KILL_LIST.md` — every
+  research/build agent MUST check it before proposing anything; it leaves only by explicit owner decision.
 - **2026-07 module review is DONE** (69 modules, 600 fns): the 90-item owner decision queue (1 P0/21 P1/68 P2)
   lives in `research/module_review_2026-07.json` — render with `/decision-queue`; queue items are owner decisions, do NOT auto-fix.
-- **Claude Code assets** (`.claude/`, currently gitignored → local-only): skills `/regression-ab`, `/decision-queue`,
-  `/improve`; workflow `group-improve-v2` (the standard campaign pipeline); blocking py-syntax PostToolUse hook.
+- **2026-08 comprehensive campaign is DONE** (10 waves: understand → research → fix → build →
+  bug-hunt; every wave gated by ab_check). Canonical docs in `research/campaign_2026-08/`:
+  `01_state_map.md` (40-defect map), `02_research.md` (literature parameters + citations),
+  `03_jetson_runbook.md` (**the activation sequence — read before flipping ANYTHING**). ~26 new
+  **default-OFF** flags gate every model-facing change (strategy_config constants + `TRADER_*` env
+  vars); flag-OFF paths are byte-pinned by tests. New measurement CLIs: `scripts/sizing_cofire_report.py`,
+  `scripts/crypto_spread_census.py`, `scripts/llm_qualify.py`, `scripts/train_lexicon.py`,
+  `scripts/meta_learning_curve.py`; the weekly backtest now auto-emits `{slot}_stage0_preds.json`
+  for `scripts/ic_by_name.py` + `scripts/rank_gradient_report.py`.
+- **Claude Code assets** (`.claude/` is COMMITTED as of 2026-07-21 — only `settings.local.json` stays
+  gitignored, so skills/workflows/hooks/settings travel to the Jetson): skills `/regression-ab`, `/decision-queue`,
+  `/improve`, `/panel-improve`; workflows `group-improve-v2` (broad cheap sweep — one designer per group) and
+  `module-improve-v3` (deep panel pass — N independent Opus reviewers per module on an identical brief →
+  Fable adjudicates into a verified spec → Sonnet implements → Fable hardens → one serialized ab_check gate);
+  blocking py-syntax PostToolUse hook.
+- **Spawned agents:** point them at `research/AGENT_CONTEXT.md` (the canonical brief — two-machine
+  table, conventions, ab_check verification standard) plus the task itself; don't re-type context.
 - **Effort:** the user wants real max-effort, literature-grounded, multi-agent work and accepts long
   runs. Priorities, in order: **Jetson 8 GB memory/perf › financial soundness › LLM utilization ›
   trading strategy.** See `user-working-style` memory.

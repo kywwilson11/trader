@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git stash push:*)",
+      "Bash(git stash pop)",
+      "Bash(git stash pop:*)",
+      "Bash(git stash list:*)",
+      "Bash(sort:*)",
+      "Bash(diff:*)",
+      "Bash(comm:*)",
+      "Bash(wc:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(python3 .claude/skills/decision-queue/render.py:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/py-compile-gate.sh",
+            "timeout": 10,
+            "statusMessage": "Syntax-checking edited Python file"
+          }
+        ]
+      }
+    ]
+  }
+}

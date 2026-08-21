@@ -245,6 +245,20 @@ class CryptoLoop(BaseTradingLoop):
 
     def write_prediction_cache(self, preds, **kwargs):
         try:
+            # Decision-context enrichment (2026-07 GUI review §5/§11 Phase
+            # 2.3): surface what this loop already computed elsewhere —
+            # this cycle or the last time it ran for this symbol — never
+            # recomputed here. Keys are OMITTED, not null-padded, when the
+            # loop has nothing on record for a symbol, so an unenriched
+            # entry stays byte-identical to the pre-enrichment shape.
+            # cost-gate pass/fail + bps have no cached home on the loop at
+            # all (should_trade needs a fresh quote) and are left out.
+            last_meta_p = getattr(self, '_last_meta_p', {}) or {}
+            llm_scores = getattr(self, 'llm_scores', {}) or {}
+            veto_strikes = getattr(self, '_veto_strikes', {}) or {}
+            regime = getattr(self, 'macro_regime', None)
+            regime_label = regime.regime_label if regime is not None else None
+
             data = {}
             for sym in sorted(preds):
                 pred = preds[sym]
@@ -254,12 +268,21 @@ class CryptoLoop(BaseTradingLoop):
                     signal = "BEAR"
                 else:
                     signal = "NEUTRAL"
-                data[sym] = {
+                row = {
                     "pred": round(pred, 6) if pred is not None else None,
                     "score": round(pred, 6) if pred is not None else 0,
                     "signal": signal,
                     "updated": datetime.datetime.now().isoformat(),
                 }
+                meta_p = last_meta_p.get(sym)
+                if meta_p is not None:
+                    row["meta_p"] = round(float(meta_p), 4)
+                    row["conviction"] = self._conviction_tier(pred, meta_p)
+                if regime_label is not None:
+                    row["regime"] = regime_label
+                if sym in llm_scores:
+                    row["llm_gate"] = "veto" if sym in veto_strikes else "pass"
+                data[sym] = row
             # Atomic write (tmp + rename): the GUI polls this file, and an
             # in-place write can hand it a torn read
             tmp = _PRED_CACHE_FILE.with_suffix('.tmp')

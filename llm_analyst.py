@@ -328,6 +328,18 @@ def _evidence_hash(candidates, asset_type, positions, fng_value,
 # Opt-in (analyst_dedup_ttl_sec > 0 only); empty/unused on the default path.
 _DEDUP_CACHE: dict[str, dict] = {}
 
+# c26 D33: metadata for the most recent analyze_trades call that
+# returned scores, for the caller's llm_analysis journal row.
+# Best-effort — failures here must NEVER block scoring (fail-open).
+_LAST_CALL_META: dict = {}
+
+
+def get_last_analysis_meta() -> dict:
+    """{'model','prompt_sha256','dedup_hit','latency_ms'[,'cost_usd']}
+    for the most recent analyze_trades that returned scores; {} when
+    none/unknown."""
+    return dict(_LAST_CALL_META)
+
 
 def _dedup_cache_hit(cache_entry, evidence_hash, ttl) -> bool:
     """SAFETY: a cached veto-region score must NEVER be re-served — the
@@ -455,16 +467,20 @@ def analyze_trades(candidates: list[dict], asset_type: str,
 
     Returns:
         dict mapping symbol -> {'m': float, 's': float, 'r': str,
-                                 'bull': str, 'bear': str}
+                                 'bull': str, 'bear': str}, plus
+        {'p_up', 'conviction', 'abstain', 'key_risks', 'event_flags'} per
+        symbol when advisor_v2_enabled (see below).
         Empty dict on failure (all symbols get default pass-through).
 
     Opt-in extensions (both default OFF — see llm_config.py), active only
     on the plain live path (system_prompt is None and persist is True):
       advisor_v2_enabled     extended prompt/schema/parse (p_up, conviction,
                             abstain, key_risks, event_flags) journaled as a
-                            SHADOW-ONLY 'llm_advisor_v2' row; the returned
-                            dict's 's' handling and llm_analysis.json shape
-                            are unaffected either way.
+                            SHADOW-ONLY 'llm_advisor_v2' row AND persisted
+                            into llm_analysis.json (GUI display only — see
+                            _save_analysis); the returned dict's 's'
+                            handling is unaffected either way, and these
+                            extra fields never gate or size a trade.
       analyst_dedup_ttl_sec  evidence-hash call-dedup cache; a cache HIT
                             skips call_model/_save_analysis entirely (see
                             _dedup_cache_hit for the veto-margin safety
@@ -472,6 +488,7 @@ def analyze_trades(candidates: list[dict], asset_type: str,
     With both at their shipped defaults (False / 0) this function's
     behavior is byte-identical to before these options existed.
     """
+    global _LAST_CALL_META
     config = load_llm_config()
     if not config.get("enabled") or not candidates:
         return {}
@@ -513,6 +530,15 @@ def analyze_trades(candidates: list[dict], asset_type: str,
                         computed_events_by_sym, dedup_hit=True,
                         prompt_sha256=cache_entry.get("prompt_sha256"),
                         prompt_version=cache_entry.get("prompt_version"))
+                try:
+                    _LAST_CALL_META = {
+                        'model': cache_entry.get('model', ''),
+                        'prompt_sha256': cache_entry.get('prompt_sha256'),
+                        'dedup_hit': True,
+                        'latency_ms': 0,
+                    }
+                except Exception:
+                    pass
                 return cached_result
         except Exception:
             evidence_hash = None
@@ -537,6 +563,12 @@ def analyze_trades(candidates: list[dict], asset_type: str,
     # failure, returns {} for pass-through") — an unexpected exception from
     # either transport (network/provider-SDK error) degrades to no-response
     # rather than propagating into the caller's trading loop.
+    _t0 = time.monotonic()
+    try:
+        from llm_client import get_routing_info
+        _cost0 = get_routing_info().get('daily_cost')
+    except Exception:
+        _cost0 = None
     try:
         response = call_model(prompt, system=system,
                               model=analyst_model, max_tokens=max_tok,
@@ -558,6 +590,7 @@ def analyze_trades(candidates: list[dict], asset_type: str,
         return {}
 
     result = _parse_response(response, symbols, extended=advisor_v2)
+    _latency_ms = int((time.monotonic() - _t0) * 1000)
 
     # Persist analysis to disk for GUI display — recording the model that
     # ACTUALLY responded, not the one we asked for (fallbacks used to be
@@ -572,12 +605,11 @@ def analyze_trades(candidates: list[dict], asset_type: str,
                         model_used)
 
         prompt_sha256_val = None
-        if advisor_v2 or use_dedup:
-            try:
-                prompt_sha256_val = hashlib.sha256(
-                    (system + '\x00' + prompt).encode('utf-8')).hexdigest()
-            except Exception:
-                prompt_sha256_val = None
+        try:
+            prompt_sha256_val = hashlib.sha256(
+                (system + '\x00' + prompt).encode('utf-8')).hexdigest()
+        except Exception:
+            prompt_sha256_val = None
 
         if advisor_v2:
             _journal_advisor_shadow(
@@ -600,6 +632,25 @@ def analyze_trades(candidates: list[dict], asset_type: str,
             except Exception:
                 pass
 
+        try:
+            cost_usd = None
+            if _cost0 is not None:
+                from llm_client import get_routing_info
+                c1 = get_routing_info().get('daily_cost')
+                if c1 is not None and c1 >= _cost0:
+                    cost_usd = round(c1 - _cost0, 4)
+            meta = {
+                'model': model_used,
+                'prompt_sha256': prompt_sha256_val,
+                'dedup_hit': False,
+                'latency_ms': _latency_ms,
+            }
+            if cost_usd is not None:
+                meta['cost_usd'] = cost_usd
+            _LAST_CALL_META = meta
+        except Exception:
+            pass
+
     return result
 
 
@@ -607,7 +658,11 @@ def load_analysis() -> dict:
     """Load the latest LLM analysis from disk.
 
     Returns dict with keys: crypto, stock — each mapping
-    symbol -> {m, s, r, bull, bear, timestamp, model}.
+    symbol -> {m, s, r, bull, bear, timestamp, model}, plus
+    {p_up, conviction, abstain, key_risks, event_flags, prompt_version}
+    when that entry was produced with advisor_v2_enabled (see
+    _save_analysis) — readers should use .get() for the v2 keys since
+    older/non-v2 entries won't have them.
     """
     try:
         if _ANALYSIS_FILE.exists():
@@ -618,8 +673,28 @@ def load_analysis() -> dict:
     return {}
 
 
+def _bounded_str_list(value, limit: int = 5, max_len: int = 300) -> list:
+    """Coerce a dossier list field to disk-safe shape: cap element count and
+    per-element string length. Accepts a list (the normal shape) or a dict
+    (persist its values) and tolerates None/other types by returning []
+    rather than raising — this feeds file-growth-bounded persistence, never
+    a live gate, so it must never itself be a new failure point."""
+    if isinstance(value, dict):
+        value = list(value.values())
+    if not isinstance(value, list):
+        return []
+    return [str(x)[:max_len] for x in value[:limit]]
+
+
 def _save_analysis(result: dict, asset_type: str, model: str):
-    """Append analysis results to the JSON file."""
+    """Append analysis results to the JSON file.
+
+    Also persists the advisor-v2 decision dossier (p_up, conviction,
+    abstain, key_risks, event_flags, prompt_version) when present — GUI
+    review 2026-07 §5/Phase 2.1: these were computed by analyze_trades and
+    discarded right here, so the GUI could never show them. Shadow/
+    measurement fields only; never gates or sizes a trade either way.
+    """
     ts = datetime.now(timezone.utc).isoformat(timespec='seconds')
 
     # Load existing
@@ -634,7 +709,7 @@ def _save_analysis(result: dict, asset_type: str, model: str):
         if m is None:
             print(f"[LLM-ANALYST] Skipping {sym}: entry has neither 'm' nor 's'")
             continue
-        section[sym] = {
+        record = {
             "m": m,
             "s": entry.get("s", m / 1.5),
             "r": entry.get("r", ""),
@@ -643,6 +718,25 @@ def _save_analysis(result: dict, asset_type: str, model: str):
             "timestamp": ts,
             "model": model,
         }
+        # _parse_response's `if extended:` block sets all five v2 keys
+        # together (never a subset) only when analyze_trades ran the
+        # advisor-v2 schema — so presence of "p_up" on `entry` IS the "was
+        # this call v2" signal, with zero extra plumbing needed. On the
+        # default (v1) path `entry` has none of these keys, so `record`
+        # keeps exactly its original 7 keys — byte-identical to before,
+        # pinned by
+        # test_llm_advisor.py::test_analyze_trades_default_llm_analysis_json_keys.
+        # Never fabricated: a field present-but-unparseable on `entry`
+        # (e.g. p_up failed to coerce to float) is already None there and
+        # is persisted as None, not invented.
+        if "p_up" in entry:
+            record["p_up"] = entry.get("p_up")
+            record["conviction"] = entry.get("conviction")
+            record["abstain"] = entry.get("abstain")
+            record["key_risks"] = _bounded_str_list(entry.get("key_risks"))
+            record["event_flags"] = _bounded_str_list(entry.get("event_flags"))
+            record["prompt_version"] = PROMPT_VERSION_V2
+        section[sym] = record
 
     # Atomic write: crypto loop, stock loop, and the GUI refresh subprocess
     # all write this file, and the GUI reads it concurrently. Write to a
@@ -739,7 +833,9 @@ def _build_symbol_profiles(symbols):
 
             # Volatility
             if len(close) >= 21:
-                vol20 = close.pct_change().rolling(20).std().iloc[-1] * 100
+                # pandas pin (c26-T3/B21): explicit ffill + fill_method=None
+                # == pandas-2 pad semantics, pandas-3-proof
+                vol20 = close.ffill().pct_change(fill_method=None).rolling(20).std().iloc[-1] * 100
                 techs.append(f"20d volatility: {vol20:.2f}%")
 
             if techs:

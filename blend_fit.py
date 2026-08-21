@@ -70,3 +70,71 @@ def fit_blend_weight(lstm_oof, lgb_oof, y, objective='sharpe', threshold=0.0,
     w = min(max(w, 0.0), 1.0)
     lam = min(max(float(shrink_lambda), 0.0), 1.0)
     return float((1.0 - lam) * w + lam * shrink_to)
+
+
+def fit_blend_weight_v2(lstm_oof, lgb_oof, y, forward_bars=1, shrink_to=0.5,
+                        shrink_lambda=0.5):
+    """NNLS blend weight with an overlap-corrected significance gate (T1/B12.2).
+
+    Deploy the estimated weight only when it differs from the simple average
+    by more than 2 standard errors — otherwise ship EXACTLY 0.5. The SE uses
+    the label-overlap effective sample size n_eff = n / forward_bars
+    (overlapping fb-bar labels are ~fb-times over-counted), and a significant
+    estimate is still Diebold-Shin shrunk toward shrink_to. Model-averaging
+    weights estimated on modest samples routinely lose to the simple average
+    (Claeskens et al. 2016 — estimated weights add variance that swamps the
+    bias saved; Stock & Watson 2004 forecast-combination puzzle; Diebold &
+    Shin 2019 — shrink to equal weights).
+
+    Returns dict {'w', 'w_raw', 'se', 'significant', 'n', 'n_eff'}; on
+    degenerate/thin input w falls back to the clipped shrink target with
+    w_raw/se/n_eff None (fail-safe to the simple average, mirroring
+    fit_blend_weight).
+    """
+    a = np.asarray(lstm_oof, float)
+    b = np.asarray(lgb_oof, float)
+    y = np.asarray(y, float)
+    m = np.isfinite(a) & np.isfinite(b) & np.isfinite(y)
+    a, b, y = a[m], b[m], y[m]
+    n = a.size
+    shrink_to = min(max(float(shrink_to), 0.0), 1.0)
+    d = a - b
+    denom = float(d @ d) if n else 0.0
+    if n < 20 or denom < 1e-12:
+        return {'w': float(shrink_to), 'w_raw': None, 'se': None,
+                'significant': False, 'n': int(n), 'n_eff': None}
+
+    w_raw = float(((y - b) @ d) / denom)          # UNCLIPPED estimator
+    eps = y - (w_raw * a + (1.0 - w_raw) * b)
+    sigma2 = float(eps @ eps) / max(n - 1, 1)
+    # Label-overlap correction (B12): n_eff = n / forward_bars, i.e. the
+    # OLS variance is multiplied by the overlap factor fb.
+    fb = max(int(forward_bars), 1)
+    n_eff = n / fb
+    se = float(np.sqrt(sigma2 / denom * fb))
+    significant = abs(w_raw - 0.5) > 2.0 * se     # tested on the UNSHRUNK w
+    if significant:
+        lam = min(max(float(shrink_lambda), 0.0), 1.0)
+        w_clip = min(max(w_raw, 0.0), 1.0)
+        w = min(max((1.0 - lam) * w_clip + lam * shrink_to, 0.0), 1.0)
+    else:
+        w = 0.5
+    return {'w': float(w), 'w_raw': w_raw, 'se': se,
+            'significant': bool(significant), 'n': int(n),
+            'n_eff': float(n_eff)}
+
+
+def smooth_across_retrains(w_new, w_prev=None, lo=0.25, hi=0.75):
+    """Cross-retrain smoothing of the blend weight (T1/B12).
+
+    Average the fresh estimate with the champion's previously persisted
+    weight, then clamp to [lo, hi] — all the safe time-variation at weekly
+    cadence with zero live-path code. w_prev None/non-finite -> the fresh
+    estimate alone (still clamped).
+    """
+    w_new = float(w_new)
+    if w_prev is None or not np.isfinite(w_prev):
+        w = w_new
+    else:
+        w = 0.5 * (w_new + float(w_prev))
+    return float(min(max(w, lo), hi))

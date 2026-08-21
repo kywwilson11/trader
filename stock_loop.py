@@ -91,6 +91,7 @@ class StockLoop(BaseTradingLoop):
         self.hold_symbols: set[str] = set()
         self._clock_cache: tuple[float, object] = (0.0, None)
         self._last_preds: dict[str, float] = {}
+        self._tp_order_ids: dict[str, str] = {}  # bracket TP-leg ids (c26 D06/B09)
 
     def get_symbol_universe(self) -> list[str]:
         return [s for s in load_stock_universe() if '/' not in s]
@@ -451,6 +452,21 @@ class StockLoop(BaseTradingLoop):
     def write_prediction_cache(self, preds, **kwargs):
         top_symbols = kwargs.get('top_symbols', self.top_symbols)
         try:
+            # Decision-context enrichment (2026-07 GUI review §5/§11 Phase
+            # 2.3): surface what this loop already computed elsewhere —
+            # this cycle or the last time it ran for this symbol — never
+            # recomputed here. Keys are OMITTED, not null-padded, when the
+            # loop has nothing on record for a symbol, so an unenriched
+            # entry stays byte-identical to the pre-enrichment shape.
+            # cost-gate pass/fail + bps have no cached home on the loop at
+            # all (should_trade needs a fresh quote) and are left out.
+            last_meta_p = getattr(self, '_last_meta_p', {}) or {}
+            llm_scores = getattr(self, 'llm_scores', {}) or {}
+            veto_strikes = getattr(self, '_veto_strikes', {}) or {}
+            regime = getattr(self, 'macro_regime', None)
+            regime_label = regime.regime_label if regime is not None else None
+            rank_by_symbol = {sym: i for i, sym in enumerate(top_symbols, 1)}
+
             data = {}
             for sym in sorted(preds):
                 pred = preds[sym]
@@ -460,12 +476,24 @@ class StockLoop(BaseTradingLoop):
                     signal = "BEAR"
                 else:
                     signal = "NEUTRAL"
-                data[sym] = {
+                row = {
                     "pred": round(pred, 6) if pred is not None else None,
                     "score": round(pred, 6) if pred is not None else 0,
                     "signal": signal,
                     "updated": datetime.datetime.now().isoformat(),
                 }
+                meta_p = last_meta_p.get(sym)
+                if meta_p is not None:
+                    row["meta_p"] = round(float(meta_p), 4)
+                    row["conviction"] = self._conviction_tier(pred, meta_p)
+                if regime_label is not None:
+                    row["regime"] = regime_label
+                rank = rank_by_symbol.get(sym)
+                if rank is not None:
+                    row["rank"] = rank
+                if sym in llm_scores:
+                    row["llm_gate"] = "veto" if sym in veto_strikes else "pass"
+                data[sym] = row
             # Atomic write (tmp + rename): the GUI polls this file, and an
             # in-place write can hand it a torn read
             tmp = _PRED_CACHE_FILE.with_suffix('.tmp')
@@ -630,8 +658,14 @@ class StockLoop(BaseTradingLoop):
         """Journal a position that closed at the broker outside our tracking
         (typically the bracket TP leg filling between cycles): trade_memory
         for the Kelly sample AND a log_decision sell row so the Stage-0 /
-        slippage journals see these exits (both estimated — the real fill
-        price is unknown here)."""
+        slippage journals see these exits. c26 D06/B09: first tries
+        _recover_external_exit for a CONFIRMED real-fill row; only when
+        that fails does it fall back to the estimated midpoint row below."""
+        try:
+            if self._recover_external_exit(symbol, info):
+                return
+        except Exception:
+            pass
         quote = self.get_quote(symbol)
         px = quote['midpoint'] if quote else info.entry_price
         pnl = ((px - info.entry_price) / info.entry_price * 100
@@ -649,6 +683,98 @@ class StockLoop(BaseTradingLoop):
                           "estimated": True})
         except Exception:
             pass
+
+    def _recover_external_exit(self, symbol, info) -> bool:
+        """c26 D06/B09: a position that vanished at the broker usually
+        closed via its bracket TP leg (or a server stop) — fetch the REAL
+        fill and journal a CONFIRMED exit instead of a midpoint estimate
+        (estimated rows are censored out of Kelly's sample, biasing the
+        stock book's sizing against its own winners). Returns True when a
+        confirmed row was written; never raises — False falls back to the
+        estimated path."""
+        try:
+            api = getattr(self, 'api', None)
+            if api is None:
+                return False
+            probes = []
+            tp_id = getattr(self, '_tp_order_ids', {}).get(symbol)
+            if tp_id:
+                probes.append((tp_id, 'take_profit'))
+            so_id = getattr(info, 'stop_order_id', None)
+            if so_id:
+                probes.append((so_id, 'server_stop'))
+            order = reason = None
+            for oid, why in probes:
+                try:
+                    o = api.get_order(oid)
+                except Exception:
+                    continue
+                if getattr(o, 'status', None) == 'filled':
+                    order, reason = o, why
+                    break
+            if order is None:
+                # Fallback: newest filled sell in the closed-order list
+                def _order_ts_local(o):
+                    """Best-effort naive-LOCAL datetime of an order's fill;
+                    None on failure."""
+                    ts = (getattr(o, 'filled_at', None)
+                          or getattr(o, 'submitted_at', None))
+                    try:
+                        if isinstance(ts, str):
+                            ts = datetime.datetime.fromisoformat(
+                                ts.replace('Z', '+00:00'))
+                        if ts.tzinfo is not None:
+                            ts = ts.astimezone().replace(tzinfo=None)
+                        return ts
+                    except Exception:
+                        return None
+
+                try:
+                    try:
+                        closed = api.list_orders(status='closed',
+                                                 symbols=[symbol], limit=10)
+                    except TypeError:
+                        closed = api.list_orders(status='closed',
+                                                 symbols=[symbol])
+                except Exception:
+                    closed = None
+                # c26 final review: without a time filter this could attribute
+                # a stale sell from a PREVIOUS round trip (wrong fill price
+                # entering Kelly's sample uncensored). Candidate must postdate
+                # this position's entry (last_trade_time proxy, 5-min slack);
+                # with no entry proxy (restart), accept only fills from the
+                # last 24h. Unverifiable candidates fall through to the
+                # estimated path — the pre-D06 safe behavior.
+                entry_ref = self.last_trade_time.get(symbol)
+                for o in closed or []:
+                    if (getattr(o, 'side', None) != 'sell'
+                            or getattr(o, 'status', None) != 'filled'):
+                        continue
+                    ots = _order_ts_local(o)
+                    if ots is None:
+                        continue
+                    if entry_ref is not None:
+                        if ots < entry_ref - datetime.timedelta(minutes=5):
+                            continue
+                    elif (datetime.datetime.now() - ots) \
+                            > datetime.timedelta(hours=24):
+                        continue
+                    order, reason = o, 'external_close'
+                    break
+            if order is None:
+                return False
+            try:
+                float(order.filled_avg_price)
+            except (TypeError, ValueError):
+                return False    # truly unrecoverable -> estimated path
+            llm_info = self.llm_scores.get(symbol, {})
+            self._record_confirmed_exit(symbol, info, order, None,
+                                        exit_reason=reason,
+                                        llm_score=llm_info.get('s'),
+                                        reasoning=llm_info.get('r', ''))
+            return True
+        except Exception:
+            return False
 
     def _bucket_room_ok(self, symbol: str) -> bool:
         """Sector-bucket notional cap. Conservative: blocks when one more
@@ -802,13 +928,15 @@ class StockLoop(BaseTradingLoop):
                     continue
 
             # Correlation check
+            avg_corr = None
             if self.corr_matrix and self.positions:
                 allowed, avg_corr = check_portfolio_correlation(
                     list(self.positions.keys()), symbol, self.corr_matrix)
                 if not allowed:
                     vc['correlation'] += 1
                     self._journal_skip(symbol, 'correlation', rank=rank,
-                                       pred=pred, snapshot=snapshot)
+                                       pred=pred, snapshot=snapshot,
+                                       avg_corr=round(avg_corr, 4))
                     continue
 
             # Macro regime halt
@@ -927,21 +1055,72 @@ class StockLoop(BaseTradingLoop):
             if order:
                 result = manage_order_lifecycle(self.api, order.id, timeout=self.ORDER_TIMEOUT,
                                                fallback_to_market=False)
-                if result and result.status == 'filled':
-                    child_stop_id = None
+                # Judge by ACQUIRED qty, not status (mirror of
+                # base_loop._place_and_track_buy, c26 D16): a partially-
+                # filled-then-canceled parent bought REAL shares that must
+                # be tracked, stopped and journaled.
+                try:
+                    partial_qty = float(getattr(result, 'filled_qty', 0) or 0)
+                except (TypeError, ValueError):
+                    partial_qty = 0.0
+                acquired = result is not None and (
+                    getattr(result, 'status', None) == 'filled'
+                    or partial_qty > 0)
+                if acquired:
+                    filled_qty_int = qty
                     try:
-                        legs = self.api.list_orders(status='open', symbols=[symbol])
+                        fill_price = float(result.filled_avg_price)
+                    except (TypeError, ValueError):
+                        fill_price = None
+                    if getattr(result, 'status', None) != 'filled':
+                        # Partial parent: broker truth preferred, order
+                        # evidence as fallback.
+                        from order_utils import verify_position
+                        vp = verify_position(self.api, symbol)
+                        if vp is not None:
+                            filled_qty_int = int(float(vp.qty))
+                            fill_price = float(vp.avg_entry_price)
+                        else:
+                            filled_qty_int = int(partial_qty)
+                        logger.warning("[BUY] %s: parent %s with filled_qty"
+                                       "=%s — tracking %d share(s) from the"
+                                       " partial fill", symbol,
+                                       getattr(result, 'status', None),
+                                       partial_qty, filled_qty_int)
+                    if filled_qty_int <= 0 or not fill_price or fill_price <= 0:
+                        logger.error("[BUY] %s: acquired but unusable fill "
+                                     "state (qty=%s px=%s) — position may "
+                                     "be UNTRACKED until the orphan sweep",
+                                     symbol, filled_qty_int, fill_price)
+                        time.sleep(0.5)
+                        continue
+                    child_stop_id = None
+                    tp_leg_id = None
+                    try:
+                        legs = list(getattr(result, 'legs', None) or []) \
+                            or list(getattr(order, 'legs', None) or [])
+                        if not legs:
+                            legs = self.api.list_orders(status='open',
+                                                        symbols=[symbol])
                         for leg in legs:
-                            if leg.side == 'sell' and leg.type in ('stop', 'stop_limit'):
+                            if getattr(leg, 'side', None) != 'sell':
+                                continue
+                            ltype = getattr(leg, 'type', None)
+                            if ltype in ('stop', 'stop_limit') and child_stop_id is None:
                                 child_stop_id = leg.id
-                                break
+                            elif ltype == 'limit' and tp_leg_id is None:
+                                # TP limit leg (c26 D06): its REAL fill is
+                                # one get_order away when it closes the
+                                # position between cycles.
+                                tp_leg_id = leg.id
                     except Exception:
                         pass
+                    if tp_leg_id:
+                        self._tp_order_ids[symbol] = tp_leg_id
 
-                    fill_price = float(result.filled_avg_price)
                     from types_mod import Position
                     self.positions[symbol] = Position(
-                        qty=qty,
+                        qty=filled_qty_int,
                         entry_price=fill_price,
                         high_water_mark=fill_price,
                         stop_order_id=child_stop_id,
@@ -956,7 +1135,7 @@ class StockLoop(BaseTradingLoop):
                     # fill (wave-5 Tier1-1): book_risk_pct lets Stage-0
                     # measure how often the $5k notional cap binds before
                     # the 0.5%-risk sizing does (notional-cap-bind audit).
-                    book_risk_pct = (round(qty * fill_price * stop_dist
+                    book_risk_pct = (round(filled_qty_int * fill_price * stop_dist
                                            / max(self._equity, 1) * 100, 4))
                     buy_rec = {"symbol": symbol, "action": "buy",
                                "pred_return": pred,
@@ -973,6 +1152,8 @@ class StockLoop(BaseTradingLoop):
                                "skip_reason": None}
                     buy_rec.update(self._conv_fields(symbol, pred, snapshot,
                                                      rank=rank))
+                    if avg_corr is not None:
+                        buy_rec['avg_corr'] = round(avg_corr, 4)
                     # Sizing decomposition — base _place_and_track_buy
                     # attaches this to its buy rows; without it here the
                     # VIX-ladder/macro-mult co-fire audit has no stock data
@@ -982,7 +1163,7 @@ class StockLoop(BaseTradingLoop):
                     log_decision(buy_rec)
                     self.last_trade_time[symbol] = datetime.datetime.now()
                     self._count_trade(symbol)
-                    estimated_exposure = current_exposure + qty * fill_price
+                    estimated_exposure = current_exposure + filled_qty_int * fill_price
 
                     # After fill confirmation (None on API error — fall back
                     # to the local estimate instead of `None > int` crashing)
@@ -999,34 +1180,18 @@ class StockLoop(BaseTradingLoop):
 
     def _manage_stops(self):
         """Stock-specific: check server-side stop fills, upgrade to trailing stops."""
+        # Prune TP-leg ids for symbols no longer held (c26 D06) — mirrors
+        # crypto_loop's _resting_stop_px prune.
+        for s in list(getattr(self, '_tp_order_ids', {})):
+            if s not in self.positions:
+                self._tp_order_ids.pop(s, None)
         for symbol in list(self.positions):
             info = self.positions[symbol]
             if info.stop_order_id:
+                stop_order = None
+                via_stream = False
                 try:
                     stop_order = self.api.get_order(info.stop_order_id)
-                    if stop_order.status == 'filled':
-                        logger.info("[STOP-FILL] %s: Stop filled at $%s",
-                                    symbol, stop_order.filled_avg_price)
-                        # Server-side exits were previously never journaled,
-                        # censoring exactly the losing trades out of the
-                        # Kelly sizing sample.
-                        llm_info = self.llm_scores.get(symbol, {})
-                        self._record_confirmed_exit(symbol, info, stop_order, None,
-                                                    exit_reason='server_stop',
-                                                    llm_score=llm_info.get('s'),
-                                                    reasoning=llm_info.get('r', ''))
-                        del self.positions[symbol]
-                        self.last_trade_time[symbol] = datetime.datetime.now()
-                        # KNOWN (2026-07 review P2, deferred): after the
-                        # trailing upgrade this order can be the TRAILING
-                        # stop — the lockout + exit_reason='server_stop'
-                        # then misclassify a profitable trailing exit as a
-                        # hard stop.
-                        self.hard_stop_lockout[symbol] = datetime.datetime.now()
-                        self._save_hard_stop_lockout()
-                        continue
-                    elif stop_order.status in ('canceled', 'expired', 'rejected'):
-                        info.stop_order_id = None
                 except Exception as e:
                     # Discard the id only when the order is genuinely gone.
                     # On a transient error (429/timeout/5xx) KEEP it and
@@ -1040,8 +1205,47 @@ class StockLoop(BaseTradingLoop):
                                        symbol, info.stop_order_id)
                         info.stop_order_id = None
                     else:
-                        logger.warning("[STOP-CHECK] %s: get_order failed (%s) — keeping id, retry next cycle",
-                                       symbol, e)
+                        # Stream assist (c26 T6; self-gated on base_loop's
+                        # STREAM_STOP_DETECT inside the method — flag OFF
+                        # returns None and today's retry path runs).
+                        # getattr default: tests/test_review_b01.py executes
+                        # this method's source against a bare namespace.
+                        stop_order = getattr(self, '_stream_stop_fallback',
+                                             lambda oid: None)(info.stop_order_id)
+                        via_stream = stop_order is not None
+                        if stop_order is None:
+                            logger.warning("[STOP-CHECK] %s: get_order failed (%s) — keeping id, retry next cycle",
+                                           symbol, e)
+                if stop_order is not None:
+                    if stop_order.status == 'filled':
+                        logger.info("[STOP-FILL] %s: Stop filled at $%s",
+                                    symbol, stop_order.filled_avg_price)
+                        # Server-side exits were previously never journaled,
+                        # censoring exactly the losing trades out of the
+                        # Kelly sizing sample.
+                        llm_info = self.llm_scores.get(symbol, {})
+                        # c26 T6: after the trailing upgrade this order can
+                        # be the TRAILING stop — classify hard-vs-trail
+                        # (trailing_activated is decisive here; always
+                        # journaled) and let _apply_server_stop_lockout
+                        # decide; flag OFF the lockout stays unconditional
+                        # as before. exit_reason stays 'server_stop' (report
+                        # vocabularies unchanged).
+                        kind, stop_px = self._classify_server_stop(symbol, info, stop_order)
+                        extra = {'server_stop_kind': kind, 'stop_px': stop_px}
+                        if via_stream:
+                            extra['detect_source'] = 'stream'
+                        self._record_confirmed_exit(symbol, info, stop_order, None,
+                                                    exit_reason='server_stop',
+                                                    llm_score=llm_info.get('s'),
+                                                    reasoning=llm_info.get('r', ''),
+                                                    extra=extra)
+                        del self.positions[symbol]
+                        self.last_trade_time[symbol] = datetime.datetime.now()
+                        self._apply_server_stop_lockout(symbol, kind)
+                        continue
+                    elif stop_order.status in ('canceled', 'expired', 'rejected'):
+                        info.stop_order_id = None
 
             quote = get_stock_quote(self.api, symbol)
             if quote is None:
@@ -1127,7 +1331,10 @@ class StockLoop(BaseTradingLoop):
             return 1.0
         prev_close = float(prior.iloc[-1])
         rod = (float(spy.iloc[-1]) / prev_close - 1.0) * 100
-        daily = spy.groupby(dates).last().pct_change().dropna() * 100
+        # pandas pin (c26-T3/B21): ffill + fill_method=None ==
+        # pandas-2 pad semantics, pandas-3-proof
+        daily = (spy.groupby(dates).last().ffill()
+                 .pct_change(fill_method=None).dropna() * 100)
         vol = float(daily.tail(20).std())
         if vol <= 0:
             return 1.0

@@ -286,11 +286,16 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
                                    cached_only=False):
     """Fetch historical news for stock tickers via Finnhub and keyword-score.
 
-    Fetches in 30-day windows, rate-limited at 25 calls/min. Caches all articles
-    in SQLite. NOTE: a ticker is re-fetched only when it has ZERO cached articles
-    in [start_date, end_date] — there is NO incremental refresh of an
-    already-fetched ticker (known P1; the fix is model-facing and deferred to
-    the promotion path).
+    Fetches in 30-day windows, rate-limited at 25 calls/min. Caches all
+    articles in SQLite. Refresh policy (D27 dark half, c26-P5): a ticker
+    with ZERO cached articles in [start_date, end_date] gets a full-range
+    fetch; a ticker WITH cached articles gets an INCREMENTAL fetch from its
+    newest cached article date (inclusive — same-day re-sends dedupe via
+    the UNIQUE(symbol,date,headline) constraint) to end_date; a ticker
+    cached through end_date is skipped. Harvest reads use cached_only=True
+    and this network path runs only when the owner invokes it, so training
+    VALUES change only after the owner runs this fetch AND the next
+    harvest+retrain — feature reactivation stays an owner decision.
 
     Args:
         tickers: List of stock ticker symbols (crypto symbols with '/' are skipped)
@@ -337,26 +342,36 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
     for sym, dt, score in cached_rows:
         result[(sym, dt)] = score
 
-    # Determine which symbols need fetching
-    # A symbol needs fetching if it has no articles in our date range
-    tickers_to_fetch = []
+    d_start = datetime.date.fromisoformat(start_date)
+    d_end = datetime.date.fromisoformat(end_date)
+
+    # Determine which symbols need fetching, and from which date:
+    #   zero cached articles in range -> full-range fetch from d_start
+    #   cached but tail < end_date    -> incremental fetch from the newest
+    #                                    cached article date (inclusive)
+    #   cached through end_date       -> skip
+    tickers_to_fetch = []  # (ticker, fetch_start: datetime.date)
+    n_full = n_incr = 0
     for ticker in stock_tickers:
-        count = db.execute(
-            "SELECT COUNT(*) FROM articles WHERE symbol=? AND date >= ? AND date <= ?",
+        max_dt = db.execute(
+            "SELECT MAX(date) FROM articles WHERE symbol=? AND date >= ? AND date <= ?",
             (ticker, start_date, end_date),
         ).fetchone()[0]
-        if count == 0:
-            tickers_to_fetch.append(ticker)
+        if max_dt is None:
+            tickers_to_fetch.append((ticker, d_start))
+            n_full += 1
+        elif max_dt < end_date:
+            tickers_to_fetch.append((ticker, datetime.date.fromisoformat(max_dt)))
+            n_incr += 1
 
     if not tickers_to_fetch:
-        print(f"[SENTIMENT_HIST] All {len(stock_tickers)} tickers cached, {len(result)} daily scores")
+        print(f"[SENTIMENT_HIST] All {len(stock_tickers)} tickers current, "
+              f"{len(result)} daily scores")
         return result
 
     print(f"[SENTIMENT_HIST] Fetching news for {len(tickers_to_fetch)} tickers "
-          f"({len(stock_tickers) - len(tickers_to_fetch)} cached)...")
-
-    d_start = datetime.date.fromisoformat(start_date)
-    d_end = datetime.date.fromisoformat(end_date)
+          f"({n_full} full, {n_incr} incremental, "
+          f"{len(stock_tickers) - len(tickers_to_fetch)} current)...")
 
     # Rate limiter: 25 calls/min (Finnhub free tier = 30/min, leave headroom)
     call_times = []
@@ -365,13 +380,13 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
     total_articles = 0
     now_iso = datetime.datetime.now().isoformat()
 
-    for ti, ticker in enumerate(tickers_to_fetch):
+    for ti, (ticker, fetch_start) in enumerate(tickers_to_fetch):
       try:
         ticker_articles = 0
         ticker_scores = []
 
         # Fetch in 30-day windows (reduces API calls ~4x vs 7-day)
-        window_start = d_start
+        window_start = fetch_start
         while window_start <= d_end:
             window_end = min(window_start + datetime.timedelta(days=29), d_end)
 
@@ -444,7 +459,7 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
         # Aggregate daily scores for this ticker
         dates_with_articles = db.execute(
             "SELECT DISTINCT date FROM articles WHERE symbol=? AND date >= ? AND date <= ?",
-            (ticker, start_date, end_date),
+            (ticker, fetch_start.isoformat(), end_date),
         ).fetchall()
 
         for (dt,) in dates_with_articles:

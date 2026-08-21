@@ -8,7 +8,9 @@ State is persisted per asset type in adaptive_state_{asset_type}.json.
 """
 
 import json
+import math
 import os
+import random
 from datetime import datetime
 from pathlib import Path
 
@@ -99,6 +101,14 @@ def _default_state(asset_type: str) -> dict:
         'mode': 'refine',
         'cycles_without_improvement': 0,
         'expansion_history': [],
+        # Selection-pressure accounting (2026-08 B03.2): cumulative trial /
+        # holdout-gate counters, the dated trial history feeding the
+        # overlap-weighted deflation pool, and the study-DB deletion audit
+        # log. load_adaptive_state back-fills them on old files.
+        'cum_trials': 0,
+        'cum_holdout_gates': 0,
+        'trial_history': [],
+        'db_deletions': [],
         'last_updated': datetime.now().isoformat(),
     }
 
@@ -118,6 +128,12 @@ def load_adaptive_state(asset_type: str) -> dict:
 
     A corrupt state file raises (fail closed): silently resetting to
     defaults would wipe the best_score ratchet.
+
+    cum_trials (the cumulative selection-pressure counter) resets ONLY via
+    the documented gotcha-#2 objective-change reset — deleting this state
+    file — the same event that resets the best_score ratchet; the
+    forward-compat loop below back-fills it (and trial_history /
+    db_deletions / cum_holdout_gates) on old files.
     """
     path = _state_path(asset_type)
     if path.exists():
@@ -152,6 +168,158 @@ def save_adaptive_state(state: dict) -> None:
     with open(tmp, 'w') as f:
         json.dump(state, f, indent=2)
     os.replace(tmp, str(path))
+
+
+def _count_study_trials(db_path):
+    """Row count of an Optuna study DB's `trials` table, or None.
+
+    Fail-soft instrumentation (stdlib sqlite3): any problem — missing
+    file, locked/corrupt DB, missing table — returns None, never raises.
+    """
+    try:
+        if not db_path or not os.path.exists(db_path):
+            return None
+        import sqlite3
+        con = sqlite3.connect(db_path)
+        try:
+            return int(con.execute(
+                'SELECT COUNT(*) FROM trials').fetchone()[0])
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def record_trials(asset_type: str, n_new: int, event: str = 'search') -> dict:
+    """Accrue selection pressure for a run that did NOT update best state.
+
+    A losing hypersearch run still spent trials against the same holdout —
+    update_after_search counts them when it runs, this counts them when it
+    is skipped (final_score <= 0 / no params / gate-rejected no-op).
+    Increments cum_trials by max(n_new, 0) and appends a dated
+    trial_history record when n_new > 0. Returns the saved state.
+    """
+    state = load_adaptive_state(asset_type)
+    n = max(int(n_new), 0)
+    state['cum_trials'] = int(state.get('cum_trials', 0)) + n
+    if n > 0:
+        state.setdefault('trial_history', []).append(
+            {'date': datetime.now().isoformat(), 'n': n, 'event': event})
+    save_adaptive_state(state)
+    return state
+
+
+def record_db_deletion(asset_type: str, db_path: str, reason: str) -> None:
+    """Persist a study-DB deletion event (audit log; never raises).
+
+    Deleting a study DB resets the visible trial count while the
+    best_score ratchet persists — selection pressure survives the reset,
+    so every deletion is logged with the trials it erased and the
+    cum_trials counter that keeps counting them.
+    """
+    try:
+        state = load_adaptive_state(asset_type)
+        rec = {
+            'deleted_at': datetime.now().isoformat(),
+            'db': str(db_path),
+            'reason': reason,
+            'trials_lost': _count_study_trials(db_path),
+            'best_score_retained': state.get('best_score'),
+            'cum_trials': state.get('cum_trials'),
+        }
+        state.setdefault('db_deletions', []).append(rec)
+        save_adaptive_state(state)
+        print(f"[ADAPTIVE] study-DB deletion logged: {rec}")
+    except Exception as e:
+        print(f"[ADAPTIVE] WARNING: could not log study-DB deletion "
+              f"for {db_path}: {e}")
+
+
+def overlap_weighted_trials(trial_history, now=None,
+                            holdout_span_days: float = 43.8) -> float:
+    """Overlap-weighted effective trial pool n_trials_eff (B03.2).
+
+    Successive weekly retrains re-gate on an ~84-92%-overlapping rolling
+    holdout, so older trials still exert selection pressure on today's
+    holdout in proportion to the calendar overlap. n_trials_eff =
+    sum over records of max(0, 1 - age_days/holdout_span_days) * n.
+    43.8 = 0.12*365, the 12% holdout span: a steady 100 trials/week over
+    7+ weeks yields ~364. Malformed records are skipped; `now` accepts a
+    datetime or iso string (default datetime.now()).
+    """
+    if now is None:
+        now = datetime.now()
+    elif isinstance(now, str):
+        now = datetime.fromisoformat(now)
+    total = 0.0
+    for rec in (trial_history or []):
+        try:
+            d = rec['date']
+            if isinstance(d, str):
+                d = datetime.fromisoformat(d)
+            n = float(rec['n'])
+            age_days = (now - d).total_seconds() / 86400.0
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if not math.isfinite(n) or n <= 0:
+            continue
+        total += max(0.0, 1.0 - max(age_days, 0.0) / holdout_span_days) * n
+    return total
+
+
+def noisy_ratchet(new_score, stored_score, fold_sharpes, seed=None) -> dict:
+    """Thresholdout-shaped noisy best_score acceptance (Dwork et al. 2015).
+
+    The weekly retrain compares each winner's score against a persistent
+    ratchet on a heavily-overlapping holdout — classic adaptive holdout
+    reuse. The Thresholdout remedy: accept only when
+    new > stored + 2*sigma + eta with eta ~ Laplace(sigma/2), and on
+    accept store new + Laplace(sigma/2) (an independent draw), where
+    sigma = std(fold_sharpes, ddof=0)/sqrt(n_folds) is the winner's own
+    fold-score noise scale. Fewer than 2 finite folds -> sigma = 0.0 and
+    'degraded': True, which reduces exactly to the legacy strict
+    comparison (zero noise, zero margin). Deterministic for a given seed
+    (callers pass an int derived from study name + date so the draw is
+    reproducible and logged).
+
+    Returns {'accept', 'sigma', 'threshold', 'noise', 'store_value',
+    'degraded'}.
+    """
+    folds = list(fold_sharpes or [])
+    degraded = False
+    sigma = 0.0
+    try:
+        vals = [float(x) for x in folds]
+    except (TypeError, ValueError):
+        vals, degraded = [], True
+    if len(vals) < 2 or any(not math.isfinite(x) for x in vals):
+        degraded = True
+    else:
+        m = sum(vals) / len(vals)
+        var = sum((x - m) ** 2 for x in vals) / len(vals)  # ddof=0
+        sigma = math.sqrt(var) / math.sqrt(len(vals))
+        if not math.isfinite(sigma):
+            sigma, degraded = 0.0, True
+    if degraded:
+        sigma = 0.0
+
+    rnd = random.Random(seed)
+
+    def _laplace(scale):
+        if scale <= 0.0:
+            return 0.0
+        u = rnd.random() - 0.5
+        return -scale * math.copysign(
+            math.log(max(1.0 - 2.0 * abs(u), 1e-300)), u)
+
+    eta = _laplace(sigma / 2.0)
+    threshold = float(stored_score) + 2.0 * sigma + eta
+    accept = float(new_score) > threshold
+    store_value = (float(new_score) + _laplace(sigma / 2.0) if accept
+                   else float(stored_score))
+    return {'accept': bool(accept), 'sigma': float(sigma),
+            'threshold': float(threshold), 'noise': float(eta),
+            'store_value': float(store_value), 'degraded': bool(degraded)}
 
 
 def detect_edges(best_params: dict, search_space: dict) -> list:
@@ -294,7 +462,9 @@ def get_search_space_for_trial(state: dict) -> dict:
 
 def update_after_search(state: dict, new_best_score: float,
                         new_best_params: dict,
-                        study_db_path: str = None) -> dict:
+                        study_db_path: str = None,
+                        new_trials_completed: int = 0,
+                        store_score: float = None) -> dict:
     """Update adaptive state after a hypersearch completes.
 
     Handles:
@@ -302,7 +472,25 @@ def update_after_search(state: dict, new_best_score: float,
       - Edge detection and search space expansion
       - Mode transitions
       - Deleting stale Optuna study DB when categorical distributions change
+      - Selection-pressure accounting: cum_trials / trial_history accrue
+        new_trials_completed BEFORE any DB-deletion path (pressure survives
+        the study reset); db_deletions logs what a deletion erased
+      - store_score: the Thresholdout noisy-store value — when supplied and
+        the score improved, best_score stores THIS (noised) value while
+        best_params still store the real winner; None = today's behavior
     """
+    # Count selection pressure FIRST — before the deletion path below can
+    # erase the study's visible trial count (B03.2 ordering requirement).
+    try:
+        _n_new = max(int(new_trials_completed), 0)
+    except (TypeError, ValueError):
+        _n_new = 0
+    state['cum_trials'] = int(state.get('cum_trials', 0)) + _n_new
+    if _n_new > 0:
+        state.setdefault('trial_history', []).append(
+            {'date': datetime.now().isoformat(), 'n': _n_new,
+             'event': 'search'})
+
     old_score = state.get('best_score', 0.0)
 
     # Track improvement
@@ -312,9 +500,11 @@ def update_after_search(state: dict, new_best_score: float,
         state['cycles_without_improvement'] = state.get(
             'cycles_without_improvement', 0) + 1
 
-    # Update best if improved
+    # Update best if improved. store_score (Thresholdout noisy-store path)
+    # replaces the STORED score only; best_params stay the real winner's.
     if new_best_score > old_score:
-        state['best_score'] = new_best_score
+        state['best_score'] = (float(store_score) if store_score is not None
+                               else new_best_score)
         state['best_params'] = new_best_params
 
     # Detect edges and expand if needed
@@ -337,6 +527,17 @@ def update_after_search(state: dict, new_best_score: float,
         # on POSIX the unlinked inode stays alive for it; only future
         # connections see the deletion.
         if categoricals_changed and study_db_path and os.path.exists(study_db_path):
+            # Audit BEFORE the remove: log what this deletion erases
+            # (selection pressure survives in cum_trials, counted above).
+            trials_lost = _count_study_trials(study_db_path)
+            state.setdefault('db_deletions', []).append({
+                'deleted_at': datetime.now().isoformat(),
+                'db': str(study_db_path),
+                'reason': 'categorical_expansion',
+                'trials_lost': trials_lost,
+                'best_score_retained': state.get('best_score'),
+                'cum_trials': state.get('cum_trials'),
+            })
             os.remove(study_db_path)
             # Remove sqlite sidecars too: a stale -wal/-journal left behind
             # could be replayed into a future DB recreated at the same path.
@@ -345,7 +546,8 @@ def update_after_search(state: dict, new_best_score: float,
                 if os.path.exists(sidecar):
                     os.remove(sidecar)
             print(f"[ADAPTIVE] Deleted {study_db_path} "
-                  f"(categorical search space expanded — incompatible with old study)")
+                  f"(categorical search space expanded — incompatible with "
+                  f"old study; trials_lost={trials_lost})")
 
     # Decide next mode
     state['mode'] = decide_mode(state, new_best_score)

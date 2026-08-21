@@ -206,10 +206,10 @@ def test_fetch_closes_requests_shadow_horizon_window(monkeypatch):
     seen = {}
     monkeypatch.setattr(
         market_data, 'fetch_bars_alpaca',
-        lambda api, symbol, limit=250: seen.__setitem__('crypto', limit))
+        lambda api, symbol, limit=250, **k: seen.__setitem__('crypto', limit))
     monkeypatch.setattr(
         market_data, 'fetch_stock_bars_alpaca',
-        lambda api, symbol, limit=320: seen.__setitem__('stock', limit))
+        lambda api, symbol, limit=320, **k: seen.__setitem__('stock', limit))
     assert shadow._fetch_closes(object(), 'BTC/USD', 'crypto') is None
     assert shadow._fetch_closes(object(), 'AAPL', 'stock') is None
     # crypto: 24/7 hourly bars must span MAX_SHADOW_DAYS + the 24h horizon
@@ -347,8 +347,11 @@ def test_early_report_fb_max_reflects_row_horizons(sandbox, monkeypatch):
 
 def test_shadow_logging_and_doc_hygiene():
     import inspect
+    import re
     src_eval = inspect.getsource(shadow.evaluate_and_maybe_promote)
-    assert 'print(' not in src_eval           # daily status routes via logger
+    # daily status routes via logger — no bare print() calls (identifier
+    # tails like _manifest_fingerprint( must not trip this check)
+    assert not re.search(r'(?<![\w.])print\(', src_eval)
     assert 'logger.info' in src_eval
     src_log = inspect.getsource(shadow.maybe_log_shadow)
     assert 'failed to append' in src_log      # append failures leave evidence

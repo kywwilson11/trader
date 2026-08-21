@@ -1,0 +1,26 @@
+# Baseline FAILED/ERROR test IDs for the dev Mac (no torch/lightgbm/optuna/joblib/numba/sklearn/dotenv); consumed by scripts/ab_check.sh for the one-command regression check.
+# Regenerate: PY_COLORS=0 python3 -m pytest tests/ --continue-on-collection-errors -q 2>/dev/null | grep -E '^(FAILED|ERROR)' | sed 's/ - .*//' | sort -u
+# MACHINE-SPECIFIC: this is the no-heavy-deps dev-Mac baseline ONLY — on Jetson/CI with full deps the suite is green, so do not port this file there.
+ERROR tests/test_asof_universe.py
+ERROR tests/test_conviction_journal.py
+ERROR tests/test_hypersearch_v2.py
+ERROR tests/test_model_v2.py
+ERROR tests/test_oi_archive.py::test_oi_features_alignment_and_values
+ERROR tests/test_oi_archive.py::test_oi_features_none_for_unknown_or_short
+ERROR tests/test_predict_now.py
+FAILED tests/test_data_utils.py::test_get_data_path_prefers_parquet
+FAILED tests/test_data_utils.py::test_migrate_csv_to_parquet
+FAILED tests/test_new_modules.py::TestRegimeDetector::test_fit_hmm
+FAILED tests/test_new_modules.py::TestSharpeWithTxnCosts::test_regime_sharpes
+FAILED tests/test_new_modules.py::TestSharpeWithTxnCosts::test_txn_costs_reduce_mean_trade_return
+FAILED tests/test_new_modules.py::TestVolatility::test_fit_garch
+FAILED tests/test_new_modules.py::TestVolatility::test_forecast_volatility
+FAILED tests/test_oi_archive.py::TestLSFeatures::test_ls_none_for_short_or_missing
+FAILED tests/test_oi_archive.py::TestLSFeatures::test_ls_z_detects_crowding_surge
+FAILED tests/test_oi_archive.py::TestTakerFeatures::test_taker_imbalance_sign
+FAILED tests/test_oi_archive.py::TestTakerFeatures::test_taker_none_without_column
+FAILED tests/test_panel_ranks.py::TestBouncedLoser::test_detector_logic
+FAILED tests/test_wave4.py::TestShortFlow::test_features_shift_one_day
+FAILED tests/test_wave4.py::TestShortFlow::test_live_uses_latest_completed
+FAILED tests/test_wave4.py::TestShortFlow::test_missing_name_none
+FAILED tests/test_wave4.py::TestShortFlow::test_svr_math_and_z_spike

@@ -155,7 +155,9 @@ def _targets_by_ticker(df, horizon, close_col='Close', ticker_col='Ticker',
     else:
         items = [('_all', df[close_col])]
     for tkr, close in items:
-        past = close.pct_change(horizon) * 100.0
+        # pandas pin (c26-T3/B21): explicit ffill + fill_method=None ==
+        # pandas-2 pad semantics, pandas-3-proof
+        past = close.ffill().pct_change(horizon, fill_method=None) * 100.0
         if side == 'forward':
             out[tkr] = past.shift(-horizon).values
         else:

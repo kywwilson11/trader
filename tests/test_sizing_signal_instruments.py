@@ -80,7 +80,7 @@ def test_signal_exit_audit_prices_forgone_upside(monkeypatch):
     import decision_report as dr
     bars = _bars(rip=True)
     monkeypatch.setattr(market_data, 'fetch_bars_alpaca',
-                        lambda api, sym: bars)
+                        lambda api, sym, **k: bars)
     out = dr.signal_exit_audit(_rows(bars.index[50]), api=object())
     assert out['n_signal_sells'] == 1          # hard_stop row excluded
     assert out['priced'] == 1
@@ -95,7 +95,7 @@ def test_signal_exit_audit_credits_good_flips(monkeypatch):
     import decision_report as dr
     bars = _bars(rip=False)
     monkeypatch.setattr(market_data, 'fetch_bars_alpaca',
-                        lambda api, sym: bars)
+                        lambda api, sym, **k: bars)
     out = dr.signal_exit_audit(_rows(bars.index[50]), api=object())
     assert out['priced'] == 1
     # selling into a bleed saved money: counterfactual is negative
@@ -107,7 +107,7 @@ def test_signal_exit_audit_empty_and_unresolved(monkeypatch):
     import decision_report as dr
     assert dr.signal_exit_audit([], api=object()) == {'n_signal_sells': 0}
     monkeypatch.setattr(market_data, 'fetch_bars_alpaca',
-                        lambda api, sym: None)
+                        lambda api, sym, **k: None)
     out = dr.signal_exit_audit(_rows(pd.Timestamp('2026-06-03', tz='UTC')),
                                api=object())
     assert out['priced'] == 0 and out['_unresolved'] == 1

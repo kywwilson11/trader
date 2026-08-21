@@ -12,7 +12,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        include:
+          # Jetson-parity: production pins (numpy<2, pandas<3) + lightgbm + alpaca-py,
+          # installed from requirements-ci.txt — the ONE non-Jetson env running the prod stack.
+          - python-version: "3.10"
+            deps: jetson-parity
+          # Modern: unpinned forward-compat leg (pre-existing behavior, unchanged).
+          - python-version: "3.12"
+            deps: modern
 
     steps:
       - uses: actions/checkout@v4
@@ -27,14 +34,20 @@ jobs:
       - name: Install CPU-only PyTorch
         run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
+      - name: Install Jetson-parity dependencies (requirements-ci.txt)
+        if: matrix.deps == 'jetson-parity'
+        run: pip install -r requirements-ci.txt
+
       - name: Install alpaca-trade-api (pins websockets<11)
+        if: matrix.deps == 'modern'
         run: pip install "alpaca-trade-api>=3.0.0"
 
       - name: Install remaining dependencies
+        if: matrix.deps == 'modern'
         run: |
           pip install python-dotenv numpy pandas scikit-learn joblib \
             optuna yfinance numba finnhub-python beautifulsoup4 \
-            requests PyYAML pytest
+            requests PyYAML pytest bidask
 
       - name: Compile all .py files (syntax check)
         run: |

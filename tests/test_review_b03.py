@@ -136,8 +136,11 @@ def test_get_api_missing_env_is_loud():
             'import alpaca_trade_api as tradeapi':
                 "raise ImportError('stubbed')",
             # don't construct a real CompatREST (needs alpaca)
-            'return CompatREST(key, secret, base_url)':
-                "return ('compat', key, secret, base_url)",
+            'api = CompatREST(key, secret, base_url)':
+                "api = ('compat', key, secret, base_url)",
+            # the timeout installer isn't in the extracted namespace
+            # (D01 wired it in; it needs a real REST client anyway)
+            '_install_rest_timeouts(api)': 'pass',
         })
     result = fn()
     assert result == ('compat', None, None, None)

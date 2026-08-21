@@ -29,8 +29,29 @@ MODULES = [
     "trading_utils",
 ]
 
+# Heavy dependencies absent on the dev Mac (CLAUDE.md two-machine table). A
+# ModuleNotFoundError rooted at one of these is an environment gap -> SKIP.
+# ANY other import error (repo-internal ModuleNotFoundError, ImportError,
+# SyntaxError, ...) is real breakage and must FAIL. On Jetson/CI (full deps)
+# nothing skips, so this cannot mask breakage where the deps exist.
+HEAVY_DEPS = {
+    "torch", "torchvision", "lightgbm", "optuna", "joblib", "numba",
+    "sklearn", "dotenv", "alpaca", "alpaca_trade_api", "finnhub",
+    "PySide6", "pyqtgraph",
+}
+
+
+def import_or_skip_missing_heavy(module_name):
+    try:
+        importlib.import_module(module_name)
+    except ModuleNotFoundError as e:
+        root = (e.name or "").split(".")[0]
+        if root in HEAVY_DEPS:
+            pytest.skip(f"missing heavy dependency: {e.name} (dev-Mac env gap)")
+        raise
+
 
 @pytest.mark.parametrize("module_name", MODULES)
 def test_import(module_name):
     """Module imports without raising."""
-    importlib.import_module(module_name)
+    import_or_skip_missing_heavy(module_name)

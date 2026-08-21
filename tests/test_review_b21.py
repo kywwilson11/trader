@@ -358,8 +358,11 @@ class TestIcTimeKey:
 
 class TestIcDocstring:
     def test_no_longer_claims_backtest_dump_exists(self):
-        assert 'NOT yet authored' in icb.__doc__
-        assert 'dump per-(symbol, bar)' not in icb.__doc__
+        # Modernized (c26 final review F14): backtest.py now SHIPS the
+        # producer (B02 stage0_preds.json, default ON) — the docstring must
+        # say so instead of the stale "NOT yet authored" claim.
+        assert 'NOT yet authored' not in icb.__doc__
+        assert 'stage0_preds.json' in icb.__doc__
 
     def test_states_ordering_and_overlap_preconditions(self):
         doc = icb.__doc__
