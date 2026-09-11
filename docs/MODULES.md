@@ -1,0 +1,1068 @@
+# docs/MODULES.md — per-module reference + CLI census
+
+**What this is.** One entry per Python module in the repo (91 root modules, 20 `scripts/*.py`, 2 `.claude/` python files = 113), grouped into the 16 subsystems `docs/MAP.md` uses, plus the complete `argparse` census of every `__main__` entry point (Appendix A) and the import-layer facts (Appendix B). As of **2026-09-08** (working tree at HEAD `20a41db` + the uncommitted R2-C / IA-1..4 work — untracked modules are marked).
+**How to read an entry.** `### module.py` — kind · size (lines) · Mac · **Goal** (the WHY, 1–3 sentences) · **Key API** (only what other modules use) · **Imports / Imported by** (non-test, from the mechanical graph; `+N tests`) · **Reads / Writes** (runtime files — `docs/STATE_FILES.md` is the authority) · **Flags** (names only — `docs/FLAGS.md` is the authority) · **Flow** (harvest / features / train / gate / serve / execute / measure / ops) · **Status** (LIVE = on a production path · STAGED = wired behind a default-OFF flag · MEASUREMENT-ONLY = never changes a decision · DORMANT = kernel with no production caller) · **Known issues** (one line each, tagged OBJECTIVE-fix-pending / OWNER-decision / MEASUREMENT-pending; cite `file.py:function`).
+**Mac legend.** ✅ importable on the dev Mac (numpy/pandas/scipy only) · ⚠ importable, but a heavy or absent dependency (torch/lightgbm/joblib/sklearn/numba/dotenv/finnhub/alpaca/arch/hmmlearn/pyarrow) is imported lazily or try-guarded, so some functions are Jetson-only · ❌ unimportable on the Mac (an eager heavy import, directly or through an eager import chain). Parquet round-trips (`pd.read_parquet`/`to_parquet`) are invisible to import analysis and fail on the Mac (no `pyarrow`) — noted per entry.
+**Line numbers.** Anchors are `file.py:function` (stable). Where a line number is quoted it is a snapshot as of 2026-09-08.
+**Issue tags.** `OBJECTIVE-fix-pending` marks defects found by the 2026-09-08 audit; most of the doc/comment ones were applied later the same day by the fix ledger (`research/cleanup_2026-09/README.md`) — read the tag as "found in that audit" and check the ledger before re-fixing. `OWNER-decision` and `MEASUREMENT-pending` items were deliberately left untouched (`docs/MAP.md §9`).
+**Regenerate the mechanical parts** (imports, imported-by, entry points, argparse flags, heavy-dep guarding, fan-in/out): `python3 scripts/repo_graph.py --summary` → `docs/graphs/import_graph.json` (see `docs/graphs/README.md`). Goals, status and known issues are hand-written and must be re-verified against code.
+**Companion docs.** `docs/MAP.md` (how it fits together) · `docs/FLAGS.md` (every flag: default, read site, model-facing?) · `docs/STATE_FILES.md` (every runtime file: writer, reader, machine) · `docs/GLOSSARY.md` · `research/KILL_LIST.md` (check before proposing features).
+
+---
+
+## Index (113 modules, sorted by subsystem then name)
+
+| module | subsystem | kind | Mac | one-line goal |
+|---|---|---|---|---|
+| `adaptive_config.py` | 1 Configuration | config+library | ✅ | Optuna search-space governance, best_score ratchet, selection-pressure ledger (adaptive_state_*.json) |
+| `indicator_config.py` | 1 Configuration | config | ✅ | feature presets + the persisted preset choice; HURST_ON_RETURNS |
+| `llm_config.py` | 1 Configuration | config | ✅ | shape/defaults of llm_config.json (keys, provider routing, pricing, LLM flags) |
+| `stock_config.py` | 1 Configuration | config | ✅ | traded universe (stock_universe.json), candidate pool, sector buckets, crypto lists |
+| `strategy_config.py` | 1 Configuration | config | ✅ | single source of truth for policy dicts, sizing constants and ~41 behaviour flags |
+| `types_mod.py` | 1 Configuration | types | ✅ | shared dataclasses (MacroRegime, position/decision records) for the loops |
+| `basis_archive.py` | 2 Data & harvest | library+CLI | ✅ | spot-perp basis archive (funding_archive clone) — DORMANT, unwired |
+| `data_sources.py` | 2 Data & harvest | library | ✅ | multi-source (Alpaca > yfinance > CryptoCompare) fallback/merge for the harvest |
+| `data_utils.py` | 2 Data & harvest | library | ✅ | training-store I/O (parquet-first, atomic), raw sidecar, merge/gap guards |
+| `funding_archive.py` | 2 Data & harvest | library+CLI | ✅ | Binance monthly perp funding archive -> Funding_* features + live z baseline |
+| `market_data.py` | 2 Data & harvest | library | ✅ | Alpaca/yfinance bar fetch, forming-bar drop, daily-bars cache, live ATR |
+| `oi_archive.py` | 2 Data & harvest | library+CLI | ✅ | Binance OI/top-trader/taker archive + OKX live serving |
+| `scripts/harvest_crypto_data.py` | 2 Data & harvest | entry-point | ❌ | build training_data.{parquet,csv}: 6 coins x hourly OHLCV + features + labels |
+| `scripts/harvest_stock_data.py` | 2 Data & harvest | entry-point | ❌ | build stock_training_data.*: universe+pool, EDGE spreads, as-of masks, panel ranks, labels |
+| `short_flow.py` | 2 Data & harvest | library+CLI | ✅ | FINRA daily short-volume archive -> SVR features (PIT-lagged) |
+| `cost_regime.py` | 3 Features & signals | library | ✅ | harvest-side META features: PIT VIX regime + Amihud ILLIQ (flag-gated) |
+| `funding.py` | 3 Features & signals | library | ✅ | live OKX perp funding -> feature values + size tilt; funding_history.json |
+| `indicator_leadlag.py` | 3 Features & signals | CLI+library | ✅ | leading/lagging IC diagnostic + redundancy clusters (measurement-only) |
+| `indicators.py` | 3 Features & signals | kernel | ⚠ | ONE implementation of every TA/session/daily feature for harvest AND live (numba/pure dispatch) |
+| `panel_ranks.py` | 3 Features & signals | library | ✅ | cross-sectional rank features + the dv30 membership mask shared by harvest and live |
+| `squeeze_features.py` | 3 Features & signals | kernel | ✅ | funding x OI interaction features — DORMANT, not wired into harvest |
+| `borrow_proxy.py` | 4 Labels, exits & costs | library | ✅ | likely-shortable universe filter from market cap — offline only |
+| `fees.py` | 4 Labels, exits & costs | kernel | ✅ | canonical round-trip cost + admission floor (MIN_EDGE_MULTIPLE ladder) |
+| `liquidity.py` | 4 Labels, exits & costs | kernel | ✅ | EDGE per-name effective spread, vectorized per-bar cost, market impact |
+| `policy_exits.py` | 4 Labels, exits & costs | kernel | ⚠ | the exit-stack walk shared by labels, backtest, meta replay, decision_report (NOT live) |
+| `short_cost.py` | 4 Labels, exits & costs | library | ✅ | regime-dated short-side cost model — offline only, tests-only importer |
+| `blend_fit.py` | 5 Models & training | kernel | ✅ | OOF stacked blend-weight fit + H1/H2 repairs; owns DEFAULT_LSTM_WEIGHT |
+| `calibration.py` | 5 Models & training | kernel | ✅ | leak-free purged cross-fit calibration for the meta gate + Brier/ECE |
+| `model_lgb.py` | 5 Models & training | library | ⚠ | LightGBM leg: flatten/train/save/load + serving blend arithmetic |
+| `model_v2.py` | 5 Models & training | library | ❌ | RegressionLSTM (LSTM + MHA) architecture |
+| `objective_utils.py` | 5 Models & training | kernel | ✅ | pure hypersearch objective/gate math (hold walk, thresholds, embargo, rank-IC) |
+| `retrain_ledger.py` | 5 Models & training | library | ⚠ | FR-08 retrain-gain ledger: paired incumbent-vs-fresh scores appended to adaptive state |
+| `sample_weights.py` | 5 Models & training | kernel | ⚠ | AFML average-uniqueness weights + three effective-n estimators |
+| `scripts/hypersearch_v2.py` | 5 Models & training | entry-point | ❌ | Optuna TPE trainer/certifier: purged walk-forward, holdout DSR gate, atomic artifact save |
+| `validation.py` | 5 Models & training | kernel | ✅ | Deflated Sharpe (DSR_MIN), PBO/CSCV, MinTRL, bootstrap p-values |
+| `backtest.py` | 6 Promotion & serving | entry-point+library | ⚠ | event-driven policy replay net of costs; weekly --gate with .prev rollback; stage-0 dump; fee sweep |
+| `monitor_drift.py` | 6 Promotion & serving | CLI+library | ✅ | PSI/CUSUM prediction drift -> retrain_requested.flag |
+| `predict_now.py` | 6 Promotion & serving | library+entry | ❌ | live prediction engine: artifact hot-load, feature injection, LSTM+LGB blend, q10 veto |
+| `prediction_cache.py` | 6 Promotion & serving | kernel | ✅ | bar-keyed prediction memo (PREDICTION_CACHE_ENABLED) |
+| `serving_cache.py` | 6 Promotion & serving | kernel | ✅ | mtime-keyed lazy loader for predict_now booster caches (untracked R2-C) |
+| `shadow.py` | 6 Promotion & serving | library | ⚠ | champion/challenger shadow scoring + DM-HLN promotion on live evidence |
+| `base_loop.py` | 7 Live loops | library | ❌ | Template-Method trading loop: sizing, gates, stops, journaling shared by both books |
+| `crypto_loop.py` | 7 Live loops | entry-point | ❌ | 24/7 crypto book subclass (maker entries, funding tilt) |
+| `run_bots.py` | 7 Live loops | entry-point | ✅ | both loops as threads in ONE process + ops thread |
+| `run_pipeline.py` | 7 Live loops | entry-point | ⚠ | orchestrator: harvest -> train -> gate -> bots -> weekly retrain (subprocess phases) |
+| `stock_loop.py` | 7 Live loops | entry-point | ❌ | RTH stock book subclass (entry windows, EOD flatten, overnight sleeve, panel ranks) |
+| `trading_utils.py` | 7 Live loops | library | ❌ | get_api() broker constructor, REST timeouts, model-manifest helpers, Kelly stats |
+| `edgar_events.py` | 8 Gates | library+CLI | ✅ | SEC EDGAR 8-K / M&A entry veto (fail-open) |
+| `events_calendar.py` | 8 Gates | library | ⚠ | Finnhub earnings calendar: overnight-hold block, post-print tilt |
+| `llm_analyst.py` | 8 Gates | library+entry | ✅ | batched schema-enforced LLM conviction score s (veto / 2-strike liquidation / tilt) |
+| `macro_calendar.py` | 8 Gates | config+library | ✅ | FOMC/CPI stand-down windows for new entries |
+| `macro_indicators.py` | 8 Gates | library | ✅ | VIX / FRED stress / stablecoin peg / SPY trend -> MacroRegime |
+| `meta_label.py` | 8 Gates | library+entry | ⚠ | meta-labeling: secondary LightGBM veto/size gate trained by kernel replay |
+| `novelty.py` | 8 Gates | library | ✅ | headline shingle de-dup so reprints do not re-trigger sentiment/LLM |
+| `sentiment.py` | 8 Gates | library | ⚠ | live news + Fear&Greed -> bounded sentiment size multiplier (never vetoes) |
+| `alpaca_compat.py` | 9 Execution & broker | library | ⚠ | alpaca-py adapter exposing the legacy alpaca-trade-api REST surface |
+| `execution_policy.py` | 9 Execution & broker | library | ✅ | table-driven entry-tactic chooser — STAGED, no production caller |
+| `order_stream.py` | 9 Execution & broker | library | ⚠ | optional alpaca-py trade_updates websocket cache (TRADER_ORDER_STREAM) |
+| `order_utils.py` | 9 Execution & broker | library | ✅ | order lifecycle kernel: quotes, limit pricing, maker ladder, fills, flatten, rebuild |
+| `bet_sizing.py` | 10 Risk & sizing | kernel | ✅ | AFML / edge-Kelly bet sizing — DORMANT (EDGE_KELLY_ENABLED) |
+| `crypto_trend.py` | 10 Risk & sizing | kernel | ✅ | BTC 200h-SMA TSMOM risk-off scalar — DORMANT |
+| `drawdown.py` | 10 Risk & sizing | kernel | ✅ | account drawdown de-leveraging ladder + persisted high-water mark |
+| `portfolio.py` | 10 Risk & sizing | kernel+library | ⚠ | correlation gate/haircut, ENB book-risk kernels, book-vol de-risk scalar |
+| `regime_detector.py` | 10 Risk & sizing | library | ⚠ | Gaussian-HMM regime -> sizing multiplier (hmmlearn undeclared) |
+| `risk_budget.py` | 10 Risk & sizing | kernel+library | ✅ | cross-book account stop-risk cap (measurement) + two-book simulator |
+| `volatility.py` | 10 Risk & sizing | library | ⚠ | HAR-RV / GARCH sigma for vol-targeted sizing + BTC-RV regime state |
+| `beta_ledger.py` | 11 Journals & measurement | CLI+library | ✅ | realized beta ledger (lagged/HAC/up-down/conditional betas) |
+| `decision_report.py` | 11 Journals & measurement | CLI+library | ⚠ | gate attribution + conviction calibration via kernel counterfactual replay |
+| `execution_report.py` | 11 Journals & measurement | CLI | ✅ | implementation-shortfall report from journaled fills |
+| `ic_diagnostic.py` | 11 Journals & measurement | kernel | ✅ | per-name rank-IC universe-promotion gate |
+| `journal_stats.py` | 11 Journals & measurement | library | ✅ | stdlib-only trade pairing/stats + EOD digest for GUI and notify |
+| `rank_gradient.py` | 11 Journals & measurement | kernel | ✅ | rank-1-3 vs rank-6-7 net-return gate for concentration/edge-Kelly |
+| `scripts/crypto_spread_census.py` | 11 Journals & measurement | script | ⚠ | Alpaca crypto quote-spread census -> crypto_spread_census.json |
+| `scripts/ic_by_name.py` | 11 Journals & measurement | script | ✅ | per-name IC report over the stage-0 dump |
+| `scripts/rank_gradient_report.py` | 11 Journals & measurement | script | ✅ | rank-gradient Stage-0 gate harness (offline + live) |
+| `scripts/reliability_report.py` | 11 Journals & measurement | script | ✅ | meta-calibration Brier/ECE before/after verdict |
+| `scripts/sizing_cofire_report.py` | 11 Journals & measurement | script | ✅ | de-risk multiplier co-fire/saturation report (DERISK_STACK_V2 evidence) |
+| `scripts/wave6_stage0.py` | 11 Journals & measurement | script | ✅ | label concurrency / effective-n measurement per book |
+| `stage0_preds.py` | 11 Journals & measurement | kernel | ✅ | stage-0 prediction dump schema + hourly MTM equity (measurement-only) |
+| `trade_journal.py` | 11 Journals & measurement | library | ✅ | append-only JSONL decision journal (journals/YYYY-MM-DD.jsonl) |
+| `trade_memory.py` | 11 Journals & measurement | library | ✅ | past-trade lessons store injected into LLM prompts + CUSUM outcomes |
+| `fundamentals.py` | 12 LLM layer | library | ✅ | yfinance/FMP/EDGAR fundamentals text block for the LLM prompt |
+| `learned_lexicon.py` | 12 LLM layer | kernel | ✅ | offline supervised lexicon induction — DARK artifact |
+| `llm_client.py` | 12 LLM layer | library | ✅ | provider-agnostic LLM transport (Gemini/Anthropic/OpenAI), routing, $-cap, rate limits |
+| `llm_eval.py` | 12 LLM layer | CLI+library | ✅ | does s add signal beyond pred? echo-gap / b2 regression scorecard |
+| `scripts/llm_qualify.py` | 12 LLM layer | script | ✅ | free-LLM qualification harness for the analyst role |
+| `scripts/prompt_ab.py` | 12 LLM layer | script | ✅ | offline prompt A/B adjudicator using llm_eval statistics |
+| `scripts/train_lexicon.py` | 12 LLM layer | script | ✅ | thin CLI over learned_lexicon |
+| `sentiment_history.py` | 12 LLM layer | library+entry | ⚠ | SQLite historical sentiment store, harvest feature source, Batch-API backfill worker |
+| `chart_core.py` | 13 GUI & charts | kernel | ✅ | all chart/panel math for gui.py (numpy + stdlib only) |
+| `design_tokens.py` | 13 GUI & charts | config | ✅ | semantic colour/type/space tokens for the GUI |
+| `gui.py` | 13 GUI & charts | entry-point | ❌ | PySide6 operator console: 8 tabs, 12 themes, file/subprocess control channel |
+| `tax_lots.py` | 13 GUI & charts | kernel | ✅ | MinTax lot matching extracted from gui.py |
+| `gpu_lock.py` | 14 Ops & Jetson | library | ✅ | .gpu.lock mutex so training and bots never share CUDA |
+| `hw_monitor.py` | 14 Ops & Jetson | library+entry | ⚠ | Jetson GPU temp / RAM / thermal readers |
+| `log_config.py` | 14 Ops & Jetson | library | ✅ | rotating-file logger factory (trader.log) |
+| `notify.py` | 14 Ops & Jetson | library | ✅ | Telegram/webhook/healthcheck notifications; halt + flatten flags |
+| `scripts/connection_test.py` | 14 Ops & Jetson | script | ❌ | Alpaca credential/account smoke test |
+| `gap_audit.py` | 15 Research kernels | CLI+library | ✅ | overnight forfeited-drift + gap-through audit |
+| `horizon_transfer.py` | 15 Research kernels | kernel | ✅ | horizon-transfer curves vs the IID null (untracked R2-C) |
+| `meta_curve.py` | 15 Research kernels | kernel | ✅ | meta-label learning-curve math (honest sample floor) |
+| `naive_baseline.py` | 15 Research kernels | kernel | ✅ | Nagel zero-fit EWMA-momentum/vol baseline (untracked R2-C) |
+| `options_overlay.py` | 15 Research kernels | CLI+library | ✅ | BSM overnight-vertical friction pricer — self-gates NO-GO |
+| `portfolio_backtest.py` | 15 Research kernels | kernel | ✅ | cross-sectional admission-policy A/B engine (top-K vs conviction-gated) |
+| `scripts/cscv_audit.py` | 15 Research kernels | script | ✅ | CSCV-PBO audit over per-trial OOS blocks (trainer does not record them yet) |
+| `scripts/entry_timing_probe.py` | 15 Research kernels | script | ✅ | train-vs-live label-anchor IC delta + fill-gap probe (untracked R2-C) |
+| `scripts/funding_drift_audit.py` | 15 Research kernels | script | ✅ | Funding_* regime-shift audit (PSI/KS/split IC) |
+| `scripts/horizon_transfer_report.py` | 15 Research kernels | script | ✅ | horizon-transfer report over harvest labels (untracked R2-C) |
+| `scripts/meta_learning_curve.py` | 15 Research kernels | script | ⚠ | meta-labeler learning-curve harness -> meta_curve_report.json |
+| `scripts/naive_vs_blend.py` | 15 Research kernels | script | ✅ | deployed blend vs naive baseline on identical stage-0 rows (untracked R2-C) |
+| `scripts/window_ab.py` | 15 Research kernels | script | ❌ | fixed-config training-window A/B (no selection pressure; untracked R2-C) |
+| `.claude/hooks/py_compile_gate.py` | 16 Tooling | hook | ✅ | blocking PostToolUse syntax gate (compiles in memory) |
+| `.claude/skills/decision-queue/render.py` | 16 Tooling | skill | ✅ | renders the 2026-07 owner decision queue |
+
+---
+
+## 1. Configuration / single source of truth
+
+**Goal.** Every policy number, universe list and behaviour flag has exactly one declared home, read (never mutated) by both the live loops and the offline stack, so the backtester validates the policy that actually trades. **Invariants:** `strategy_config.py` is a pure leaf (fan-out 0, fan-in 21 + 32 tests — any rename is a 53-file blast radius); model-facing flags default OFF and their flag-OFF path is byte-pinned by a test; the JSON config files are gitignored except `stock_universe.json`; flag inventory lives only in `docs/FLAGS.md`.
+
+### strategy_config.py
+- config · 653 lines · ✅
+- **Goal.** The single source of truth for the exit policy dicts (`CRYPTO_POLICY`/`STOCK_POLICY`), sizing constants (`RISK_PCT_PER_TRADE`, `MAX_BOOK_RISK_PCT`, `KELLY_CAP`, `PORTFOLIO_VOL_TARGET`, `TILT_MAX`), entry windows, overnight sleeve, execution table, IOC caps, and ~41 behaviour flags whose flip criteria and evidence gates are recorded in the file's own comments. Both loops AND `backtest.py` read it — drift here means the backtest validates a different policy than trades.
+- **Key API.** `policy_for(asset_type)` (the canonical accessor), the two policy dicts, the sizing constants, `STOCK_ENTRY_WINDOWS_ET`, `IOC_CAP_BPS`, and every flag constant.
+- **Imports** none. **Imported by** `backtest`, `base_loop`, `calibration`, `crypto_loop`, `decision_report`, `events_calendar`, `execution_policy`, `gui`, `liquidity`, `meta_label`, `order_utils`, `policy_exits`, `portfolio`, `predict_now`, `run_pipeline`, `scripts/hypersearch_v2`, `scripts/meta_learning_curve`, `scripts/sizing_cofire_report`, `shadow`, `stock_loop`, `volatility` (+32 tests).
+- **Reads / Writes** nothing. **Flags** defines them all — `docs/FLAGS.md`. **Flow** config, read at every stage. **Status** LIVE.
+- **Known issues.** OWNER-decision: 17 declared-ahead constants have no production reader (`TILT_MIN`, `IOC_EXIT_CAP_BPS`, the four `EXEC_*`, the WAVE-9 block `EDGE_KELLY_ENABLED` … `TIER_A_K`) because the kernels they would gate are dormant (see §10, §15) · OBJECTIVE-fix-pending: the `GATE_TARGETS_CHALLENGER` comment calls the `{slot}_policy_gate.json` consumer a "future shadow.py change" — `shadow._gate_preflight` exists and is consulted · OBJECTIVE-fix-pending: the `HYPERSEARCH_V3` comment block cites `predict_now.py:405` for the `lstm_weight` read (it is at `predict_now.py:470-471` as of 2026-09-08) and the `LGB_REFIT_FULL` block claims `scripts/reliability_report.py` verifies q10 coverage — no q10-coverage tool exists · OWNER-decision: policy-shaped constants that live outside this file by design (`fees.py` fee table, `validation.DSR_MIN`, `meta_label.META_VETO_PROB`/`HOLDOUT_FRACTION`, `portfolio.MAX_AVG_CORRELATION`, `risk_budget.ACCOUNT_RISK_CAP`, `shadow` window/p-values) and the unguarded duplicate literals (`CORR_SANITY_MAX` 0.85 fallback in `base_loop`/`stock_loop`, `DEFAULT_LSTM_WEIGHT` 0.6, the holdout 0.12 spelled three ways).
+
+### stock_config.py
+- config · 218 lines · ✅ (stdlib only, so the GUI env can import it)
+- **Goal.** The one declaration of which symbols exist and how they cluster: the traded universe (persisted in the committed `stock_universe.json`, GUI-editable), the training-only candidate pool that dilutes survivorship, the sector buckets that cap factor crowding, and the crypto lists. As-of membership itself is computed in `scripts/harvest_stock_data._asof_membership_mask` from these inputs, not here.
+- **Key API.** `load_stock_universe()`, `save_stock_universe()` (atomic), `LEVERAGED_ETFS`, `SAFE_HAVEN_SYMBOLS`, `ETF_TICKERS`, `TRAINING_CANDIDATE_POOL`, `AS_OF_TOP_K`, `CANDIDATE_START`, `SECTOR_BUCKETS`, `BUCKET_CAP_FRACTION`, `CRYPTO_SYMBOLS`, `CRYPTO_POOL`.
+- **Imports** none. **Imported by** `base_loop`, `borrow_proxy`, `crypto_loop`, `gui`, `indicators`, `llm_analyst`, `panel_ranks`, `scripts/crypto_spread_census`, `scripts/harvest_stock_data`, `sentiment_history`, `short_flow`, `stock_loop` (+6 tests).
+- **Reads / Writes** `stock_universe.json` (+`.tmp`). **Flags** `TRADABLE_POOL_ENABLED` + `AS_OF_TRADABLE_TOP_K`/`TRADABLE_K_ENTER`/`TRADABLE_K_HOLD` — declared, zero readers (their consumer `panel_ranks.live_tradable_members` is test-only). **Flow** config. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: the `CRYPTO_POOL` comment says "DECLARATION ONLY, nothing reads it yet" — it is read by `gui.py`, `scripts/crypto_spread_census.py` and named in `liquidity.py` (the rest of the comment — the crypto harvest hardcodes its own 6-coin list — is accurate) · OWNER-decision: `_DEFAULTS` (the fallback universe) has drifted from the JSON (JSON adds AVGO/COST/PRME, `_DEFAULTS` keeps RKLB), and `COST` has no `SECTOR_BUCKETS` entry so it is uncapped by the crowding cap.
+
+### indicator_config.py
+- config · 284 lines · ✅
+- **Goal.** Name the feature subsets ("presets": `minimal`, `standard` (code default), `stationary`, `stationary_lean`, `full`) training may use, and persist the chosen one. The harvest always writes ALL columns; the preset only filters `scripts/hypersearch_v2.load_data`'s feature list.
+- **Key API.** `PRESETS`, `load_indicator_config()`, `save_indicator_config()` (atomic), `get_preset_name()`, `get_preset_features(name)`, `get_all_preset_info()`, `HURST_ON_RETURNS`, `CRYPTO_ONLY_COLS`, `STOCK_ONLY_COLS`.
+- **Imports** none. **Imported by** `gui`, `indicator_leadlag`, `indicators`, `scripts/hypersearch_v2` (+4 tests).
+- **Reads / Writes** `indicator_config.json` (gitignored). **Flags** `HURST_ON_RETURNS` (model-facing; flip only with harvest+retrain — gotcha #2) and the preset mode switch. **Flow** train (feature selection), ops (GUI picker). **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: the docstring says cross-asset columns are "auto-included via asset-type filtering in hypersearch" — no such filter exists; `hypersearch_v2.load_data` intersects the preset with the columns present, and `CRYPTO_ONLY_COLS`/`STOCK_ONLY_COLS` are consumed only by `gui.py` display text · OWNER-decision: `run_pipeline._build_training_phases` hardcodes `--preset stationary`, so the persisted preset (and the GUI picker) has no effect on production training; the R2C-04 half of campaign finding L8 fixed only `hypersearch_v2`'s CLI default.
+
+### adaptive_config.py
+- config + library · 578 lines · ✅
+- **Goal.** Keep the weekly hyperparameter search honest across months: detect a winner sitting on a search-space edge and widen it, alternate explore/refine on stagnation, ratchet `best_score` (noisy Thresholdout-shaped ratchet under `PROMOTION_GATE_V2`), and — since 2026-08 — account for accumulated selection pressure (`cum_trials`, `trial_history`) so deleting an Optuna study cannot launder the trials already spent on an overlapping holdout.
+- **Key API.** `load_adaptive_state`/`save_adaptive_state`, `record_trials`, `record_db_deletion`, `overlap_weighted_trials`, `noisy_ratchet`, `detect_edges`, `expand_search_space`, `decide_mode`, `get_trial_count`, `get_search_space_for_trial`, `update_after_search`, `get_max_forward_bars`, `get_forward_bars_list`; constants `DEFAULT_SEARCH_SPACE`, `TRIAL_COUNTS`, `HARD_LIMITS`.
+- **Imports** none. **Imported by** `backtest`, `retrain_ledger`, `run_pipeline`, `scripts/harvest_crypto_data`, `scripts/harvest_stock_data`, `scripts/hypersearch_v2`, `scripts/naive_vs_blend`, `scripts/window_ab` (+6 tests).
+- **Reads / Writes** `adaptive_state_{crypto,stock}.json` (+ PID-unique `.tmp`; corrupt file RAISES — fail closed); reads the Optuna study DB trial count; DELETES `{prefix}v2_study.db` (+`-wal/-shm/-journal`) after a categorical expansion. **Flags** none (module constants). **Flow** train (search governance) + measure (selection-pressure ledger; the FR-08 `retrain_ledger` key lives in the same file). **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending (residue): `tests/test_c26_Q1.py` calls `record_trials('testq1', …)` against the real `BASE_DIR`, leaving `adaptive_state_testq1.json` in the repo root (archived per `archive/README.md`; the durable fix is a test-side monkeypatch — OWNER-decision) · OWNER-decision: `cum_holdout_gates` is seeded but never incremented anywhere; `overlap_weighted_trials(holdout_span_days=43.8)` hardcodes 0.12·365 separately from `meta_label.HOLDOUT_FRACTION` and hypersearch's.
+
+### llm_config.py
+- config · 340 lines · ✅
+- **Goal.** Own the shape and defaults of the gitignored `llm_config.json` — API keys, provider selection mode, per-role model overrides, pricing corrections and the LLM-behaviour flags — so a price/provider change is a data edit and the GUI settings tab and `llm_client` share one contract.
+- **Key API.** `load_llm_config()` (migrates legacy keys, fills only missing keys, re-saves on migration), `save_llm_config()` (atomic), `LLM_CONFIG_FILE`, `_DEFAULTS`, `FREE_CANDIDATE_PRESETS` (registry metadata read only by `scripts/llm_qualify.py`).
+- **Imports** none. **Imported by** `base_loop`, `fundamentals`, `gui`, `llm_analyst`, `llm_client`, `scripts/llm_qualify`, `sentiment_history`, `trade_journal` (+5 tests).
+- **Reads / Writes** `llm_config.json` (+`.tmp`). **Flags** defines the JSON-key flags (`enabled`, `selection_mode`, `rich_context_enabled`, `replay_capture_enabled`, `advisor_v2_enabled`, `analyst_dedup_ttl_sec`, `journal_enabled`, `anthropic_cache_system_ttl`, `tier_override` …) — `docs/FLAGS.md`. **Flow** ops/config for the serve-time LLM gate and every LLM measurement CLI. **Status** LIVE.
+- **Known issues.** none objective. Note: there is no `GEMINI_API_KEY` env var anywhere — the Gemini key comes only from this JSON; `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env fallbacks live in `llm_client`.
+
+### types_mod.py
+- types · 58 lines · ✅ (stdlib dataclasses)
+- **Goal.** Typed, slotted records for the loops instead of raw dicts: `Position` (qty, entry, HWM, stop id, trailing flag, entry ATR, TP price), `Quote` (bid/ask/spread/mid/spread_pct — the shape `order_utils.get_quote` documents as canonical), and `MacroRegime` (stress, VIX, `cape` kept for fixture compat and always `None` since the pseudo-CAPE removal, sizing/stop multipliers, stablecoin alert) with the VIX>35 halt and VIX>25 risky-entry properties the loops consult.
+- **Key API.** `Position`, `Quote`, `MacroRegime` (`is_defensive`, `should_halt_stocks`, `should_block_risky_entries`).
+- **Imports** none. **Imported by** `base_loop` (eager), `macro_indicators` (lazy, `get_macro_regime`), `stock_loop` (lazy) (+8 tests). **Reads / Writes** nothing. **Flags** none. **Flow** serve. **Status** LIVE.
+- **Known issues.** none.
+
+## 2. Data sources, market data & harvest
+
+**Goal.** Turn venue bars plus free alternative-data archives (Binance funding/OI, FINRA short volume, Finnhub news) into the two training stores `training_data.*` (crypto) and `stock_training_data.*` (stock), and serve the *same* bar shape live. **Invariants:** the fetchers differ (harvest = `data_sources.fetch_with_fallback`, live = `market_data.fetch_*_bars_alpaca`) but the feature functions are shared (`indicators`), which is the train/serve-parity contract; `adjustment='all'` on both paths; the forming bar is dropped live (`market_data.drop_forming_bar`); archives are PIT (`reindex(method='ffill')`, publication lags); the store is written atomically by `data_utils` only. Everything here is Jetson-run; parquet I/O needs `pyarrow` (absent on the Mac).
+
+### market_data.py
+- library · 705 lines · ✅ (Alpaca-touching functions need a live `api`)
+- **Goal.** The single place bars enter the system: short-TTL cached live hourly bars for both books (one REST call per cycle serves prediction + sizing + ATR), chunked historical fetch for the harvest, a persisted daily-bar cache shared by two default-OFF model-facing features, and `get_live_atr` (the stop-distance input). Separate from `data_sources` because that module owns multi-source merging while this one owns the Alpaca protocol + caching.
+- **Key API.** `fetch_bars_alpaca`, `fetch_stock_bars_alpaca`, `fetch_spy_bars_alpaca` (`closed_only=`), `fetch_bars_yfinance`, `drop_forming_bar`, `fetch_historical_bars` (harvest, 6-month chunks), `get_live_atr`, `refresh_daily_bars`/`load_daily_bars`/`daily_bars_fetched_at`, `flatten_yfinance_columns`; flag readers `closed_bars_v2_enabled()`, `daily_feature_restore_enabled()`, `har_daily_feed_enabled()` (read env at call time).
+- **Imports** `indicators`. **Imported by** `base_loop`, `crypto_loop`, `data_sources`, `decision_report`, `panel_ranks`, `portfolio`, `predict_now`, `scripts/harvest_crypto_data`, `scripts/harvest_stock_data`, `shadow`, `stock_loop`, `volatility` (+15 tests; fan-in #4).
+- **Reads / Writes** `daily_bars_cache.json` (+`.tmp`); CryptoCompare endpoint in the dead `fetch_crypto_volume`. **Flags** `TRADER_CLOSED_BARS_V2`, `TRADER_DAILY_FEATURE_RESTORE`, `TRADER_HAR_DAILY_FEED`. **Flow** harvest + serve. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending (dead code): `market_data.fetch_crypto_volume` has no production caller (`tests/test_review_b01.py` asserts its absence from `crypto_loop`) and calls the keyless CryptoCompare endpoint `data_sources` documents as HTTP-401 since ~2026-07 — move-not-delete candidate · OWNER-decision: `_filter_bad_prints` runs on live frames only, never on `fetch_historical_bars` output.
+
+### data_sources.py
+- library · 244 lines · ✅
+- **Goal.** One call that returns the best obtainable hourly history for a ticker — Alpaca (the venue we trade) merged `keep='first'` with yfinance and CryptoCompare in priority order for crypto; for stocks yfinance is used only when Alpaca returned nothing (the two grids are `:30`- vs `:00`-aligned). Stamps a `Src` provenance column the harvests drop before feature computation.
+- **Key API.** `fetch_with_fallback(ticker, start_date, api, asset_type)`, `fetch_cryptocompare_hourly` (inert: 401), `_yf_window_slice_enabled()`.
+- **Imports** `market_data` (lazy). **Imported by** `scripts/harvest_crypto_data`, `scripts/harvest_stock_data` (+3 tests).
+- **Reads / Writes** network only. **Flags** `TRADER_YF_WINDOW_SLICE` (fixes the `period='max'`-ignores-`start_date` hazard). **Flow** harvest step 1. **Status** LIVE.
+- **Known issues.** OWNER-decision: the in-code hazard block records that the cross-run stock grid-interleaving hazard (after a full Alpaca outage) has no fix · MEASUREMENT-pending: the inert CryptoCompare call still costs one request + sleep per crypto ticker per harvest.
+
+### data_utils.py
+- library · 454 lines · ✅ (parquet paths need `pyarrow`; two `tests/test_data_utils.py` ids are in the Mac baseline for that reason)
+- **Goal.** One owner of the shape and atomicity of the training stores so harvest, hypersearch, backtest and the research scripts never disagree about where the data is or how it is written; plus the raw-OHLCV sidecar (D39) and the merge/gap guard kernels.
+- **Key API.** `get_data_path(prefix)`, `load_training_data(prefix, columns=None)`, `save_training_data(df, prefix)`, `append_ticker_data`, `migrate_csv_to_parquet`, `validate_training_data`; sidecar `raw_sidecar_enabled()`, `raw_sidecar_path`, `load_raw_ohlcv`/`save_raw_ohlcv`/`merge_raw_ohlcv`; guards `overlap_close_divergence` (+`OVERLAP_DIVERGENCE_MAX`), `find_interior_gaps`; `_atomic_to_disk`.
+- **Imports** none. **Imported by** `backtest`, `meta_label`, `run_pipeline`, both harvests, `scripts/hypersearch_v2`, `scripts/{entry_timing_probe, funding_drift_audit, horizon_transfer_report, meta_learning_curve, naive_vs_blend, wave6_stage0, window_ab}` (+5 tests; fan-in #3).
+- **Reads / Writes** `training_data.{parquet,csv}`, `stock_training_data.{parquet,csv}`, `raw_ohlcv.parquet`, `stock_raw_ohlcv.parquet` (+`.tmp` siblings). **Flags** `TRADER_RAW_SIDECAR`. **Flow** harvest → store → train/backtest. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending (dead code): `data_utils.latest_raw_ts` has no production caller (tests only) · OWNER-decision: the B15 merge guard is wired into the stock harvest only; the crypto harvest documents the omission.
+
+### funding_archive.py
+- library + CLI · 235 lines · ✅ (parquet write needs `pyarrow`)
+- **Goal.** Point-in-time historical 8 h perp funding rates from `data.binance.vision` monthly zips (free, keyless, not geo-blocked) — the training features AND the live z-score baseline, so train/serve distributions match from day one. Idempotent by `(symbol, month)`; pre-listing months floored out.
+- **Key API.** `sync(symbols, start)`, `load_archive()`, `get_funding_series(alpaca_symbol)`, `funding_features_for_index(alpaca_symbol, index)` → `Funding_Rate_Ann`, `Funding_Z` (90-print trailing z, `sd==0 → 0`), `Funding_Chg_24h`; maps `BINANCE_SYMBOLS`, `LISTING_MONTH`.
+- **Imports** none. **Imported by** `basis_archive`, `funding`, `oi_archive`, `scripts/harvest_crypto_data` (+4 tests).
+- **Reads / Writes** `funding_archive.parquet` (+`.tmp`). **Flags** none. **Flow** harvest (weekly `sync()`) + serve (z baseline). **Status** LIVE.
+- **Known issues.** none objective; the tail can be ~5 weeks stale by design (complete months only, weekly sync) — `funding.py` stamps and warns.
+
+### oi_archive.py
+- library + CLI · 557 lines · ✅ (parquet needs `pyarrow`; six `tests/test_oi_archive.py` ids are in the Mac baseline)
+- **Goal.** Open-interest / top-trader / taker-flow positioning: training from Binance daily metrics zips (hourly-resampled), live from OKX (Binance live is HTTP-451 from US IPs) against a venue-local rolling history.
+- **Key API.** `sync(symbols, start, max_files)`, `load_archive()`, `get_oi_series`, `oi_features_for_index`, `ls_features_for_index`, `taker_features_for_index`; live `live_oi_features`, `live_ls_features`, `live_taker_features`.
+- **Imports** `funding` (`OKX_INSTRUMENTS`), `funding_archive` (`BINANCE_SYMBOLS`), `log_config`. **Imported by** `predict_now`, `scripts/harvest_crypto_data` (+3 tests).
+- **Reads / Writes** `oi_archive.parquet` (corrupt file preserved as `.corrupt`), `oi_history.json` (lock-guarded live samples). **Flags** none. **Flow** harvest + serve. **Status** LIVE.
+- **Known issues.** OWNER-decision (self-documented, in the module-review queue): live OKX `oiCcy` (coin units) vs training Binance `sum_open_interest_value` (USD) — dynamics comparable, quantities differ; and `live_ls_features` uses OKX all-account L/S while `TT_LS_Z` trains on Binance top-trader positions · OBJECTIVE-fix-pending: docstring says metrics exist "since ~2021-12" while `OI_START='2023-01-01'` is the sync floor.
+
+### basis_archive.py
+- library + CLI · 206 lines · ✅ (parquet needs `pyarrow`)
+- **Goal.** The spot-perp basis (premium index) — the same carry/crash signal as funding but before its 8 h smoothing — as a faithful clone of `funding_archive` pointed at Binance `premiumIndexKlines`.
+- **Key API.** `sync`, `load_archive`, `get_basis_series`, `basis_features_for_index` → `Basis_Bps`, `Basis_Z`, `Basis_Chg_24h`, `Basis_minus_Funding`.
+- **Imports** `funding_archive` (lazy). **Imported by** tests only (`test_basis_archive`, `test_grp_deriv`).
+- **Reads / Writes** `basis_archive.parquet`. **Flags** none. **Flow** harvest (intended). **Status** DORMANT — no harvest calls it and `Basis_*` is in no preset (KILL_LIST lists basis features as commonly-confused *survivors*: the kernel shipped, the wiring did not).
+- **Known issues.** OBJECTIVE-fix-pending: `basis_archive.parquet` is NOT gitignored, unlike its three sibling archives (`.gitignore` addition is conductor-owned).
+
+### short_flow.py
+- library + CLI · 216 lines · ✅ (parquet needs `pyarrow`; four `tests/test_wave4.py::TestShortFlow` ids are in the Mac baseline)
+- **Goal.** FINRA daily per-name short VOLUME (free, published the same evening) as a long-only sell-side-pressure feature; PIT: training maps day-D values onto day-D+1 bars (`svr.shift(1)`), live serves the latest completed day.
+- **Key API.** `sync(days_back, max_files)`, `load_archive`, `svr_series(symbol)`, `svr_features_for_index(symbol, index)`, `live_svr_features(symbol)`.
+- **Imports** `log_config`, `stock_config` (lazy). **Imported by** `predict_now`, `scripts/harvest_stock_data` (+3 tests).
+- **Reads / Writes** `short_flow.parquet`; `cdn.finra.org` daily files. **Flags** none. **Flow** harvest (weekly newest-first `sync()`, capped so history back-fills) + serve. **Status** LIVE.
+- **Known issues.** MEASUREMENT-pending: the live value can be ~a week stale (sync only at harvest) while training assumes a 1-day lag — the module stamps age and warns once per symbol.
+
+### scripts/harvest_crypto_data.py
+- entry-point · 405 lines · ❌ (eager `dotenv`; also `pyarrow`, `alpaca`)
+- **Goal.** Build the crypto training store: 6 coins (`CRYPTO_TICKERS` — hardcoded, NOT `stock_config.CRYPTO_POOL`) × hourly OHLCV from 2021-01-01, all features, funding/OI archive merges, same-day F&G sentiment, fixed-horizon `Target_Return_{fb}` and triple-barrier `TB_*` labels for `adaptive_config.get_forward_bars_list('crypto')`, with incremental fetching.
+- **Key API.** `main()`, `prepare_data(ticker, btc_close, api, existing_ohlcv, start_date, …)`, `_fill_archive_features(df)`, `ARCHIVE_FEATURES`. No argparse.
+- **Imports** `adaptive_config`, `cost_regime`, `data_sources`, `data_utils`, `funding_archive`, `indicators`, `liquidity`, `market_data`, `oi_archive`, `policy_exits`, `sentiment_history`, `trading_utils`. **Imported by** tests only (+3); spawned by `run_pipeline.py`.
+- **Reads / Writes** reads `.env`, the store, `raw_ohlcv.parquet`, both archives, `sentiment_cache.db`; writes `training_data.{parquet,csv}` (+ `raw_ohlcv.parquet` under the sidecar flag); exits nonzero on total fetch/save failure so `run_pipeline` retries/notifies. **Flags** `TRADER_RAW_SIDECAR`, `TRADER_YF_WINDOW_SLICE`, `TRADER_CRYPTO_SPREAD_STAMP`, `TRADER_COST_REGIME_FEATURES` (all model-facing; runbooks in the module docstring). **Flow** harvest. **Status** LIVE.
+- **Known issues.** OWNER-decision: stamps TB labels then `df.dropna()` with NO `_tb_stamp_index` L7 span guard (the stock twin has one) — `TB_Bars` positional spans are valid only for prefix/suffix removals · OWNER-decision: the `dropna()` erodes the ~100-bar warmup head on every incremental run (the `TRADER_RAW_SIDECAR` runbook exists to fix this) · never calls `panel_ranks.add_crypto_panel_ranks` (so no crypto `CS_*` columns) — consistent with `CRYPTO_CS_RANK_ENABLED` being dormant.
+
+### scripts/harvest_stock_data.py
+- entry-point · 577 lines · ❌ (eager `dotenv`; also `pyarrow`, `alpaca`)
+- **Goal.** Build the stock training store — universe ∪ `TRAINING_CANDIDATE_POOL` × hourly OHLCV from 2016 — with per-name EDGE spreads (`Eff_Spread_Pct`), as-of tradability (`MIN_DOLLAR_VOLUME`, `MIN_PRICE`) and per-day top-`AS_OF_TOP_K` membership masks (kills listing/liquidity/membership look-ahead), cross-sectional panel ranks, D-1-lagged sentiment, warmup fills, and both label families.
+- **Key API.** `main()`, `prepare_stock_data(...)`, `_asof_tradability_mask`, `_asof_membership_mask(df, top_k)`, `_minute_edge_overlay`, the R2C-06/L7 guards `_removals_prefix_suffix_only`, `_warn_tb_span_violation`, `_tb_membership_guard`; `STOCK_TICKERS`, `MINUTE_EDGE_DAYS`. No argparse.
+- **Imports** `adaptive_config`, `cost_regime`, `data_sources`, `data_utils`, `indicators`, `liquidity`, `market_data`, `panel_ranks`, `policy_exits`, `sentiment_history`, `short_flow`, `stock_config`, `trading_utils`. **Imported by** tests only (+6); spawned by `run_pipeline.py`.
+- **Reads / Writes** reads `.env`, the store, `stock_raw_ohlcv.parquet`, `short_flow.parquet`, `stock_universe.json`, `sentiment_cache.db` (`cached_only=True` — training sentiment changes only when the owner runs the network fetch); writes `stock_training_data.{parquet,csv}` (+ sidecar). **Flags** `TRADER_RAW_SIDECAR`, `TRADER_YF_WINDOW_SLICE`, `TRADER_STOCK_MINUTE_EDGE`, `TRADER_COST_REGIME_FEATURES`, `TRADER_MINUTE_EDGE_DAYS`. **Flow** harvest. **Status** LIVE.
+- **Known issues.** OWNER-decision (campaign L7): `TB_Bars_*` spans are stamped BEFORE `dropna()` and the as-of masks; the R2C-06 guards WARN rather than raise · OBJECTIVE-fix-pending: `MINUTE_EDGE_DAYS = int(os.getenv(...))` has no `ValueError` guard (its two sibling int-env reads do) · OWNER-decision: `_minute_edge_overlay` carries an unresolved prerequisite (SIP vs IEX minute bars) in its docstring.
+
+## 3. Features & signals
+
+**Goal.** One implementation of every model input, called identically by the harvest (offline) and `predict_now` (live), so train/serve parity is structural rather than a convention. **Invariants:** all features strictly trailing (PIT); the same `indicators.compute_*` and the same `panel_ranks.dv30` membership mask on both sides; every feature-set change is model-facing (harvest + retrain, gotcha #2); feature-family experiments ship as harvest-side columns behind `TRADER_*` flags whose OFF path returns the identical frame object. The volatility/regime *sizing* inputs live in §10; the sentiment/LLM *evidence* inputs in §8 and §12.
+
+### indicators.py
+- kernel + library · 1089 lines · ⚠ (numba optional; pure numpy/pandas fallback is the portable reference)
+- **Goal.** ONE implementation of every price/TA/session/daily-window feature with three dispatch backends per primitive (C ext > numba > pure). The harvest and `predict_now` call the same `compute_features` / `compute_stock_features`, and both import the same neutral warmup fill, which is what makes the feature contract shared instead of copied.
+- **Key API.** `compute_features(df, btc_close)` (crypto/base block), `compute_stock_features(df, spy_close, symbol)` (base + session + daily-window), TA primitives `compute_rsi/macd/atr/bbands/stoch/obv/roc/rolling_percentile/linear_slope/hurst`, stock primitives `compute_vwap/gap/relative_strength/normalized_atr`, `WARMUP_FEATURES_ZERO`/`WARMUP_FEATURES_HALF`/`fill_warmup_features`, D11 `DAILY_RESTORE_COLUMNS`/`build_daily_restore_features`/`apply_daily_restore`/`count_warmup_constant_columns`.
+- **Imports** `indicator_config` (guarded), `stock_config` (lazy). **Imported by** `market_data`, `panel_ranks`, `predict_now`, `scripts/harvest_crypto_data`, `scripts/harvest_stock_data` (+12 tests).
+- **Reads / Writes** nothing (pure; mutates the caller's frame in place). **Flags** `indicator_config.HURST_ON_RETURNS` (model-facing). **Flow** features (the shared node). **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: `import indicators_c` is attempted but no `indicators_c` source/build/requirements entry exists anywhere in the repo — the `_HAS_C` branch of every public function is permanently dead in-repo (unverified whether the Jetson has a local extension) · OBJECTIVE (documented, pinned by `tests/test_indicators_parity.py`): `compute_rolling_percentile`/`compute_stoch` pure fallbacks diverge from the numba kernels on NaN-bearing windows · OWNER-decision: `build_daily_restore_features` rebinds a module-global function under a lock — fragile.
+
+### panel_ranks.py
+- library · 361 lines · ✅ (harvest-side half); `compute_live_panel_ranks` needs Alpaca + `market_data`
+- **Goal.** Cross-sectional rank features (per-period signed rank to [-1,1] + dispersion/breadth context) so a pooled model learns RELATIVE strength, with ONE `dv30()` dollar-volume mask shared by the harvest's as-of membership and the live pre-pass for population parity.
+- **Key API.** `CS_RANK_BASE_COLS`, `CS_FEATURE_COLS`, `dv30(ohlcv)`, `add_panel_ranks(df)`, `neutral_fill_cs(df)`, `compute_live_panel_ranks(api, spy_close, top_k)` (3300 s cache), `live_tradable_members(...)`; crypto `add_crypto_panel_ranks`, `compute_live_crypto_ranks`, `cs_size_tilt`.
+- **Imports** `log_config`; lazy `indicators`, `market_data`, `stock_config`. **Imported by** `scripts/harvest_stock_data` (`dv30`, `add_panel_ranks`, `neutral_fill_cs`), `stock_loop` (`compute_live_panel_ranks`) (+7 tests).
+- **Reads / Writes** none on disk (in-memory TTL cache). **Flags** reads `market_data.closed_bars_v2_enabled()`, `daily_feature_restore_enabled()`, `stock_config.AS_OF_TOP_K`. **Flow** features (harvest) + serve (hourly pre-pass feeding `predict_now`). **Status** LIVE (stock ranks); DORMANT (`add_crypto_panel_ranks`, `compute_live_crypto_ranks`, `cs_size_tilt`, `live_tradable_members` — no production caller; `CRYPTO_CS_RANK_ENABLED` has no reader).
+- **Known issues.** `tests/test_panel_ranks.py::TestBouncedLoser::test_detector_logic` is in the Mac baseline (lazy `import stock_loop`), not a regression.
+
+### funding.py
+- library · 267 lines · ✅ (network-gated)
+- **Goal.** Live perp funding positioning from OKX public REST (Binance live is 451 from US IPs) as (a) a bounded entry-size de-risk tilt and (b) the LIVE values of the model's `Funding_*` features, z-scored against the same Binance archive distribution training used.
+- **Key API.** `get_funding_rate(symbol)`, `live_funding_features(symbol)`, `funding_tilt(symbol)`; `OKX_INSTRUMENTS`, `CROWDED_*`/`EXTREME_*` thresholds.
+- **Imports** `log_config`, `funding_archive` (lazy). **Imported by** `crypto_loop`, `oi_archive`, `predict_now` (+3 tests).
+- **Reads / Writes** `funding_history.json` (+`.tmp`); OKX `funding-rate` endpoint. **Flags** `TRADER_FUNDING_Z_TIME_THINNING` (D28: one sample per ~7.5 h + archive-preferred baseline; OFF = ~96 samples/day, so the 270-sample window spans ~2.8 days). **Flow** serve (feature injection + size tilt). **Status** LIVE.
+- **Known issues.** OWNER-decision: with the flag OFF (production today) the crowding tilt fires off a ~3-day z baseline; the module warns once and keeps the behaviour.
+
+### cost_regime.py
+- library · 327 lines · ✅
+- **Goal.** Two FREE point-in-time cost-regime META features for the meta-learner — VIX regime (FRED `VIXCLS`, 1-day lagged) and Amihud ILLIQ — so it can discover when crossing a wide book costs more. "OPTION B only" by docstring: a feature the model may learn from; regressing realized shortfall on VIX into the cost gate (option A) is wave-6 kill-listed.
+- **Key API.** `amihud_illiq`, `parse_fred_vixcls`, `fetch_fred_vixcls` (memoized), `vix_regime_code`, `vix_features_for_index` → `{VIX_Level, VIX_Regime, VIX_Pctile}`, `stamp_cost_regime_features(df, asset_type, vix_daily)`.
+- **Imports** none. **Imported by** `scripts/harvest_crypto_data`, `scripts/harvest_stock_data` (+4 tests).
+- **Reads / Writes** FRED CSV (network). **Flags** `TRADER_COST_REGIME_FEATURES` (OFF returns the SAME `df` object — byte-identity contract). **Flow** harvest → features. **Status** STAGED (flag default OFF).
+- **Known issues.** OWNER-decision / prerequisite gap: live-serve injection parity in `predict_now` is missing (`research/campaign_2026-08/03_jetson_runbook.md`), so flipping the flag alone would create a train/serve gap.
+
+### squeeze_features.py
+- kernel · 47 lines · ✅
+- **Goal.** Give the model the funding × OI INTERACTION explicitly (extreme funding is dangerous only when open interest is large) instead of hoping trees rediscover a product from a starved panel.
+- **Key API.** `squeeze_interaction(funding_z, oi_z)` → `{Funding_x_OI, Squeeze_Setup}`; `SQUEEZE_FUNDING_Z`.
+- **Imports** none. **Imported by** tests only (`test_squeeze_features`, `test_review_b09`). **Flags** none. **Flow** features (intended for the crypto harvest). **Status** DORMANT — self-documented "wiring NOT yet done"; the harvest never imports it and the columns are in no preset (KILL_LIST lists them as survivors: kernel yes, wiring no).
+- **Known issues.** none beyond the dormancy.
+
+### indicator_leadlag.py
+- CLI + library · 361 lines · ✅ (reading a parquet input needs `pyarrow`)
+- **Goal.** Replace the "leading vs lagging indicator" argument with a measurement: per feature, predictive Spearman IC vs forward h-bar returns and reactive coupling vs past returns, overlap-adjusted (n/h), inverse-variance pooled across tickers, BH-FDR controlled; plus |Spearman| redundancy clusters and exact duplicates.
+- **Key API.** `spearman`, `bh_fdr`, `pooled_ic`, `redundancy_clusters`, `run_diagnostic`, `format_report`.
+- **Imports** `indicator_config`. **Imported by** tests only (+1); spawned by `gui.py` (Models tab report buttons).
+- **Reads / Writes** `--data` store; optional `--json`. **Flags** none (thresholds `REACTIVE_STRONG`, `CLUSTER_THRESHOLD`, `EXACT_DUP_THRESHOLD` are module constants). **Flow** measure. **Status** MEASUREMENT-ONLY.
+- **Known issues.** OBJECTIVE-fix-pending: the usage docstring (and `gui.py`'s report button, byte-pinned by `tests/test_c26_U1.py` and `tests/test_gui_contracts.py`) names `crypto_training_data.parquet`; the crypto store is `training_data.parquet` (`data_utils._FILE_STEMS`) — the GUI button is dead on a real Jetson; 4-file fix.
+
+## 4. Labels, exit kernel & cost model
+
+**Goal.** Price what a trade actually returns: one exit-stack kernel gives the triple-barrier labels, the policy backtest, the meta-label replay and the counterfactual replay identical barrier semantics, and one cost model (`fees` scalar + `liquidity` vectorized twin) is the denominator every gate shares. **Invariants:** `policy_exits.exit_walk` is called by four OFFLINE consumers and by NO live loop (pinned by `tests/test_ia4_flagged.py` — live exits are a hand-written mirror, documented overlays in `policy_exits.py` docstring); `fees.round_trip_cost_pct` is linear in `spread_pct ≥ 0` (the vectorized twin depends on it); the admission floor is `cost × MIN_EDGE_MULTIPLE (2.0)`; TB labels are GROSS and the cost is charged downstream. Two documented, test-pinned exceptions to "one cost function": `scripts/hypersearch_v2.TXN_COST_PCT` is a hard-coded copy (source-text pinned) and `liquidity.per_bar_round_trip_cost` deliberately substitutes the flat spread for NaN/inf/negative stamps where the scalar charges zero.
+
+### policy_exits.py
+- kernel · 513 lines · ⚠ (numba optional; identical Python loop as fallback)
+- **Goal.** ONE exit-stack walk — gap-aware hard stop → take-profit → HWM/trailing → signal flip → EOD → vertical — computed for an entry at EVERY bar's close, so labels == backtest == meta replay by construction. `side=+1` is the long path; `side=-1` is the offline short mirror (`_exit_walk_kernel_short`).
+- **Key API.** `exit_walk(close, high, low, open_, atr, is_eod, policy, preds, threshold, cooldown_bars, max_hold, use_signal_exit, side)` → `(exit_idx, exit_px, reason_code)`; `eod_mask_from_index(index, asset_type)`; `compute_tb_labels(df, forward_bars_list, asset_type, side)` → `TB_Ret_{fb}`/`TB_Bars_{fb}`/`TB_Reason_{fb}`; `REASON_NAMES` (0 end_of_data … 6 vertical).
+- **Imports** `strategy_config.policy_for` (lazy). **Imported by** `backtest`, `decision_report`, `meta_label`, `scripts/harvest_crypto_data`, `scripts/harvest_stock_data` (+6 tests).
+- **Reads / Writes** nothing. **Flags** none (`CRYPTO_VERTICAL_BARRIER` is implemented in the loop layer; the kernel is untouched). **Flow** harvest (labels) → train → gate → meta → measure; NOT serve. **Status** LIVE (long path); DORMANT (short mirror — built, tested, no production `side=-1` caller; not kill-listed).
+- **Known issues.** OBJECTIVE-fix-pending (doc gap): the NORMATIVE overlay list omits the trailing-distance denominator asymmetry — kernel scales the trail by ATR/entry, `base_loop._desired_stop_for` by ATR/HWM, while `stock_loop`'s native `trailing_stop` percent agrees with the kernel (live carries two conventions; whether to unify is OWNER-decision) · OBJECTIVE-fix-pending: docstring "max_hold=fb (12-48)" — the harvest reads the adaptive `forward_bars` list, so 12-48 is the default, not a bound · OWNER-decision: short labels reuse the long column names.
+
+### fees.py
+- kernel · 273 lines · ✅ (stdlib only)
+- **Goal.** ONE answer to "what does a round trip cost?" and "what edge must a trade clear?" — a cost-multiple ladder (1.0× charged to P&L, 2.0× admission floor, +1.5× execution headroom) — so the objective, backtest gate, meta replay and live entry gate cannot drift apart.
+- **Key API.** `round_trip_cost_pct(asset_type, spread_pct, maker, live)` (percent of notional; `fee_const + spread`), `required_edge_pct(..., min_edge=None → MIN_EDGE_MULTIPLE at call time)`, `crypto_entry_fee_bps(live)`, `realized_crypto_maker_share(days, min_entries)` (order-COUNT share from journals, 1 h TTL, fail-closed to `None`); constants `CRYPTO_TAKER_BPS`/`CRYPTO_MAKER_BPS`, `STOCK_REGULATORY_BPS`, `STOCK_SLIPPAGE_BPS_PER_SIDE`, `FLAT_SPREAD_PCT`, `MIN_EDGE_MULTIPLE`, `MAKER_SHARE_*`.
+- **Imports** `trade_journal.JOURNAL_DIR` (late, monkeypatchable). **Imported by** `backtest`, `decision_report`, `execution_report`, `liquidity`, `llm_analyst`, `meta_label`, `objective_utils`, `order_utils`, `short_cost` (+18 tests; fan-in #7).
+- **Reads / Writes** reads `journals/YYYY-MM-DD.jsonl` buy rows (maker share). **Flags** none. **Flow** gate (offline + live) + P&L charging. **Status** LIVE.
+- **Known issues.** OWNER-decision: NaN spread → fail-OPEN and negative spread → zero cost are left unfixed pending a ruling (the vectorized twin diverges on purpose) · OWNER-decision: `order_utils` documents a cleaner home for the notional maker-share delta as a `share=` parameter on `crypto_entry_fee_bps`.
+
+### liquidity.py
+- kernel · 599 lines · ✅ (`bidask` is installed on the Mac)
+- **Goal.** Kill the train/deploy cost asymmetry: the offline stack used a flat spread haircut while the live gate saw the quoted spread. EDGE (Ardia–Guidotti–Kroencke 2024) estimates the effective spread from OHLC alone, so the harvest stamps a per-bar PIT `Eff_Spread_Pct` on the same free bars; the vectorized cost twin and market-impact model consume it.
+- **Key API.** `edge_spread_series(ohlc_df, window=35, …)` (clipped `[SPREAD_FLOOR_PCT, SPREAD_CAP_PCT]`, never NaN), `per_bar_round_trip_cost(asset_type, spread_pct_array, maker, live, adv_dollar, notional, impact_k)` (indexed at the ENTRY bar), `impact_inputs_from_df(df)`, `market_impact_pct` (scalar reference, no production caller); dark: `stamp_crypto_spreads`, `get_crypto_spread_tier`, `edge_spread_daily_from_minute`, `volscale_impact_k`.
+- **Imports** `fees`, `strategy_config` (lazy). **Imported by** `backtest`, `meta_label`, `scripts/harvest_crypto_data`, `scripts/harvest_stock_data` (+8 tests).
+- **Reads / Writes** reads `crypto_spread_census.json` (path from `TRADER_CRYPTO_CENSUS_FILE`). **Flags** `TRADER_SPREAD_FILL_V2`, `TRADER_CRYPTO_SPREAD_STAMP`, `TRADER_STOCK_MINUTE_EDGE`, `TRADER_IMPACT_VOLSCALE` (env), `IMPACT_COST_ENABLED`/`IMPACT_K`/`IMPACT_TYPICAL_NOTIONAL` (strategy_config). **Flow** harvest (stamp) → cost gate (backtest + meta). **Status** LIVE (stock EDGE stamp); STAGED (crypto tier stamp, minute-EDGE overlay, impact).
+- **Known issues.** OBJECTIVE-fix-pending: redundant `import numpy as np` inside `_finalize_spread_pct` · OBJECTIVE-fix-pending: two warning strings say "stamped at the … floor" while formatting `fill_pct` (the flat spread under `TRADER_SPREAD_FILL_V2`), and the `n < max(window, 5)` guard message prints `window` only · OBJECTIVE-fix-pending: module docstring "STOCKS ONLY — harvest_stock_data is the sole site that stamps" is stale (a default-OFF crypto stamping site exists in `scripts/harvest_crypto_data.py`) · OWNER-decision: `IMPACT_COST_ENABLED` is a warned no-op because the stock harvest drops the DV30 level after the rank layer; crypto tier defaults are labelled placeholders.
+
+### short_cost.py
+- library · 128 lines · ✅
+- **Goal.** Price a short's all-in cost without back-charging today's economics onto historical sims — borrow cost is regime-dated (Alpaca moved to $0 ETB borrow on 2025-10-01) — plus PIT FINRA bi-monthly short-interest metrics. Reuses `fees.round_trip_cost_pct('stock', spread)` for the spread + fee base.
+- **Key API.** `borrow_cost_bps_annual(asof, likely_etb, htb_score)`, `borrow_drag_pct`, `short_round_trip_cost_pct(asof, eff_spread_pct, hold_days, …)`, `short_interest_metrics`, `pit_publication_map`; `BORROW_REGIME_START`.
+- **Imports** `fees` (lazy). **Imported by** tests only (`test_grp_risk`, `test_review_b11`, `test_short_cost`). **Flags** none. **Flow** offline short research. **Status** DORMANT (the consumer of the short mirror was never built; `policy_exits` documents that short TB_Ret must be charged here, not via `fees`).
+- **Known issues.** none objective (`si_pct_float` is a fraction despite the name — documented).
+
+### borrow_proxy.py
+- library · 104 lines · ✅
+- **Goal.** Stop an offline short backtest crediting un-shortable names (anomaly-short alpha concentrates in the HTB names Alpaca cannot short) by proxying borrow risk from the supply side (market cap, `spec_growth` class) with an exclude-when-uncertain rule.
+- **Key API.** `htb_risk_score(market_cap, name_class)`, `likely_shortable(symbol, …)`, `restrict_short_universe(symbols, cap_lookup, class_lookup)`, `class_lookup_from_config()`.
+- **Imports** `stock_config.SECTOR_BUCKETS` (lazy). **Imported by** tests only (`test_review_b11`, `test_short_cost`). **Flags** none. **Flow** offline short research. **Status** DORMANT.
+- **Known issues.** none (`symbol` parameter documented as deliberately unused). Note the trap `execution_policy` documents: this module's `name_class` vocabulary is disjoint from `execution_policy.VALID_CLASSES`.
+
+## 5. Models, training, validation & calibration
+
+**Goal.** Search one RegressionLSTM config per book with Optuna over a purged, embargoed walk-forward objective, certify the winner ONCE on an untouched trailing holdout with a Deflated Sharpe gate, and write the serving artifacts atomically (manifest LAST — the hot-reload signal). **Invariants:** the holdout boundary is one choke point (`hypersearch_v2.get_holdout_boundary` → `objective_utils.holdout_boundary`) inherited by folds, refit purge, blend fit, OOF pack and certificate; fold scalers are fit on train rows only; flatten order == `windows.reshape(-1)`, blend `w·LSTM + (1−w)·LGB`, strict `>` threshold, q10 veto — all pinned so cert == deploy; every objective/feature change makes old Optuna scores incomparable (gotcha #2: delete the study DBs, reset `best_score`). Only the kernels marked ✅ run on the Mac; the trainer, `model_v2`, and the LightGBM/torch loaders are Jetson-only. The R2-C signal-model repairs (`HYPERSEARCH_V3`, `OBJECTIVE_V3`, `LGB_REFIT_FULL`, `TRAINING_REPAIRS_V1`, `TRAINER_SEED`, `FIXED_HOLDOUT_DAYS`, `BLEND_*`) are all default OFF and uncommitted — `docs/FLAGS.md`.
+
+### scripts/hypersearch_v2.py
+- entry-point · 3047 lines · ❌ (eager torch, sklearn, joblib, optuna)
+- **Goal.** The trainer/certifier: Optuna TPE over a 3-fold purged+embargoed walk-forward objective (mean fold Sharpe − 0.5·std, cost-aware, regime-penalised; `HuberLoss` weighted by `clamp(|y|+1, 50)`, AMP, OOM probe, K=4 checkpoint soup, `MedianPruner`, 900 s/trial), then ONE holdout certificate (`evaluate_on_holdout` → `validation.dsr_from_trade_returns`, `DSR_MIN`), then `save_model_atomically`. Owns the GPU (`gpu_lock`), the Jetson memory envelope (`ScaledCache`, `LGB_X_BYTE_BUDGET`) and the atomic save protocol; under `HYPERSEARCH_V3` adds the full-data refit, LGB legs before the gate, and a fitted blend weight so the certified predictor is the deployed one.
+- **Key API** (consumed by `scripts/window_ab.py` + tests). `load_data(data_path, preset_override, max_rows, window_days)`, `get_holdout_boundary`/`get_holdout_indices`/`get_walk_forward_folds`, `simulate_trades`/`compute_sharpe`/`compute_regime_sharpes`, `create_objective`, `train_lgb_ensemble(…, save)`, `final_refit`, `evaluate_on_holdout`, `save_model_atomically`, `main()`; flag readers `_objective_long_only`, `_hypersearch_v3`, `_objective_v3`, `_lgb_refit_full`, `_training_repairs`, `_trainer_seed`, `_fixed_holdout_days`; constants `NUM_TRIALS`, `MAX_EPOCHS`, `NUM_FOLDS`, `HOLDOUT_FRACTION=0.12`, `TXN_COST_PCT`, `BARS_PER_YEAR`.
+- **Imports** `adaptive_config`, `blend_fit`, `data_utils`, `gpu_lock`, `indicator_config`, `meta_label`, `model_lgb`, `model_v2`, `objective_utils`, `retrain_ledger`, `sample_weights`, `shadow`, `strategy_config`, `validation` (fan-out #3). **Imported by** `scripts/window_ab` (+2 tests, both in the Mac baseline); spawned by `run_pipeline.py` (always `--preset stationary --no-status`; `--shadow` only on weekly retrains; stock adds `--data stock_training_data.csv --prefix stock --max-rows 200000`).
+- **Reads / Writes** reads the store, `indicator_config.json`, `adaptive_state_*.json`, `{prefix}v2_study.db`, the champion `config_v2.pkl` (previous blend weight); writes `{p}model_v2.pth`, `{p}config_v2.pkl`, `{p}scaler_v2.pkl`, `{p}feature_cols_v2.pkl`, `{p}lgb_model.txt`, `{p}lgb_q10.txt`, `{p}lgb_q10_meta.json`, `{p}oof_preds.npz`, `{p}model_v2.manifest.json` (LAST) + `.prev` of each, `hypersearch_{p}v2_log.json`, `pipeline_status.json` (unless `--no-status`), `adaptive_state_*.json`, `.gpu.lock`. `{p}` = `''`, `stock_`, `challenger_`, `stock_challenger_`. **Flags** `OBJECTIVE_LONG_ONLY`, `HYPERSEARCH_V3`, `OBJECTIVE_V3`, `LGB_REFIT_FULL`, `TRAINING_REPAIRS_V1`, `TRAINER_SEED`/`TRADER_TRAINER_SEED`, `FIXED_HOLDOUT_DAYS`/`TRADER_FIXED_HOLDOUT_DAYS`, `UNIQUENESS_WEIGHTS_ENABLED`, `PROMOTION_GATE_V2`, `KISH_NEFF_ENABLED`, `KISH_RHO_FLOOR`, `BLEND_FIT_ON_REFIT`, `BLEND_THRESHOLD_RESELECT`. **Flow** train + gate (certificate). **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: docstring says the book is chosen "by --prefix stem"; `load_data` chooses by `'stock' in --data` (`--prefix stock` alone trains the crypto panel into `stock_*` artifacts — `window_ab` guards this) · OBJECTIVE-fix-pending: the q10-floor comment cites `scripts/reliability_report.py` for coverage verification — no such tool exists · OBJECTIVE-fix-pending: `evaluate_on_holdout` docstring lists 5 return keys; the report has 15 (+4 when blended) · OBJECTIVE-fix-pending: `HOLDOUT_FRACTION` comment says "calendar time" — the default rule is a row-quantile · OBJECTIVE-fix-pending: rejection message "new best X <= existing Y" is wrong under the noisy ratchet; `cfg.get('forward_bars', 12)` print default vs 24 elsewhere · OWNER-decision (doc/code contradiction): `validation.dsr_from_trade_returns` says `n_trials` must include pruned/failed trials; this caller pools COMPLETE trials only · OWNER-decision: default path still carries defects L1 (val loss ignores huber_delta/weights) and L2 (regime-penalty look-ahead) — repaired only under `TRAINING_REPAIRS_V1`; the trial objective trains NO LGB leg (H2; gated fix); two cost models (`TXN_COST_PCT` vs `fees`); `kish_divisor` never passed (L4); mixed cwd-relative/absolute artifact paths masked by `run_pipeline`'s `cwd=BASE_DIR`.
+
+### model_v2.py
+- library · 42 lines · ❌ (eager torch)
+- **Goal.** The single regression network per book — stacked `nn.LSTM` → `MultiheadAttention` with residual + LayerNorm → mean-pool → 2-layer head → one continuous return (%) — kept minimal so the trainer, `predict_now`, `backtest`, `retrain_ledger` and `window_ab` instantiate byte-identical architectures from `config_v2.pkl`.
+- **Key API.** `RegressionLSTM(input_dim, hidden_dim, num_layers, dropout, n_heads)`; `forward(x: (B, seq_len, F)) → (B,)`.
+- **Imports** none. **Imported by** `backtest`, `predict_now`, `retrain_ledger`, `scripts/hypersearch_v2`, `scripts/window_ab` (+2 tests, both in the Mac baseline). **Flags** none. **Flow** train + serve. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending (trivial): `import torch` is unused (only `torch.nn` is referenced).
+
+### model_lgb.py
+- library · 169 lines · ⚠ (`lightgbm` lazy; `flatten_sequence`/`ensemble_predict` are pure numpy)
+- **Goal.** The tree leg of the per-book blend: flattens the LSTM's `(seq_len, F)` window into one row and trains/serves a LightGBM regressor; holds the serving-side blend arithmetic with the historical default `w=0.6`.
+- **Key API.** `flatten_sequence(sequence, feature_names)` (row-major == `windows.reshape(-1)`, pinned by hypersearch), `train_lgb(X, y, X_val, y_val, params, sample_weight, …)` (`params={'num_iterations': k}` overrides the round count — used by the R2C-03 refit), `save_lgb_model(model, prefix)` (atomic, `_MODEL_DIR`-absolute), `load_lgb_model(prefix)`, `predict_lgb`, `ensemble_predict(lstm_pred, lgb_pred, lstm_weight=0.6)`.
+- **Imports** `log_config`. **Imported by** `backtest`, `predict_now`, `scripts/hypersearch_v2` (+4 tests).
+- **Reads / Writes** `<repo>/{pfx}lgb_model.txt`. **Flags** none directly. **Flow** train (leg) + serve (blend). **Status** LIVE.
+- **Known issues.** OWNER-decision: `DEFAULT_LSTM_WEIGHT` lives in `blend_fit.py` and must stay in lockstep with the keyword default here (two homes for one constant, documented).
+
+### blend_fit.py
+- kernel · 214 lines · ✅
+- **Goal.** Replace the hardcoded 0.6 LSTM weight with an out-of-fold stacked estimate, shrunk toward the simple average, gated on an overlap-corrected significance test, smoothed across retrains and clamped `[0.25, 0.75]`; since R2C-02 also the certificate-visible home of the default weight and of the blend-consistent threshold re-selection (H2).
+- **Key API.** `DEFAULT_LSTM_WEIGHT`, `effective_lstm_weight(fitted, ship_boosters, default)` (H1 cert==deploy resolver), `fit_blend_weight` (diagnostic grid), `fit_blend_weight_v2(lstm_oof, lgb_oof, y, forward_bars, shrink_to, shrink_lambda, kish_divisor)` → `{w, w_raw, se, significant, n, n_eff}` (the deployed estimator), `smooth_across_retrains`, `reselect_trade_threshold`.
+- **Imports** none. **Imported by** `scripts/hypersearch_v2`, `scripts/window_ab` (+4 tests). **Flags** none here (deployment gated by `HYPERSEARCH_V3`, `BLEND_FIT_ON_REFIT`, `BLEND_THRESHOLD_RESELECT` in the trainer). **Flow** train (post-search, V3 only). **Status** STAGED.
+- **Known issues.** OWNER-decision: docstring describes the 0.6 weight as "never tuned" in the present tense — true for the flag-OFF path, stale for the V3 path this module implements.
+
+### objective_utils.py
+- kernel · 353 lines · ✅ (verified by execution on the Mac)
+- **Goal.** Every piece of the hypersearch objective/gate that is provable without torch, hoisted so it is Mac-testable: the exact legacy non-overlapping hold walk, `OBJECTIVE_V3` extensions (ticker-block resets, q10 long veto), the V3 threshold range anchored to `fees.required_edge_pct` (0.8×–2.5× the deployment floor), refit budgets, the R2C-04 repairs (lagged regime series, bar-denominated embargo, seed derivation), the FR-01/FR-02 boundary/cutoff rules and the FR-05 cross-sectional rank-IC kernel.
+- **Key API.** `derive_seed`, `lagged_regime_series`, `embargo_end_time`, `ticker_block_ids`, `simulate_trades_core(predictions, actual_returns, threshold, forward_bars, txn_cost_pct, long_only, block_ids, long_veto)`, `v3_trade_threshold_range`, `refit_epoch_budget`, `lgb_refit_indices`, `holdout_boundary(all_times, fixed_days, holdout_fraction)`, `window_cutoff`, `cs_rank_ic`, `fixed_boost_rounds`.
+- **Imports** `fees` (lazy). **Imported by** `scripts/hypersearch_v2`, `scripts/window_ab` (+6 tests). **Flags** none (callers pass flag-derived args). **Flow** train/gate kernels. **Status** LIVE (legacy walk) / STAGED (V3 helpers).
+- **Known issues.** none objective. OWNER-decision: `simulate_trades_core` is a per-row Python `while` loop called per epoch per fold — accepted CPU cost.
+
+### sample_weights.py
+- kernel · 530 lines · ⚠ (numba optional, no-op `njit` fallback)
+- **Goal.** Quantify how non-IID overlapping forward-window labels are: per-row average uniqueness for LightGBM training weights (behind `UNIQUENESS_WEIGHTS_ENABLED`) and the effective trade count that widens the DSR null in both promotion gates. Three n_eff estimators coexist: per-ticker uniqueness, cross-name interval clustering (legacy gate takes the harsher), calendar-concurrency uniqueness (the ONE correction under `PROMOTION_GATE_V2`).
+- **Key API.** `average_uniqueness(hold_bars, ticker_boundaries)`, `effective_n(u_bar, mask)` (0.0 = unmeasurable), `clustered_effective_n(entry_times, exit_times)`, `calendar_effective_n(entry_times, exit_times, rho_bar)` → `{n_eff, n_trades, u, …}`, `uniqueness_weights` (no production caller — documented), `fold_train_weights`.
+- **Imports** none. **Imported by** `backtest`, `scripts/hypersearch_v2`, `scripts/wave6_stage0` (+7 tests). **Flags** consumed by callers (`UNIQUENESS_WEIGHTS_ENABLED`, `PROMOTION_GATE_V2`, `KISH_*`). **Flow** train (weights) + gate (n_eff). **Status** LIVE (n_eff) / STAGED (weights).
+- **Known issues.** none objective. Name collision only: `learned_lexicon.uniqueness_weights` is unrelated.
+
+### validation.py
+- kernel · 796 lines · ✅
+- **Goal.** The anti-selection-bias mathematics: expected max Sharpe of N null configs, the Deflated Sharpe probability with effective-n, MinTRL, two PBO estimators (coarse fold-score screen; proper CSCV), the Lo-2002 serial factor (OFF by design — gotcha #4: never stack it with uniqueness n_eff) and a stationary-bootstrap Sharpe p-value. Owns `DSR_MIN = 0.60`, the promotion bar for both books.
+- **Key API.** `DSR_MIN`, `MAX_CSCV_SPLITS`, `expected_max_sharpe`, `min_track_record_length`, `deflated_sharpe_ratio`, `dsr_from_trade_returns(trade_returns, n_trials, sr_std_across_trials, n_eff, n_eff_source, fail_closed_floor)` → status `ok/insufficient_n/degenerate/insufficient_effective_n` (THE gate function), `pbo_from_fold_scores`, `pbo_cscv`, `serial_correlation_factor`, `build_oos_blocks`, `pbo_from_oos_blocks`, `politis_white_block_length`, `stationary_bootstrap_sharpe_pvalue`.
+- **Imports** none. **Imported by** `backtest`, `portfolio_backtest`, `scripts/cscv_audit`, `scripts/hypersearch_v2`, `scripts/naive_vs_blend` (+9 tests). **Flags** none (`fail_closed_floor` passed under `PROMOTION_GATE_V2`). **Flow** gate (holdout certificate + backtest gate). **Status** LIVE (`dsr_from_trade_returns`, `pbo_from_fold_scores` print); DORMANT (`pbo_cscv`, `serial_correlation_factor`, `stationary_bootstrap_sharpe_pvalue`, `min_track_record_length` direct — tests/`cscv_audit` only).
+- **Known issues.** OBJECTIVE-fix-pending: `stationary_bootstrap_sharpe_pvalue` docstring says it is "logged NEXT TO the analytic DSR" — no production caller logs it · OWNER-decision: the `n_trials` "including pruned/failed" docstring contradicts the trainer's COMPLETE-only pool · note CLAUDE.md's "CSCV-PBO" runs in production only as the coarse screen.
+
+### calibration.py
+- kernel · 459 lines · ✅
+- **Goal.** Give `meta_label` a purged cross-fit calibrator (isotonic PAVA at n ≥ 1000, Platt otherwise) so the live veto/size probability is not fitted on the slice the booster early-stopped on; plus Brier/ECE/reliability diagnostics and the before/after `compare_calibrations` verdict that decides the `META_CALIBRATION_MODE` flip. Closes the META leak only, not the primary model's in-sample `pred` feature.
+- **Key API.** `ISOTONIC_MIN_N`, `IsotonicCalibrator(pool_ties)`, `SigmoidCalibrator(platt_v2)`, `choose_calibration_method`, `fit_calibrator(scores, y, min_n, v2)` (reads `CALIBRATION_V2` at call time), `purged_kfold_indices(entry, exit, k, embargo)`, `crossfit_oof_predict`, `brier`, `reliability_curve`, `expected_calibration_error`, `compare_calibrations`.
+- **Imports** `strategy_config` (lazy). **Imported by** `meta_label`, `scripts/meta_learning_curve`, `scripts/reliability_report` (+4 tests). **Flags** `CALIBRATION_V2`; `META_CALIBRATION_MODE` is read by `meta_label`. **Flow** train (meta) → gate (live p). **Status** LIVE (legacy path) / STAGED (purged OOF, V2).
+- **Known issues.** none objective (the `embargo` fraction-vs-absolute dual semantics is documented and pinned).
+
+### retrain_ledger.py
+- library · 339 lines · ⚠ (kernels pure; `_load_stack`/`record_retrain_gain` need joblib/torch/lightgbm) · **untracked (R2-C)**
+- **Goal.** Answer "does the weekly retrain pay?" (FR-08): at every accepted save, score the incumbent stack and the fresh stack on the same trailing ~7 days of purged bars and append one paired `{MSE, IC}` row to the adaptive state (cap 104); ≥12 rows feed an owner-run IM block-t. Resolves the incumbent correctly for `--shadow` saves (champion) vs same-slot saves (`.prev`).
+- **Key API.** `paired_scores`, `stack_valid_rows`, `trailing_purged_rows`, `append_ledger_row`, `window_gather_plan`, `incumbent_paths(prefix, save_prefix)`, `record_retrain_gain(...)`; `LEDGER_CAP`, `LEDGER_KEY='retrain_ledger'`.
+- **Imports** `adaptive_config`, `model_v2` (lazy). **Imported by** `scripts/hypersearch_v2` (+1 test). **Reads / Writes** reads the artifact stack (+`.prev`); writes the `retrain_ledger` key of `adaptive_state_{book}.json`. **Flags** none. **Flow** measure (post-save). **Status** MEASUREMENT-ONLY.
+- **Known issues.** OBJECTIVE-fix-pending (trivial): docstring's pure-kernel list omits `incumbent_paths`.
+
+## 6. Promotion, shadow & serving
+
+**Goal.** Get a certified model into the bots without ever trading an uncertified one: the weekly `backtest.py --gate` replays the ACTUAL policy on the saved stack and rolls back to `.prev` on failure; retrains land in the challenger slot (`--shadow`) and `shadow.py` promotes them on LIVE forward evidence (DM-HLN over 14–28 days), rewriting the champion manifest LAST so the running bots hot-reload; `predict_now` is the only serving path. **Invariants:** manifest-last atomic writes are the reload signal (`trading_utils.model_reload_key`); the certified predictor (blend + q10 veto + threshold) must be exactly what `predict_now` and `backtest` run ("cert == deploy"); the gate replays the CHAMPION under default shadow mode unless `GATE_TARGETS_CHALLENGER` is ON (a documented structural caveat); drift is measured (`monitor_drift`) and turns into a retrain request flag, never a live change.
+
+### backtest.py
+- entry-point + library · 1437 lines · ⚠ (`simulate_ticker`/`aggregate_metrics`/`breakeven_fee_mult`/rollback are pure; `_load_artifacts`/`_predict_ticker`/`run_backtest` need joblib/torch/lightgbm)
+- **Goal.** Event-driven replay of the ACTUAL trading policy — threshold + cost-floor entries, the shared exit stack (`policy_exits.exit_walk(max_hold=0, use_signal_exit=True)`), EOD flatten, cooldowns, hard-stop lockouts, meta veto, q10 veto — over the saved model's predictions, net of venue fees + spread, so a model is promoted on POLICY P&L rather than fit metrics. Also the weekly promotion gate (`--gate`: `n_trades ≥ 10 AND sharpe > 0 AND dsr ≥ DSR_MIN`; exit 3 on failure), the Stage-0 predictions dump producer, and the FR-16 fee sweep (breakeven cost headroom λ*).
+- **Key API.** `simulate_ticker(tdf, preds, asset_type, threshold, policy, meta_probs, q10_preds, q10_floor, fee_mult)`, `aggregate_metrics(all_trades, asset_type, span_days, n_search_trials)`, `run_backtest(prefix, days, n_search_trials, model_prefix, stage0_dump, fee_mult)`, `restore_previous_model(prefix)` (12 `ARTIFACT_SUFFIXES` legs, manifest last), `breakeven_fee_mult`, `_entry_window_mask`, `_load_artifacts`/`_predict_ticker`/`_load_lgb`/`_load_q10` (reused by `meta_label` and `scripts/meta_learning_curve`); `SPREAD_PCT` (copy of `fees.FLAT_SPREAD_PCT`, test-pinned), `STAGE0_DUMP_DEFAULT=True`.
+- **Imports** `adaptive_config`, `data_utils`, `fees`, `liquidity`, `meta_label` (lazy — the lazy-broken cycle), `model_lgb`, `model_v2`, `notify`, `policy_exits`, `sample_weights`, `stage0_preds`, `strategy_config`, `validation`. **Imported by** `meta_label`, `scripts/meta_learning_curve` (+11 tests); spawned by `run_pipeline.py` (crypto `--days 44 --gate`, stock `--prefix stock --days 60 --gate`, `--model-prefix <challenger>` only under `GATE_TARGETS_CHALLENGER`) and via the GUI's pipeline commands.
+- **Reads / Writes** reads the artifact stack (+ manifests, meta triple, `.prev`), the store, `adaptive_state.cum_trials`; writes `backtest_report.json` / `backtest_stock_report.json` (challenger-targeted runs: `backtest_<slot>_report.json`; `--fee-mult`: `backtest_<slot>_stress_report.json`), `{slot}_stage0_preds.json`, `{slot}_policy_gate.json` (challenger-targeted `--gate`), `backtest_<slot>_fee_sweep.json`; on gate failure `os.replace(*.prev → live)`. **Flags** `PROMOTION_GATE_V2`, `KISH_NEFF_ENABLED`/`KISH_RHO_FLOOR`, `ENTRY_WINDOWS_ENABLED`/`STOCK_ENTRY_WINDOWS_ET`, `IMPACT_COST_ENABLED` (via `liquidity`), `DSR_MIN`. **Flow** gate (weekly) + measure. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: `_report_slot` docstring says the champion report is what "the GUI reads" — `gui.py` has no reader of `backtest_*report.json` · OBJECTIVE-fix-pending: `_predict_ticker` docstring "ensembled 0.6/0.4" — the code uses `config['lstm_weight']` (0.6 is the default) · OBJECTIVE-fix-pending: the exit-code docstring omits the third exit-3 outcome (`hold_champion_no_challenger`: fallback-champion replay with `.prev` present → HELD, nothing restored) · OWNER-decision: `config.get('forward_bars', 4)` here and in `predict_now` vs 24 everywhere else (latent — the key is always present) · OWNER-decision (documented): gate compares ROUNDED sharpe/dsr; stock hard-stop lockout in bars is ~3.4× longer than live; entry `edge_floor` uses the FLAT spread while realized cost uses per-bar `Eff_Spread_Pct`; the replay is a "permissive superset" of live admission.
+
+### shadow.py
+- library + daily job · 1197 lines · ⚠ (`dm_hln`, `im_cluster_t`, `dm_fixed_b`, `collapse_by_hour` are pure; evaluation needs Alpaca; `promote_challenger` needs joblib)
+- **Goal.** Promote retrained models on LIVE forward evidence instead of static gates: every bot cycle logs champion and challenger predictions side by side (`maybe_log_shadow`), and the pipeline's daily check runs a Diebold–Mariano test with the Harvey–Leybourne–Newbold correction over 14–28 days (`EARLY_PROMOTE_P=0.05`, `FINAL_PROMOTE_P=0.10`, `MIN_OBS=200`); on promotion the challenger stack is copied over the champion (manifest LAST), `.prev`/`.stale` backups are kept, and a background `meta_label.py` retrain is spawned. Owns the champion/challenger slot mechanics.
+- **Key API.** `challenger_prefix(prefix)`, `champion_exists(prefix)`, `maybe_log_shadow`, `dm_hln`, `evaluate_shadow`, `promote_challenger`, `evaluate_and_maybe_promote`, `_gate_preflight` (consults `{challenger}_policy_gate.json`); constants `MIN_SHADOW_DAYS`, `MAX_SHADOW_DAYS`, `V2_*`.
+- **Imports** `log_config`; lazy `market_data`, `notify`, `predict_now`, `strategy_config`, `trading_utils`. **Imported by** `base_loop` (lazy), `run_pipeline` (lazy), `scripts/hypersearch_v2` (+9 tests); spawns `meta_label.py`.
+- **Reads / Writes** `{p}shadow_preds.jsonl`, `{p}shadow_status.json`, `{p}promotion_ledger.jsonl`, `{p}shadow_v2_state.json`, `{challenger}_policy_gate.json`, every champion/challenger artifact (+`.prev`, `.stale`), `meta_retrain.log`. **Flags** `TRADER_SHADOW_DM_V2` → `DM_V2_ENABLED`, `GATE_TARGETS_CHALLENGER`; `TRADER_SHADOW_MODE` is read by `run_pipeline`, not here. **Flow** serve (logging) → promotion. **Status** LIVE (legacy DM) / STAGED (DM v2).
+- **Known issues.** OWNER-decision: the documented anti-conservative approximations of the legacy DM remain the default · note `shutil.copy2` preserves source mtimes, so a promoted champion's booster files carry the challenger's timestamps (harmless for `serving_cache` keys; the manifest carries `promoted_from_shadow`).
+
+### predict_now.py
+- library + entry · 585 lines · ❌ (eager torch, joblib)
+- **Goal.** The serving engine: load the RegressionLSTM stack (`config_v2.pkl`, scaler, feature columns, `.pth`; JIT-traced) plus the LGB mean/q10 boosters through `serving_cache`, and produce one blended prediction + indicator snapshot per symbol from live bars with every live feature injection mirroring the harvest (sentiment, funding, OI, short flow, panel ranks, D11 daily restore, warmup fill).
+- **Key API.** `load_model`, `load_models`, `get_live_prediction(...)`, `set_panel_features`; module caches `_lgb_models`, `_q10_models`, `_PRED_CACHE` (cleared by `base_loop`/`shadow` on reload).
+- **Imports** `funding`, `indicators`, `market_data`, `model_lgb`, `model_v2`, `oi_archive`, `prediction_cache`, `sentiment_history`, `serving_cache`, `short_flow`, `strategy_config` (fan-out 11). **Imported by** `base_loop`, `shadow`, `stock_loop`, `trading_utils` (+1 test, in the Mac baseline).
+- **Reads / Writes** reads `{p}config_v2.pkl`, `{p}scaler_v2.pkl`, `{p}feature_cols_v2.pkl`, `{p}model_v2.pth` (cwd-relative), `{p}lgb_model.txt` (absolute), `{p}lgb_q10.txt` + `{p}lgb_q10_meta.json` (cwd-relative), `daily_bars_cache.json`; env `CUDA_VISIBLE_DEVICES`, `TORCH_NUM_THREADS`; writes nothing. **Flags** `PREDICTION_CACHE_ENABLED`, `TRADER_DAILY_FEATURE_RESTORE` (via `market_data`). **Flow** features → serve. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: a stale comment still explains the deleted Hurst mean-reversion filter (keep `'Hurst'` in the snapshot columns — meta features use it) · OWNER-decision: mixed absolute/relative artifact paths (masked by `cwd=BASE_DIR`); `__main__` demo path uses yfinance symbols and strict `>` (the loops admit `>=`).
+
+### prediction_cache.py
+- kernel · 75 lines · ✅
+- **Goal.** Bar-keyed single-slot memo so ~119 of 120 cycles skip the feature + LSTM + LGB recompute on hourly bars; must be bit-identical when on.
+- **Key API.** `bar_key`, `PredictionCache.get/put/hit_rate/clear`, `MISS`.
+- **Imports** none. **Imported by** `predict_now` (+1 test). **Flags** `PREDICTION_CACHE_ENABLED` (gated at the `predict_now` call site). **Flow** serve. **Status** STAGED.
+- **Known issues.** none.
+
+### serving_cache.py
+- kernel · 93 lines · ✅ · **untracked (R2-C)**
+- **Goal.** mtime-keyed lazy-load with bounded retry (`RETRY_SEC=300`) for `predict_now`'s per-prefix booster caches (R2C-01), so a hot-reloaded booster is picked up without a restart and a missing file is not re-stat'd every cycle.
+- **Key API.** `stat_key(paths)`, `cache_get(...)`.
+- **Imports** none. **Imported by** `predict_now` (+1 test). **Flags** none. **Flow** serve. **Status** LIVE (once committed).
+- **Known issues.** OBJECTIVE-fix-pending: a comment cites `hypersearch_v2.py:1171-1172`; the q10 write is at `scripts/hypersearch_v2.py:1469,1473` (as of 2026-09-08).
+
+### monitor_drift.py
+- CLI + library · 496 lines · ✅
+- **Goal.** Detect when live predictions leave the training distribution and request a retrain only after SUSTAINED drift: PSI over the holdout's prediction deciles (`PSI_WARN=0.10`, `PSI_ACTION=0.25`, two consecutive action days), a CUSUM on realized hit-rate vs the manifest's holdout hit rate, and a model-deploy fence so a fresh model is not judged against stale history.
+- **Key API.** `log_predictions(prefix, preds)`, `load_recent_predictions`, `prune_history`, `clear_history`, `compute_psi`, `load_ref_deciles`, `check_drift`, `load_holdout_hit_rate`, `run_cusum`, `run_check(prefix, label)`, `main()` (exit 2 on `action`).
+- **Imports** `notify`, `trade_memory` (lazy). **Imported by** `base_loop` (every cycle), `run_bots`, `run_pipeline` (`_maybe_run_drift_check`, once daily) (+4 tests).
+- **Reads / Writes** reads `{p}model_v2.manifest.json` (deciles, hit rate, content hash), `trade_memory.json`; writes `{p}pred_history.jsonl` (flock sidecar), `drift_state.json`, `{p}retrain_requested.flag` (consumed by `run_pipeline._check_drift_trigger`). **Flags** none. **Flow** measure → retrain trigger. **Status** LIVE.
+- **Known issues.** none objective.
+
+## 7. Decision engine — the live loops
+
+**Goal.** One Template-Method skeleton (`base_loop.BaseTradingLoop`) runs both books: per cycle, closed bars → predictions → the exit stack FIRST (stops/TP/trail/signal flip) → the gate funnel (cost → threshold → correlation → VIX → sentiment → LLM → meta → q10 → sizing) → orders → journal. **Invariants:** the loops are CPU-only (`CUDA_VISIBLE_DEVICES=''`, `TORCH_NUM_THREADS=2`) and read every policy number from `strategy_config`; they never import `policy_exits` (live exits are a hand-written mirror, test-pinned); artifact paths are cwd-relative, so the bots must be launched with `cwd=BASE_DIR` (a manual `python run_bots.py` elsewhere finds no models and fails closed — buys disabled); restart survival = `position_state.json` + `hard_stop_lockout.json` per book + `order_utils.reconstruct_positions`; the file kill switch (`trading_halt.flag`, `flatten_{book}.flag`) is honoured every cycle; training and trading are process-isolated by `run_pipeline` on the 8 GB Jetson. The cycle order and gate funnel are documented step by step in `docs/MAP.md`.
+
+### base_loop.py
+- library (Template-Method base) · 3360 lines · ❌ (eager `predict_now` → torch; tests exercise methods on stubs and pin source text)
+- **Goal.** The shared live-trading skeleton: `run`/`_run_one_cycle`, circuit breaker, the stop/TP/trail exit stack with two-reading confirmation, prediction fan-out with timeout, the LLM/meta/cost/risk gate funnel, the single sizing function `_compute_position_size` (§10), conviction journaling, restart persistence. Fan-out 28 (the repo's centre of gravity); 20 of those imports are lazy inside methods, which is how it costs little at import on the Jetson.
+- **Key API.** class `BaseTradingLoop`: `run`, `_run_one_cycle`, `_desired_stop_for`, `_manage_stops`, `_execute_stop_exit`, `_get_predictions`, `_execute_sells`, `_meta_gate`, `_compute_position_size`, `_entries_allowed`, `_execute_buys`, `_place_and_track_buy`, `_journal_skip`/`_journal_entry_window`, `_record_account_risk`, `_check_vertical_barrier`, `_run_llm_analysis`/`_expire_llm_scores`; module flags `STOP_CLASSIFY_V2`, `STREAM_STOP_DETECT`; constants `LLM_INTERVAL_SEC=600`, `LLM_SCORE_TTL_SEC=7200`.
+- **Imports** eager: `fundamentals`, `hw_monitor`, `llm_config`, `log_config`, `predict_now`, `regime_detector`, `trade_journal`, `trade_memory`, `types_mod`, `volatility`, `portfolio`, `sentiment`, `llm_analyst`, `macro_indicators`, `order_utils`, `trading_utils`; lazy: `drawdown`, `macro_calendar`, `market_data`, `meta_label`, `monitor_drift`, `notify`, `novelty`, `order_stream`, `risk_budget`, `shadow`, `stock_config`, `strategy_config`. **Imported by** `crypto_loop`, `stock_loop` (+7 tests).
+- **Reads / Writes** `{prefix}_position_state.json`, `{prefix}_hard_stop_lockout.json`, `flatten_{book}.flag`, `trading_halt.flag`, `llm_analysis.json` (via `llm_analyst.load_analysis`), journals (actions `buy`/`sell`/`skip`/`entry_window`/`llm_analysis`/`llm_backoff`/`account_risk`/`cycle_latency`/`circuit_breaker_trip`/`signal_exit_reading`/`vertical_barrier`…), `trade_memory.json`, `{p}pred_history.jsonl` (via `monitor_drift`), `{p}shadow_preds.jsonl` (via `shadow`), `account_risk_registry.json` (via `risk_budget`). **Flags** `BREAKER_PER_BOOK`, `CRYPTO_VERTICAL_BARRIER`, `SIGNAL_EXIT_CONFIRM_READS`, `CONVICTION_JOURNAL_ENABLED`, `DERISK_STACK_V2`, `CORR_FAMILY_MERGED`/`CORR_SANITY_MAX`, `KELLY_SAMPLE_GATE`/`_MIN_TRADES`/`_SINCE`, `TRADE_BUDGET_BACKSTOP`/`_MULT`, `VIX25_BLOCK_REMOVED`, `CROSS_BOOK_RHO`, `RISK_PCT_PER_TRADE`, `MAX_BOOK_RISK_PCT`, `KELLY_CAP`, `TILT_MAX`, `MIN_ORDER_NOTIONAL`, `MAX_TRADES_PER_SYMBOL_PER_DAY`; env `TRADER_STOP_CLASSIFY_V2`, `TRADER_STREAM_STOP_DETECT`. **Flow** serve → exit → journal. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: stale pointer "see stock_loop.py ~line 1003" in `_place_and_track_buy` — the hand-synced stock buy row is in `stock_loop._execute_buys` (~1352 as of 2026-09-08) · OWNER-decision: class-level stop defaults (`ATR_STOP_FLOOR_PCT=0.05`, `TAKE_PROFIT_RR=3.0` …) are stale vs `strategy_config` and only ever govern test stubs (both subclasses override) — latent drift for a third loop · OWNER-decision: the "STOP-MATH SYNC CONTRACT" list names 7 live copies of the stop arithmetic but not the kernel nor the 8th copy in `stock_loop`; the trailing denominator differs from the kernel (§4) · OWNER-decision (verified): gate ORDER differs between `base_loop._execute_buys` (cost floor before threshold) and `stock_loop._execute_buys` (threshold first) and the `llm_veto`/`q10` journal shapes differ — documented as hand-synced.
+
+### crypto_loop.py
+- entry-point + library · 318 lines · ❌ (via `base_loop`)
+- **Goal.** The 24/7 crypto book: universe (`stock_config.CRYPTO_SYMBOLS`), quotes, maker-ladder entries (`MAKER_ENTRIES_ENABLED`, `MAKER_STAGE_TIMEOUT`), resting GTC `stop_limit` protection at the broker that survives process death, the funding tilt, and the GUI prediction cache.
+- **Key API.** `CryptoLoop`, `run_crypto_bot()`.
+- **Imports** `base_loop`, `funding` (lazy), `log_config`, `market_data`, `order_utils`, `sentiment`, `stock_config`, `strategy_config` (lazy). **Imported by** `run_bots`; spawned by `run_pipeline.py` (split mode).
+- **Reads / Writes** writes `crypto_predictions.json` (+`.tmp`); reads `CRYPTO_POLICY`. **Flags** `MAKER_ENTRIES_ENABLED`, `MAKER_STAGE_TIMEOUT`, `TRADER_FUNDING_Z_TIME_THINNING` (via `funding`). **Flow** serve/exit (crypto). **Status** LIVE.
+- **Known issues.** none objective; `place_buy_order` is a self-documented dead delegation stub (pinned by `tests/test_review_b01.py`).
+
+### stock_loop.py
+- entry-point + library · 1640 lines · ❌ (via `base_loop`)
+- **Goal.** The RTH stock book: Alpaca-clock market hours, `compute_live_panel_ranks` → top-N (`TOP_N=7`) with hold-rank hysteresis, bracket entries with server stops upgraded to native `trailing_stop`, the 15:50 EOD flatten with the overnight sleeve (`OVERNIGHT_SLEEVE_*`, fails closed without an earnings calendar), entry windows, sector bucket cap, earnings/EDGAR/SPY-trend gates, and hand-mirrored `_execute_buys`/`_execute_sells`.
+- **Key API.** `StockLoop`, `run_stock_bot()`.
+- **Imports** `base_loop`, `fundamentals`, `llm_analyst`, `log_config`, `market_data`, `sentiment`, `stock_config`, `trade_memory` (eager); lazy `edgar_events`, `events_calendar`, `macro_indicators`, `notify`, `order_utils`, `panel_ranks`, `portfolio`, `predict_now`, `strategy_config`, `trade_journal`, `trading_utils`, `types_mod` (fan-out 20). **Imported by** `run_bots` (+6 tests; `tests/test_panel_ranks.py::TestBouncedLoser` lazily imports it → Mac baseline); spawned by `run_pipeline.py` (split mode).
+- **Reads / Writes** writes `stock_predictions.json`; state files via `base_loop` with the `stock_` prefix. **Flags** `ENTRY_WINDOWS_ENABLED`/`STOCK_ENTRY_WINDOWS_ET`, `OVERNIGHT_SLEEVE_ENABLED`/`_MAX_POSITIONS`/`_MAX_PCT_EQUITY`/`_MIN_PRED`, `EVENTS_TRADING_DAY_WINDOWS` (via `events_calendar`), the IA-4 flags shared with `base_loop`, `stock_config.SECTOR_BUCKETS`/`BUCKET_CAP_FRACTION`/`SAFE_HAVEN_SYMBOLS`. **Flow** serve/exit (stock). **Status** LIVE.
+- **Known issues.** OWNER-decision: the `MARKET_*`/`FLATTEN_*` constants are wall-clock fallbacks only; the native `trailing_stop` percent uses ATR/entry (kernel convention) while `base_loop._desired_stop_for` uses ATR/HWM (§4).
+
+### run_bots.py
+- entry-point · 224 lines · ✅ to import (loops imported lazily) — a real run needs the Jetson stack
+- **Goal.** Run both loops as daemon threads in ONE process (staggered 5 s) to save a duplicate torch/pandas import stack (~0.5–0.8 GB) on the Jetson, plus a 60 s ops thread (Telegram commands + daily drift check only when `pipeline_status.json` is stale > 120 s, journal rotation always) that defers to a live pipeline and deliberately never runs shadow promotion. Any loop exception sets a shared shutdown so one book dying exits the process (rc 0) and `run_pipeline`'s crash-restart relaunches both.
+- **Key API.** `main()`; `_ops_cycle`, `_pipeline_alive` (tests). CLI `--crypto-only` / `--stock-only`.
+- **Imports** `log_config`; lazy `crypto_loop`, `monitor_drift`, `notify`, `stock_loop`, `trade_journal`. **Imported by** none (+1 test); spawned by `run_pipeline._launch_bots` under `--combined-bots` (the systemd unit in `scripts/setup_jetson_system.sh` uses it).
+- **Reads / Writes** reads `pipeline_status.json` mtime. **Flags** `TRADER_BOTS_OPS` (default ON), `TRADER_JOURNAL_ROTATE_DAYS` (via `trade_journal`); sets `CUDA_VISIBLE_DEVICES=''`, `TORCH_NUM_THREADS=2`, `OMP_NUM_THREADS=2` by `setdefault`. **Flow** serve (process host). **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: docstring claims `run_pipeline` uses this "as the default bot launch mode; pass --separate-bots there" — `run_pipeline`'s default is split processes and no `--separate-bots` flag exists (`--combined-bots` opts in) · OWNER-decision: a loop-thread crash exits rc 0, relying on the parent's crash-restart.
+
+### run_pipeline.py
+- entry-point · 1838 lines · ⚠ (`pyarrow` lazy in `_needs_force_harvest`; everything else stdlib/subprocess; `tests/test_pipeline.py` imports it)
+- **Goal.** The long-lived Jetson orchestrator (systemd `Type=notify`, `WatchdogSec=900`, `MemoryMax=6G`): per book, harvest → `hypersearch_v2` → `meta_label` → `backtest --gate` as sequential child processes (`_build_harvest_phases`/`_build_training_phases`, run by `_run_training`), then launch/monitor/crash-restart the bots, then the wait loop: weekly (`--retrain-day`/`--retrain-hour`), manual (`retrain_trigger.json`) or drift-triggered (`*retrain_requested.flag`) retrains **with the bots stopped and restarted afterwards**, a daily drift + shadow-promotion check, Telegram commands, the EOD digest, and the systemd heartbeat. Every phase is a fresh interpreter — the memory strategy on 8 GB.
+- **Key API.** `main()`; tested helpers `_build_training_phases`, `_gate_model_prefix`, `_gate_reject_outcome`, `_run_training`, `_handle_command`, `_check_restart_bots`, `write_status`, `_bounded_thermal_wait`, `_resolve_retrain_trials`, `_maybe_run_drift_check`, `_check_drift_trigger`; `PYTHON` (hard-coded Jetson interpreter), `ENV`/`BOT_ENV`.
+- **Imports** `adaptive_config` (eager); lazy `data_utils`, `hw_monitor`, `journal_stats`, `monitor_drift`, `notify`, `sentiment_history`, `shadow`, `strategy_config`, `trading_utils`. **Imported by** tests only (+5); spawns `scripts/harvest_*_data.py`, `scripts/hypersearch_v2.py`, `meta_label.py`, `backtest.py`, `run_bots.py` / `crypto_loop.py` / `stock_loop.py`, `sentiment_history.py --fetch-stocks|--backfill`.
+- **Reads / Writes** writes `pipeline_status.json` (+`.tmp.{pid}`, throttled), `pipeline_output.log`, `crypto_bot_output.log`, `stock_bot_output.log`, `sentiment_fetch.log`, `backfill_output.log`, `command_result.json`; consumes `retrain_trigger.json`, `pipeline_command.json` (GUI-written), `retrain_requested.flag`/`stock_retrain_requested.flag`; reads store mtimes, `adaptive_state_*.json`, `journals/` (digest). **Flags** `TRADER_SHADOW_MODE` (default ON; only `'0'` disables — its ONLY effect is routing the weekly retrain into the challenger slot), `TRADER_EOD_DIGEST`/`_HOUR`, `NOTIFY_SOCKET`, `GATE_TARGETS_CHALLENGER`, `PROMOTION_GATE_V2`; CLI `--trials`, `--retrain-trials`, `--retrain-day`, `--retrain-hour`, `--no-retrain`, `--bot-only`, `--skip-harvest`, `--combined-bots`, `--crypto-only`, `--stock-only`. **Flow** ops/orchestration across every stage. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: comments "(bots keep running)" / "(bots keep trading with current models)" on the retrain loop contradict `_stop_bots`, which stops them (CLAUDE.md/README "hot-reload, bots never stop" inherit the same error — the daily shadow promotion hot-reloads; the weekly retrain restarts) · OBJECTIVE-fix-pending (behavioural, status only): `_update_per_bot_status` never sees the combined `'Bots'` entry, so `bots_running`/`crypto_bot_running`/`stock_bot_running` read False in `--combined-bots` mode (GUI + Telegram `/status`) · OWNER-decision: the suspended-retrain resume path launches split loops even under `--combined-bots`; `_resolve_retrain_trials` treats an explicit `--retrain-trials 100` as "not overridden" · OWNER-decision: hardcodes `--preset stationary` (see `indicator_config`).
+
+### trading_utils.py
+- library · 332 lines · ❌ (eager `dotenv` — the one unguarded import that makes a third of the top layer Mac-unimportable; fan-in 12)
+- **Goal.** The shared glue both loops, the GUI, the harvests and the measurement CLIs use: `get_api()` — the ONLY broker constructor (legacy `alpaca-trade-api`, or `alpaca_compat.CompatREST` when `TRADER_USE_ALPACA_PY=1` or the legacy import fails; warns loudly when `ALPACA_BASE_URL` is unset because both SDKs then default to LIVE) with `_install_rest_timeouts` wrapping every `requests.Session`; the model hot-reload key (manifest/`.pth` mtimes), the cooldown check, the `predict_symbol` wrapper over `predict_now`, the Kelly fraction from `trade_memory.json`, the uncensored trade count for `KELLY_SAMPLE_GATE`, and shared thresholds (`LLM_VETO_THRESHOLD=0.15`, `THERMAL_THROTTLE_TEMP`).
+- **Key API.** `get_api()`, `model_reload_key`, `choose_inference_device` (always `'cpu'`), `cooldown_ok`, `predict_symbol`, `compute_kelly_fraction`, `uncensored_trade_count`, `LLM_VETO_THRESHOLD`.
+- **Imports** lazy `alpaca_compat`, `order_utils`, `predict_now`. **Imported by** `base_loop`, `beta_ledger`, `decision_report`, `gui`, `llm_analyst`, `llm_eval`, `run_pipeline`, `scripts/connection_test`, `scripts/harvest_crypto_data`, `scripts/harvest_stock_data`, `shadow`, `stock_loop` (+6 tests).
+- **Reads / Writes** reads `.env` (`ALPACA_API_KEY`/`_SECRET`/`_BASE_URL`), `trade_memory.json`, `{p}model_v2.manifest.json`/`{p}model_v2.pth` mtimes (cwd-relative). **Flags** `TRADER_USE_ALPACA_PY` (must equal `'1'`). **Flow** serve/execute glue. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending (dead code, test-pinned presence): `trading_utils.kelly_position_size` has no production caller · OWNER-decision: `model_reload_key` paths are cwd-relative while `_TRADE_MEMORY_FILE` is absolute; `ORDER_TIMEOUT` is unused by the loops (comment says so).
+
+## 8. Gates: meta-label, sentiment/LLM, macro/VIX, risk
+
+**Goal.** Between "the model says buy" and "an order goes out" sit the admission gates, all evaluated inside `base_loop`/`stock_loop` per candidate: cost floor (`order_utils.should_trade` — §9), threshold, meta-label veto/size, LLM veto/tilt, sentiment tilt, macro stand-down + VIX tiers, earnings/EDGAR event vetoes, correlation/bucket caps (§10), q10 tail veto. **Invariants:** every gate is fail-OPEN for *new-entry* advisory inputs (missing LLM score = neutral 0.5; sentiment multiplier is strictly positive and can never veto; EDGAR fails open) but fail-CLOSED where money is at risk (overnight sleeve needs a live earnings calendar; no quote ⇒ no entry); each skip is journaled with a `skip_reason` so `decision_report` can price the counterfactual; a gate that changes admission is model-facing-adjacent and ships behind a flag. The removed gates (sentiment veto, dead Hurst branch, pseudo-CAPE) are archived verbatim in `research/campaign_2026-08/08_removed_code.md`.
+
+### meta_label.py
+- library + entry-point · 1262 lines · ⚠ (module top is numpy/stdlib; `train_meta` needs lightgbm/sklearn/joblib/torch)
+- **Goal.** López de Prado meta-labeling: a secondary LightGBM classifier on "did acting on this primary signal make money net of costs?", trained by replaying the primary's predictions through the shared exit kernel at `0.5 × trade_threshold`, then served as a calibrated probability that vetoes entries below `META_VETO_PROB = 0.30` and tilts size by `clip(2p, 0.6, 1.3)`. One feature builder and one artifact loader serve training (Jetson subprocess), live scoring (both loops) and backtest parity.
+- **Key API.** `META_VETO_PROB`, `META_THRESHOLD_FRACTION`, `HOLDOUT_FRACTION` (=0.12, twin of hypersearch's), `META_FEATURES` (13 names incl. `pred`); live `meta_probability_live(prefix, snapshot, pred)`, `meta_size_mult(p)`, `invalidate_cache()`; backtest `predict_meta_array(prefix, tdf, preds)`; `build_feature_matrix` / `features_from_snapshot` (must stay in sync); `train_meta(prefix, publish)`, `promote_staged_meta(prefix)` (the ONLY path that replaces live meta artifacts); OOF helpers `oof_pack_from_folds`, `write_oof_npz`, `load_oof_npz`, `join_oof_to_index`, `oof_starvation_tier`; `_gen_meta_rows` (the replay, also used by `scripts/meta_learning_curve`).
+- **Imports** `backtest` (lazy — the one lazy-broken cycle), `calibration`, `data_utils`, `fees`, `liquidity`, `notify`, `policy_exits`, `strategy_config`. **Imported by** `backtest`, `base_loop` (`_meta_gate`), `scripts/hypersearch_v2` (OOF writers), `scripts/meta_learning_curve` (+10 tests); spawned by `run_pipeline.py` (weekly `crypto_meta`/`stock_meta` phases) and `shadow.py` (background retrain after promotion).
+- **Reads / Writes** reads `{p}model_v2.manifest.json` (fingerprint), `{p}oof_preds.npz`, primary artifacts via `backtest._load_artifacts`, the store; writes `{p}meta_model.txt`/`{p}meta_calib.pkl`/`{p}meta_meta.json` (`.staged` → live via `promote_staged_meta`, `.prev` backups) and `{p}meta_refused.json` on a publish-guard refusal. **Flags** `META_CALIBRATION_MODE` (`legacy`/`purged_oof`), `CALIBRATION_V2`, `META_OOF_PRED`, `META_REPLAY_POLICY_PARITY`; guard constants `META_GUARD_*`. **Flow** train (secondary) → gate (backtest) → serve (`base_loop._meta_gate`, fail-open to neutral). **Status** LIVE.
+- **Known issues.** OWNER-decision (the "meta in-sample-primary leak"): `pred` is the primary's IN-SAMPLE fitted value by default; `META_OOF_PRED` supplies the purged OOF value instead · OBJECTIVE (test-guarded): the inline flat spread `0.10/0.05` in `_gen_meta_rows` is a third copy of `fees.FLAT_SPREAD_PCT` · OWNER-decision: `train_meta` row order is load-bearing via an unstable `np.argsort` (documented, model-facing) · `META_FEATURES` zero-fills `Daily_Sentiment`/`Hurst` when absent (warns).
+
+### llm_analyst.py
+- library + entry-point · 1484 lines · ✅ (pure parts; `_build_symbol_profiles`/`refresh_all` need yfinance + the stock stack)
+- **Goal.** Turn the qualitative evidence the ML model cannot see (headlines, fundamentals, macro, F&G) into ONE conviction score `s ∈ [0,1]` per symbol with a single batched, schema-enforced LLM call per gate cycle (throttled to `base_loop.LLM_INTERVAL_SEC` = 600 s). Owns the prompt contract (system prompt, response schema, parse, journaling); "on any failure returns `{}` for pass-through — never blocks trades". The three and only three roles: hard veto on new entries at `s < LLM_VETO_THRESHOLD (0.15)`, forced liquidation after TWO consecutive vetoing analyses (headlines are an untrusted prompt-injection channel), and sizing tilt `llm_mult = 0.5 + s`. Advisor-v2 fields are shadow-only.
+- **Key API.** `analyze_trades(candidates, asset_type, equity, positions, fng_value, model_config, position_details, system_prompt, include_pred, persist, model_override)`, `load_analysis()`, `get_last_analysis_meta()`, `rich_context_enabled()`, `build_compact_evidence`, `refresh_one`/`refresh_all` (`python llm_analyst.py --refresh-all` — parsed from `sys.argv`, no argparse), `PROMPT_REGISTRY`, `EVENT_FLAG_VOCAB`; harness hooks `_build_prompt`, `_response_schema`, `_SYSTEM_PROMPT`, `_sanitize_untrusted`.
+- **Imports** `events_calendar`, `fees`, `fundamentals`, `llm_client`, `llm_config`, `macro_calendar`, `sentiment`, `stock_config`, `trade_journal`, `trade_memory`, `trading_utils` (fan-out 11). **Imported by** `base_loop`, `scripts/llm_qualify`, `scripts/prompt_ab`, `stock_loop` (+4 tests); spawned by `gui.py` (refresh buttons).
+- **Reads / Writes** reads `llm_config.json`, `llm_analysis.json`, the earnings cache; writes `llm_analysis.json` (+`.tmp`), `journals/llm_replay/<date>.jsonl` (pruned > 45 d), `llm_advisor_v2` journal rows. **Flags** `enabled`, `rich_context_enabled`, `replay_capture_enabled`, `advisor_v2_enabled`, `analyst_dedup_ttl_sec` (all `llm_config.json`). **Flow** serve → gate (between prediction and sizing). **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: docstring "One LLM call per trading cycle" — the gate runs every 600 s, many cycles · OBJECTIVE-fix-pending: docstring says schema enforcement "replaces ~130 lines of fence stripping" while `_parse_response` still fence-strips (deliberate fallback; wording contradicts) · note `_response_schema` emits Gemini-dialect UPPERCASE types — correct only because `llm_client` normalises per provider · OWNER-decision: `_build_symbol_profiles` duplicates `indicators` RSI/SMA/vol math for prompt text; `refresh_all` bypasses the 600 s cadence and can move daily cost.
+
+### sentiment.py
+- library · 1279 lines · ⚠ (`dotenv`/`finnhub`/`bs4` guarded or lazy; scoring/gate math is pure)
+- **Goal.** Give the loops two things the model cannot compute: a market-regime read (Crypto F&G, CNN F&G/VIX) and a per-symbol news read (Finnhub, LLM-scored with a keyword-lexicon fallback), compressed into ONE bounded position-size multiplier. `sentiment_gate` is clamped to `[0.15, 1.5]` — strictly positive, so it can never veto (the unreachable veto was deleted 2026-08-22).
+- **Key API.** `sentiment_gate(symbol, asset_type)` → `(multiplier, reasons)`, `get_news_sentiment`, `get_market_sentiment`, `get_recent_headlines`, `get_fear_greed`, `get_cnn_fear_greed`, `score_article_batch`/`try_llm_upgrade` (GUI news tab); internals reused by `sentiment_history` and the standalone runner: `_score_text`, `_validate_text`, `_kw_score_article`, `_llm_score_batch`, `_aggregate_scores`, `_score_articles`.
+- **Imports** `llm_client` (lazy). **Imported by** `base_loop`, `crypto_loop`, `gui`, `llm_analyst`, `sentiment_history`, `stock_loop` (+8 tests incl. the standalone `tests/test_sentiment_headlines.py` runner).
+- **Reads / Writes** nothing on disk (in-process TTL caches); env `FINNHUB_API_KEY`. **Flags** none. **Flow** serve → gate (size multiplier) + evidence (headlines for the LLM prompt). **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: the `sentiment` role's provider switch is inert — `_get_scoring_tiers` and `try_llm_upgrade` hard-code Gemini model ids, so with an Anthropic-only config all article scoring silently falls back to the keyword lexicon (the comment claiming `get_recommended_model('sentiment')` can return a Claude model describes an unreachable path) · OWNER-decision (model-facing, unshipped): `_score_text` Phase 2 re-tokenises the unmasked text so `('rate cut', +1.0)` is partly cancelled by `'cut'` — the phrase-mask fix would move `Daily_Sentiment` · OWNER-decision: the symbol-news "triple count" (feature `Daily_Sentiment`, `sym_news` multiplier, raw headlines in the LLM prompt) and the hand-set multiplier ladder are unmeasured.
+
+### novelty.py
+- library · 179 lines · ✅
+- **Goal.** Stop wire reprints from re-triggering the sentiment/LLM stack: 3-word crc32 shingles, Jaccard vs the symbol's trailing 7-day history, `novelty = 1 − max Jaccard`; thread-locked store flushed once per batch.
+- **Key API.** `headline_novelty(symbol, headline, remember, flush)`, `filter_novel(symbol, headlines, min_novelty)` (fail-open); `WINDOW_DAYS`, `NOVELTY_MIN`.
+- **Imports** none. **Imported by** `base_loop` (lazy, headline filter) (+2 tests). **Reads / Writes** `novelty_store.json` (+`.tmp`). **Flags** none. **Flow** serve (input hygiene). **Status** LIVE.
+- **Known issues.** none.
+
+### macro_calendar.py
+- config + library · 107 lines · ✅
+- **Goal.** Block NEW entries inside scheduled macro-release windows (FOMC 12:00→15:30 ET, CPI 06:30→09:30 ET) where an hourly-bar model has no edge and only donates spread; exits and protective stops keep running.
+- **Key API.** `macro_standdown(now)` → `(bool, reason)`, `standdown_window_id(now)` (journal key so each window's counterfactual is journaled once), `calendar_exhausted(now)`; tables `FOMC_STATEMENT_DAYS`, `CPI_RELEASE_DAYS` (2026 only).
+- **Imports** none. **Imported by** `base_loop`, `llm_analyst` (+5 tests). **Reads / Writes** nothing. **Flags** none. **Flow** serve (entry gate, both books). **Status** LIVE.
+- **Known issues.** OWNER-decision: no NFP window — `research/campaign_2026-08/02_research.md` recommends adding one at high confidence; not implemented (grep `NFP|payroll` → zero hits in `*.py`) · MEASUREMENT-pending: the table ends 2026-12-10, so `calendar_exhausted()` flips in 2027 and the loop then warns daily + notifies once.
+
+### macro_indicators.py
+- library · 349 lines · ✅ (Alpaca-touching functions need an `api`)
+- **Goal.** Compose the market-wide risk regime — VIX (yfinance with FRED `VIXCLS` fallback), FRED financial stress, stablecoin peg, SPY 200d trend — into a `MacroRegime` the loops use for sizing and stop multipliers; plus the `DERISK_STACK_V2` helpers (one VIX tier map with hysteresis, regime-family multipliers).
+- **Key API.** `fetch_vix`, `fetch_financial_stress`, `check_stablecoin_pegs(api)`, `get_spy_trend_ok(api)`, `get_macro_regime(api, asset_type)`, `vix_tier_mult_v2(vix)`, `regime_family_mults_v2(regime, asset_type)`.
+- **Imports** `log_config`, `types_mod` (lazy). **Imported by** `base_loop`, `stock_loop` (+6 tests). **Reads / Writes** network only (in-memory TTL caches). **Flags** none directly (`DERISK_STACK_V2` is composed in `base_loop`). **Flow** serve (risk regime → sizing/stops/entry gates). **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending (minor): docstring lists "VIX: yfinance" only; the FRED fallback is unmentioned · the pseudo-CAPE estimator and its 0.7× haircut were deleted 2026-08-22 (docstrings and `types_mod.MacroRegime.cape` record this correctly) · failure semantics are asymmetric by design (blind VIX still labels; `get_spy_trend_ok` → `None` fails open).
+
+### events_calendar.py
+- library · 271 lines · ⚠ (`finnhub` guarded; cache readers and trading-day helpers are pure)
+- **Goal.** Earnings-print awareness: GTC stops do not protect against overnight gaps, so the overnight sleeve fails CLOSED on an unavailable calendar while new entries fail OPEN, and the first day after a print gets a size tilt. One unfiltered −3..+11-day Finnhub call per 24 h.
+- **Key API.** `calendar_available()`, `next_earnings_date(symbol)` (cache-READ only — hot LLM path), `earnings_within_days`, `blocks_overnight_hold(symbol)`, `reported_recently(symbol)`, `refresh_if_stale()`.
+- **Imports** `log_config`, `strategy_config` (lazy). **Imported by** `llm_analyst`, `stock_loop` (+4 tests). **Reads / Writes** `earnings_calendar.json` (pid-unique tmp + replace); env `FINNHUB_API_KEY`. **Flags** `EVENTS_TRADING_DAY_WINDOWS` (walk NYSE trading days — strictly wider windows). **Flow** serve (entry gate, sleeve eligibility, post-print tilt). **Status** LIVE.
+- **Known issues.** MEASUREMENT-pending: `_NYSE_HOLIDAYS` covers 2026+2027 and must be refreshed by hand annually.
+
+### edgar_events.py
+- library + CLI · 219 lines · ✅ (network-gated)
+- **Goal.** An ENTRY VETO from SEC EDGAR submissions — fresh solvency/credibility 8-K items (1.03, 2.04, 4.02, 5.02 within 5 days) and pending M&A forms (90 days) invalidate hourly technical signals. Free, keyless, official; FAIL OPEN with a rate-limited warning; failures are not cached so the next call retries.
+- **Key API.** `entry_blocked(symbol)` → `(bool, reason)`; `VETO_8K_ITEMS`, `MA_FORMS`. CLI `python edgar_events.py SYM …` (positional `sys.argv`, no argparse).
+- **Imports** `log_config`. **Imported by** `stock_loop` (+3 tests). **Reads / Writes** `edgar_cache.json` (one fetch per symbol per day), `edgar_tickers.json` (weekly CIK map); `data.sec.gov`. **Flags** none. **Flow** serve (entry gate, stocks only). **Status** LIVE.
+- **Known issues.** none objective (5.02 and acquirer-side S-4/425 are deliberately over-broad — documented).
+
+## 9. Execution & broker
+
+**Goal.** Own everything between "the strategy decided to trade" and "the broker confirmed it", once, for both books. **Invariants:** `trading_utils.get_api()` (§7) is the ONLY broker constructor (legacy `alpaca-trade-api`, or `alpaca_compat.CompatREST` over `alpaca-py` when `TRADER_USE_ALPACA_PY=1` or the legacy import fails); every `order_utils` function takes an injected `api` and is exercised against fakes on the Mac; entries fail CLOSED (no quote ⇒ no entry, unknown ladder outcome ≠ zero fill, no uncapped market entry when the IOC cap is on) while liquidations never cancel themselves (CONFIRM-ONLY mode) and are never capped; both books share ONE Alpaca account, so cancels are scoped to this bot's orders; the `'<list_positions failed>'` sentinel from `emergency_flatten` is string-matched by `base_loop` — a frozen contract.
+
+### order_utils.py
+- library · 1310 lines · ✅ (stdlib + `log_config`; heavy deps only via the injected `api`)
+- **Goal.** The order-lifecycle kernel: quote fetch + sanity (rejects NaN/non-positive/stale > 180 s; logs but returns crossed quotes), limit pricing, the crypto maker ladder, fill polling with fallback, cancel-and-wait, position verification/reconstruction, circuit breaker, emergency flatten — centralised so crypto and stock loops cannot drift on order semantics.
+- **Key API.** `get_quote(api, symbol, asset_type)` → `{bid, ask, spread, midpoint, spread_pct, fetched_ts}`; `compute_limit_price`, `ioc_limit_price`; `place_limit_order` (crypto notional→qty), `place_stock_limit_order`, `place_marketable_ioc`, `place_maker_buy` (bid-join ladder, idempotent per-rung ids); `manage_order_lifecycle(api, order_id, timeout, poll_interval, fallback_to_market, time_in_force, cancel_on_timeout, ioc_fallback)` (returns cancelled orders carrying partial fills; `cancel_on_timeout=False` = CONFIRM-ONLY); `verify_position`, `get_all_positions`, `reconstruct_positions`; `should_trade(predicted_return, spread_pct, min_edge, asset_type, maker)` — the cost gate, the ONLY production `fees.required_edge_pct(live=True)` caller; `realized_crypto_maker_share_notional`; `cancel_all_open_orders`, `cancel_orders_for_symbol`, `check_circuit_breaker` (`(False, None)` on API error = unknown ⇒ skip entries), `emergency_flatten`; `install_session_timeout`; `make_client_order_id` (explicitly NOT idempotent).
+- **Imports** `fees`, `log_config`, `order_stream`, `strategy_config`, `trade_journal` (all but `log_config` lazy). **Imported by** `base_loop`, `crypto_loop`, `stock_loop`, `trading_utils` (+15 tests).
+- **Reads / Writes** reads `journals/*.jsonl` (notional maker share); writes journal rows `entry_fills`, `ioc_entry_fallback` (suppressed under pytest). **Flags** `TRADER_IOC_ENTRY_CAP` → `IOC_ENTRY_CAP_ENABLED`, `TRADER_MAKER_SHARE_NOTIONAL` → `MAKER_SHARE_NOTIONAL_ENABLED` (both captured at IMPORT time as module globals, re-read from the global at call time); `strategy_config.IOC_CAP_BPS`. **Flow** gate → order → fill → journal → (restart) rebuild. **Status** LIVE.
+- **Known issues.** OWNER-decision (verified): the two loops order the cost gate and the threshold gate differently (`base_loop` evaluates `should_trade` before the threshold; `stock_loop` the reverse), skewing `cost_floor` skip attribution in `decision_report` · OWNER-decision: `place_marketable_ioc`'s "NOT YET WIRED" docstring is half-stale — it IS reached via `_ioc_entry_fallback` when the cap flag is on · OWNER-decision: two notional maker-share estimators exist (`realized_crypto_maker_share_notional` over `entry_fills` rows vs `execution_report` over `buy` rows) · `cancel_all_open_orders` lists unfiltered then filters client-side while `cancel_orders_for_symbol` passes the server hint (consistent result, inconsistent style).
+
+### order_stream.py
+- library · 171 lines · ⚠ (`alpaca.trading.stream` inside `start_order_stream`)
+- **Goal.** Replace thousands of daily `GET /orders` polls with pushed `trade_updates`, while keeping correctness independent of the stream — the cache only decides *when* `manage_order_lifecycle` makes its one authoritative REST fetch. Alpaca allows ONE `trade_updates` connection per account, so it is safe only in combined-bots single-process mode.
+- **Key API.** `start_order_stream()` (idempotent), `get_order_state(order_id)`, `TERMINAL`, `_next_backoff` (pure).
+- **Imports** `log_config`. **Imported by** `base_loop`, `order_utils` (+3 tests). **Reads / Writes** in-memory bounded dict only; env `TRADER_ORDER_STREAM` (must equal `'1'` — `true` is a silent no-op), `ALPACA_*` (unset `ALPACA_BASE_URL` ⇒ stream disabled rather than guessing paper vs live). **Flags** `TRADER_ORDER_STREAM`. **Flow** execute (latency). **Status** STAGED (default OFF).
+- **Known issues.** OWNER-decision: server-side bracket/trailing-stop fill events are recorded but nothing reads them (documented future work).
+
+### execution_policy.py
+- library · 219 lines · ✅
+- **Goal.** Lift the entry-tactic decision (today buried in `compute_limit_price`'s magic constants) into one auditable table-driven pure function with named `strategy_config.EXEC_*` thresholds, so the live loop and the backtester can eventually choose the *same* tactic (`cross` / `post` / `ladder`).
+- **Key API.** `choose_entry_tactic(asset_type, live_spread_pct, pred_return, edge_floor, name_class)` → `{tactic, post_offset_pct, name_class, name_class_coerced, reason}`; `VALID_CLASSES`.
+- **Imports** `strategy_config`. **Imported by** tests only (`test_execution_policy`, `test_execution_policy_v3`, `test_review_b02`). **Flags** the four `EXEC_*` constants (inert while unwired). **Flow** would sit between gate and order. **Status** STAGED-not-wired (docstring "NOT YET WIRED" is accurate).
+- **Known issues.** OWNER-decision (documented in its own docstring): `name_class` has no seed table (every caller would get `'mid'`), and `edge_floor` has an unpinned contract — `fees.round_trip_cost_pct` vs `fees.required_edge_pct` are 2.0× apart and yield opposite tactics; its ex-ante tactic vocabulary is NOT the journaled ex-post `entry_tactic` vocabulary.
+
+### alpaca_compat.py
+- library · 366 lines · ⚠ (`alpaca.*` imported inside methods; nothing constructible without `alpaca-py`)
+- **Goal.** Present the legacy `alpaca-trade-api` REST surface (`submit_order`, `get_bars`, `bar.o/.h/.l/.c`, `quote.bp/.ap` …) on top of the maintained `alpaca-py` SDK, so the switch is one constructor swap in `trading_utils.get_api()` and zero call-site edits when the unmaintained legacy SDK rots. Each shim gained fields only after a missing one caused a real failure (stop/limit price, `quote.t`, `after`/`until`, `None` equity points).
+- **Key API.** `CompatREST(key, secret, base_url, api_version)`; orders/positions/account/clock/calendar/portfolio-history/bars/quotes/snapshots methods; `_shim_*` translators.
+- **Imports** none (deliberately zero repo deps). **Imported by** `trading_utils` (+3 tests). **Reads / Writes** nothing. **Flags** selected by `TRADER_USE_ALPACA_PY` (read in `trading_utils`, not here). **Flow** execute (broker boundary). **Status** LIVE (fallback path).
+- **Known issues.** OBJECTIVE-fix-pending: docstring names `cancel_all_orders` among "surface-parity methods with no current callers" — it has two live callers in `order_utils` (`cancel_all_open_orders`, `emergency_flatten`); only `get_calendar` and `close_all_positions` are caller-less · OWNER-decision: `_shim_portfolio_history` silently shortens `profit_loss` arrays when the broker returns fewer P/L points than equity points; `api_version` is accepted and unused (signature parity).
+
+## 10. Risk, portfolio & sizing
+
+**Goal.** Size every entry from account risk, not conviction alone, and cap the book against correlated factor exposure. The single sizing function is `base_loop._compute_position_size` (§7): risk base (`equity × RISK_PCT_PER_TRADE / stop_dist`) × Kelly multiplier × vol-target multiplier × a composite tilt (signal confidence, VIX tier, drawdown ladder, macro, correlation haircut, HMM, disagreement, sentiment, LLM, meta, book-vol) clamped to `[0.1, TILT_MAX]`, then correlation admission, ENB book-risk budget, cross-book cap (journal-only) and the crowding bucket cap. **Invariants:** every multiplier can only shrink or block, never enlarge past its clamp; `DERISK_STACK_V2` (default OFF) is always computed and journaled as a shadow so `scripts/sizing_cofire_report.py` can compare compositions before a flip; the modules below are consumed by `base_loop` unless marked DORMANT.
+
+### portfolio.py
+- kernel + library · 648 lines · ⚠ (sklearn `LedoitWolf` lazy with `np.corrcoef` fallback)
+- **Goal.** Three components off the same pairwise-|corr| inputs: the correlation admission gate + sizing haircut, the equicorrelation-ENB book-risk kernels (`risk_budget` imports these to net both books), and the Moreira–Muir account-level realized-vol de-risk-only scalar.
+- **Key API.** `get_correlation_matrix_cached(api, symbols, asset_type)` (cache key is `asset_type` ONLY — pass the full universe), `compute_correlation_matrix`, `check_portfolio_correlation` → `(allowed, avg_corr)`, `get_correlation_sizing_factor`, `avg_book_correlation(symbols, corr, uncovered)`, `diversified_book_risk(risks, avg_corr)`, `book_risk_budget(existing, avg_corr, cap)`, `get_book_vol_scalar_cached(api, asset_type)` (clamped `[0.5, 1.0]`), `ewma_annualized_vol`; `MAX_AVG_CORRELATION = 0.7` (local, not in `strategy_config`).
+- **Imports** `log_config`, `market_data`, `strategy_config` (lazy). **Imported by** `base_loop`, `risk_budget`, `stock_loop` (+9 tests). **Reads / Writes** Alpaca bars + portfolio history only. **Flags** `DERISK_STACK_V2` (outlier exclusion in the book-vol EWMA), `PORTFOLIO_VOL_TARGET`. **Flow** serve (entry gate + sizing). **Status** LIVE.
+- **Known issues.** OWNER-decision: `MAX_AVG_CORRELATION` lives outside the single source of truth (annotated in-source) · OWNER-decision: `_TRADING_DAYS = 252` annualisation may be wrong if Alpaca's 1D history includes weekend points for a crypto-holding account (the `[BOOK-VOL] spacing_days=` diagnostic already exists) · `_avg_abs_corr` treats a negative hedge like a clone.
+
+### risk_budget.py
+- kernel + library · 574 lines · ✅
+- **Goal.** The per-book equicorrelation cap is enforced PER BOOK, so the stock book (COIN/MSTR/MARA crypto-proxies) and crypto book can each run 2.5 % stop-risk behind the SAME factor (~5 % combined vs an intended ~3 %). This module nets the two books with one cross-book correlation term — a CONSTRAINT that can only shrink or block — plus the GATE-1 registry and a two-book equity simulator (GATE-2).
+- **Key API.** `account_stop_risk`, `account_risk_budget` (bisection), `allocate_book_caps`, `scale_for_account_cap`, `simulate_two_books` (additive equity — drawdowns are a lower bound), `read_registry`, `write_book_risk`, `account_risk_gate1_report`, `record_book_risk_and_report(book, book_risks, rho_book, …)` (the ONLY production caller); `ACCOUNT_RISK_CAP = 0.03` (defined only here).
+- **Imports** `log_config`, `portfolio`. **Imported by** `base_loop` (+5 tests). **Reads / Writes** `account_risk_registry.json` (+ per-writer tmp, sidecar `.lock`); also read by `gui.py` with its own hardcoded 600 s staleness rule (documented). **Flags** `CROSS_BOOK_RHO` (passed in by `base_loop`). **Flow** measure (journal `action='account_risk'`; takes NO trading action). **Status** MEASUREMENT-ONLY (the cap itself is not enforced).
+- **Known issues.** OWNER-decision (documented degeneracy): at `rho_cross == 1.0` (the production value) `account_stop_risk == book_sum` identically, so the report restates the assumption; `account_stop_risk_indep` is journaled alongside to bracket the truth.
+
+### volatility.py
+- library · 725 lines · ⚠ (`arch` lazy; HAR path pure) — `tests/test_new_modules.py::TestVolatility` GARCH ids are in the Mac baseline
+- **Goal.** Forward-looking per-bar sigma for vol-targeted sizing — HAR-RV on Parkinson realized range (primary) with EGARCH/GARCH fallback — plus the crypto book's own BTC realized-vol regime state machine (VIX is an equity gauge) with hysteresis and persisted history.
+- **Key API.** `get_sigma(symbol, returns, bars, asset_type)`, `compute_vol_adjusted_size(base_notional, sigma, asset_type)`, `har_forecast_sigma`, `daily_realized_range`, `update_crypto_rv_state(symbol, bars)`, `get_crypto_rv_mult()` → `(mult, state, pctile)`, `fit_garch`, `forecast_volatility`, `get_cached_sigma`.
+- **Imports** `log_config`, `market_data`, `strategy_config` (lazy). **Imported by** `base_loop` (+7 tests). **Reads / Writes** `crypto_rv_history.json`, `har_rrv_history.json` (atomic); reads `daily_bars_cache.json` via `market_data.load_daily_bars`. **Flags** `HAR_VOL_ENABLED` (True, but the HAR branch is structurally unreachable live until `TRADER_HAR_DAILY_FEED=1`), `TRADER_HAR_DAILY_FEED` (proxied from `market_data`), `PORTFOLIO_VOL_TARGET`, `CRYPTO_RV_*` thresholds (live only under `DERISK_STACK_V2`). **Flow** serve (sizing sigma; de-risk regime). **Status** LIVE (GARCH/fallback path) / STAGED (HAR daily feed, BTC-RV v2 composition).
+- **Known issues.** OBJECTIVE-fix-pending (stale comment): `get_garch_stop` is described as kept "because base_loop.py:40 still imports the name" — `base_loop` does not reference it and `tests/test_grp_loops.py` asserts its absence; the helper is dead · `_har_rrv_load` references names defined ~200 lines later (legal, hard to follow).
+
+### drawdown.py
+- kernel · 80 lines · ✅ (zero imports)
+- **Goal.** Make the account-drawdown de-leveraging ladder (10/15/20 % drawdown → 0.75/0.50/0.25× size, Grossman–Zhou) and its high-water-mark persistence testable off `base_loop`; closes wave-8 #4 (a restart mid-drawdown used to reset the peak and silently disable the ladder when the account was underwater).
+- **Key API.** `DRAWDOWN_LADDER`, `PEAK_SEED`, `update_peak_equity`, `restore_peak_equity` (rejects NaN/±inf/non-positive saved peaks), `drawdown_fraction`, `drawdown_size_multiplier`.
+- **Imports** none. **Imported by** `base_loop` (+4 tests). **Reads / Writes** nothing (`base_loop` owns the persisted peak in `{prefix}_position_state.json`). **Flags** none; stays OUTSIDE the `DERISK_STACK_V2` regime-family MIN by design (measures the account, not market vol). **Flow** sizing. **Status** LIVE.
+- **Known issues.** none.
+
+### regime_detector.py
+- library · 230 lines · ⚠ (`hmmlearn` lazy; absent → `fit_hmm` returns `(None, None)`) — `tests/test_new_modules.py::TestRegimeDetector::test_fit_hmm` is in the Mac baseline
+- **Goal.** Hamilton-style regime switching as a 3-state Gaussian HMM per symbol (daily refit cache) mapped to a sizing multiplier (bull 1.2 / bear 0.3 / high-vol 0.5) consumed by `base_loop` sizing; excluded from the `DERISK_STACK_V2` composition.
+- **Key API.** `fit_hmm(returns, n_states)`, `get_current_regime`, `get_cached_regime(symbol, returns)` (the live entry), `_smooth_regime`.
+- **Imports** `log_config`. **Imported by** `base_loop` (+2 tests). **Reads / Writes** process-memory caches only. **Flags** none (`DERISK_STACK_V2` excludes it in `base_loop`). **Flow** serve (sizing). **Status** LIVE (legacy stack) — KILL_LIST marks the layer "cut recommended (pending)".
+- **Known issues.** OWNER-decision: `hmmlearn` is declared in NO requirements file (the code's own comment calls it "Undeclared/broken dependency") — declare vs kill the layer is the pending decision; do not add the dependency in passing · the module carries a KNOWN-INVERTED smoothing note (pinned by `tests/test_review_b07.py`).
+
+### crypto_trend.py
+- kernel · 106 lines · ✅
+- **Goal.** A BTC-native 200 h-SMA TSMOM risk-off scalar with an asymmetric Schmitt trigger (de-risk fast, re-arm slow) + N-bar persistence, to shrink crypto entries in a calm-VIX, no-depeg BTC downtrend — the one regime the equity-vol/stablecoin gates miss.
+- **Key API.** `sma_gap(closes, window)`, `trend_scalar(gap, floor, scale)` (fails OPEN to 1.0), `hysteresis_state` (fails HOLD), `smooth_state`.
+- **Imports** none. **Imported by** tests only (`test_crypto_trend`, `test_grp_loops`, `test_review_b01`). **Flags** `CRYPTO_TREND_GATE_ENABLED`/`CRYPTO_TREND_SMA_WINDOW`/`CRYPTO_TREND_FLOOR` have zero consumers — flipping is a silent no-op, as the module says. **Flow** serve (sizing tilt) — not wired. **Status** DORMANT.
+- **Known issues.** none beyond dormancy.
+
+### bet_sizing.py
+- kernel · 170 lines · ✅ (`scipy.special.ndtr` lazy)
+- **Goal.** Edge-/probability-proportional bet sizing (AFML ch.10 size-from-p, asymmetric-payoff Kelly, concurrency scaling, breakeven p) to replace the flat-topped `clip(2p, 0.6, 1.3)` once a calibrated p exists — DECLARED-AHEAD, activation gated on `EDGE_KELLY_ENABLED`, itself gated on `META_CALIBRATION_MODE='purged_oof'` + a rank-gradient PASS.
+- **Key API.** `afml_bet_size(p, base_rate, step)`, `kelly_edge_odds(p, b, a, fraction, cap)`, `concurrency_scale(n)`, `breakeven_p(b, a)`.
+- **Imports** none. **Imported by** tests only (`test_bet_sizing*`, `test_review_b13`, `test_grp_models`). **Flags** `EDGE_KELLY_ENABLED` (no reader). **Flow** sizing — not wired. **Status** DORMANT.
+- **Known issues.** none objective (unit-mismatch warnings documented).
+
+## 11. Journals, ledgers & measurement instruments
+
+**Goal.** Grade the system afterwards without touching a decision: every entry, skip, exit, LLM call and account-risk snapshot lands in `journals/YYYY-MM-DD.jsonl` under a frozen producer contract (`trade_journal.py` docstring), and a shelf of measurement-only CLIs reads the journals and the stage-0 prediction dumps back into reports the owner (and the GUI's report buttons) consult before any flag flips. **Invariants:** measurement-only modules never import a trading path and ship without the promotion gate; "Stage-0" = this substrate (conviction journal → `decision_report`; `backtest` dump → `ic_by_name`/`rank_gradient_report`); reports are written atomically and always stamped (`stale: True` on failure) so downstream gates can refuse a stale read; journal consumers break on a key rename — keep the contract in sync.
+
+### trade_journal.py
+- library · 315 lines · ✅
+- **Goal.** The append-only daily JSONL decision journal with a frozen producer contract (rows tagged by `action`: `buy`, `sell`, `skip`, `llm_analysis`, `entry_window`, `account_risk`, …; only `ts` is guaranteed by the writer) that the Stage-0 consumers (`decision_report`, `llm_eval`, `fees`, `execution_report`) read; optional gzip retention.
+- **Key API.** `log_decision(entry)`, `open_journal(path)` (transparent `.gz`), `rotate_old_journals(now)`, `iter_journal_rows(days)`, `get_journal_summary(date)`, `JOURNAL_DIR`.
+- **Imports** `llm_config`, `log_config`. **Imported by** `base_loop`, `execution_report`, `fees`, `llm_analyst`, `order_utils`, `run_bots`, `stock_loop` (+12 tests).
+- **Reads / Writes** `journals/YYYY-MM-DD.jsonl` (append) and `.jsonl.gz` (rotation); reads `llm_config.json` `journal_enabled`. **Flags** `TRADER_JOURNAL_ROTATE_DAYS` (0 = off), `journal_enabled`. **Flow** journal. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: the schema docstring lists `sentiment_block` as a producer `skip_reason`; no producer has written it since the 2026-08-22 removal (only `decision_report.GATE_REASONS` keeps it, correctly, to price historical rows).
+
+### trade_memory.py
+- library · 196 lines · ✅
+- **Goal.** A rolling per-symbol record (50) of completed round trips — the Kelly sample for `trading_utils.compute_kelly_fraction`, the CUSUM outcomes for `monitor_drift`, and one-line lesson summaries injected into the LLM prompt — with thread + flock-safe atomic writes because both loops write it (threads in combined mode, processes in split mode).
+- **Key API.** `record_trade(symbol, action, entry_price, …)`, `get_lesson_summary(symbol)`, `load_all()`.
+- **Imports** `log_config`. **Imported by** `base_loop`, `llm_analyst`, `monitor_drift` (private `_load`), `stock_loop` (+4 tests). **Reads / Writes** `trade_memory.json` (+ per-writer tmp, `.lock` sidecar, `.corrupt` quarantine). **Flags** none. **Flow** journal → sizing/LLM/drift. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: `load_all`'s docstring names consumers that do not use it (`trading_utils` reads the file directly; `monitor_drift` imports `_load`); `load_all` has no production caller.
+
+### journal_stats.py
+- library · 599 lines · ✅ (stdlib only by design — no numpy/pandas)
+- **Goal.** The `chart_core` of the journal: LIFO buy/sell pairing, win-rate/P&L stats, a formatted summary and the end-of-day digest, returned as plain dicts so `gui.py` only paints and `run_pipeline` only notifies.
+- **Key API.** `load_trades(journal_dir, since_ts, until_ts, …)`, `compute_stats(trades)`, `format_summary(stats)`, `build_eod_digest(journal_dir, positions, now)`.
+- **Imports** none. **Imported by** `gui`, `run_pipeline` (+2 tests). **Reads / Writes** reads `journals/*.jsonl[.gz]`; writes nothing. **Flags** none. **Flow** measure / GUI / EOD digest. **Status** MEASUREMENT-ONLY.
+- **Known issues.** OBJECTIVE-fix-pending: the docstring's producer citations (`base_loop.py:1950-1961`, `stock_loop.py:961-973`, `trade_journal.py:81`, …) are systematically stale — every coordinate moved; the content of each claim still holds.
+
+### decision_report.py
+- CLI + library · 991 lines · ⚠ (`dotenv` guarded; `run_report` needs Alpaca; the pure helpers run on the Mac)
+- **Goal.** "Every veto the system logs is a COUNTERFACTUAL trade": replay journaled skips through the SAME `policy_exits` kernel that prices labels (`max_hold=24`, closed bars only) to price what each gate saved or cost — (1) gate attribution per `skip_reason` (19 priced `GATE_REASONS`, 11 unpriced mechanical vetoes), (2) conviction calibration by predicted-return decile / meta-prob band / entry rank (Stage-0 experiments 1 and 2), plus the signal-exit audit and the admitted-k distribution.
+- **Key API.** `load_journal(days)` (streams + projects to `_KEPT_FIELDS` — the raw 30-day journal is ~10⁶ dicts on 8 GB), `replay_entry`, `_replay_grouped`, `gate_attribution`, `signal_exit_audit`, `conviction_calibration`, `admitted_k_distribution`, `run_report(days)`; `GATE_REASONS`, `UNPRICED_GATES`, `MAX_HOLD_BARS`.
+- **Imports** `fees`, `market_data`, `policy_exits`, `strategy_config`, `trading_utils` (all lazy). **Imported by** tests only (+5); spawned by `gui.py` (`--days 30`). Its output is read by `gui.py`, `chart_core.gate_panel_model`, `rank_gradient.rank_gradient_verdict`, `scripts/rank_gradient_report.py`.
+- **Reads / Writes** reads `journals/*.jsonl`, Alpaca bars (`closed_only=True`), `llm_config.json`; writes `decision_report.json` (ALWAYS, atomically, `stale: True` + reason on failure). **Flags** `CONVICTION_JOURNAL_ENABLED` (reported), `journal_enabled`. **Flow** measure. **Status** MEASUREMENT-ONLY.
+- **Known issues.** OBJECTIVE-fix-pending: `replay_entry`'s comment cites the `spread_pct` producers as `base_loop.py:1751-1753 / stock_loop.py:815`; the real sites are in `base_loop._execute_buys` / `stock_loop._execute_buys` (~3020 / ~1093 as of 2026-09-08) · OWNER-decision: `MAX_HOLD_BARS` is 24 for both books (24 h crypto vs ~3.4 sessions stock).
+
+### execution_report.py
+- CLI · 228 lines · ✅ (needs real journals → effectively Jetson)
+- **Goal.** Check backtest cost assumptions against REALIZED fills: implementation shortfall (`decision_price` vs `fill_price`, signed so positive = worse) by asset/action/exit reason, crypto maker share (count and notional), entry slippage by quote age, LLM call economics.
+- **Key API.** `run_report(days)`, `_load(days)`, `_write_json`.
+- **Imports** `fees`, `trade_journal`. **Imported by** tests only (+3); spawned by `gui.py` (`--days 14`). **Reads / Writes** reads `journals/` (`days+1` files); writes `execution_report.json` (even on an empty window). **Flags** none. **Flow** measure. **Status** MEASUREMENT-ONLY.
+- **Known issues.** OBJECTIVE-fix-pending: the closing advice attributes the spread haircuts to "fees.py" — they are `backtest.SPREAD_PCT` (the same message's next sentence says so) · OWNER-decision: its notional maker share (over `buy` rows) duplicates `order_utils.realized_crypto_maker_share_notional` (over `entry_fills` rows) with different inputs.
+
+### beta_ledger.py
+- CLI + library · 739 lines · ✅ (statistics pure; `load_equity_alpaca` needs Alpaca, `load_benchmarks_yf` yfinance)
+- **Goal.** Answer "how much of the strategy's P&L is market exposure?" — the 2026-07 review found a long-only book on two correlated factor sleeves with nothing measuring realized beta. Dimson-style lagged betas (Asness–Krail–Liew), trend-conditional betas (Goulding–Harvey–Mazzoleni), up/down split (Henriksson–Merton), HAC alpha t-stat, rolling beta.
+- **Key API.** `ols_hac`, `align_benchmark_returns`, `clean_returns_from_pl`, `lagged_beta_regression`, `up_down_betas`, `conditional_betas`, `rolling_beta`, `beta_report(equity, bench_prices, lags, clean_ret)`, `format_report`, `load_equity_alpaca`, `load_benchmarks_yf`.
+- **Imports** `trading_utils` (lazy). **Imported by** tests only (+3); spawned by `gui.py` (`--days 90 --json beta_report.json`). **Reads / Writes** Alpaca portfolio history, yfinance SPY/BTC-USD, or `--equity-csv`/`--benchmarks-csv`; writes only with `--json` (atomic). Manual/on-demand only — no scheduler. **Flags** none. **Flow** measure. **Status** MEASUREMENT-ONLY.
+- **Known issues.** none objective (`portfolio.py` explicitly says never to import it from a live sizing path).
+
+### stage0_preds.py
+- kernel · 275 lines · ✅
+- **Goal.** The stage-0 prediction dump: per-(symbol, bar) NON-OVERLAPPING rows (`ts, symbol, pred/signal, fwd_return, close, horizon_bars, lstm_pred, lgb_pred, meta_p, q10, pred_thresh_ratio`; PERCENT units) anchored to every horizon-th union-grid timestamp so cross-name panel periods align, plus an honest hourly mark-to-market equity for the replay window. Emitted by `backtest.run_backtest` (default ON) and consumed by every FR-04/M1/FR-05 driver.
+- **Key API.** `index_ns`, `global_anchor_ns`, `select_row_indices`, `build_rows`, `write_rows(rows, path)`, `max_drawdown_from_equity`, `mtm_equity`.
+- **Imports** none. **Imported by** `backtest`, `scripts/entry_timing_probe`, `scripts/funding_drift_audit`, `scripts/horizon_transfer_report`, `scripts/naive_vs_blend`, `scripts/window_ab` (+2 tests). **Writes** `{slot}_stage0_preds.json|.csv` when called. **Flags** `backtest.STAGE0_DUMP_DEFAULT`. **Flow** measure. **Status** MEASUREMENT-ONLY.
+- **Known issues.** none.
+
+### ic_diagnostic.py
+- kernel · 101 lines · ✅ (scipy)
+- **Goal.** Decide which candidate names the model actually predicts: Spearman rank-IC per name with sub-period consistency and a signed t-stat hurdle; everything that fails stays training-only (the wave-9 #3 universe-promotion gate — consumed by report scripts, not by the live universe loader).
+- **Key API.** `rank_ic(pred, fwd_return)`, `ic_by_name(rows, name_key, pred_key, fwd_key, n_subperiods)`, `promote_set(ic_table, min_ic, min_consistency, min_t)`.
+- **Imports** none. **Imported by** `scripts/entry_timing_probe`, `scripts/ic_by_name`, `scripts/naive_vs_blend` (+4 tests). **Flags** none. **Flow** measure. **Status** MEASUREMENT-ONLY.
+- **Known issues.** none.
+
+### rank_gradient.py
+- kernel · 143 lines · ✅
+- **Goal.** The Stage-0 go/no-go for the conviction flagship + edge-Kelly: does rank 1-3 realize MATERIALLY more net return than rank 6-7? Must PASS on both the offline holdout panel and the live journals before either lever ships.
+- **Key API.** `DEFAULT_BUCKETS`, `MIN_BUCKET_N`, `rank_gradient_from_panel(panel, buckets, cost_pct, fwd_bars)`, `rank_gradient_verdict(buckets, ratio_threshold, min_bucket_n, require_ci)` (accepts a bare bucket dict OR a full `decision_report.json`).
+- **Imports** none. **Imported by** `scripts/rank_gradient_report` (+3 tests). **Flags** gates `CONCENTRATION_ENABLED`/`EDGE_KELLY_ENABLED` (both dormant). **Flow** measure. **Status** MEASUREMENT-ONLY.
+- **Known issues.** none objective (its `_Z90` analytic CI vs `decision_report`'s bootstrap CI are different constructions at the same nominal level — documented).
+
+### scripts/ic_by_name.py
+- script · 102 lines · ✅
+- **Goal.** Per-name rank-IC report over the stage-0 dump (`--time-key ts` recommended) = the universe-promotion gate for wave-9 #3 breadth: PROMOTE only names with positive, consistent, significant OOS rank-IC.
+- **Imports** `ic_diagnostic`. **Imported by** tests only (+1). **Reads** the dump JSON/CSV; **writes** stdout. **Status** MEASUREMENT-ONLY. **Known issues** none.
+
+### scripts/rank_gradient_report.py
+- script · 134 lines · ✅
+- **Goal.** Rank-gradient Stage-0 harness: `--preds` (holdout dump → `portfolio_backtest.panel_from_frame` → `rank_gradient_from_panel`) or `--buckets decision_report.json` (live side); `--strict` for ship decisions; exit 0 CONFIRMED / 1 no-go / 2 unusable input (stale report). Run with `--fwd-bars 1` on the non-overlapping dump.
+- **Imports** `portfolio_backtest` (lazy), `rank_gradient`. **Imported by** tests only (+1). **Status** MEASUREMENT-ONLY. **Known issues** none.
+
+### scripts/reliability_report.py
+- script · 110 lines · ✅
+- **Goal.** Print Brier/ECE/reliability for the legacy vs purged-OOF META calibrators on a Jetson-produced `{p_legacy, p_purged, y}` JSON and the verdict for flipping `META_CALIBRATION_MODE='purged_oof'` (refuses empty arrays; flags near-identical arms as zero evidence). It is NOT a q10-coverage tool despite two comments elsewhere claiming so.
+- **Imports** `calibration`. **Imported by** tests only (+1). **Status** MEASUREMENT-ONLY. **Known issues** none in the script.
+
+### scripts/sizing_cofire_report.py
+- script · 360 lines · ✅ (stdlib; `strategy_config` guarded)
+- **Goal.** Answer defect D10 with real fills: which de-risk multipliers fire, how often they co-fire on the same driver, how often the composed product saturates the 0.1 floor or `TILT_MAX`, and how the `DERISK_STACK_V2` min-family composition (journaled as a shadow by `base_loop`) compares to the legacy product BEFORE any flip.
+- **Key API.** `_load_rows`, `build_report`, `print_report`, `main`; `MULT_KEYS`, `DERISK_KEYS`.
+- **Imports** `strategy_config` (guarded). **Imported by** none (source-referenced by `tests/test_c26_S3.py`). **Reads** `journals/*.jsonl` (`sizing.*` producer contract); **writes** stdout / `--json`. **Status** MEASUREMENT-ONLY (the `DERISK_STACK_V2` evidence gate).
+- **Known issues.** OBJECTIVE-fix-pending: `marginal_effect` iterates `MULT_KEYS`, which includes `kelly_mult` and `vol_mult` — those are applied OUTSIDE the tilt product in `base_loop._compute_position_size` and never enter `tilt_raw`, so `raw / m` is meaningless for exactly those two keys (fix: iterate the in-tilt subset) · OWNER-decision: reads whole journal files before ts-filtering (memory-heavy for 30 days on 8 GB).
+
+### scripts/crypto_spread_census.py
+- script · 198 lines · ⚠ (`dotenv` guarded; pure kernels; `main()` needs `requests` + Alpaca keys)
+- **Goal.** Owner EVIDENCE for `liquidity.py`'s crypto tier map and the KILL_LIST ruling: poll Alpaca v1beta3 latest crypto quotes for `CRYPTO_POOL` over a window and write per-pair spread statistics, with a units tripwire (percent vs fraction — the wave-7 100× slip).
+- **Key API.** `quote_spread_pct`, `summarize`, `sanity_check`, `fetch_latest_quotes`, `main`.
+- **Imports** `stock_config`. **Imported by** tests only (+1). **Writes** `crypto_spread_census.json` (consumed only by `liquidity._load_census` under the dark `TRADER_CRYPTO_SPREAD_STAMP`). **Status** MEASUREMENT-ONLY.
+- **Known issues.** OBJECTIVE-fix-pending: uses `datetime.utcnow()` (deprecated since 3.12; the only `utcnow()` in non-test code) — drop-in `datetime.now(timezone.utc)`.
+
+### scripts/wave6_stage0.py
+- script · 191 lines · ✅ (needs the store)
+- **Goal.** Wave-6 Experiment 1: realized label concurrency / effective sample size per book from the harvested `TB_Bars_*` columns (`sample_weights.average_uniqueness`/`effective_n`); verdict crypto ū < 0.30 ⇒ ship uniqueness weights + effective-n DSR, stock ū > 0.60 ⇒ near-IID no-op. Gates `UNIQUENESS_WEIGHTS_ENABLED`.
+- **Imports** `data_utils` (lazy), `sample_weights`. **Imported by** tests only (+2). **Writes** optional `--json`. **Status** MEASUREMENT-ONLY. **Known issues** none.
+
+## 12. LLM layer
+
+**Goal.** One provider-agnostic transport (`llm_client`) behind every LLM call — Gemini, Anthropic/Claude and OpenAI/OpenAI-compatible endpoints, all schema-enforced (Gemini `responseSchema`, Claude forced tool use, OpenAI strict structured outputs), one daily `$1.00` cap, per-model RPD budgets, a shared rate limiter and 429 cooldown — feeding three consumers: the pre-trade analyst gate (`llm_analyst`, §8), article sentiment scoring (`sentiment`, §8) and the historical Batch-API backfill (`sentiment_history`). **Invariants:** a failure anywhere returns `None`/`{}` and never blocks a trade (fail-open end to end); the `backfill` role is pinned to Gemini (Batch API); callers author Gemini-dialect schemas and `llm_client` normalises per provider; keys and routing live in `llm_config.json` (§1); every prompt change is adjudicated offline by `scripts/prompt_ab.py` with the same statistics `llm_eval` uses; the keep/kill-LLM-spend verdict is `llm_eval`'s `b2` significance at n ≥ 60.
+
+### llm_client.py
+- library · 1626 lines · ✅ (pure stdlib `urllib`; no SDKs by design)
+- **Goal.** Hide three wire protocols behind one `str|None` contract, route every call through `resolve_provider_chain(role)` (modes `auto` (default: `provider_preference` order + own fallback chains + enabled endpoints), `single`, `free-only`, `best-free`), and govern spend: `_DAILY_COST_LIMIT = $1.00` (reset midnight America/Los_Angeles), per-model RPD budgets, a sliding-window RPM limiter, per-provider 429 cooldown, a never-raise cost recorder that credits cache tokens.
+- **Key API.** `call_llm(prompt, system, max_tokens, json_schema, temperature, role)`, `call_model(…, model)`, `call_gemini`/`call_claude`/`call_openai`, `resolve_provider_chain(role, config)`, `get_recommended_model(role)`, `get_routing_info()`, `get_tier()`, `get_budget(model)`, `get_daily_cost()`, `record_call(model)`, `get_last_model_used()`; registries `GEMINI_MODELS`, `ANTHROPIC_MODELS`, `OPENAI_MODELS`; `_normalize_schema_for_anthropic`/`_openai`.
+- **Imports** `llm_config`. **Imported by** `fundamentals`, `gui`, `llm_analyst`, `llm_eval`, `scripts/llm_qualify`, `scripts/prompt_ab`, `sentiment`, `sentiment_history` (+5 tests; fan-in #10).
+- **Reads / Writes** reads `llm_config.json` (on nearly every path), `llm_cost.json`; env `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `<ENDPOINTNAME>_API_KEY`; writes `llm_cost.json` (+`.lock` flock), `llm_config.json` on tier auto-detect. **Flags** every `llm_config.json` routing/pricing key. **Flow** serve (transport) + ops (GUI routing/cost panels). **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending (dead): `_FALLBACK_CODES` is never referenced; `probe_tier()` and `probe_available_models()` have no in-repo caller · OBJECTIVE-fix-pending: docstring "progressively downgrades as daily cost increases" — every routing bracket maps every role to the same model, so no downgrade can occur · OWNER-decision (recorded handoff in `llm_qualify`): `call_openai(base_url=third-party)` resolves the OpenAI bearer token (unreachable in production — endpoints route via `call_llm`) · OWNER-decision: one global rate-limit deque for ALL providers; `get_routing_info()['budgets']` and `get_recommended_model` know only the Gemini family; `gpt-5.4*` prices are self-declared placeholders.
+
+### fundamentals.py
+- library · 391 lines · ✅ (network-gated; `llm_client` path lazy)
+- **Goal.** Fundamental context (P/E, market cap, insider activity, SEC filing summary) formatted as a TEXT block for the LLM prompt — NOT a model feature. In-memory TTL caches only (yfinance 4 h / FMP 24 h / SEC 7 d).
+- **Key API.** `get_fundamentals(symbol, asset_type)`, `get_insider_activity`, `get_sec_filings`, `get_filing_summary`, `format_fundamentals_for_llm`.
+- **Imports** `llm_config`, `llm_client` (lazy). **Imported by** `base_loop`, `llm_analyst`, `stock_loop` (+2 tests). **Reads** `llm_config.json` (`fmp_api_key`). **Flags** none. **Flow** serve (LLM evidence). **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending: FMP's `revenuePerShare` (dollars) is assigned to `revenue_growth` and rendered as a percentage in the prompt (fires only when yfinance lacks `revenueGrowth` AND an FMP key is set) · OBJECTIVE (documented): the SEC path is inoperative — `efts.sec.gov` `dateRange=custom` returns 500 and the code reads `form_type` where the field is `file_type`, so the 10-K/10-Q filter never matches.
+
+### llm_eval.py
+- CLI + library · 1464 lines · ✅ (every `compute_*` pure; `run_eval`/`advisor_report` need Alpaca bars)
+- **Goal.** Answer the one question that justifies the LLM spend: does `s` add signal INCREMENTAL to the ML `pred`? The prompt shows the LLM the prediction, so raw correlation can be pure echo — this separates echo from orthogonal alpha (partial Spearman, 2×2 agree/disagree grid, encompassing regression `realized = a + b1·pred + b2·z_s` with Driscoll–Kraay SEs clustered by t0-hour) and abstains when the panel lacks power (`MIN_POWER_N=60`, ≥120 clusters, effective n ≥ 20). Realization steps the horizon in BARS per symbol, matching the kernel's vertical barrier. `--advisor` scores the shadow advisor-v2 dossiers (`p_up`, calibration, per-event-flag stats).
+- **Key API.** `run_eval(days, asset_filter, api)`, `advisor_report`, `compute_incremental_report`, `compute_calibration_report`, `realize_scored_rows` (shared with `prompt_ab`), `partial_spearman`, `two_by_two_grid`, `_newey_west_se`, `_driscoll_kraay_se`, `_im_block_pvalue`; `VETO_THRESHOLD` (single-sourced from `trading_utils`).
+- **Imports** `llm_client`, `trading_utils` (lazy/guarded). **Imported by** `scripts/prompt_ab` (+5 tests); spawned by `gui.py` (`--days 14 [--advisor]`). **Reads / Writes** reads `journals/` (`llm_analysis` / `llm_advisor_v2` rows; `s: null` rows skipped, dedup re-serves collapsed), Alpaca bars, `llm_cost.json`; writes `llm_eval_report.json`, `llm_advisor_report.json` (atomic). **Flags** none. **Flow** measure (Stage-0). **Status** MEASUREMENT-ONLY.
+- **Known issues.** OWNER-decision: the spend-vs-benefit ledger applies `llm_mult` in isolation and ignores the composite `TILT_MAX` clamp and co-firing multipliers, over-stating the deployed effect at high `s` (the note says "not a fill simulation" but does not name the clamp).
+
+### sentiment_history.py
+- library + entry-point · 980 lines · ⚠ (`dotenv` guarded, `finnhub` lazy; stdlib `sqlite3`)
+- **Goal.** Make sentiment a TRAINABLE feature with PIT discipline: fetch once (Finnhub `company_news` in 30-day windows; F&G history), keyword-score instantly so training can start, then let a background worker upgrade scores with the LLM in place (Gemini Batch API — 50 % price on a separate quota) so the next weekly retrain picks up better labels. Owns history and persistence; `sentiment.py` owns "right now". Article date = UTC day; stocks attribute day D-1's aggregate to day-D bars on BOTH sides (train and `get_live_daily_sentiment`).
+- **Key API.** `fetch_crypto_sentiment_history(start, end)`, `fetch_stock_sentiment_history(tickers, start, end, cached_only)`, `get_daily_sentiment`, `get_live_daily_sentiment(symbol, asset_type)`, `set_live_mode`/`_is_live_mode`, `get_backfill_stats`, `submit_sentiment_batch`, `poll_and_ingest_batch`, `run_backfill_worker(max_rpm)`; `_keyword_score` (deliberately NOT shared with `sentiment._kw_score_article` — stored rows are training features). CLI `--backfill | --fetch-stocks | --stats [--rpm N]`.
+- **Imports** `llm_client`, `llm_config`, `sentiment`, `stock_config` (lazy). **Imported by** `predict_now`, `run_pipeline`, both harvests, `scripts/train_lexicon` (+3 tests); spawned by `run_pipeline.py` (`--fetch-stocks`, `--backfill`).
+- **Reads / Writes** `sentiment_cache.db` (+`-wal`/`-shm`; tables `articles`, `daily_sentiment`, `fng_daily`, `state`); reads `llm_config.json`; the worker's stdout goes to `backfill_output.log`. **Flags** `enabled`, `models.gemini.api_key`. **Flow** harvest → features (`Daily_Sentiment`) + serve (live value) + ops worker. **Status** LIVE.
+- **Known issues.** none objective. OWNER-decision (by design): the backfill rewrites historical `llm_score`s in place, so a training parquet's `Daily_Sentiment` is not reproducible from the DB later.
+
+### learned_lexicon.py
+- kernel · 1037 lines · ✅
+- **Goal.** Answer "would a LEARNED wordlist beat the hand-built one?" honestly before anyone ships one: terms weighted by realized forward returns after their appearance (Jegadeesh–Wu word power; Ke–Kelly–Xiu screen-then-fit), evaluated under purged, embargoed expanding walk-forward; verdicts never stronger than `candidate_signal_review_required`. Nothing live consumes its outputs — a construction invariant.
+- **Key API.** `load_articles`, `tokenize`, `offline_novelty` (mirrors `novelty._shingles` on purpose), `build_docs`, `attach_forward_returns`, `uniqueness_weights` (unrelated to `sample_weights`), `combine_weights`, `build_vocab`, `screen_terms`, `build_X`, `fit_ridge`, `purged_folds`, `choose_lambda`, `walkforward_eval`, `load_llm_journal_scores`, `train_lexicon`, `write_json_atomic`.
+- **Imports** none (deliberately self-contained). **Imported by** `scripts/train_lexicon` (+1 test). **Reads** `sentiment_cache.db` (read-only URI), a stock parquet, optionally `journals/`. **Flags** none. **Flow** research/offline. **Status** DORMANT (dark artifact; promotion = owner harvest+retrain decision).
+- **Known issues.** none.
+
+### scripts/llm_qualify.py
+- script · 1100 lines · ✅ (pure helpers; real calls need provider keys)
+- **Goal.** Decide WITH EVIDENCE whether a free/cheap OpenAI-compatible endpoint can stand in for the paid analyst before the owner flips `selection_mode`: fire analyst-shaped calls using the REAL `_build_prompt` + `_response_schema` bytes (schema validity %, fence-strip fallback %, p50/p95 latency vs the 45 s budget, 429 sustainability), optionally shadow-score identical evidence through prod and each candidate, and emit a `config_patch` plus three fixed HANDOFFS the harness cannot fix itself. Bypasses the cost ledger by design; never flips config.
+- **Key API.** `run_qualification`, `run_shadow`, `assemble_report`, `verdict_for`, `agreement_stats`, `pricing_zero`, `discover_candidates`, `schema_check`, `main`.
+- **Imports** `llm_analyst`, `llm_client`, `llm_config`. **Imported by** tests only (+1). **Reads / Writes** `llm_config.json`, `journals/llm_replay/*.jsonl` (`--replay`); writes `journals/llm_qualify/llm_qualify_report.json`, `journals/llm_qualify/shadow_scores.jsonl`. **Status** MEASUREMENT-ONLY. **Known issues** none (`main()` is fail-open, always rc 0).
+
+### scripts/prompt_ab.py
+- script · 545 lines · ✅ (`run --dry-run` builds both prompts with zero API calls; `score` needs Alpaca bars)
+- **Goal.** The single instrument that adjudicates every future gate-behaviour change to the analyst (system-prompt swap, pred-blind scoring, rich-context adoption) with the SAME statistics the live scorecard uses: ADOPT B only if `n ≥ MIN_POWER_N` AND `b2_B > 0` at p < 0.05 AND (`b2_B > b2_A` OR A not significant) AND `echo_gap_B ≤ echo_gap_A`. Every `analyze_trades` call passes `persist=False` so no live state is touched.
+- **Key API.** `load_replay_cycles`, `build_variant_b_candidates`, `pair_variant_samples`, `decide_adopt`, `cmd_run`/`cmd_score`.
+- **Imports** `llm_analyst`, `llm_client`, `llm_eval` (lazy). **Imported by** tests only (+2). **Reads / Writes** `journals/llm_replay/*.jsonl`; writes `llm_prompt_ab_scores.jsonl`, `llm_prompt_ab_report.json`. **Status** MEASUREMENT-ONLY.
+- **Known issues.** OBJECTIVE-fix-pending: the report is written with a plain `open()` — the only non-atomic report writer in this layer · OBJECTIVE-fix-pending: its two repo-root outputs are NOT gitignored (conductor-owned `.gitignore` addition).
+
+### scripts/train_lexicon.py
+- script · 153 lines · ✅ (stdlib at module level by design; `main()` lazily imports pandas + `learned_lexicon`)
+- **Goal.** Run the dark lexicon experiment end to end and print the honest IC verdict; keep `py_compile`/import Mac-safe.
+- **Imports** `learned_lexicon`, `sentiment_history` (both lazy). **Imported by** none (source-referenced by `tests/test_c26_V2.py`). **Reads / Writes** `sentiment_cache.db`, `stock_training_data.parquet`, optionally `journals/`; writes `learned_lexicon.json`, `lexicon_eval_report.json` (atomic). **Status** MEASUREMENT-ONLY (dark). **Known issues** none.
+
+## 13. GUI & charts
+
+**Goal.** One operator console over the same tree — a read-mostly observer plus a small command channel that acts only through FILES (`pipeline_command.json`, `retrain_trigger.json`, halt/flatten flags) and SUBPROCESSES, never by importing or driving the loops — so the bots survive a GUI crash and the GUI can run on another machine pointed at the same keys (the Jetson is headless; `requirements-jetson.txt` has no PySide6). **Invariants:** all chart/panel math is in pure-numpy `chart_core.py` and the token table in `design_tokens.py` so the GUI is auditable from the Mac (tests parse `gui.py` as source text — it cannot be imported here); theme → chart colour derivation happens in exactly one place (`chart_core.derive_chart_palette`); the `logos/96/` thumbnails are the preferred decode path on 8 GB.
+
+### gui.py
+- entry-point · 10537 lines (16 % of all source lines in one file) · ❌ (eager PySide6, pyqtgraph, dotenv)
+- **Goal.** The PySide6 dashboard: 8 tabs (Cockpit, Trading, Performance, News, Markets, Models, Logs, Settings), 12 themes, two `DataFetcher` worker threads (hot/slow) + a `LogTailer` thread, cadences from `gui_settings.json`; polls Alpaca and ~40 on-disk state artifacts; launches the measurement CLIs (`decision_report`, `beta_ledger --json`, `indicator_leadlag`, `gap_audit`, `llm_eval [--advisor]`, `execution_report`), `llm_analyst --refresh-all`, and the pipeline restart (`run_pipeline.py … --skip-harvest --bot-only`) through `_engine_python()` (prefers the Jetson interpreter); detects liveness by `pgrep`.
+- **Key API.** none (leaf; `main()`).
+- **Imports** `chart_core`, `design_tokens`, `hw_monitor`, `indicator_config`, `journal_stats`, `llm_client`, `llm_config`, `notify`, `sentiment`, `stock_config`, `strategy_config`, `tax_lots`, `trading_utils`. **Imported by** nothing (8 test modules read its source text).
+- **Reads / Writes** reads `pipeline_status.json`, the three bot/pipeline logs, `*config_v2.pkl` (pickle), `*model_v2.pth` mtimes, manifests (champion + challenger), `*shadow_status.json`, `drift_state.json`, `beta_report.json`, `*meta_meta.json`, `*meta_refused.json`, `*policy_gate.json`, `decision_report.json`, `llm_eval_report.json`, `llm_advisor_report.json`, `execution_report.json`, `promotion_ledger.jsonl`, `*v2_study.db`, `*_predictions.json`, `llm_analysis.json`, `journals/`, `account_risk_registry.json`, `*position_state.json`, heartbeats, `trading_halt.flag`, `news_cache.json`, `gui_settings.json`, `logos/`, `fonts/`, sysfs telemetry; writes `gui_settings.json`, `news_cache.json`, `pipeline_command.json` (atomic), `account_baseline.json`, `retrain_trigger.json`, `llm_refresh*.log`, `pipeline_output.log` (append), halt/flatten flags via `notify`. **Flags** reads `TRADER_WEBHOOK_URL`, `TRADER_TELEGRAM_*`, `TRADER_HEALTHCHECK_URL*`, `TRADER_SHADOW_MODE` for status chips; `.env` secrets. **Flow** ops (observation + manual control). **Status** LIVE (Jetson-adjacent machine).
+- **Known issues.** OBJECTIVE-fix-pending: `TRADER_SHADOW_MODE` polarity is inverted (`bool(os.getenv(...))` reads OFF when unset — the pipeline default is ON — and ON for the documented `=0`), and the chip text "orders suppressed" names a behaviour no code has (the only effect is the retrain slot) · OBJECTIVE-fix-pending: the crypto Lead/Lag button passes `--data crypto_training_data.parquet`, a file nothing ever writes (`training_data.parquet` is the crypto store) — byte-pinned by two tests · OBJECTIVE-fix-pending: `_THEME_IMAGES["Salander"]` points at a non-existent `logos/salander.png` (falls through to SVG); unused `QAction` import · OWNER-decision: the app icon loads the 8.2 MB `logos/circuit_bull.png` although a 26 KB `logos/96/` twin exists unreferenced; `read_config` unpickles `*_v2.pkl`; `TradingDashboard` is 190 methods in one class; `pipeline_status` staleness threshold 600 s and the registry rule 600 s are local literals.
+
+### chart_core.py
+- kernel · 1354 lines · ✅ (numpy + stdlib; MUST stay free of PySide6/pyqtgraph/pandas)
+- **Goal.** Hold ALL chart and panel math for `gui.py` in a module the Mac can unit-test: view builders (`build_equity_view`, `build_price_view` → dataclasses), LTTB downsampling, true Wilder ATR, NaN-safe performance stats, benchmark alignment, colour science (`derive_chart_palette`, contrast/luminance/mix, heatmap styling), and the journal/report readers that feed panels (`load_trade_markers`, `sizing_stack_summary`, `gate_panel_model`, `meta_panel_model`, `artifact_freshness`, `format_*_summary`).
+- **Imports** none. **Imported by** `gui` (+2 tests). **Reads** `journals/*.jsonl` and report JSON paths passed in. **Flags** none. **Flow** ops (render leg). **Status** LIVE.
+- **Known issues.** none.
+
+### design_tokens.py
+- config · 189 lines · ✅ (zero imports)
+- **Goal.** Semantic names for `gui.py`'s colour/spacing/type primitives so one token set feeds widgets and charts; Phase A is a byte-compatible renaming (`resolve_colors()` must reproduce today's `THEMES` values with zero transformation).
+- **Key API.** `resolve_colors(theme)`, `font_qss()`, `numeric_qss(px, weight)`, `TYPE`, `SPACE`, `RADIUS`, `NUMERIC_FAMILY`, `UI_FAMILY`, `FALLBACKS`.
+- **Imports** none. **Imported by** `gui` (+1 test). **Status** LIVE.
+- **Known issues.** `UI_FAMILY`, `FALLBACKS`, `SOURCE_DEFAULTS` have no `gui.py` reader (test-only) — OWNER-decision.
+
+### tax_lots.py
+- kernel · 214 lines · ✅ (stdlib)
+- **Goal.** MinTax lot matching (losses first, then long-term gains, then short-term, highest basis within each tier — NOT IRS-default FIFO, disclosed) extracted from `gui.py` so the arithmetic is testable without PySide6; `LONG_TERM_DAYS=365` with strict `>` (the GUI original was off by one).
+- **Key API.** `estimate_taxes(orders, *, fed_short, fed_long, state_rate, crypto_symbols, now, window_truncated)`.
+- **Imports** none. **Imported by** `gui` (+1 test). **Status** LIVE (GUI reporting).
+- **Known issues.** none (`crypto_symbols`/`now` are documented inert reserved parameters).
+
+## 14. Ops, Jetson & notifications
+
+**Goal.** Keep an unattended 8 GB box alive and reachable: never-blocking deduped alerts and a file-based kill switch (`notify`), one rotating logger (`log_config`), sysfs thermal/RAM readers with no subprocess and no torch (`hw_monitor`), a file-flock GPU mutex so training never shares CUDA with anything else (`gpu_lock`), and a credential smoke test. **Invariants:** all in-process concurrency is `threading` (no `multiprocessing` anywhere); every ops helper fails soft (an alert failure never raises into a trading path); the systemd unit (`scripts/setup_jetson_system.sh`) runs `run_pipeline.py --combined-bots --bot-only` with `MemoryMax=6G`, `WatchdogSec=900`, `CUDA_VISIBLE_DEVICES=` and is installed but deliberately not enabled; chrony replaces `systemd-timesyncd` because the dev kit has no RTC battery and the bots reject stale timestamps. Shell scripts and CI are in §16.
+
+### notify.py
+- library · 274 lines · ✅
+- **Goal.** Never-blocking, deduped (600 s) alerts over Telegram/webhook (background threads), the dead-man heartbeat (`TRADER_HEALTHCHECK_URL[_CRYPTO|_STOCK]`), the file-based kill switch (`trading_halt.flag`, `flatten_request.flag`) and Telegram command polling for the ops thread / pipeline.
+- **Key API.** `notify(...)`, `ping_heartbeat`, `halt_active`/`set_halt`/`clear_halt`, `flatten_requested`/`request_flatten`/`clear_flatten_request`, `poll_telegram_commands`.
+- **Imports** `log_config`. **Imported by** `backtest`, `base_loop`, `gui`, `meta_label`, `monitor_drift`, `run_bots`, `run_pipeline`, `shadow`, `stock_loop` (+9 tests; fan-in #8).
+- **Reads / Writes** `telegram_offset.json`, `trading_halt.flag`, `flatten_request.flag` (+`.tmp`), `{name}_heartbeat`. **Flags** `TRADER_WEBHOOK_URL`, `TRADER_TELEGRAM_BOT_TOKEN`/`_CHAT_ID`, `TRADER_HEALTHCHECK_URL{,_CRYPTO,_STOCK}`. **Flow** ops. **Status** LIVE.
+- **Known issues.** none.
+
+### log_config.py
+- library · 69 lines · ✅
+- **Goal.** One root logger configuration shared by every module: console INFO + rotating `logs/trader.log` DEBUG (10 MB × 5), noisy third-party loggers quieted.
+- **Key API.** `get_logger(name)`. **Imports** none. **Imported by** 22 modules (+2 tests; fan-in #1). **Writes** `logs/trader.log[.1-5]`. **Status** LIVE. **Known issues** none.
+
+### hw_monitor.py
+- library + entry · 184 lines · ⚠ (`torch` guarded; returns `None` off-Jetson)
+- **Goal.** sysfs GPU temperature (20 s cache) and `/proc/meminfo` RAM for thermal gating without subprocesses; `CUDA_VISIBLE_DEVICES=''` short-circuits `is_gpu_available`.
+- **Key API.** `get_gpu_temp`, `get_ram_usage`, `is_gpu_available`, `wait_for_cool_gpu`. **Imports** none. **Imported by** `base_loop`, `gui`, `run_pipeline` (`get_gpu_temp` only) (+3 tests). **Reads** sysfs thermal zones, `/proc/meminfo`. **Flags** none. **Flow** ops. **Status** LIVE.
+- **Known issues.** OBJECTIVE-fix-pending (dead code): `hw_monitor.wait_for_cool_gpu` has no production caller — replaced by `run_pipeline._bounded_thermal_wait`; `scripts/setup_jetson_system.sh` still says "run_pipeline's wait_for_cool_gpu already throttles" · `get_ram_usage`/`is_gpu_available` are CLI/test-only.
+
+### gpu_lock.py
+- library · 150 lines · ✅ (POSIX `fcntl`)
+- **Goal.** File-flock GPU mutex so two training processes never share the Jetson's unified memory (CUDA OOM).
+- **Key API.** `acquire_for_training(owner)`, `is_gpu_free`, `gpu_lock_status`, `get_lock_info`. **Imports** none. **Imported by** `scripts/hypersearch_v2`, `scripts/window_ab` (+2 tests). **Reads / Writes** `.gpu.lock`, `.gpu_lock_info.json` (+`.tmp`). **Flags** none. **Flow** ops (train). **Status** LIVE.
+- **Known issues.** none (`is_gpu_free`/`gpu_lock_status`/`get_lock_info` have no production caller — documented).
+
+### scripts/connection_test.py
+- script · 61 lines · ❌ (eager `dotenv`)
+- **Goal.** One command to confirm the `.env` credentials work and report equity / buying power / `trading_blocked` plus a `HALT | SAFE_TO_TRADE | CONSERVATIVE | ERROR` status (`get_trading_status()`). No argparse.
+- **Imports** `trading_utils` (lazy). **Imported by** none (dynamic-import smoke in `tests/test_imports.py`). **Reads** `.env`, Alpaca account. **Status** LIVE (ops).
+- **Known issues.** OBJECTIVE-fix-pending: unused `import os` · `scripts/setup.sh`'s "Next steps" prints `python connection_test.py` (root) — the file is `scripts/connection_test.py`.
+
+## 15. Research kernels & driver scripts
+
+**Goal.** The offline instruments behind the 12-step Jetson experiment sequence (`research/campaign_2026-08/06_signal_model_plan.md`) and the wave-5..9 Stage-0 gates: pure kernels unit-tested on the Mac plus thin driver scripts that need real stores/dumps/journals on the Jetson. **Invariants:** every verdict here is an OWNER REPORT, never an action; drivers read the stage-0 dump (`{slot}_stage0_preds.json`) or the training store and write stdout or a JSON report; nothing imports a trading path; the untracked R2-C modules (`naive_baseline`, `horizon_transfer`, `scripts/{window_ab, naive_vs_blend, horizon_transfer_report, entry_timing_probe}`) are referenced only by untracked tests, so the uncommitted tree is internally consistent.
+
+### portfolio_backtest.py
+- kernel · 544 lines · ✅
+- **Goal.** The correct instrument for an ADMISSION-POLICY change (top-K vs conviction-gated dynamic K, equal- vs edge-weighted): replay two policies over the SAME ranked panel and score the difference net of turnover cost with DSR deflation — because `shadow.py`'s forecast test is the wrong tool for that question.
+- **Key API.** policies `top_k(k)`, `conviction_gated(k_max, signal_floor, meta_floor, ratio_floor, strict)`; engines `run_policy`, `run_policy_weighted`; `compare`, `compare_deflated(…, fwd_bars, n_trials, weight_fns)`; `panel_from_frame(df, signal_col, fwd_return_col, ticker_col, extra_cols, signal_lag, stats_out)`; `edge_proportional_weights`, `equal_weights`.
+- **Imports** `validation` (lazy). **Imported by** `scripts/rank_gradient_report` (+7 tests). **Flags** none (thresholds are arguments; `CONCENTRATION_*`/`TIER_SIZING_ENABLED` are forward-declared with no reader). **Status** DORMANT kernel / MEASUREMENT-ONLY driver use.
+- **Known issues.** none objective (missing-field fail-open default, cost bases and the fully-invested constraint are documented owner items).
+
+### meta_curve.py
+- kernel · 356 lines · ✅
+- **Goal.** B04.3 "honest sample floor" for the meta-labeler: temporal-block subsampling plans, tie-aware rank AUC, cross-seed veto flip rates, inverse-power-law fits, and the floor rule (smallest n with plateau-AUC gap < 0.01 AND flip rate < 10 %); deliberately does NOT import `meta_label` (mirrors `VETO_PROB=0.30`, test-pinned).
+- **Key API.** `resolve_n_grid`, `build_subsample_plan`, `rank_auc`, `veto_flip_rate`, `fit_power_law`, `n_for_target`, `empirical_floor`, `assemble_report` (schema `meta_curve_report/1`).
+- **Imports** none. **Imported by** `scripts/meta_learning_curve` (+1 test). **Status** MEASUREMENT-ONLY. **Known issues** `DEFAULT_N_GRID` duplicated as the CLI default string.
+
+### naive_baseline.py
+- kernel · 132 lines · ✅ · **untracked (R2-C)**
+- **Goal.** FR-04 Nagel (2025) falsification baseline: a zero-fit strictly-trailing EWMA-momentum / trailing-vol signal the deployed blend must beat on identical stage-0 rows (purged IC AND DSR) or its edge is suspect.
+- **Key API.** `bar_returns`, `ewma_momentum`, `trailing_vol`, `naive_signal`, `lookup_at_times`, `long_only_returns(preds, fwd, threshold)`.
+- **Imports** none. **Imported by** `scripts/naive_vs_blend` (+1 test). **Status** MEASUREMENT-ONLY.
+- **Known issues.** OBJECTIVE-fix-pending: `long_only_returns` docstring cites strict `>` as "the deployed convention — objective_utils.py:67, backtest.py, predict_now.py"; the strict comparison is `objective_utils.simulate_trades_core` (hypersearch) and the `predict_now` demo, while `backtest.simulate_ticker` and `base_loop._execute_buys` admit `>=` (measure-zero for float preds; the citation is wrong). Same wording in `scripts/naive_vs_blend.py`.
+
+### horizon_transfer.py
+- kernel · 169 lines · ✅ · **untracked (R2-C)**
+- **Goal.** FR-07-A cheap stage-A test of the "Label Horizon Paradox": corr(r^δ, r^Δ) of same-anchored forward returns vs the IID null √(δ/Δ), non-overlapping anchors strided by Δ, weekly-block-bootstrap SEs. A curve on the null kills the horizon topic; off-diagonal structure sequences FR-07-B.
+- **Key API.** `forward_returns`, `iid_null`, `strided_pair`, `weekly_block_ids`, `block_bootstrap_se(stat_fn, block_ids, n_boot, seed)`, `transfer_stat`, `transfer_matrix`.
+- **Imports** none. **Imported by** `scripts/entry_timing_probe`, `scripts/horizon_transfer_report` (+1 test). **Status** MEASUREMENT-ONLY. **Known issues** `MIN_PAIRS=8` is an unexplained magic floor (OWNER-decision).
+
+### options_overlay.py
+- CLI + library · 392 lines · ✅ (math; `main()` needs network via `gap_audit.fetch_daily`)
+- **Goal.** The stock book flattens at 15:50 and forfeits overnight drift; wave-7 asked whether a cheap defined-risk DEBIT VERTICAL is a better overnight carrier. The owner rejects a paid OPRA feed, so this prices options from FREE inputs (Black–Scholes, IV bootstrapped from HAR-RV × `IV_RV_RATIO`, spread tiers) PURELY TO DECIDE — it holds no position and touches no trading path. Pre-registered and currently self-gating to NO-GO: ACTIVE measurement code, not kill-listed (the killed items are naked options/weeklies, immediate OPRA, earnings straddles).
+- **Key API.** `bs_price`, `bs_greeks`, `vertical_debit`, `vertical_value`, `vertical_payoff_at_expiry`, `option_round_trip_cost`, `friction_fraction_per_night`, `required_edge_clears`, `iv_from_har`, `overnight_overlay_pnl`, `overlay_decision`, `realized_vol_annual`, `run_verdict`, `main`; `MIN_EDGE_MULTIPLE=2.0` (intentionally decoupled from `fees`).
+- **Imports** `gap_audit` (lazy). **Imported by** tests only (+3). **Writes** `options_overlay_verdict.json`. **Flags** none (no live caller, so no flag). **Status** MEASUREMENT-ONLY (self-gates NO_GO).
+- **Known issues.** OBJECTIVE-fix-pending: `options_overlay_verdict.json` is NOT gitignored, unlike every sibling generated artifact (conductor-owned).
+
+### gap_audit.py
+- CLI + library · 194 lines · ✅ (pure functions; `main()`/`fetch_daily` need yfinance/network)
+- **Goal.** Size the problem the overlay would solve from free daily OHLC: the overnight drift `stock_loop`'s flatten forfeits, and how often/badly an overnight gap blows through a GTC stop (which fills at the gapped open — zero tail protection). Pairs with `options_overlay`; on plausible numbers this yields a clean NO-GO.
+- **Key API.** `overnight_intraday_returns`, `gap_stats` (std/skew/kurtosis/Student-t df), `forfeited_drift_annual`, `gap_through_cost_annual(overnight, stop_dist_frac, notional, side)`, `audit_name`, `fetch_daily`, `main`.
+- **Imports** none. **Imported by** `options_overlay` (+2 tests); spawned by `gui.py` (`--symbols <universe> --json <tmp>`). **Writes** optional `--json`. **Status** MEASUREMENT-ONLY. **Known issues** none (`intraday_mean_bps` is informational only).
+
+### scripts/window_ab.py
+- script · 475 lines · ❌ (eager joblib, torch, `hypersearch_v2`) · **untracked (R2-C)**
+- **Goal.** FR-02 fixed-config training-window A/B: retrain the CURRENT champion config (no Optuna → zero new selection pressure) on several trailing spans (`full`, 730, 365, `pt2007` = from 2025-02-10) and score each arm on the IDENTICAL holdout with identical DSR deflation, calling `hs.load_data(window_days=…)`, `hs.final_refit`, `hs.train_lgb_ensemble(save=False)`, `blend_fit.fit_blend_weight_v2`, `hs.evaluate_on_holdout`; no model artifacts written. Jetson experiment #9.
+- **Key API.** `run_arm(...)`, `_predict_rows`, `_stage0_dump`, `main()`.
+- **Imports** `adaptive_config`, `blend_fit`, `data_utils`, `gpu_lock`, `model_v2`, `objective_utils`, `scripts/hypersearch_v2`, `stage0_preds`. **Imported by** none (source-referenced by `tests/test_r2c_holdout_boundary.py`). **Reads / Writes** reads `{prefix}config_v2.pkl`, `adaptive_state_*.json`, the store; writes `window_ab_{book}_{arm}_stage0.json`, `window_ab_summary_{book}.json`. **Flags** inherits every hypersearch flag; warns if `TRADER_FIXED_HOLDOUT_DAYS` is unset. **Status** MEASUREMENT-ONLY.
+- **Known issues.** OWNER-decision: `--prefix` convention (`'stock_'` with underscore) differs from hypersearch (`'stock'`) — documented in its help.
+
+### scripts/cscv_audit.py
+- script · 96 lines · ✅
+- **Goal.** Run the honest combinatorially-symmetric PBO over a hypersearch run's per-trial OOS return streams — which the trainer does not yet record (the docstring gives the two-line `trial.set_user_attr('oos_block_perf', …)` the owner must add on the Jetson first). Forward-looking.
+- **Imports** `validation`. **Imported by** tests only (+1). **Status** MEASUREMENT-ONLY (unwired input). **Known issues** none (its scope statement is accurate).
+
+### scripts/meta_learning_curve.py
+- script · 334 lines · ⚠ (`lightgbm` guarded; `--help` works on the Mac; a real run needs torch via `backtest._load_artifacts`)
+- **Goal.** B04.3 harness: assemble the CURRENT meta-row population exactly as `train_meta` would (same holdout cutoff, same `_gen_meta_rows`, same flag state), fit a small LightGBM per (n, seed) temporal-block draw, score a fixed chronological eval slice, report the honest sample floor → `{p}meta_curve_report.json`. Supports the `META_OOF_PRED` flip decision.
+- **Imports** `backtest`, `calibration`, `data_utils`, `meta_curve`, `meta_label`, `strategy_config`. **Imported by** none (source-referenced by `tests/test_c26_V3.py`). **Flags** `META_OOF_PRED`, `META_REPLAY_POLICY_PARITY` (the measured population follows them). **Status** MEASUREMENT-ONLY.
+- **Known issues.** OBJECTIVE-fix-pending: its LightGBM params block is a hand copy of `meta_label.train_meta`'s ("keep in sync"; no test pins it).
+
+### scripts/naive_vs_blend.py
+- script · 217 lines · ✅ (given a dump + the store; parquet needs `pyarrow`) · **untracked (R2-C)**
+- **Goal.** FR-04 driver (plan step 3): join per-name closes to the stage-0 dump, stamp the naive signal at each row, print per-name + pooled rank IC and DSR side by side (blend deflated at `adaptive_state.cum_trials`, naive at `n_trials=1`).
+- **Imports** `adaptive_config`, `data_utils`, `ic_diagnostic`, `naive_baseline`, `stage0_preds`, `validation`. **Imported by** none (+1 test). **Status** MEASUREMENT-ONLY. **Known issues** the same strict-`>` wording as `naive_baseline`.
+
+### scripts/horizon_transfer_report.py
+- script · 126 lines · ✅ · **untracked (R2-C)**
+- **Goal.** FR-07-A driver (plan step 7) over the harvest's existing `Target_Return_{h}` columns (label parity): each (δ, Δ) pair vs the IID null with a PERSIST/REVERT flag at ±2·SE; prints the stock caveat that TB labels are horizon-degenerate above one session.
+- **Imports** `data_utils`, `horizon_transfer`, `stage0_preds`. **Imported by** tests only (+1). **Status** MEASUREMENT-ONLY. **Known issues** none.
+
+### scripts/entry_timing_probe.py
+- script · 266 lines · ✅ · **untracked (R2-C)**
+- **Goal.** M1 entry-timing probe (plan step 6): score the existing stage-0 predictions against BOTH label anchors (train `Close[i]→Close[i+h]` vs live `Close[i-1]→Close[i-1+h]`), report delta-IC with a weekly-block bootstrap SE, plus the realized fill gap from journal buy rows; |delta| > 2·SE ⇒ schedule `WINDOW_INCLUDES_ENTRY_BAR`.
+- **Key API.** `anchor_returns`, `ic_anchor_delta`, `fill_gap_seconds`, `scan_journal_buys`.
+- **Imports** `data_utils`, `horizon_transfer`, `ic_diagnostic`, `stage0_preds`. **Imported by** tests only (+1). **Reads** dump, store, `journals/`. **Status** MEASUREMENT-ONLY. **Known issues** book classification of journal rows by `'/' in symbol` (OWNER-decision).
+
+### scripts/funding_drift_audit.py
+- script · 264 lines · ✅ (kernels pure; `main()` needs the crypto store)
+- **Goal.** FR-03 regime-shift audit of the surviving `Funding_*` family — the models were fit on a mostly positive-funding world and 2026 funding is persistently negative: PSI vs training deciles (`PSI_FLAG=0.25` = `monitor_drift.PSI_ACTION`), two-sample KS, split purged IC with Fisher CIs. A FLAG means the next retrain re-fits on the shifted distribution; features are never removed.
+- **Key API.** `psi_from_train_deciles`, `spearman_with_ci`, `strided_anchor_mask`, `sign_flip_disjoint`, `audit_frame`, `main`.
+- **Imports** `data_utils` (lazy), `stage0_preds`. **Imported by** tests only (+1). **Writes** `research/funding_drift_2026-08.json` (default `--out`). **Status** MEASUREMENT-ONLY.
+- **Known issues.** OBJECTIVE-fix-pending: docstring names `CS_Rank_Funding_Z` in the audited family; no such column exists anywhere (the code correctly selects `'Funding' in c`).
+
+## 16. Tooling (`scripts/*.sh`, `.claude/` python, CI)
+
+**Goal.** The verification and setup rails: the zero-regression gate, the Jetson provisioning and backup scripts, the Claude Code assets that make every session behave the same on Mac + Jetson, and CI. **Invariants:** regressions are judged by failure NAMES against `tests/baseline_failures.txt`, never counts (`scripts/ab_check.sh`); `.claude/` is committed except `settings.local.json`; the PostToolUse hook compiles in memory and imports nothing, so it is safe for the heavy-dep modules; no background automation is scheduled (gotcha #5).
+
+- **`scripts/ab_check.sh`** (POSIX sh, dev Mac) — runs the canonical pytest command once, extracts `^(FAILED|ERROR)` names, `comm`-diffs against `tests/baseline_failures.txt`, exits 0 iff no NEW names. Hardening: `PY_COLORS=0` (ANSI would blind the grep → false clean), watchdog (`AB_CHECK_TIMEOUT_S=900`, `AB_CHECK_RERUN_TIMEOUT_S=300`), launch-sanity floor `AB_CHECK_MIN_PASSED=1500`, flaky/persistent triage of NEW ids (labels only — any NEW name still fails), `AB_CHECK_PYTEST` override for self-tests. Never touches git state.
+- **`scripts/setup.sh`** (bash; Ubuntu or `--jetson`) — installs torch (Jetson wheel index) + `requirements[-jetson].txt`, writes a `.env` template, verifies imports. FIXED 2026-09-08: "Next steps" now prints `python scripts/connection_test.py` (note `SCRIPT_DIR` actually holds the repo root).
+- **`scripts/setup_jetson_system.sh`** (bash, root, Jetson only) — headless target, 12 GB swapfile + `vm.swappiness=15`, cuSPARSELt/cuDSS libs into the CUDA lib dir + `ldconfig`, `jetson-stats`, chrony (`makestep 1.0 -1`), the `trader.service` unit (installed, not enabled), prints the backup crontab and `nvpmodel` guidance. OBJECTIVE-fix-pending: cites `hw_monitor.wait_for_cool_gpu` (no caller) instead of `run_pipeline._bounded_thermal_wait`.
+- **`scripts/backup_state.sh`** (bash, Jetson) — online-consistent `sqlite3 .backup` of both Optuna DBs, `cp -p` of JSON/flat state, model artifacts and `journals/`, then `restic` (tag `trader-state`, keep 14) or a `~/trader_backups/*.tar.gz` fallback keeping 14.
+- **`.claude/hooks/py_compile_gate.py`** (+ `py-compile-gate.sh`) — blocking PostToolUse syntax gate on `Edit|Write`: reads the hook JSON from stdin, `compile()`s the edited `.py` in memory (no `.pyc`, no imports), exit 2 on `SyntaxError`, fails open on anything unexpected. Invoked only by the harness (`.claude/settings.json`).
+- **`.claude/skills/decision-queue/render.py`** — stdlib-only renderer of the 90-item owner decision queue in `research/module_review_2026-07.json` (`--ledger`, `--severity {P0,P1,P2}`, `--module`, `--full`); pre-approved in `.claude/settings.json`.
+- **`.claude/skills/{regression-ab, improve, panel-improve}/SKILL.md`**, **`.claude/workflows/{group-improve-v2, module-improve-v3}.js`** (+ `*.example.json`; the stale committed run-state `modules-v3.run.json` was moved to `archive/claude_workflow_runs/` on 2026-09-08 and `*.run.json` is now gitignored), **`.claude/agents/fable-high.md`** (new 2026-09-08) — see `.claude/README.md`. FIXED 2026-09-08: `regression-ab/SKILL.md` and `modules-v3.example.json` no longer carry a stale count string (the only live count is `CLAUDE.md § Running tests`) · OWNER-decision: `.claude/settings.json` pre-approves `git stash push/pop`, which `research/AGENT_CONTEXT.md` forbids on a shared tree (three-way contradiction with the skill's documented fallback).
+- **`.github/workflows/ci.yml`** — Ubuntu, two legs: py3.10 `jetson-parity` (`requirements-ci.txt`: prod pins, `numpy<2`, `pandas<3`, lightgbm, alpaca-py) and py3.12 `modern` (unpinned); both install CPU torch, `py_compile` root + `scripts/` (not `tests/` or `.claude/`), run the standalone sentiment runner, then `pytest tests/ -v --tb=short -x` (no `--continue-on-collection-errors`; `pyproject.toml` already injects `-v --tb=short`). FIXED 2026-09-08: `pyarrow` is now declared (unversioned) in all three requirements files (gotcha #7 records that it is still absent on the Mac — six baseline names). Still open: the `modern` leg never installs `lightgbm`. CI status itself is unverified from the Mac.
+
+## Appendix A — CLI census (every `__main__` entry point; flags extracted from `add_argument`, as of 2026-09-08)
+
+Regenerate: `python3 scripts/repo_graph.py --json` → `docs/graphs/import_graph.json` (field `argparse_flags`). "Jetson" = an unguarded heavy import sits somewhere in the module's eager import chain, so it cannot even be imported on the dev Mac; "Mac" = importable here (running it may still need real data/journals — see `scripts/README.md`).
+
+### Mac-importable entry points
+
+| entry point | flags (=default) | docstring, first line |
+|---|---|---|
+| `.claude/hooks/py_compile_gate.py` | — | Blocking PostToolUse syntax gate (stdin: Claude Code hook JSON). |
+| `.claude/skills/decision-queue/render.py` | `--ledger`=str(DEFAULT_LEDGER), `--severity`, `--module`, `--full` | Render the 2026-07 module-review owner decision queue (stdlib only — Mac-safe). |
+| `backtest.py` | `--prefix`=, `--days`=60, `--trials`, `--gate`, `--min-sharpe`=0.0, `--min-dsr`=DSR_MIN, `--model-prefix`=, `--no-stage0-dump`, `--fee-mult`, `--fee-sweep` | Event-driven backtest of the ACTUAL trading policy, net of real costs. |
+| `basis_archive.py` | `--start`=2020-01 | Spot-perp BASIS archive — the higher-frequency carry primitive (wave-7). |
+| `beta_ledger.py` | `--days`, `--lags`=1, `--equity-csv`, `--benchmarks-csv`, `--json` | Beta ledger — how much of the strategy's P&L is market exposure? |
+| `decision_report.py` | `--days`=30 | Gate attribution + conviction calibration from the decision journals. |
+| `edgar_events.py` | — | SEC EDGAR corporate-event entry veto (8-K items + pending M&A). |
+| `execution_report.py` | `--days`=14 | Implementation-shortfall report — what execution actually costs. |
+| `funding_archive.py` | `--start`=2020-01 | Historical perp funding rates from Binance public archives (training data). |
+| `gap_audit.py` | `--symbols` (required), `--notional`=5000.0, `--stop-frac`=0.02, `--json` | Overnight forfeited-drift + GTC gap-through audit (wave-7, overlay decision). |
+| `hw_monitor.py` | — | Hardware monitoring utilities for Jetson Orin Nano 8GB. |
+| `indicator_leadlag.py` | `--data` (required), `--preset`=stationary, `--features`, `--horizons`=1,4,12,24,48, `--fdr-q`=0.1, `--json` | Leading/lagging indicator diagnostic + redundancy clusters (2026-07). |
+| `llm_analyst.py` | — | Pre-trade LLM qualitative conviction scorer. |
+| `llm_eval.py` | `--days`=14, `--asset`, `--advisor` | Measure whether the LLM gate adds signal BEYOND the ML model. |
+| `meta_label.py` | `--prefix`=, `--no-publish`, `--promote-staged` | Meta-labeling: a second model that sizes/vetoes the first one's trades. |
+| `monitor_drift.py` | `--prefix` | PSI drift monitor — detect when live predictions leave the training |
+| `oi_archive.py` | `--start`=OI_START, `--max-files`=MAX_FILES_PER_SYNC | Open-interest features from Binance public archives + live OKX serving. |
+| `options_overlay.py` | `--symbols`=sorted(SYMBOL_TIERS), `--period`=2y, `--dte`=1, `--width-frac`=0.05, `--puts`, `--out`=options_overlay_verdict.json | Free, offline option-pricing + cost-realism harness for the overnight overlay. |
+| `run_bots.py` | `--crypto-only`, `--stock-only` | Combined bot runner — crypto + stock loops as threads in ONE process. |
+| `run_pipeline.py` | `--trials`=200, `--bot-only`, `--skip-harvest`, `--crypto-only`, `--stock-only`, `--no-retrain`, `--retrain-day`=5, `--retrain-hour`=2, `--retrain-trials`=100, `--combined-bots` | Overnight pipeline: train models, start trading, auto-retrain weekly. |
+| `scripts/crypto_spread_census.py` | `--minutes`=60, `--interval`=5.0, `--loc`=us, `--symbols`, `--out`=crypto_spread_census.json | Crypto venue spread census (B05.1 / NEW-opportunity #1). |
+| `scripts/cscv_audit.py` | `--blocks`, `--returns`, `--n-blocks`=8, `--n-groups`=8, `--pbo-max`=0.5 | Offline CSCV Probability-of-Backtest-Overfitting audit (wave-8 #2). |
+| `scripts/entry_timing_probe.py` | `--preds` (required), `--prefix`=, `--journal-dir`=str(BASE_DIR / 'journals'), `--n-boot`=500, `--seed`=0 | M1 entry-timing probe (R2C-06d, measurement-only) — MEASURE-FIRST for |
+| `scripts/funding_drift_audit.py` | `--split`=2026-01-01, `--trailing-days`=90, `--fwd-bars`, `--out`=str(BASE_DIR / 'research/funding_drift_2026-08.json') | FR-03 funding-feature regime-shift audit (R2C-06c, measurement-only). |
+| `scripts/horizon_transfer_report.py` | `--prefix`=, `--n-boot`=200, `--seed`=0, `--stride`, `--per-name` | FR-07-A driver — horizon-transfer curves from harvest labels (R2C-06b). |
+| `scripts/ic_by_name.py` | `--in` (required), `--name-key`=symbol, `--pred-key`=pred, `--fwd-key`=fwd_return, `--time-key`, `--min-ic`=0.0, `--min-consistency`=0.6, `--min-t`=2.0, `--subperiods`=4 | Per-name IC diagnostic — the universe-promotion gate (wave-9 #3 activation). |
+| `scripts/llm_qualify.py` | `--models`, `--n`=DEFAULT_N_CALLS, `--spacing`=DEFAULT_SPACING_S, `--out`=str(OUT_DIR_DEFAULT), `--shadow`, `--replay`, `--days`=2, `--max-cycles`=6, `--report` | Free-LLM qualification harness for the analyst role (c26 packet V1). |
+| `scripts/meta_learning_curve.py` | `--prefix`=, `--seeds`=meta_curve.DEFAULT_N_SEEDS, `--block-len`=meta_curve.DEFAULT_BLOCK_LEN, `--grid`=100,200,400,800,1600,3200, `--eval-fraction`=0.2, `--no-tiering`, `--out`, `--base-seed`=meta_curve.DEFAULT_BASE_SEED | B04.3 learning-curve harness (campaign 2026-08, packet V3) — Jetson CLI. |
+| `scripts/naive_vs_blend.py` | `--preds` (required), `--prefix`=, `--half-life`=nb.DEFAULT_HALF_LIFE, `--vol-window`=nb.DEFAULT_VOL_WINDOW, `--cum-trials` | FR-04 driver — deployed blend vs the Nagel naive one-liner (R2C-06a). |
+| `scripts/prompt_ab.py` | `--days`=14, `--asset`, `--system-b`, `--hide-pred-b`, `--rich-context-b`, `--model`, `--max-cycles`, `--sleep-sec`=2.0, `--out`=str(DEFAULT_OUT), `--dry-run`, `--in` (required), `--min-n`=MIN_POWER_N_DEFAULT | Offline prompt A/B harness for the LLM conviction gate. |
+| `scripts/rank_gradient_report.py` | `--preds`, `--buckets`, `--signal-lag`=0, `--cost-pct`=0.0, `--fwd-bars`=1, `--extra-cols`=, `--strict` | Rank-gradient Stage-0 gate (wave-9 #4/#5 activation harness). |
+| `scripts/reliability_report.py` | `--in` (required), `--bins`=10 | Calibration before/after gate (wave-9 #1 activation harness). |
+| `scripts/sizing_cofire_report.py` | `--days`=30, `--journal-dir`=os.path.join(_REPO, 'journals'), `--book`=all, `--json` | Sizing multiplier co-fire report (c26 S3 / defects D10 / 02_research B06). |
+| `scripts/train_lexicon.py` | `--db`=str(_REPO / 'sentiment_cache.db'), `--data`=str(_REPO / 'stock_training_data.parquet'), `--horizons`=1,3,5, `--fit-horizon`=3, `--start`, `--end`, `--min-df`=10, `--screen-t`=2.0, `--embargo-days`, `--folds`=4, `--lambda-grid`=0.01,0.1,1,10,100, `--journal-days`=0, `--no-novelty`, `--recompute-kw`, `--out`=str(_REPO / 'learned_lexicon.json'), `--report`=str(_REPO / 'lexicon_eval_report.json'), `--seed`=0 | Offline trainer CLI for the learned sentiment lexicon — DARK ARTIFACT. |
+| `scripts/wave6_stage0.py` | `--book`, `--fb`, `--json` | Wave-6 Stage-0 measurement (offline, no live data). |
+| `sentiment_history.py` | `--backfill`, `--fetch-stocks`, `--stats`, `--rpm`=8 | Historical sentiment data — fetch, cache, score, and background-enrich. |
+| `short_flow.py` | `--days-back`=START_DAYS_BACK, `--max-files`=MAX_FILES_PER_SYNC | FINRA daily short-volume flow — per-name positioning features. |
+
+### Jetson-importable entry points
+
+| entry point | flags (=default) | docstring, first line |
+|---|---|---|
+| `crypto_loop.py` | — | 24/7 crypto trading loop — subclass of BaseTradingLoop. |
+| `gui.py` | — | PySide6 Trading Dashboard for Alpaca paper trading system. |
+| `predict_now.py` | — | ML prediction engine — RegressionLSTM loading, JIT tracing, live predictions. |
+| `scripts/connection_test.py` | — | Alpaca API connection test — verifies credentials and reports account status. |
+| `scripts/harvest_crypto_data.py` | — | Harvest crypto training data — Alpaca + yfinance + CryptoCompare hourly OHLCV. |
+| `scripts/harvest_stock_data.py` | — | Harvest stock training data — Alpaca + yfinance hourly OHLCV. |
+| `scripts/hypersearch_v2.py` | `--trials`=NUM_TRIALS, `--fresh`, `--data`=training_data.csv, `--prefix`=, `--shadow`, `--preset`, `--max-rows`=500000, `--mode`=, `--no-status` | Regression-based Optuna hyperparameter search with walk-forward cross-validation. |
+| `scripts/window_ab.py` | `--prefix`=, `--data`=training_data.csv, `--preset`, `--max-rows`=500000, `--arms`=full,730,365,pt2007, `--seed`=42, `--cum-trials`, `--epochs`, `--out` | FR-02 fixed-config training-window A/B runner (R2C-05, Jetson-only). |
+| `stock_loop.py` | — | Stock trading loop — subclass of BaseTradingLoop. |
+
+## Appendix B — import layers (mechanical; full tables + the Mermaid main-flow diagram in `docs/graphs/README.md`)
+
+**Fan-in top 25 (most depended-upon):** `log_config.py` 22, `strategy_config.py` 21, `data_utils.py` 13, `market_data.py` 12, `stock_config.py` 12, `trading_utils.py` 12, `fees.py` 9, `notify.py` 9, `adaptive_config.py` 8, `llm_client.py` 8, `llm_config.py` 8, `trade_journal.py` 7, `sentiment.py` 6, `stage0_preds.py` 6, `indicators.py` 5, `model_v2.py` 5, `policy_exits.py` 5, `sentiment_history.py` 5, `validation.py` 5, `funding_archive.py` 4, `indicator_config.py` 4, `liquidity.py` 4, `llm_analyst.py` 4, `meta_label.py` 4, `order_utils.py` 4.
+
+**Fan-out top 15 (most dependent):** `base_loop.py` 28, `stock_loop.py` 20, `scripts/hypersearch_v2.py` 14, `backtest.py` 13, `gui.py` 13, `scripts/harvest_stock_data.py` 13, `scripts/harvest_crypto_data.py` 12, `llm_analyst.py` 11, `predict_now.py` 11, `run_pipeline.py` 10, `crypto_loop.py` 8, `meta_label.py` 8, `scripts/window_ab.py` 8, `run_bots.py` 6, `scripts/meta_learning_curve.py` 6.
+
+**Unguarded heavy imports (the Mac-unimportable roots):** `gui.py` (PySide6, dotenv, pyqtgraph), `model_v2.py` (torch), `predict_now.py` (joblib, torch), `scripts/connection_test.py` (dotenv), `scripts/harvest_crypto_data.py` (dotenv), `scripts/harvest_stock_data.py` (dotenv), `scripts/hypersearch_v2.py` (joblib, optuna, sklearn, torch), `scripts/window_ab.py` (joblib, torch), `trading_utils.py` (dotenv). `trading_utils.py`'s `dotenv` line is the single choke point that makes the whole loop/pipeline/GUI layer unimportable here (owner recommendation: guard it — it would change the dev-Mac baseline, so it is not an auto-fix).
+
+**Cycles:** exactly one mutual pair, `backtest.py` ↔ `meta_label.py`, broken at runtime by function-local imports — zero EAGER cycles; `scripts/repo_graph.py --check` enforces this and reachability. **Unreachable modules:** none (every module imported by nothing is a `__main__` entry point). **Entry points:** 46. **Process graph:** `run_pipeline.py` `Popen`s the harvest → hypersearch → meta-label → backtest `--gate` → bots chain (`run_pipeline._launch_bots` and the phase functions); `gui.py`, `notify.py`, `order_stream.py`, `run_bots.py`, `shadow.py` also spawn processes; there is no `multiprocessing` anywhere — in-process concurrency is `threading` only.
+

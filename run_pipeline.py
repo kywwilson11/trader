@@ -1646,7 +1646,8 @@ def main():
             return
 
         # =============================================================
-        # PHASE C: Weekly retrain loop (bots keep running)
+        # PHASE C: Weekly retrain loop (bots run between retrains, and are
+        # STOPPED for the duration of each one — see _stop_bots below)
         # =============================================================
         cycle = 0
         while not _shutdown_requested:
@@ -1705,7 +1706,8 @@ def main():
             if _shutdown_requested:
                 break
 
-            # --- Retrain (bots keep trading with current models) ---
+            # --- Retrain (bots are STOPPED for it, restarted after: the
+            # _stop_bots / _restart_bots pair further down this block) ---
             # Determine what to retrain: manual trigger overrides defaults
             if manual_trigger:
                 rt_crypto = manual_trigger.get('crypto', False)

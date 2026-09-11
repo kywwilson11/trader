@@ -197,17 +197,11 @@ class TestMacroFetchers:
             assert mi.fetch_financial_stress() is None
         assert _warnings(caplog, 'STLFSI2')
 
-    def test_fetch_cape_missing_pe_warns(self, monkeypatch, caplog):
-        """trailingPE=None raises no exception — the no-log gap that was fixed."""
-        monkeypatch.setitem(sys.modules, 'yfinance', _yfinance_with(info={}))
-        with caplog.at_level(logging.DEBUG, logger='macro_indicators'):
-            assert mi.fetch_cape() is None
-        assert _warnings(caplog, 'CAPE')
-
-    def test_fetch_cape_happy_path(self, monkeypatch):
-        monkeypatch.setitem(sys.modules, 'yfinance',
-                            _yfinance_with(info={'trailingPE': 25.0}))
-        assert mi.fetch_cape() == pytest.approx(40.0)  # 25 * 1.6
+    # (fetch_cape tests removed 2026-08-22: pseudo-CAPE deleted by owner
+    # ruling — decision-influence ledger §3.5 unanimous NO, KILL_LIST ask #3
+    # RULED. New-truth pins live in tests/test_grp_macro.py::
+    # TestPseudoCapeDeleted and tests/test_ia1_removals.py; archive:
+    # research/campaign_2026-08/08_removed_code.md IA-1.1.)
 
 
 # ---------------------------------------------------------------------------
@@ -288,10 +282,9 @@ class TestSpyTrend:
 # macro_indicators: get_macro_regime composition
 # ---------------------------------------------------------------------------
 
-def _patch_fetchers(monkeypatch, vix=None, stress=None, cape=None):
+def _patch_fetchers(monkeypatch, vix=None, stress=None):
     monkeypatch.setattr(mi, 'fetch_vix', lambda: vix)
     monkeypatch.setattr(mi, 'fetch_financial_stress', lambda: stress)
-    monkeypatch.setattr(mi, 'fetch_cape', lambda: cape)
 
 
 class TestMacroRegime:
@@ -314,17 +307,17 @@ class TestMacroRegime:
         assert r.stop_mult == pytest.approx(0.8)
         assert 'high_stress' in r.regime_label
 
-    def test_cape_overvaluation_stocks_only(self, monkeypatch):
-        _patch_fetchers(monkeypatch, vix=10.0, cape=40.0)  # z = 1.875 > 1.5
-        r = mi.get_macro_regime(api=None, asset_type='stock')
-        assert r.sizing_mult == pytest.approx(0.7)
-        assert 'overvalued' in r.regime_label
-
-    def test_cape_not_fetched_for_crypto(self, monkeypatch):
-        _patch_fetchers(monkeypatch, vix=10.0, cape=40.0)
-        r = mi.get_macro_regime(api=None, asset_type='crypto')
-        assert r.cape is None
-        assert 'overvalued' not in r.regime_label
+    def test_cape_haircut_deleted_stock_regime_unaffected(self, monkeypatch):
+        # Rewritten 2026-08-22: previously pinned the pseudo-CAPE 0.7x
+        # stock haircut (ledger §3.5 unanimous NO; owner-ruled deletion,
+        # 08_removed_code.md IA-1.1). New truth: no valuation haircut, no
+        # 'overvalued' label, cape always None — for BOTH asset types.
+        _patch_fetchers(monkeypatch, vix=10.0)
+        for asset_type in ('stock', 'crypto'):
+            r = mi.get_macro_regime(api=None, asset_type=asset_type)
+            assert r.sizing_mult == pytest.approx(1.0)
+            assert 'overvalued' not in r.regime_label
+            assert r.cape is None
 
     def test_stablecoin_emergency_zeroes_sizing(self, monkeypatch):
         _patch_fetchers(monkeypatch, vix=10.0)

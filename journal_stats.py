@@ -2,7 +2,7 @@
 
 Measurement-only: no writes, no trading-path imports, stdlib only
 (json/pathlib/datetime/math/collections — no numpy, no pandas). Consumed by
-the GUI's future journal-analytics view (research/gui_review_2026-07.md §4
+the GUI's future journal-analytics view (research/reviews_2026-07/gui_review_2026-07.md §4
 "journal analytics" missing item, §11 Phase 2.5) — the same role
 chart_core.py plays for chart math: gui.py owns Qt rendering, this module
 just hands back plain dicts/lists it can render directly.
@@ -10,18 +10,19 @@ just hands back plain dicts/lists it can render directly.
 Row schema this module reads (see trade_journal.py's own module docstring
 for the full producer contract; only the keys below are ever touched here):
 
-  "buy"  (base_loop.py:1950-1961 — crypto AND the shared/base path;
-          stock_loop.py:961-973 — stock's own bracket-order path; both
+  "buy"  (base_loop._place_and_track_buy — crypto AND the shared/base path;
+          stock_loop._execute_buys — stock's own bracket-order path; both
           write the identical key set): symbol, action="buy",
           final_notional, decision_price, fill_price, ts. `final_notional`
           is the dollar SIZE of the fill (Alpaca notional, not qty) — the
           only place a dollar amount is journaled for an entry.
-  "sell" (base_loop.py:1080-1086 `_record_confirmed_exit` — used by BOTH
+  "sell" (base_loop._record_confirmed_exit — used by BOTH
           books for every signal/stop/TP/EOD-flatten/circuit-breaker exit,
-          e.g. exit_reason values 'signal_sell' base_loop.py:1123,
-          'server_stop' base_loop.py:708, 'circuit_breaker' base_loop.py:477,
-          'eod_flatten' stock_loop.py:387; PLUS stock_loop.py:643-649
-          `_journal_external_close` for broker-side closes the bot didn't
+          e.g. exit_reason values 'signal_sell' base_loop._execute_sells,
+          'server_stop' base_loop._manage_stops, 'circuit_breaker'
+          base_loop._circuit_breaker_check, 'eod_flatten'
+          stock_loop.flatten_before_close; PLUS
+          stock_loop._journal_external_close for broker-side closes the bot didn't
           initiate — identical key set in every case): symbol,
           action="sell", exit_reason, pnl_pct, ts. pnl_pct is REALIZED and
           self-contained (written as
@@ -32,20 +33,20 @@ for the full producer contract; only the keys below are ever touched here):
           `final_notional`.
 
 Every row also carries `ts` (offset-aware ISO-8601, stamped once by
-trade_journal.py:81 for every row type) and lives in a date-named file
-`journals/YYYY-MM-DD.jsonl` (trade_journal.py:82).
+trade_journal.log_decision for every row type) and lives in a date-named file
+`journals/YYYY-MM-DD.jsonl` (trade_journal.JOURNAL_DIR).
 
 Pairing strategy (buys -> round-trip trades): LIFO, one open slot per
 symbol. Crypto and stock symbols never collide — crypto is always
 'BASE/QUOTE' (e.g. 'BTC/USD'), stocks never contain '/' — the same
-convention used codebase-wide to tell the books apart (order_utils.py:30,
-trading_utils.py:202, monitor_drift.py:280, gui.py:2560), so one dict keyed
+convention used codebase-wide to tell the books apart (`'/' in symbol`, in
+order_utils.py, trading_utils.py, monitor_drift.py and gui.py), so one dict keyed
 by bare symbol is enough to keep both books' open entries apart without
 ambiguity. A second buy for the same symbol before its sell (a scale-in
 "add") OVERWRITES the pairing slot with the newer buy's ts/notional rather
 than blending — this mirrors what the live bots themselves do:
 `self.positions[symbol] = Position(entry_price=fill_price, ...)` on every
-buy (base_loop.py:1937-1944) REPLACES entry_price with the latest fill
+buy (base_loop._place_and_track_buy) REPLACES entry_price with the latest fill
 instead of computing a weighted-average cost basis, so the sell row's own
 `pnl_pct` is already anchored to the MOST RECENT buy — LIFO pairing
 reproduces the same basis the writer used, it doesn't invent a new one.

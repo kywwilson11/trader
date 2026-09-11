@@ -212,8 +212,9 @@ def run_report(days: int = 14) -> dict:
               f"{la['mean_latency_ms']} ms, cost ${la['total_cost_usd']}, "
               f"{la['n_backoffs']} backoff(s)")
 
-    print("Compare against the backtest's assumptions (fees.py spread "
-          "haircuts: crypto 10 bps, stock 5 bps round trip). If realized "
+    print("Compare against the backtest's assumptions (backtest.py "
+          "SPREAD_PCT haircuts: crypto 10 bps, stock 5 bps round trip). "
+          "If realized "
           "shortfall is persistently higher, the backtest is optimistic — "
           "raise SPREAD_PCT in backtest.py and the entry edge floor.")
 

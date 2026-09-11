@@ -597,7 +597,7 @@ def test_c2_models_tab_buttons_and_strip():
     # U5 legacy command-string pins survive
     assert '"decision_report.py", "--days", "30"' in body
     assert '"beta_ledger.py", "--days", "90"' in body
-    assert '"indicator_leadlag.py", "--data", "crypto_training_data.parquet"' \
+    assert '"indicator_leadlag.py", "--data", "training_data.parquet"' \
         in body
 
 

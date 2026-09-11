@@ -1217,7 +1217,12 @@ def sentiment_gate(symbol, asset_type='crypto'):
         else:
             reasons.append(f"market={mscore:+.2f}(neutral)")
 
-    # Clamp: never fully block (ML signal always gets a chance), cap upside
+    # Clamp: never fully block (ML signal always gets a chance), cap upside.
+    # INVARIANT: the 0.15 floor makes the return strictly positive — the
+    # loops' former `gate <= 0` veto branches were mathematically unreachable
+    # and were deleted 2026-08-22 (decision-influence ledger; verbatim code
+    # in research/campaign_2026-08/08_removed_code.md). Do not rebuild a
+    # sentiment veto on this return value without an owner ruling.
     multiplier = max(0.15, min(1.5, multiplier))
 
     return multiplier, reasons

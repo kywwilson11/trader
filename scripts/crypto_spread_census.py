@@ -165,7 +165,8 @@ def main():
     summary = summarize(samples)
     violations = sanity_check(summary)
     out = {
-        'generated_utc': datetime.datetime.utcnow().isoformat() + 'Z',
+        'generated_utc': (datetime.datetime.now(datetime.timezone.utc)
+                          .replace(tzinfo=None).isoformat() + 'Z'),
         'loc': args.loc,
         'window_min': args.minutes,
         'interval_s': args.interval,

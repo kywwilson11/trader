@@ -84,7 +84,10 @@ const pick = (k, d) => (A && A[k] !== undefined) ? A[k]
   : ((cfg && cfg[k] !== undefined && cfg[k] !== null) ? cfg[k] : d)
 const REVIEWERS = Math.max(2, Math.min(5, pick('reviewers', 3)))
 const N_WORKERS = Math.max(1, pick('workers', 2))
-const REPORT_PATH = pick('report_path', 'research/module_improve_v3_report.md')
+// Default = the 2026-07 panel batch's report, now filed under research/reviews_2026-07/.
+// A new batch MUST set `report_path` in its run config (the config is the primary channel and
+// `modules` is required there, so this default is only ever a last-resort fallback).
+const REPORT_PATH = pick('report_path', 'research/reviews_2026-07/module_improve_v3_report.md')
 const WANT_PACK = pick('context_pack', true) !== false
 
 // Reasoning effort per model family. Reviewers and implementers run at max; Fable's

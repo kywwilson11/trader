@@ -86,7 +86,10 @@ def _get_incremental_start(existing_df, ticker):
 
 # B05.1 minute-EDGE fetch window (bars are heavy: ~390/day/name). Bounded so
 # the Jetson never pulls the full 2016+ minute history.
-MINUTE_EDGE_DAYS = int(os.getenv('TRADER_MINUTE_EDGE_DAYS', '120'))
+try:
+    MINUTE_EDGE_DAYS = int(os.getenv('TRADER_MINUTE_EDGE_DAYS', '120') or '120')
+except ValueError:
+    MINUTE_EDGE_DAYS = 120
 
 
 def _minute_edge_overlay(api, ticker, df):
@@ -223,6 +226,11 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     from policy_exits import compute_tb_labels
     for col, vals in compute_tb_labels(df, FORWARD_BARS, 'stock').items():
         df[col] = vals
+    # R2C-06 (L7 guard): TB_Bars_* spans are POSITIONAL offsets in the
+    # frame AS OF this stamp (policy_exits.py caveat) — remember the
+    # stamped index so the post-filter guard below can verify removals
+    # stayed prefix/suffix-only.
+    _tb_stamp_index = df.index
 
     # FINRA daily shorting-flow features (wave 4; informed sell-side
     # pressure, day-D file maps to day-D+1 bars — point-in-time)
@@ -250,6 +258,8 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     df = _fill_warmup_features(df)
     df = df.dropna()
     df = _asof_tradability_mask(df, ticker)
+    _warn_tb_span_violation(_tb_stamp_index, df.index, ticker,
+                            'dropna/tradability')
     return df
 
 
@@ -261,6 +271,69 @@ from indicators import (
     WARMUP_FEATURES_ZERO, WARMUP_FEATURES_HALF,
     fill_warmup_features as _fill_warmup_features,
 )
+
+
+# --- R2C-06 (L7) TB-span/filter-ordering guard --------------------------
+# TB_Bars_* positional spans are stamped BEFORE the dropna + as-of masks
+# (see prepare_stock_data), against policy_exits' own documented caveat:
+# a span is invalid as a row offset after ANY interior row removal.
+# Today's removals are per-ticker prefix/suffix only (offset-preserving
+# for every surviving row's forward span) — nothing enforced that until
+# now. These guards WARN LOUDLY instead of raising (a harvest must never
+# die on a measurement check); a fired warning is the trigger for the
+# deferred re-stamp-after-filtering fix (06 plan, deferred item 8).
+
+def _removals_prefix_suffix_only(pre_index, post_index):
+    """(ok, n_interior_gaps): ok iff post_index is ONE contiguous run of
+    pre_index — i.e. rows were removed only from the front and/or back.
+    Rows in post but not in pre count as violations too. Empty post is
+    vacuously ok (no surviving row carries a stale span)."""
+    if len(post_index) == 0:
+        return True, 0
+    pos = pre_index.get_indexer(post_index)
+    if (pos < 0).any():
+        return False, int((pos < 0).sum())
+    gaps = int(((pos[1:] - pos[:-1]) != 1).sum())
+    return gaps == 0, gaps
+
+
+def _warn_tb_span_violation(pre_index, post_index, ticker, stage):
+    """Loud [TB-GUARD] warning when a filter removed INTERIOR rows after
+    TB stamping. Returns the ok flag so callers/tests can assert on it.
+
+    Fail-soft on the check itself (e.g. get_indexer refuses a non-unique
+    per-ticker index): a broken CHECK must not kill the harvest, and it is
+    not evidence of a violation — it prints its own distinct line and
+    returns True (no L7 trigger)."""
+    try:
+        ok, n_bad = _removals_prefix_suffix_only(pre_index, post_index)
+    except Exception as e:  # measurement check must never kill a harvest
+        print(f"  [TB-GUARD] {ticker}: {stage} span check itself failed "
+              f"({type(e).__name__}: {e}) — check skipped, NOT a "
+              f"violation.")
+        return True
+    if not ok:
+        print(f"  [TB-GUARD] {ticker}: {stage} removed INTERIOR rows "
+              f"({n_bad} discontinuities) after TB stamping — TB_Bars_* "
+              f"positional spans are now INVALID for this name "
+              f"(policy_exits.py caveat). Re-stamp-after-filtering is "
+              f"required before trusting TB labels/sample-weight "
+              f"uniqueness (R2C-06 L7 trigger — report to owner).")
+    return ok
+
+
+def _tb_membership_guard(pre_tickers, post_tickers):
+    """Per-ticker prefix/suffix check across the cross-sectional
+    membership mask. pre_tickers/post_tickers: one-column 'Ticker'
+    frames (index + ticker) captured before/after the mask. A ticker
+    removed entirely is fine (no surviving rows carry spans)."""
+    ok_all = True
+    for t in post_tickers['Ticker'].unique():
+        pre_idx = pre_tickers.index[pre_tickers['Ticker'] == t]
+        post_idx = post_tickers.index[post_tickers['Ticker'] == t]
+        ok_all &= _warn_tb_span_violation(pre_idx, post_idx, t,
+                                          'as-of membership mask')
+    return ok_all
 
 
 def _asof_membership_mask(df, top_k=AS_OF_TOP_K):
@@ -439,7 +512,12 @@ def main():
     final_df = final_df.sort_index()
 
     # Cross-sectional as-of membership (uses _DV30 stamped per ticker)
+    # R2C-06 (L7): capture index+Ticker only (cheap) so the TB-span guard
+    # can verify the mask removed prefix/suffix rows only, per ticker.
+    _pre_member = final_df[['Ticker']].copy()
     final_df = _asof_membership_mask(final_df)
+    _tb_membership_guard(_pre_member, final_df[['Ticker']])
+    del _pre_member
 
     # Cross-sectional rank features over the surviving members (wave-3
     # flagship: selection is a RELATIVE decision — give the models each

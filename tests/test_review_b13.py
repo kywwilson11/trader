@@ -103,17 +103,20 @@ def test_sharpe_degenerate_input_returns_shrink_target():
 
 def test_sharpe_plateau_tie_breaks_toward_shrink_target():
     # pred = w*a + (1-w)*(a-1) = a - 1 + w; threshold 0 takes rows with
-    # a >= 1 - w. 24 always-taken good rows plus one a=0.5 disaster row that
-    # enters the take-set only for w >= 0.5 -> the max-sharpe plateau is
-    # exactly w in [0.00, 0.49]. Leftmost-argmax returned 0.0; tie-aware
-    # selection returns the plateau point nearest shrink_to=0.5, i.e. 0.49.
+    # a - 1 + w > 0. 24 always-taken good rows plus one a=0.5 disaster row
+    # that enters the take-set only for w > 0.5 -> the max-sharpe plateau is
+    # exactly w in [0.00, 0.50]. Leftmost-argmax returned 0.0; tie-aware
+    # selection returns the plateau point nearest shrink_to=0.5, i.e. 0.50.
+    # (R2C-02e/L9 modernization: _policy_sharpe now uses strict '>' to
+    # match every deployed path, moving the plateau edge from 0.49 to 0.50
+    # — the tie-break behavior under test is unchanged.)
     a = np.full(25, 5.0)
     a[-1] = 0.5
     y = np.array([1.0, 0.5] * 12 + [-50.0])
     b = a - 1.0
     w = fit_blend_weight(a, b, y, objective='sharpe', threshold=0.0,
                          shrink_lambda=0.0, shrink_to=0.5)
-    assert w == pytest.approx(0.49)
+    assert w == pytest.approx(0.50)
 
 
 def test_nnls_degenerate_returns_shrink_target_exactly():

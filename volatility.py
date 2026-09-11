@@ -100,8 +100,10 @@ def forecast_volatility(model_result) -> float | None:
 
 
 # DEAD in live paths: stops are ATR-based (base_loop) and this floor/ceil
-# does not track strategy_config stop policy. Kept only because
-# base_loop.py:40 still imports the name — delete both together.
+# does not track strategy_config stop policy. It has NO non-test consumer —
+# base_loop no longer imports it (tests/test_grp_loops.py::test_dead_imports_pruned
+# asserts the name is absent from base_loop); the only exercise is
+# tests/test_new_modules.py.
 def get_garch_stop(entry_price: float, sigma: float, multiplier: float = 2.0,
                    floor_pct: float = 0.03, ceil_pct: float = 0.10) -> float:
     """Compute stop-loss price using GARCH volatility.

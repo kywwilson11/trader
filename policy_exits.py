@@ -36,6 +36,13 @@ Live-only overlays the kernel does NOT model (see also backtest.py's
     derives from highs through bar j-1; live re-derives the trail from
     the same-cycle HWM and can exit on an intrabar spike-then-fade that
     the kernel holds through
+  - trailing-distance denominator: the kernel scales the trail by ATR/entry
+    (`td`) and enforces hwm*(1 - td), while base_loop._desired_stop_for
+    scales by ATR/hwm — so once the HWM has risen above entry, live's
+    crypto/base trail sits entry/hwm x CLOSER to the HWM than the kernel's.
+    stock_loop._manage_stops divides by entry_price and agrees with the
+    kernel (the underlying base_loop-vs-kernel arithmetic difference is an
+    open OWNER item, not a documentation choice)
   - stock rank-drop sell: stock_loop._execute_sells also flattens a held
     name that leaves the top-HOLD_RANK cross-sectional ranking while its
     pred is merely negative; the kernel's only discretionary exit is the
@@ -52,7 +59,8 @@ Live-only overlays the kernel does NOT model (see also backtest.py's
 
 Consumer parameterization differs BY DESIGN — labels and the backtest
 answer different questions with the same kernel:
-  - compute_tb_labels: max_hold=fb (12-48), use_signal_exit=False
+  - compute_tb_labels: max_hold=fb (the harvest's adaptive forward_bars list,
+    default 12-48), use_signal_exit=False
   - backtest.py / meta_label.py: max_hold=0 (unlimited), use_signal_exit=True
   - decision_report.py: max_hold=24, use_signal_exit=False
 so a TB_Ret_{fb} label and a backtest trade from the same entry bar can

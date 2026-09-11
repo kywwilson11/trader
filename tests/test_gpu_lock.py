@@ -4,10 +4,32 @@ import sys
 import json
 import multiprocessing
 import time
+from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import gpu_lock
+
+
+@pytest.fixture(autouse=True)
+def _lock_sandbox(tmp_path, monkeypatch):
+    """Keep the lock files out of the repo root.
+
+    gpu_lock._LOCK_FILE / _INFO_FILE are module globals anchored to the
+    module's own directory, and both are created at call time, so an
+    unsandboxed run leaves <repo>/.gpu.lock behind (and, if a test ever dies
+    between acquire and release, <repo>/.gpu_lock_info.json — which is not
+    even gitignored). Same pattern as tests/test_review_b19.py::lock_sandbox.
+    The child processes below re-import gpu_lock (macOS spawns rather than
+    forks), so they are handed these paths explicitly — parent and child must
+    contend for ONE file or the cross-process assertions mean nothing.
+    """
+    monkeypatch.setattr(gpu_lock, '_LOCK_FILE', tmp_path / '.gpu.lock')
+    monkeypatch.setattr(gpu_lock, '_INFO_FILE',
+                        tmp_path / '.gpu_lock_info.json')
+    return tmp_path
 
 
 def test_is_gpu_free_when_unlocked():
@@ -26,8 +48,14 @@ def test_acquire_and_release():
     assert gpu_lock.is_gpu_free() is True
 
 
-def _child_acquire(ready_event, release_event):
-    """Helper: acquire lock in child process, signal ready, wait for release."""
+def _child_acquire(lock_path, info_path, ready_event, release_event):
+    """Helper: acquire lock in child process, signal ready, wait for release.
+
+    The spawned child re-imports gpu_lock, so the parent's sandbox paths are
+    re-applied here rather than inherited.
+    """
+    gpu_lock._LOCK_FILE = Path(lock_path)
+    gpu_lock._INFO_FILE = Path(info_path)
     with gpu_lock.acquire_for_training("child_process"):
         ready_event.set()
         release_event.wait(timeout=10)
@@ -38,7 +66,10 @@ def test_cross_process_lock():
     ready = multiprocessing.Event()
     release = multiprocessing.Event()
 
-    p = multiprocessing.Process(target=_child_acquire, args=(ready, release))
+    p = multiprocessing.Process(
+        target=_child_acquire,
+        args=(str(gpu_lock._LOCK_FILE), str(gpu_lock._INFO_FILE),
+              ready, release))
     p.start()
 
     # Wait for child to acquire
@@ -55,9 +86,10 @@ def test_cross_process_lock():
     assert gpu_lock.is_gpu_free() is True
 
 
-def _child_crash():
+def _child_crash(lock_path):
     """Helper: acquire lock then crash (OS should release flock)."""
     # Acquire lock via context manager, then hard-exit without releasing
+    gpu_lock._LOCK_FILE = Path(lock_path)   # spawned child re-imports gpu_lock
     gpu_lock._LOCK_FILE.touch(exist_ok=True)
     import fcntl
     fd = open(gpu_lock._LOCK_FILE, 'w')
@@ -67,7 +99,8 @@ def _child_crash():
 
 def test_lock_released_on_crash():
     """Lock should be released when process crashes (OS releases flock)."""
-    p = multiprocessing.Process(target=_child_crash)
+    p = multiprocessing.Process(target=_child_crash,
+                                args=(str(gpu_lock._LOCK_FILE),))
     p.start()
     p.join(timeout=5)
 

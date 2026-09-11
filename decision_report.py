@@ -63,7 +63,14 @@ JOURNAL_DIR = BASE_DIR / 'journals'
 GATE_REASONS = ['sentiment_block', 'llm_veto', 'meta_veto', 'q10_tail_veto',
                 'edgar_event', 'below_threshold', 'cost_floor',
                 'winners_curse', 'correlation', 'bucket_cap', 'trend_filter',
-                'sizing_zero', 'earnings', 'qty_zero']
+                'sizing_zero', 'earnings', 'qty_zero',
+                # 2026-08 influence audit (open question #4): the formerly
+                # UNPRICED book-wide gates now journal per-symbol skip rows
+                # (IA-3). NOTE: the loops' vc[...] counter keys for the two
+                # VIX gates stay 'macro_halt'/'vix_block' (entry_window
+                # back-compat) — only the skip_reason names are new.
+                'vix_halt', 'vix25_block', 'macro_standdown',
+                'rr5_demotion', 'rank_near_miss']
 MAX_HOLD_BARS = {'crypto': 24, 'stock': 24}   # vertical barrier for replays
 
 MIN_VERDICT_N = 9    # no REVIEW/OK/CHANGE verdict below this n (matches the >=9 bucketing floor)
@@ -145,7 +152,7 @@ def replay_entry(bars, ts, asset_type: str,
 
     spread_pct: per-row spread (percent of price) if the journal carries
     one ('spread_pct' — both loops journal this on cost_floor skips since
-    2026-07-13, base_loop.py:1751-1753 / stock_loop.py:815); falls back to
+    2026-07-13, base_loop._execute_buys / stock_loop._execute_buys); falls back to
     fees.FLAT_SPREAD_PCT[asset_type] for rows predating that (or other
     gates that don't journal it). See the cost_floor caveat run_report
     prints when this flat fallback is in play for a spread-sensitive gate.

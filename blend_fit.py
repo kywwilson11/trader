@@ -19,10 +19,44 @@ regressions — non-negativity is crucial); Granger-Ramanathan 1984; Diebold-Shi
 """
 import numpy as np
 
+# The hardcoded serving-side fallback: model_lgb.ensemble_predict(...,
+# lstm_weight=0.6) == predict_now/backtest's cfg.get('lstm_weight', 0.6).
+# R2C-02a (defect H1): this is now the ONE certificate-visible home of that
+# default — whenever boosters ship without a fitted weight, BOTH the holdout
+# certificate and the shipped config resolve to this value. B12.2 OWNER NOTE:
+# the pending 0.6 -> 0.5 default question is decided HERE (decision-queue
+# item), in lockstep with model_lgb.ensemble_predict's keyword default.
+DEFAULT_LSTM_WEIGHT = 0.6
+
+
+def effective_lstm_weight(fitted_weight, ship_boosters, default=None):
+    """The ONE effective blend weight for certificate AND deployment (H1).
+
+    Whenever the LGB boosters will ship, live's ensemble_predict blends at
+    cfg.get('lstm_weight', DEFAULT_LSTM_WEIGHT) regardless of whether the
+    blend fit succeeded — so a None fitted weight must resolve to the SAME
+    default for the holdout certificate and the shipped config (cert ==
+    deploy; the R2C-02a repair of the blend-fit failure path that
+    previously certified a raw LSTM while deploying a 0.6 blend).
+
+    ship_boosters False -> the fitted weight passes through unchanged
+    (None stays None: raw-LSTM certificate, no boosters — the legacy path).
+    """
+    if not ship_boosters:
+        return None if fitted_weight is None else float(fitted_weight)
+    if fitted_weight is None:
+        return float(DEFAULT_LSTM_WEIGHT if default is None else default)
+    return float(fitted_weight)
+
 
 def _policy_sharpe(pred, y, threshold):
-    """Per-trade Sharpe of the long-only policy "take pred>=threshold"."""
-    take = pred >= threshold
+    """Per-trade Sharpe of the long-only policy "take pred > threshold".
+
+    Strict '>' matches every deployed path (objective_utils
+    simulate_trades_core, backtest.py, predict_now.py) — R2C-02e / L9;
+    the old '>=' admitted exact-threshold rows no live gate takes.
+    """
+    take = pred > threshold
     if int(take.sum()) < 5:
         return 0.0
     r = y[take]
@@ -73,7 +107,7 @@ def fit_blend_weight(lstm_oof, lgb_oof, y, objective='sharpe', threshold=0.0,
 
 
 def fit_blend_weight_v2(lstm_oof, lgb_oof, y, forward_bars=1, shrink_to=0.5,
-                        shrink_lambda=0.5):
+                        shrink_lambda=0.5, kish_divisor=None):
     """NNLS blend weight with an overlap-corrected significance gate (T1/B12.2).
 
     Deploy the estimated weight only when it differs from the simple average
@@ -85,6 +119,15 @@ def fit_blend_weight_v2(lstm_oof, lgb_oof, y, forward_bars=1, shrink_to=0.5,
     (Claeskens et al. 2016 — estimated weights add variance that swamps the
     bias saved; Stock & Watson 2004 forecast-combination puzzle; Diebold &
     Shin 2019 — shrink to equal weights).
+
+    kish_divisor (R2C-02e / L4, default None = legacy byte-identical):
+    optional Kish design-effect divisor for pooled CROSS-SECTIONAL rows —
+    deff = 1 + (G-1)*rho_bar for G names with intra-timestamp residual
+    correlation rho_bar (Kish 1965). The temporal n/fb correction alone
+    understates the SE on multi-ticker panels (crypto cross-name rho
+    0.7-0.9), firing 'significant' too liberally. When provided (clamped
+    to >= 1), n_eff divides by it and the SE grows by sqrt of it. The
+    caller stays on the legacy default; activation is a runbook event.
 
     Returns dict {'w', 'w_raw', 'se', 'significant', 'n', 'n_eff'}; on
     degenerate/thin input w falls back to the clipped shrink target with
@@ -110,8 +153,13 @@ def fit_blend_weight_v2(lstm_oof, lgb_oof, y, forward_bars=1, shrink_to=0.5,
     # Label-overlap correction (B12): n_eff = n / forward_bars, i.e. the
     # OLS variance is multiplied by the overlap factor fb.
     fb = max(int(forward_bars), 1)
-    n_eff = n / fb
-    se = float(np.sqrt(sigma2 / denom * fb))
+    if kish_divisor is None:            # legacy path — byte-identical
+        n_eff = n / fb
+        se = float(np.sqrt(sigma2 / denom * fb))
+    else:
+        kd = max(float(kish_divisor), 1.0)
+        n_eff = n / (fb * kd)
+        se = float(np.sqrt(sigma2 / denom * fb * kd))
     significant = abs(w_raw - 0.5) > 2.0 * se     # tested on the UNSHRUNK w
     if significant:
         lam = min(max(float(shrink_lambda), 0.0), 1.0)
@@ -138,3 +186,29 @@ def smooth_across_retrains(w_new, w_prev=None, lo=0.25, hi=0.75):
     else:
         w = 0.5 * (w_new + float(w_prev))
     return float(min(max(w, lo), hi))
+
+
+def reselect_trade_threshold(preds, y, tt_range, old_threshold, score_fn,
+                             step=0.01):
+    """Re-select the trade threshold on BLENDED predictions (R2C-02d / H2).
+
+    The Optuna-searched trade_threshold is scored against raw-LSTM fold
+    predictions, but serving applies it to w*LSTM + (1-w)*LGB whose
+    distribution is variance-compressed by the tree leg — a systematic
+    scale mismatch. This grid re-scores score_fn(preds, y, threshold) over
+    [tt_range[0], tt_range[1]] at the SAME step Optuna searched (0.01) and
+    returns (best_threshold, best_score). Exact score ties break toward
+    old_threshold (least policy change — mirrors fit_blend_weight's
+    plateau rule). Pure numpy: the caller supplies the scorer (hypersearch
+    passes its compute_sharpe closure); deployment of the result is gated
+    by strategy_config.BLEND_THRESHOLD_RESELECT (default OFF).
+    """
+    lo, hi = float(tt_range[0]), float(tt_range[1])
+    step = float(step)
+    n_steps = max(int(round((hi - lo) / step)), 0)
+    grid = np.round(lo + np.arange(n_steps + 1) * step, 10)
+    scores = np.asarray([float(score_fn(preds, y, float(t))) for t in grid])
+    best = np.flatnonzero(scores == scores.max())
+    thr = float(grid[best[np.argmin(np.abs(grid[best]
+                                           - float(old_threshold)))]])
+    return thr, float(scores.max())

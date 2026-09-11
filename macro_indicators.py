@@ -1,15 +1,18 @@
 """Macro indicators for regime-based risk management.
 
-Fetches financial stress, VIX, CAPE, and stablecoin peg data.
+Fetches financial stress, VIX, and stablecoin peg data.
 Combines into a MacroRegime that trading loops use for position sizing
 and stop-loss adjustments.
 
 Sources:
 - Financial Stress: FRED STLFSI2 (free, no auth)
-- VIX: yfinance (already installed)
-- CAPE: estimated from SPY trailing P/E x1.6 (real-time Shiller APIs
-  proved unreliable — see fetch_cape)
+- VIX: yfinance primary, FRED VIXCLS CSV fallback
 - Stablecoins: Alpaca crypto quotes
+
+The pseudo-CAPE estimator (SPY trailing P/E x1.6) and its 0.7x sizing
+haircut were DELETED 2026-08-22 by owner ruling (KILL_LIST pending ask #3:
+"fake data driving a real haircut"). Verbatim code + restoration notes:
+research/campaign_2026-08/08_removed_code.md.
 """
 
 import time
@@ -20,7 +23,6 @@ logger = get_logger(__name__)
 # Cache durations (seconds)
 _VIX_CACHE_TTL = 3600       # 1 hour
 _STRESS_CACHE_TTL = 86400   # 1 day (weekly data anyway)
-_CAPE_CACHE_TTL = 86400     # 1 day
 _STABLECOIN_TTL = 300        # 5 min
 
 # Cache storage
@@ -45,7 +47,6 @@ _VIX_TIER_ENTER = (25.0, 35.0)
 _VIX_TIER_EXIT = (22.0, 31.0)
 _VIX_TIER_MULTS = (1.0, 0.5, 0.3)   # normal / defensive / crisis
 _vix_tier_state = {'tier': 0}        # VIX is global — one state for both books
-_cape_exclusion_logged = False
 
 
 def _reset_vix_tier_state():
@@ -67,16 +68,16 @@ def vix_tier_mult_v2(vix) -> float:
     return _VIX_TIER_MULTS[t]
 
 
-def regime_family_mults_v2(regime, asset_type: str, announce: bool = False) -> dict:
+def regime_family_mults_v2(regime, asset_type: str) -> dict:
     """De-risk REGIME-family components for the DERISK_STACK_V2 MIN aggregation.
 
     stock  -> {'vix': vix_tier_mult_v2(regime.vix), 'stress': 0.5|1.0}
     crypto -> {'stress': 0.5|1.0}   (VIX replaced by BTC-RV state — caller adds it)
-    Pseudo-CAPE is EXCLUDED by design (KILL_LIST; announce=True logs it once,
-    loudly). The HMM multiplier and book-vol scalar are composed by the caller.
+    The HMM multiplier and book-vol scalar are composed by the caller.
+    (Pseudo-CAPE, formerly excluded here with a one-shot announce, was
+    DELETED from the module 2026-08-22 by owner ruling — see module header.)
     Never raises; regime None -> {}.
     """
-    global _cape_exclusion_logged
     if regime is None:
         return {}
     try:
@@ -86,11 +87,6 @@ def regime_family_mults_v2(regime, asset_type: str, announce: bool = False) -> d
         # Same constant as the legacy STLFSI2 rule in get_macro_regime.
         out['stress'] = (0.5 if (regime.stress_level is not None
                                  and regime.stress_level > 1.0) else 1.0)
-        if announce and asset_type == 'stock' and not _cape_exclusion_logged:
-            _cape_exclusion_logged = True
-            logger.warning("[DERISK-V2] pseudo-CAPE multiplier EXCLUDED from "
-                           "sizing composition (KILL_LIST item still live in "
-                           "legacy path; code retained pending owner deletion)")
         return out
     except Exception as e:
         logger.warning("[DERISK-V2] regime_family_mults_v2 failed: %s", e)
@@ -176,36 +172,6 @@ def fetch_financial_stress() -> float | None:
         logger.debug("[MACRO] STLFSI2 fetch error: %s", e)
     logger.warning("[MACRO] Financial stress (STLFSI2) unavailable — "
                    "stress rule blind")
-    return None
-
-
-# --- Shiller CAPE ---
-
-def fetch_cape() -> float | None:
-    """Fetch Shiller CAPE ratio estimate.
-
-    Uses a simple approximation: SPY P/E * 1.6 adjustment factor
-    since real-time Shiller CAPE APIs are unreliable.
-    """
-    cached = _get_cached('cape', _CAPE_CACHE_TTL)
-    if cached is not None:
-        return cached
-
-    try:
-        import yfinance as yf
-        spy = yf.Ticker('SPY')
-        info = spy.info
-        pe = info.get('trailingPE')
-        if pe is not None:
-            # CAPE is roughly 1.5-1.8x trailing PE historically
-            cape_est = pe * 1.6
-            _set_cached('cape', cape_est)
-            logger.info("[MACRO] CAPE estimate: %.1f (PE=%.1f)", cape_est, pe)
-            return cape_est
-    except Exception as e:
-        logger.debug("[MACRO] CAPE fetch error: %s", e)
-    logger.warning("[MACRO] CAPE estimate unavailable (no SPY trailingPE) — "
-                   "valuation rule blind")
     return None
 
 
@@ -298,11 +264,6 @@ def get_spy_trend_ok(api) -> bool | None:
 
 # --- Regime Computation ---
 
-# Historical CAPE mean and std (approximate)
-_CAPE_MEAN = 25.0
-_CAPE_STD = 8.0
-
-
 def get_macro_regime(api=None, asset_type='crypto') -> 'MacroRegime':
     """Compute current macro regime with sizing and stop multipliers.
 
@@ -312,7 +273,9 @@ def get_macro_regime(api=None, asset_type='crypto') -> 'MacroRegime':
         VIX 25-35 → defensive (0.5x sizing)
         VIX > 35 → halt new stock entries
         STLFSI2 > 1.0 → reduce sizing 50%, tighten stops
-        CAPE z-score > 1.5 → reduce stock sizing 30%
+
+    (The pseudo-CAPE z>1.5 -> 0.7x stock haircut was deleted 2026-08-22
+    by owner ruling — see module header. MacroRegime.cape is always None.)
 
     Returns:
         MacroRegime dataclass with sizing_mult and stop_mult.
@@ -321,7 +284,6 @@ def get_macro_regime(api=None, asset_type='crypto') -> 'MacroRegime':
 
     vix = fetch_vix()
     stress = fetch_financial_stress()
-    cape = fetch_cape() if asset_type == 'stock' else None
 
     sizing_mult = 1.0
     stop_mult = 1.0
@@ -352,13 +314,6 @@ def get_macro_regime(api=None, asset_type='crypto') -> 'MacroRegime':
         stop_mult *= 0.8  # tighter stops
         labels.append('high_stress')
 
-    # CAPE (stocks only)
-    if cape is not None:
-        cape_z = (cape - _CAPE_MEAN) / _CAPE_STD
-        if cape_z > 1.5:
-            sizing_mult *= 0.7
-            labels.append('overvalued')
-
     # Stablecoin check (crypto only)
     stablecoin_alert = False
     if api is not None and asset_type == 'crypto':
@@ -384,7 +339,9 @@ def get_macro_regime(api=None, asset_type='crypto') -> 'MacroRegime':
     return MacroRegime(
         stress_level=stress,
         vix=vix,
-        cape=cape,
+        # Field kept in types_mod for row/fixture compat; always None since
+        # the 2026-08-22 pseudo-CAPE deletion.
+        cape=None,
         regime_label=regime_label,
         sizing_mult=round(sizing_mult, 3),
         stop_mult=round(stop_mult, 3),

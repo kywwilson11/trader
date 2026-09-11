@@ -15,8 +15,9 @@ Selection logic lives in trading_utils.get_api():
 Every returned object is a thin shim exposing the legacy attribute names
 (bar.o/.h/.l/.c/.v/.t, quote.bp/.ap, order.filled_avg_price, ...), with
 three exceptions that return raw alpaca-py objects: get_calendar,
-close_all_positions and cancel_all_orders (surface-parity methods with no
-current callers repo-wide).
+close_all_positions and cancel_all_orders. get_calendar and
+close_all_positions are surface-parity methods with no current callers
+repo-wide; cancel_all_orders IS called in production (order_utils.py, twice).
 """
 
 import logging

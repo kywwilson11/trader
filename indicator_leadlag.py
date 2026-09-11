@@ -33,7 +33,7 @@ MACDs = MACD - MACDh.
 Pure numpy/pandas — unit-tested on synthetic panels on the dev Mac; run it
 on the Jetson against the harvested training files:
 
-    python indicator_leadlag.py --data crypto_training_data.parquet
+    python indicator_leadlag.py --data training_data.parquet
     python indicator_leadlag.py --data stock_training_data.csv \
         --preset stationary --horizons 1,4,12,24,48 --json leadlag_stock.json
 

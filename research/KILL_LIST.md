@@ -16,8 +16,8 @@ drop an entry.
 - `wave-2` … `wave-7` — the wave{2..7} memory archives (`~/.claude/projects/-Users-kywwilson-Desktop-Projects-trader/memory/wave{2-roadmap,3-selection-timing,4-patterns-ta-leading,5-conviction-shorts-options,6-integrity-cost-validation,7-execution-shorts-options-carry}.md`), each wave's own "RED-TEAM KILLS" / "KILLED" / "Research-REJECTED" section. wave-8 (activation) and wave-9 (money-alpha) memories were also checked — they added no new kills, only referenced/reinforced older ones.
 - `rev-07-01` — `review-2026-07-01-full-system.md` memory (six-agent full-system review; ML-verdict "cut" recommendations, not adversarially red-teamed like the wave kills — flagged as pending below).
 - `rev-07-02` — `review-2026-07-02-indicators-decision.md` memory (indicator/decision-algorithm review; has its own explicit "KILL (evidence)" list).
-- `econ-07` — `research/econ_research_2026-07.json`, the `killed_overlaps` array.
-- `nobel-07` — `research/nobel_modern_research_2026-07.md`, Section 1 & 3 SKIP entries.
+- `econ-07` — `research/literature/econ_research_2026-07.json`, the `killed_overlaps` array.
+- `nobel-07` — `research/literature/nobel_modern_research_2026-07.md`, Section 1 & 3 SKIP entries.
 - `research/module_review_2026-07.json` was checked and is **NOT** a source here — it is a code-defect
   (P0–P3 bug) review with no research kill/reject entries; its 90-item owner decision queue is a
   separate artifact (render with `/decision-queue`).
@@ -176,6 +176,11 @@ and the campaign report; activation context in `03_jetson_runbook.md` Phase 5):
    clarification: min-aggregation does NOT launder it (a fake signal inside a min() still binds
    whenever it is the minimum). Under the flag it is excluded from composition; the code remains
    until this ruling.
+   **RULED 2026-08-22 (owner: implement).** Code deleted repo-wide — `fetch_cape`, the
+   cape_z>1.5 -> 0.7x haircut in `get_macro_regime`, and the v2 exclusion-announce machinery
+   are gone (`MacroRegime.cape` field retained, always None). Verbatim code + restoration
+   instructions archived in `research/campaign_2026-08/08_removed_code.md`. The kill entry
+   itself (line ~76) stays — the deletion ENFORCES it; do not rebuild.
 4. **"BTC-lagged spillover for alts" (commonly-confused survivor #10, UNDECIDED):** ask to split
    the ruling three ways — (a) BTC-lagged alt-ALPHA features: research recommends AGAINST
    (transmission completes within one hourly bar post-2022; lag sign regime-dependent);

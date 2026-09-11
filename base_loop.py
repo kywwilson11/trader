@@ -118,12 +118,17 @@ class BaseTradingLoop(ABC):
         self.positions: dict[str, Position] = {}
         self.last_trade_time: dict[str, datetime.datetime] = {}
         self.hard_stop_lockout: dict[str, datetime.datetime] = {}
-        # KNOWN (2026-07 review P2, deferred): this file is SHARED by both
-        # books (unlike _position_state_file) and _save_hard_stop_lockout
-        # rewrites it wholesale, so each book's save clobbers the other's
-        # persisted lockouts. Per-book prefix fix queued for owner review.
-        self._lockout_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          'hard_stop_lockout.json')
+        # Per-book lockout file (2026-08 influence audit §3.4: "shared
+        # unprefixed file lets books clobber each other"). Naming mirrors
+        # _position_state_file: crypto keeps the legacy unprefixed name,
+        # stock gets 'stock_hard_stop_lockout.json'. A prefixed book whose
+        # file does not exist yet migrates ONCE from the legacy shared
+        # file on load; saves only ever write the book's own file.
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _lk = (f'{self.MODEL_PREFIX}_hard_stop_lockout.json'
+               if self.MODEL_PREFIX else 'hard_stop_lockout.json')
+        self._lockout_file = os.path.join(_here, _lk)
+        self._legacy_lockout_file = os.path.join(_here, 'hard_stop_lockout.json')
         self._load_hard_stop_lockout()
         self.llm_scores: dict = {}
         self._last_llm_time = 0.0
@@ -135,6 +140,20 @@ class BaseTradingLoop(ABC):
         self.model_mtime = 0
         self.cycle = 0
         self.macro_regime: MacroRegime | None = None
+        # Static FOMC/CPI table staleness alarm state (one loud warning
+        # per day, one notify per process — 2026-08 influence audit).
+        self._macro_cal_alarm_date: str | None = None
+        self._macro_cal_alarm_notified: bool = False
+        # Gate-pricing instrumentation (2026-08 influence audit, open
+        # question #4: "the highest-impact gates are the least priced").
+        # _entries_block_info: why _entries_allowed last said False —
+        # ('halt'|'macro_standdown', reason, window_id). _standdown_journaled:
+        # (window_id, symbol) pairs already journaled (one priced skip row
+        # per candidate per stand-down window). _vix25_gap_log_date: one
+        # log per day for the SAFE_HAVEN-untradable gap (C3).
+        self._entries_block_info: tuple | None = None
+        self._standdown_journaled: set[tuple[str, str]] = set()
+        self._vix25_gap_log_date: str | None = None
         self.corr_matrix: dict = {}
         from drawdown import PEAK_SEED
         self._equity: float = PEAK_SEED
@@ -148,6 +167,22 @@ class BaseTradingLoop(ABC):
         self._daily_trades_date: str = datetime.date.today().isoformat()
         # Stop-breach confirmation state (2-consecutive-reading rule)
         self._pending_breach: dict[str, str] = {}
+        # IA-4 flag-family state (2026-08 influence audit; every consumer
+        # getattr-guards these — unit-test stubs bypass __init__):
+        # _pending_signal_exit: symbol -> cycle of an ARMED first signal-
+        #   exit reading (consulted only when SIGNAL_EXIT_CONFIRM_READS>=2).
+        # _position_entry_ts: symbol -> epoch of first entry (persisted;
+        #   the crypto vertical-barrier age anchor).
+        # _vertical_journaled: (symbol, int(entry_ts)) already journaled as
+        #   vertical_barrier would-fire events (one row per position).
+        # _last_marks: symbol -> last midpoint seen by _manage_stops (the
+        #   BREAKER_PER_BOOK mark source; <= one cycle stale).
+        # _breaker_base: per-book breaker baseline window (BREAKER_PER_BOOK).
+        self._pending_signal_exit: dict[str, int] = {}
+        self._position_entry_ts: dict[str, float] = {}
+        self._vertical_journaled: set[tuple[str, int]] = set()
+        self._last_marks: dict[str, float] = {}
+        self._breaker_base: dict | None = None
         # Conviction instrumentation (wave-5 Tier1-1): last meta probability
         # per symbol, stashed by _meta_gate so buy/skip rows can record it
         # without recomputing. Measurement-only — never gates.
@@ -444,6 +479,12 @@ class BaseTradingLoop(ABC):
                 # a restart mid-drawdown reset the peak to ~current equity and
                 # silently disabled the ladder while underwater.
                 'peak_equity': self._peak_equity,
+                # Entry timestamps for held positions (IA-4): the crypto
+                # vertical-barrier age anchor must survive restarts or a
+                # crash would reset every position's max-hold clock.
+                'entry_ts': {s: t for s, t in
+                             getattr(self, '_position_entry_ts', {}).items()
+                             if s in self.positions},
             }
             # Skip the write when nothing changed (the common empty-book
             # case previously rewrote an identical file every 30s cycle).
@@ -519,6 +560,16 @@ class BaseTradingLoop(ABC):
                 self.last_trade_time[sym] = datetime.datetime.fromtimestamp(float(ts))
             except (TypeError, ValueError, OSError):
                 pass
+
+        # Restore entry timestamps for still-held positions (IA-4 vertical-
+        # barrier age anchor). Unknown-age positions (pre-upgrade state
+        # files) simply have no barrier clock — fail-open, journal nothing.
+        try:
+            self._position_entry_ts = {
+                s: float(t) for s, t in (saved.get('entry_ts') or {}).items()
+                if s in self.positions}
+        except (TypeError, ValueError):
+            self._position_entry_ts = {}
 
         # Restore today's per-symbol trade counts (budget survives restarts)
         dt = saved.get('daily_trades', {})
@@ -602,8 +653,19 @@ class BaseTradingLoop(ABC):
             return True
         self._halted_until = None
 
+        # BREAKER_PER_BOOK (IA-4, ledger §3.2 KEEP-COND): OFF = account-wide
+        # Alpaca last_equity baseline exactly as today; ON = this book's own
+        # P&L vs a per-book, crypto-weekend-aware baseline window.
         try:
-            tripped, dd = check_circuit_breaker(self.api, max_drawdown_pct=self.CIRCUIT_BREAKER_PCT)
+            from strategy_config import BREAKER_PER_BOOK
+        except Exception:
+            BREAKER_PER_BOOK = False
+        try:
+            if BREAKER_PER_BOOK:
+                tripped, dd = self._book_breaker_check()
+            else:
+                tripped, dd = check_circuit_breaker(
+                    self.api, max_drawdown_pct=self.CIRCUIT_BREAKER_PCT)
         except Exception as e:
             logger.error("[CIRCUIT BREAKER] API error: %s", e)
             self._buys_allowed = False  # unknown risk state — fail closed
@@ -627,6 +689,52 @@ class BaseTradingLoop(ABC):
             except Exception:
                 pass
             pre_flatten = dict(self.positions)
+            # Trip-event journal row (2026-08 influence audit §3.2 circuit
+            # breaker KEEP-COND: "Per-book (or weekend-aware) baselines +
+            # trip journaling"). Records the baseline actually used —
+            # account-wide last_equity = previous EQUITY-TRADING-DAY close,
+            # so crypto weekend trips are judged against Friday's close —
+            # the evidence substrate for the per-book-baseline decision.
+            # Measurement-only; never blocks the flatten.
+            # Halt latch end: flag OFF = the account baseline reset
+            # (~16:05 ET, unchanged); BREAKER_PER_BOOK = this book's own
+            # window end (crypto: next UTC midnight — weekend-aware).
+            try:
+                _halt_until = (self._breaker_window_end() if BREAKER_PER_BOOK
+                               else self._next_baseline_reset())
+            except Exception:
+                _halt_until = self._next_baseline_reset()
+            try:
+                _base_equity = _cur_equity = None
+                try:
+                    _acct = self.api.get_account()
+                    _cur_equity = float(_acct.equity)
+                    _base_equity = float(_acct.last_equity)
+                except Exception:
+                    pass
+                _base_kind = 'account_last_equity'
+                if BREAKER_PER_BOOK:
+                    _base_kind = 'book_window_v2'
+                    _bb = getattr(self, '_breaker_base', None) or {}
+                    if _bb.get('equity') is not None:
+                        _base_equity = _bb['equity']
+                import zoneinfo
+                _now_et = datetime.datetime.now(
+                    zoneinfo.ZoneInfo('US/Eastern'))
+                log_decision({
+                    'action': 'circuit_breaker_trip',
+                    'asset_type': self.get_asset_type(),
+                    'drawdown_pct': round(dd * 100, 3),
+                    'threshold_pct': round(self.CIRCUIT_BREAKER_PCT * 100, 2),
+                    'baseline_kind': _base_kind,
+                    'baseline_equity': _base_equity,
+                    'equity': _cur_equity,
+                    'weekend_window': _now_et.weekday() >= 5,
+                    'n_positions_at_trip': len(pre_flatten),
+                    'halted_until': _halt_until.isoformat(),
+                })
+            except Exception:
+                pass
             failures = emergency_flatten(self.api, symbols=self.get_symbol_universe())
             if failures:
                 logger.error("[CIRCUIT BREAKER] Unconfirmed flattens: %s — kept "
@@ -665,7 +773,7 @@ class BaseTradingLoop(ABC):
                        if pos.entry_price > 0 else 0.0)
                 record_trade(sym, 'sell', pos.entry_price, px, pnl,
                              exit_reason='circuit_breaker', estimated=True)
-            self._halted_until = self._next_baseline_reset()
+            self._halted_until = _halt_until
             self._buys_allowed = False
             logger.info("[CIRCUIT BREAKER] Halting new entries until %s (baseline reset)",
                         self._halted_until.isoformat())
@@ -684,6 +792,100 @@ class BaseTradingLoop(ABC):
         if now_et >= reset:
             reset += datetime.timedelta(days=1)
         return reset.astimezone(datetime.timezone.utc)
+
+    # --- BREAKER_PER_BOOK (IA-4, 2026-08 influence audit §3.2) ------------
+    # OFF (default): none of these run on the money path — the breaker uses
+    # order_utils.check_circuit_breaker exactly as today. ON: each book
+    # measures ITS OWN P&L against a baseline captured at the book's own
+    # window roll (crypto: UTC midnight daily, weekends included; stock:
+    # the ~16:05 ET account baseline reset).
+
+    def _breaker_window_end(self) -> datetime.datetime:
+        """End of the current per-book breaker window, UTC (v2 only)."""
+        if self.get_asset_type() == 'crypto':
+            now = datetime.datetime.now(datetime.timezone.utc)
+            return (now + datetime.timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+        return self._next_baseline_reset()
+
+    def _breaker_note_realized(self, pnl_dollars: float):
+        """Accumulate this book's realized P&L into the current breaker
+        window (called from the confirmed-exit chokepoints). No-op unless
+        BREAKER_PER_BOOK is on and a baseline window exists. Never raises.
+
+        Approximation, documented: a position entered BEFORE the baseline
+        roll books its full entry-to-exit P&L into this window (its ref
+        would ideally be the baseline mark) — overstates an already-losing
+        position's in-window loss, i.e. errs toward tripping EARLIER.
+        """
+        try:
+            from strategy_config import BREAKER_PER_BOOK
+            if not BREAKER_PER_BOOK:
+                return
+            base = getattr(self, '_breaker_base', None)
+            if base is not None:
+                base['realized'] = base.get('realized', 0.0) + float(pnl_dollars)
+        except Exception:
+            pass
+
+    def _book_breaker_check(self) -> tuple[bool, float | None]:
+        """(tripped, drawdown) under BREAKER_PER_BOOK.
+
+        Book drawdown = -(realized-in-window + open-position mark drift
+        since the window roll) / baseline equity. Marks come from
+        _manage_stops' stash (<= one cycle stale); a position entered after
+        the roll anchors at its entry price; positions with no mark yet
+        contribute 0 (under-counts briefly at process start — the breaker
+        is a backstop, not the sizing stack). Baseline equity is the
+        ACCOUNT equity at the roll (the shared denominator both books'
+        percentages are judged against). Returns (False, None) when the
+        account API is unreachable — the caller fails closed exactly as on
+        the legacy path.
+
+        Documented approximation: the baseline lives in process memory
+        only — a mid-window RESTART re-captures it at current equity,
+        forgetting the window's accumulated loss (errs toward NOT
+        tripping until the next roll; the legacy account-wide baseline
+        survives restarts via the broker's last_equity). Acceptable for
+        a backstop; persist the window blob if Jetson trip rows ever
+        show restart-straddled drawdowns mattering.
+        """
+        try:
+            acct = self.api.get_account()
+            equity = float(acct.equity)
+        except Exception as e:
+            logger.warning("[CIRCUIT BREAKER] book-v2 equity fetch failed: %s", e)
+            return False, None
+        window_end = self._breaker_window_end()
+        marks = getattr(self, '_last_marks', {}) or {}
+        base = getattr(self, '_breaker_base', None)
+        if not base or base.get('window_end') != window_end.isoformat():
+            # Window roll: capture baseline equity + per-position refs.
+            self._breaker_base = {
+                'window_end': window_end.isoformat(),
+                'equity': equity,
+                'refs': {s: marks.get(s, p.entry_price)
+                         for s, p in self.positions.items()},
+                'realized': 0.0,
+            }
+            return False, 0.0
+        unreal = 0.0
+        for s, p in self.positions.items():
+            ref = base['refs'].get(s)
+            if ref is None:
+                # Entered after the roll: anchor at entry.
+                ref = p.entry_price
+                base['refs'][s] = ref
+            mark = marks.get(s)
+            if mark is None or not ref or ref <= 0:
+                continue
+            unreal += (float(mark) - float(ref)) * p.qty
+        pnl = unreal + base.get('realized', 0.0)
+        be = base.get('equity') or 0.0
+        if be <= 0:
+            return False, 0.0
+        dd = -pnl / be
+        return dd >= self.CIRCUIT_BREAKER_PCT, dd
 
     def _hot_reload_check(self):
         """Check if model files changed and reload (keyed on the manifest)."""
@@ -967,7 +1169,10 @@ class BaseTradingLoop(ABC):
             from portfolio import avg_book_correlation
             from strategy_config import CROSS_BOOK_RHO
             names = list(self.positions.keys())
-            rho_b = (avg_book_correlation(names, self.corr_matrix)
+            # uncovered=0.5: keep the journaled rho consistent with the
+            # live ENB budget's no-data prior (IA-4 covered-none fix).
+            rho_b = (avg_book_correlation(names, self.corr_matrix,
+                                          uncovered=0.5)
                      if (self.corr_matrix and names) else 0.5)
             rep = record_book_risk_and_report(
                 self.get_asset_type(), self._book_stop_risks(), rho_b,
@@ -1009,6 +1214,17 @@ class BaseTradingLoop(ABC):
         for s in list(self._pending_breach):
             if s not in self.positions:
                 self._pending_breach.pop(s, None)
+        # IA-4 state prune (mirrors the breach prune above): entry-ts /
+        # vertical-journal / armed-signal-exit keys for departed positions.
+        for _d in (getattr(self, '_position_entry_ts', None),
+                   getattr(self, '_pending_signal_exit', None)):
+            if _d:
+                for s in [s for s in _d if s not in self.positions]:
+                    _d.pop(s, None)
+        _vj = getattr(self, '_vertical_journaled', None)
+        if _vj:
+            for k in [k for k in _vj if k[0] not in self.positions]:
+                _vj.discard(k)
         for symbol in list(self.positions):
             pos = self.positions[symbol]
 
@@ -1061,6 +1277,15 @@ class BaseTradingLoop(ABC):
             if quote is None:
                 continue
             current_price = quote['midpoint']
+            # Mark stash (IA-4): the BREAKER_PER_BOOK unrealized-P&L
+            # source. Measurement infrastructure — always on, never read
+            # by the legacy breaker path.
+            try:
+                if getattr(self, '_last_marks', None) is None:
+                    self._last_marks = {}
+                self._last_marks[symbol] = current_price
+            except Exception:
+                pass
             pos.high_water_mark = max(pos.high_water_mark, current_price)
             hwm = pos.high_water_mark
             entry_price = pos.entry_price
@@ -1101,9 +1326,72 @@ class BaseTradingLoop(ABC):
                                 current_price)
             else:
                 self._pending_breach.pop(symbol, None)
+                # Crypto fb-anchored vertical barrier (IA-4, ledger §3.7):
+                # only reachable with NO stop/TP/trail firing — i.e. the
+                # position drifting between the barriers past the horizon
+                # its labels were trained on. Would-fire journaled ALWAYS;
+                # the exit itself is gated on CRYPTO_VERTICAL_BARRIER.
+                if self.get_asset_type() == 'crypto':
+                    self._check_vertical_barrier(symbol, pos, current_price,
+                                                 quote)
 
         # Persist HWM / cooldown state each cycle (tiny atomic JSON write)
         self._save_position_state()
+
+    def _check_vertical_barrier(self, symbol, pos, current_price, quote):
+        """fb-anchored crypto max-hold check (IA-4, 2026-08 influence audit
+        §3.7: "Labels are triple-barrier with an fb vertical; live crypto
+        holds are unlimited ... the meta model learns a horizon the
+        deployed book doesn't enforce").
+
+        LOOP-layer age check only — the policy_exits kernel is UNTOUCHED
+        (its offline vertical stays the label/backtest semantics; this is
+        the live mirror). Horizon = the deployed model config's
+        forward_bars, read the way the labels read it (hourly bars, 24/7
+        book => fb bars == fb hours). Journals ONE would-fire row per
+        position lifetime ALWAYS (fired=false while the flag is OFF — the
+        flip evidence); under CRYPTO_VERTICAL_BARRIER the position exits
+        through the existing stop-exit path with exit_reason='vertical'
+        (retried next cycle on a failed sell). Never raises.
+        """
+        try:
+            entry_ts = getattr(self, '_position_entry_ts', {}).get(symbol)
+            if entry_ts is None:
+                return      # unknown age (pre-upgrade state) — fail open
+            fb = int((self.config or {}).get('forward_bars', 24))
+            if fb <= 0:
+                return
+            age_h = (time.time() - float(entry_ts)) / 3600.0
+            if age_h < fb:
+                return
+            from strategy_config import CRYPTO_VERTICAL_BARRIER
+            seen = getattr(self, '_vertical_journaled', None)
+            if seen is None:
+                seen = self._vertical_journaled = set()
+            key = (symbol, int(entry_ts))
+            if key not in seen:
+                seen.add(key)
+                pnl_pct = ((current_price - pos.entry_price)
+                           / pos.entry_price * 100
+                           if pos.entry_price > 0 else 0.0)
+                try:
+                    log_decision({'action': 'vertical_barrier',
+                                  'symbol': symbol,
+                                  'asset_type': self.get_asset_type(),
+                                  'age_hours': round(age_h, 1),
+                                  'forward_bars': fb,
+                                  'pnl_pct': round(pnl_pct, 4),
+                                  'fired': bool(CRYPTO_VERTICAL_BARRIER)})
+                except Exception:
+                    pass
+            if CRYPTO_VERTICAL_BARRIER:
+                logger.info("[VERTICAL] %s: held %.0fh >= forward_bars=%d "
+                            "with price between barriers — max-hold exit",
+                            symbol, age_h, fb)
+                self._execute_stop_exit(symbol, pos, 'vertical',
+                                        current_price, quote=quote)
+        except Exception as e:
+            logger.debug("[VERTICAL] check failed for %s: %s", symbol, e)
 
     def _execute_stop_exit(self, symbol, pos, stop_reason, current_price,
                            quote=None):
@@ -1205,6 +1493,7 @@ class BaseTradingLoop(ABC):
 
         pnl_pct = (((fill_price - entry_price) / entry_price) * 100
                    if entry_price > 0 else 0.0)
+        self._breaker_note_realized((fill_price - entry_price) * pos.qty)
         llm_info = self.llm_scores.get(symbol, {})
         record_trade(symbol, 'sell', entry_price, fill_price,
                      pnl_pct, llm_score=llm_info.get('s'),
@@ -1578,6 +1867,7 @@ class BaseTradingLoop(ABC):
             fill_price = quote['midpoint'] if quote else pos.entry_price
         pnl_pct = ((fill_price - pos.entry_price) / pos.entry_price) * 100 \
             if pos.entry_price > 0 else 0.0
+        self._breaker_note_realized((fill_price - pos.entry_price) * pos.qty)
         record_trade(symbol, 'sell', pos.entry_price, fill_price, pnl_pct,
                      llm_score=llm_score, reasoning=reasoning,
                      exit_reason=exit_reason, estimated=estimated)
@@ -1619,11 +1909,52 @@ class BaseTradingLoop(ABC):
                 # book on a transient fetch error is how rate-limit bursts
                 # turn into forced sales.
                 continue
+            pending = getattr(self, '_pending_signal_exit', None)
+            if pending is None:
+                pending = self._pending_signal_exit = {}
             if pred > -self.trade_threshold:
+                if pending.pop(symbol, None) is not None:
+                    # Armed first reading lapsed (pred recovered) — the
+                    # jitter evidence the 1-vs-2-reading decision needs.
+                    try:
+                        log_decision({'action': 'signal_exit_reading',
+                                      'symbol': symbol, 'event': 'lapsed',
+                                      'pred_return': round(float(pred), 4)})
+                    except Exception:
+                        pass
                 continue
 
-            if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
+            # SIGNAL_EXIT_CONFIRM_READS (IA-4, ledger §3.7): default 1 =
+            # today's single-reading exit, byte-identical. At 2 the signal
+            # exit matches stop-confirmation discipline: the first reading
+            # ARMS (journaled, no sale); a subsequent reading confirms.
+            # Pending survives a missing-pred cycle (fail toward exiting,
+            # mirroring _pending_breach's quote-less behavior).
+            try:
+                from strategy_config import SIGNAL_EXIT_CONFIRM_READS
+                confirm_reads = int(SIGNAL_EXIT_CONFIRM_READS)
+            except Exception:
+                confirm_reads = 1
+            if confirm_reads >= 2 and symbol not in pending:
+                pending[symbol] = self.cycle
+                logger.info("%s: signal exit reading 1/2 (pred=%+.4f%%) — "
+                            "awaiting confirmation next cycle", symbol, pred)
+                try:
+                    log_decision({'action': 'signal_exit_reading',
+                                  'symbol': symbol, 'event': 'armed',
+                                  'pred_return': round(float(pred), 4),
+                                  'confirm_reads': confirm_reads})
+                except Exception:
+                    pass
                 continue
+            pending.pop(symbol, None)
+
+            # Exits are NEVER cooldown-gated (2026-08 influence audit §3.4:
+            # "an entry throttle delaying risk reduction inverts the tool's
+            # purpose"). Record when this sell would previously have been
+            # blocked — measurement only.
+            cooldown_bypassed = not cooldown_ok(
+                self.last_trade_time, symbol, self.COOLDOWN_MINUTES)
 
             logger.info("%s: SELLING (pred=%+.4f%%)", symbol, pred)
 
@@ -1643,10 +1974,17 @@ class BaseTradingLoop(ABC):
             llm_info = self.llm_scores.get(symbol, {})
             order = self.place_sell_order(symbol, pos.qty, quote)
             if order:
-                self._record_confirmed_exit(symbol, pos, order, quote,
-                                            exit_reason='signal_sell',
-                                            llm_score=llm_info.get('s'),
-                                            reasoning=llm_info.get('r', ''))
+                extra = {}
+                if cooldown_bypassed:
+                    extra['cooldown_bypassed_exit'] = True
+                if confirm_reads >= 2:
+                    extra['signal_exit_readings'] = confirm_reads
+                self._record_confirmed_exit(
+                    symbol, pos, order, quote,
+                    exit_reason='signal_sell',
+                    llm_score=llm_info.get('s'),
+                    reasoning=llm_info.get('r', ''),
+                    extra=(extra or None))
                 del self.positions[symbol]
                 self.last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(1)
@@ -1670,9 +2008,11 @@ class BaseTradingLoop(ABC):
                             symbol, llm_s, self._veto_strikes.get(symbol, 0))
                 continue
 
-            if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
-                logger.info("%s: LLM VETO (%.2f) but in cooldown", symbol, llm_s)
-                continue
+            # Exits are NEVER cooldown-gated (2026-08 influence audit §3.4)
+            # — holding vetoed risk to honor an entry throttle inverted the
+            # tool's purpose. Marker is measurement only.
+            cooldown_bypassed = not cooldown_ok(
+                self.last_trade_time, symbol, self.COOLDOWN_MINUTES)
 
             logger.info("%s: LLM VETO SELL (%.2f — %s)", symbol, llm_s,
                         llm_info.get('r', ''))
@@ -1687,10 +2027,13 @@ class BaseTradingLoop(ABC):
             quote = self.get_quote(symbol)
             order = self.place_sell_order(symbol, pos.qty, quote)
             if order:
-                self._record_confirmed_exit(symbol, pos, order, quote,
-                                            exit_reason='llm_veto',
-                                            llm_score=llm_s,
-                                            reasoning=llm_info.get('r', ''))
+                self._record_confirmed_exit(
+                    symbol, pos, order, quote,
+                    exit_reason='llm_veto',
+                    llm_score=llm_s,
+                    reasoning=llm_info.get('r', ''),
+                    extra=({'cooldown_bypassed_exit': True}
+                           if cooldown_bypassed else None))
                 del self.positions[symbol]
                 self.last_trade_time[symbol] = datetime.datetime.now()
             else:
@@ -1863,6 +2206,76 @@ class BaseTradingLoop(ABC):
         except Exception:
             pass
 
+    def _journal_standdown_skips(self, preds: dict, snapshots: dict):
+        """Journal FOMC/CPI stood-down entry skips with window identity.
+
+        2026-08 influence audit §3.2 (J2 dissent) / open question #4: the
+        stand-down "fires before journaling — structurally unpriceable".
+        Called by _execute_buys when _entries_allowed() said False; only
+        acts when the recorded cause is the macro stand-down (manual halt
+        stays unjournaled — no counterfactual worth pricing there).
+
+        Volume discipline (Jetson journals): one row per (window, symbol),
+        and only candidates at/above the entry threshold — the priceable
+        counterfactual — not the whole universe every cycle. Rows go
+        through _journal_skip so they carry the same pred/rank/conviction
+        context every other priced skip class carries. Measurement-only.
+        """
+        block = getattr(self, '_entries_block_info', None)
+        if not block or block[0] != 'macro_standdown':
+            return
+        if not self._conviction_journal_on():
+            return
+        _, reason, wid = block
+        if wid is None:
+            wid = 'unknown-window'
+        seen = getattr(self, '_standdown_journaled', None)
+        if seen is None:
+            seen = self._standdown_journaled = set()
+        try:
+            ranked = sorted((s for s in preds if preds[s] is not None),
+                            key=lambda s: preds[s], reverse=True)
+            for rank, symbol in enumerate(ranked, 1):
+                pred = preds[symbol]
+                if pred < self.trade_threshold:
+                    continue
+                key = (wid, symbol)
+                if key in seen:
+                    continue
+                seen.add(key)
+                self._journal_skip(symbol, 'macro_standdown', rank=rank,
+                                   pred=pred,
+                                   snapshot=(snapshots or {}).get(symbol),
+                                   standdown_window=wid,
+                                   standdown_reason=reason)
+        except Exception:
+            pass
+
+    def _log_vix25_gap_once(self, safe_haven_symbols):
+        """One log per day stating whether the VIX>25 'safe-haven
+        carve-out' is satisfiable at all: when no SAFE_HAVEN symbol is in
+        the tradable universe the block is a de facto full book halt
+        nobody designed (2026-08 influence audit gap C3). Log-only —
+        behavior unchanged; the block's fate is a separate flag decision.
+        """
+        today = datetime.date.today().isoformat()
+        if getattr(self, '_vix25_gap_log_date', None) == today:
+            return
+        self._vix25_gap_log_date = today
+        try:
+            tradable = sorted(set(self.get_symbol_universe())
+                              & set(safe_haven_symbols))
+            if tradable:
+                logger.info("[VIX25] defensive block active — tradable "
+                            "safe havens: %s", ', '.join(tradable))
+            else:
+                logger.warning(
+                    "[VIX25] defensive block active and NO SAFE_HAVEN "
+                    "symbol is in the tradable universe — de facto full "
+                    "book halt (influence-audit gap C3)")
+        except Exception:
+            pass
+
     def _compute_position_size(self, symbol: str, pred_return: float | None,
                                quote: dict, sentiment_mult: float = 1.0,
                                llm_mult: float = 1.0,
@@ -1894,8 +2307,9 @@ class BaseTradingLoop(ABC):
         strategy_config.DERISK_STACK_V2 (c26 S3 / 02_research B06) selects
         between two compositions: legacy (this product) and v2 (regime family
         {VIX tier / BTC-RV, stress, book-vol scalar} aggregated by MIN, product
-        only across families; pseudo-CAPE + HMM + per-position vol_mult
-        excluded). Both are always computed and journaled — the legacy keys
+        only across families; HMM + per-position vol_mult excluded; the
+        pseudo-CAPE haircut was DELETED repo-wide 2026-08-22 — owner ruling,
+        08_removed_code.md). Both are always computed and journaled — the legacy keys
         always describe the legacy product, detail['v2'] the v2 composition,
         and detail['stack'] names which one was actually applied to the size.
         """
@@ -1910,6 +2324,10 @@ class BaseTradingLoop(ABC):
         from strategy_config import (RISK_PCT_PER_TRADE, KELLY_CAP,
                                      TILT_MAX, MIN_ORDER_NOTIONAL,
                                      DERISK_STACK_V2)
+        try:
+            from strategy_config import CORR_FAMILY_MERGED
+        except Exception:
+            CORR_FAMILY_MERGED = False
         from market_data import get_live_atr
 
         # --- 1. Risk base: equity at risk / stop distance ---
@@ -1932,6 +2350,28 @@ class BaseTradingLoop(ABC):
             kelly_f = min(kelly_f, KELLY_CAP)
             # 0.125 (mid of the [0.05, 0.25] clamp) maps to 1.0x
             kelly_mult = max(0.5, min(1.5, kelly_f / 0.125))
+        # KELLY_SAMPLE_GATE (IA-4, ledger §3.5 kelly_mult KEEP-COND): the
+        # pre-D06 history is winner-censored; hold neutral 1.0 until the
+        # book accumulates KELLY_SAMPLE_MIN_TRADES uncensored trades
+        # recorded on/after KELLY_SAMPLE_SINCE. Gate state journaled in
+        # the sizing detail while ON; OFF = byte-identical.
+        kelly_gate_info = None
+        try:
+            from strategy_config import (KELLY_SAMPLE_GATE,
+                                         KELLY_SAMPLE_MIN_TRADES,
+                                         KELLY_SAMPLE_SINCE)
+            if KELLY_SAMPLE_GATE:
+                from trading_utils import uncensored_trade_count
+                n_unc = uncensored_trade_count(
+                    self.get_asset_type(), since_iso=KELLY_SAMPLE_SINCE)
+                held = n_unc < KELLY_SAMPLE_MIN_TRADES
+                if held:
+                    kelly_mult = 1.0
+                kelly_gate_info = {'n_uncensored': n_unc,
+                                   'min_trades': KELLY_SAMPLE_MIN_TRADES,
+                                   'held_neutral': held}
+        except Exception:
+            pass
 
         # --- 3. GARCH vol targeting (bounded inside the helper) ---
         vol_mult = 1.0
@@ -1975,6 +2415,8 @@ class BaseTradingLoop(ABC):
                   'base': round(base, 2),
                   'kelly_mult': round(kelly_mult, 4),
                   'vol_mult': round(vol_mult, 4)}
+        if kelly_gate_info is not None:
+            detail['kelly_gate'] = kelly_gate_info
         # Signal confidence (tamed: was 0.5-2.0)
         if pred_return is not None and self.trade_threshold > 0.001:
             f_conf = min(1.25, max(0.75, pred_return / self.trade_threshold))
@@ -1997,12 +2439,18 @@ class BaseTradingLoop(ABC):
         if self.macro_regime:
             tilt *= self.macro_regime.sizing_mult
             detail['macro_mult'] = round(self.macro_regime.sizing_mult, 4)
-        # Correlation with existing book
+        # Correlation with existing book. CORR_FAMILY_MERGED (IA-4, ledger
+        # §3.3): ON bypasses the f_corr haircut — the ENB book-risk cap
+        # below is the single correlation consumer (v2's composition reads
+        # detail['corr_mult'] with a 1.0 default, so it merges too).
         if self.corr_matrix and self.positions:
-            f_corr = get_correlation_sizing_factor(
-                symbol, list(self.positions.keys()), self.corr_matrix)
-            tilt *= f_corr
-            detail['corr_mult'] = round(f_corr, 4)
+            if not CORR_FAMILY_MERGED:
+                f_corr = get_correlation_sizing_factor(
+                    symbol, list(self.positions.keys()), self.corr_matrix)
+                tilt *= f_corr
+                detail['corr_mult'] = round(f_corr, 4)
+            else:
+                detail['corr_family_merged'] = True
         # HMM regime (advisory) + disagreement penalty
         hmm_label = 'unknown'
         if returns is not None and len(returns) > 200:
@@ -2085,7 +2533,7 @@ class BaseTradingLoop(ABC):
         # (scripts/sizing_cofire_report.py reads both). Regime family
         # aggregates by MIN (comonotone reads of one latent risk-off state);
         # product only ACROSS families. EXCLUDED from v2 by design:
-        # pseudo-CAPE (KILL_LIST), HMM mult (kill-recommended; inverted
+        # HMM mult (kill-recommended; inverted
         # smoothing — see regime_detector.py), the duplicate inline VIX
         # ladder + macro VIX tiers (macro_indicators.vix_tier_mult_v2 owns
         # the ONE map), the 0.8 disagreement penalty (min already resolves
@@ -2097,8 +2545,7 @@ class BaseTradingLoop(ABC):
         try:
             from macro_indicators import regime_family_mults_v2
             family = regime_family_mults_v2(self.macro_regime,
-                                            self.get_asset_type(),
-                                            announce=DERISK_STACK_V2)
+                                            self.get_asset_type())
             if self.get_asset_type() == 'crypto':
                 from volatility import get_crypto_rv_mult
                 rv_mult, rv_state, rv_pct = get_crypto_rv_mult()
@@ -2132,7 +2579,7 @@ class BaseTradingLoop(ABC):
                     _derisk_v2_logged = True
                     logger.warning(
                         "[DERISK-V2] ACTIVE: regime family aggregated by MIN; "
-                        "pseudo-CAPE + HMM multipliers EXCLUDED (KILL_LIST); "
+                        "HMM multiplier EXCLUDED (KILL_LIST); "
                         "PORTFOLIO_VOL_TARGET owned by book scalar; legacy "
                         "product journaled as shadow")
         except Exception as e:
@@ -2175,8 +2622,14 @@ class BaseTradingLoop(ABC):
                 from strategy_config import MAX_BOOK_RISK_PCT
                 book = list(self.positions.keys())
                 # No correlation data -> assume a fairly correlated book
-                # (crypto pairwise corr typically 0.6-0.9) rather than 0
-                rho = (avg_book_correlation(book + [symbol], self.corr_matrix)
+                # (crypto pairwise corr typically 0.6-0.9) rather than 0.
+                # uncovered=0.5 (IA-4, ledger §3.3 ENB input defect,
+                # direct-ship): a NON-EMPTY matrix covering none of the
+                # book's pairs previously returned rho=0.0 — bypassing
+                # this same no-data prior and pricing a fully-unknown
+                # book as perfectly diversifying.
+                rho = (avg_book_correlation(book + [symbol], self.corr_matrix,
+                                            uncovered=0.5)
                        if self.corr_matrix else 0.5)
                 budget = book_risk_budget(self._book_stop_risks(), rho,
                                           MAX_BOOK_RISK_PCT)
@@ -2215,9 +2668,22 @@ class BaseTradingLoop(ABC):
         return int(sized)
 
     def _load_hard_stop_lockout(self):
-        """Load hard-stop lockout state from disk (survive restarts)."""
+        """Load hard-stop lockout state from disk (survive restarts).
+
+        Per-book file; when this book's prefixed file does not exist yet,
+        fall back ONCE to the legacy shared file (migration read — the
+        next save writes the prefixed file and the legacy copy is never
+        written again by this book).
+        """
+        path = self._lockout_file
+        legacy = getattr(self, '_legacy_lockout_file', path)
+        if path != legacy and not os.path.exists(path) and os.path.exists(legacy):
+            logger.info("[LOCKOUT] no %s yet — migration read from legacy "
+                        "shared %s", os.path.basename(path),
+                        os.path.basename(legacy))
+            path = legacy
         try:
-            with open(self._lockout_file, 'r') as f:
+            with open(path, 'r') as f:
                 data = json.load(f)
             now = datetime.datetime.now().timestamp()
             for symbol, expiry_ts in data.items():
@@ -2246,11 +2712,10 @@ class BaseTradingLoop(ABC):
                 expiry_ts = (lockout_time + datetime.timedelta(
                     hours=self.HARD_STOP_LOCKOUT_HOURS)).timestamp()
                 data[symbol] = expiry_ts
-            # Per-book tmp name: both books share the FINAL path (known
-            # deferred P2) but must not share the TEMP path — two threads
-            # interleaving open(tmp,'w')/os.replace can publish a torn file
-            # or raise FileNotFoundError (2026-07 panel). Published content
-            # is unchanged.
+            # Final paths are per-book now (2026-08 influence audit), but
+            # the per-book TEMP suffix stays: combined-bots mode runs both
+            # books in one process and a shared temp name could still tear
+            # under interleaved open(tmp,'w')/os.replace (2026-07 panel).
             tmp = f"{self._lockout_file}.{self.MODEL_PREFIX or 'crypto'}.tmp"
             with open(tmp, 'w') as f:
                 json.dump(data, f)
@@ -2270,10 +2735,22 @@ class BaseTradingLoop(ABC):
         self._save_position_state()
 
     def _trade_budget_ok(self, symbol: str) -> bool:
-        """True if the symbol hasn't used up today's entry budget."""
+        """True if the symbol hasn't used up today's entry budget.
+
+        TRADE_BUDGET_BACKSTOP (IA-4, ledger §3.4 cooldown+budget MERGE):
+        ON demotes the daily budget to a runaway backstop (cap x mult) so
+        cooldown is the ONE churn instrument; OFF = today's cap.
+        """
         from strategy_config import MAX_TRADES_PER_SYMBOL_PER_DAY
         self._roll_trade_budget_date()
         cap = MAX_TRADES_PER_SYMBOL_PER_DAY.get(self.get_asset_type(), 4)
+        try:
+            from strategy_config import (TRADE_BUDGET_BACKSTOP,
+                                         TRADE_BUDGET_BACKSTOP_MULT)
+            if TRADE_BUDGET_BACKSTOP:
+                cap = cap * int(TRADE_BUDGET_BACKSTOP_MULT)
+        except Exception:
+            pass
         if self._daily_trades.get(symbol, 0) >= cap:
             return False
         return True
@@ -2396,10 +2873,17 @@ class BaseTradingLoop(ABC):
         trading_halt.flag`), then the scheduled macro-event stand-down
         (FOMC/CPI windows) — an hourly-bar model has no edge against an
         8:30 CPI print, in stocks OR crypto.
+
+        Records WHY entries were blocked in self._entries_block_info so
+        _execute_buys can journal stood-down skips with window identity
+        (2026-08 influence audit §3.2: the stand-down "fires before
+        journaling — structurally unpriceable" without this).
         """
+        self._entries_block_info = None
         try:
             from notify import halt_active
             if halt_active():
+                self._entries_block_info = ('halt', 'trading_halt.flag', None)
                 if self.cycle % 10 == 1:
                     logger.warning("[HALT] trading_halt.flag active — "
                                    "entries blocked (/resume to clear)")
@@ -2409,15 +2893,40 @@ class BaseTradingLoop(ABC):
                 logger.warning("[HALT] halt-flag check failed (%s) — "
                                "failing open, entries allowed", e)
         try:
-            from macro_calendar import macro_standdown, calendar_exhausted
+            from macro_calendar import (macro_standdown, calendar_exhausted,
+                                        standdown_window_id)
             blocked, reason = macro_standdown()
             if blocked:
+                try:
+                    wid = standdown_window_id()
+                except Exception:
+                    wid = None
+                self._entries_block_info = ('macro_standdown', reason, wid)
                 if self.cycle % 10 == 1:
                     logger.info("[MACRO] entries paused: %s", reason)
                 return False
-            if calendar_exhausted() and self.cycle % 2000 == 1:
-                logger.warning("[MACRO] static FOMC/CPI table has no future "
-                               "events — refresh macro_calendar.py")
+            if calendar_exhausted():
+                # Static-table staleness alarm (2026-08 influence audit
+                # §3.2: FOMC/CPI stand-down "needs a staleness alarm for
+                # the static date table"). One loud warning per day + one
+                # notify per process; fail-open — the gate's behavior is
+                # unchanged, the alarm IS the fix.
+                today = datetime.date.today().isoformat()
+                if getattr(self, '_macro_cal_alarm_date', None) != today:
+                    self._macro_cal_alarm_date = today
+                    logger.warning(
+                        "[MACRO] STALE CALENDAR: static FOMC/CPI table has "
+                        "no future events — the stand-down gate can no "
+                        "longer fire; refresh macro_calendar.py")
+                    if not getattr(self, '_macro_cal_alarm_notified', False):
+                        self._macro_cal_alarm_notified = True
+                        try:
+                            from notify import notify
+                            notify("macro_calendar.py FOMC/CPI table "
+                                   "exhausted — refresh needed "
+                                   f"({self.get_asset_type()} book)")
+                        except Exception:
+                            pass
         except Exception as e:
             if self.cycle % 10 == 1:
                 logger.warning("[MACRO] stand-down check failed (%s) — "
@@ -2427,8 +2936,18 @@ class BaseTradingLoop(ABC):
     def _execute_buys(self, preds: dict, snapshots: dict):
         """Buy bullish symbols with all risk checks."""
         if not self._entries_allowed():
+            # Priced skip rows for FOMC/CPI stood-down candidates
+            # (measurement-only; manual halt journals nothing)
+            self._journal_standdown_skips(preds, snapshots)
             return
         from collections import Counter
+        # IA-4 flag family (all default-OFF/today; see strategy_config).
+        try:
+            from strategy_config import (VIX25_BLOCK_REMOVED,
+                                         CORR_FAMILY_MERGED, CORR_SANITY_MAX)
+        except Exception:
+            VIX25_BLOCK_REMOVED, CORR_FAMILY_MERGED = False, False
+            CORR_SANITY_MAX = 0.85
         vc = Counter()          # veto attribution for the window summary
         admitted = []           # symbols that cleared every gate
         n_candidates = 0        # symbols evaluated past the mechanical gates
@@ -2483,18 +3002,18 @@ class BaseTradingLoop(ABC):
             n_candidates += 1   # a real, evaluatable candidate this window
             snapshot = snapshots.get(symbol, {})
 
-            # Prediction gate (higher bar if mean-reverting). The old
-            # "recently hard-stopped -> 1.5x" bump was provably
-            # unreachable: _is_hard_stop_locked either `continue`s above
-            # or DELETES the expired key before returning False, so the
-            # membership test below it was always False (2026-07 panel;
-            # a REAL post-lockout elevated bar is an owner decision).
-            effective_threshold = self.trade_threshold
-            # Hurst < 0.45 = mean-reverting; momentum signals less reliable
-            hurst = snapshot.get('Hurst')
-            if hurst is not None and hurst < 0.45:
-                effective_threshold = max(effective_threshold,
-                                          self.trade_threshold * 1.3)
+            # Prediction gate. Two former threshold modifiers were removed
+            # as provably-dead code:
+            # - the "recently hard-stopped -> 1.5x" bump was unreachable:
+            #   _is_hard_stop_locked either `continue`s above or DELETES
+            #   the expired key before returning False (2026-07 panel; a
+            #   REAL post-lockout elevated bar is an owner decision);
+            # - the Hurst<0.45 -> 1.3x mean-reversion shift could never
+            #   fire: live Hurst is computed on price LEVELS (reads ~0.8+
+            #   regardless of regime — HURST_ON_RETURNS in indicator_config
+            #   is the legitimate future form, via harvest+retrain). Deleted
+            #   2026-08-22 per the decision-influence ledger (unanimous);
+            #   verbatim code in research/campaign_2026-08/08_removed_code.md.
             if not should_trade(pred_return, quote['spread_pct'],
                                 asset_type=self.get_asset_type()):
                 vc['cost_floor'] += 1
@@ -2506,7 +3025,7 @@ class BaseTradingLoop(ABC):
                                    pred=pred_return, snapshot=snapshot,
                                    spread_pct=round(quote['spread_pct'], 4))
                 continue
-            if pred_return < effective_threshold:
+            if pred_return < self.trade_threshold:
                 vc['below_threshold'] += 1
                 self._journal_skip(symbol, 'below_threshold',
                                    rank=rank_map.get(symbol),
@@ -2527,47 +3046,75 @@ class BaseTradingLoop(ABC):
                                        pred=pred_return, snapshot=snapshot)
                     continue
 
-            # Correlation check
+            # Correlation check. CORR_FAMILY_MERGED (IA-4, ledger §3.3
+            # MERGE): flag OFF = the binary >0.7 admission gate as today;
+            # ON = the ENB stop-risk budget is the single correlation
+            # consumer and only a loose sanity block (avg|corr| >
+            # CORR_SANITY_MAX) remains at admission.
             avg_corr = None
             if self.corr_matrix and self.positions:
+                _corr_kw = ({'max_avg_corr': CORR_SANITY_MAX}
+                            if CORR_FAMILY_MERGED else {})
                 allowed, avg_corr = check_portfolio_correlation(
-                    list(self.positions.keys()), symbol, self.corr_matrix)
+                    list(self.positions.keys()), symbol, self.corr_matrix,
+                    **_corr_kw)
                 if not allowed:
                     vc['correlation'] += 1
                     self._journal_skip(symbol, 'correlation',
                                        rank=rank_map.get(symbol),
                                        pred=pred_return, snapshot=snapshot,
-                                       avg_corr=round(avg_corr, 4))
+                                       avg_corr=round(avg_corr, 4),
+                                       **({'corr_sanity': True}
+                                          if CORR_FAMILY_MERGED else {}))
                     continue
 
-            # Macro regime halt check
+            # Macro regime halt check. Skip rows journaled as 'vix_halt' —
+            # now a priced skip class in decision_report.GATE_REASONS
+            # (2026-08 influence audit §3.3: keep as THE one extreme VIX
+            # read; it was previously the highest-impact stock gate with
+            # the least evidence). vc key stays 'macro_halt' (entry_window
+            # veto_counts back-compat). Measurement-only.
             if self.macro_regime and self.macro_regime.should_halt_stocks and self.get_asset_type() == 'stock':
                 logger.info("%s: Halted by VIX > 35", symbol)
                 vc['macro_halt'] += 1
+                _vix = getattr(self.macro_regime, 'vix', None)
+                self._journal_skip(symbol, 'vix_halt',
+                                   rank=rank_map.get(symbol),
+                                   pred=pred_return, snapshot=snapshot,
+                                   vix=(round(_vix, 1) if _vix is not None
+                                        else None))
                 continue
 
-            # VIX > 25: block risky entries, allow safe-havens
-            if (self.macro_regime and self.macro_regime.should_block_risky_entries
+            # VIX > 25: block risky entries, allow safe-havens. Skip rows
+            # journaled as 'vix25_block' + one daily log naming the
+            # SAFE_HAVEN-untradable gap (C3) so the de facto halt is
+            # visible. VIX25_BLOCK_REMOVED (IA-4, ledger §3.3 2-1
+            # remove-candidate): ON skips the block entirely — the graded
+            # VIX tier map owns the 25-35 band (one graded instrument per
+            # latent, one extreme hard stop: the >35 halt above).
+            if (not VIX25_BLOCK_REMOVED and self.macro_regime
+                    and self.macro_regime.should_block_risky_entries
                     and self.get_asset_type() == 'stock'):
                 from stock_config import SAFE_HAVEN_SYMBOLS
                 if symbol not in SAFE_HAVEN_SYMBOLS:
                     logger.info("%s: Blocked — VIX > 25 defensive (non-safe-haven)", symbol)
                     vc['vix_block'] += 1
+                    _vix = getattr(self.macro_regime, 'vix', None)
+                    self._journal_skip(symbol, 'vix25_block',
+                                       rank=rank_map.get(symbol),
+                                       pred=pred_return, snapshot=snapshot,
+                                       vix=(round(_vix, 1) if _vix is not None
+                                            else None))
+                    self._log_vix25_gap_once(SAFE_HAVEN_SYMBOLS)
                     continue
 
             # Sentiment gate: multiplier only — sentiment.sentiment_gate
-            # clamps to [0.15, 1.5], so this veto branch is currently
-            # unreachable (verified 2026-07 panel). Kept as a defensive
-            # guard; making sentiment a REAL veto is an owner decision.
+            # clamps to [0.15, 1.5], so a gate<=0 veto branch was
+            # mathematically unreachable and was deleted 2026-08-22 per the
+            # decision-influence ledger (zero behavior change; verbatim code
+            # in research/campaign_2026-08/08_removed_code.md). Making
+            # sentiment a REAL veto remains an owner decision.
             gate, gate_reasons = sentiment_gate(symbol, self.get_asset_type())
-            if gate <= 0:
-                vc['sentiment_block'] += 1
-                self._journal_skip(symbol, 'sentiment_block',
-                                   rank=rank_map.get(symbol),
-                                   pred=pred_return, snapshot=snapshot,
-                                   sentiment_gate=gate,
-                                   sentiment_reasons=gate_reasons)
-                continue
 
             # LLM gate (veto first; multiplier folds into sizing tilt)
             llm_info = self.llm_scores.get(symbol, {})
@@ -2721,6 +3268,17 @@ class BaseTradingLoop(ABC):
                 hwm = fill_price
                 if is_add:
                     hwm = max(self.positions[symbol].high_water_mark, fill_price)
+
+                # Vertical-barrier age anchor (IA-4): stamp the FIRST
+                # entry time; add-ons keep the original clock (max-hold
+                # anchored at first entry, matching the label's entry bar).
+                try:
+                    if getattr(self, '_position_entry_ts', None) is None:
+                        self._position_entry_ts = {}
+                    if not is_add or symbol not in self._position_entry_ts:
+                        self._position_entry_ts[symbol] = time.time()
+                except Exception:
+                    pass
 
                 self.positions[symbol] = Position(
                     qty=total_qty,

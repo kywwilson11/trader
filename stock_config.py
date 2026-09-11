@@ -210,9 +210,10 @@ CRYPTO_SYMBOLS = [
     'LINK/USD',
 ]
 
-# The intended full coin set for wave-9 #6 — a DECLARATION ONLY, nothing reads
-# it yet. The harvest does NOT consume this: scripts/harvest_crypto_data.py
-# hardcodes its own 6-coin CRYPTO_TICKERS list (~line 30), which must be
+# The intended full coin set for wave-9 #6 — no TRADING path reads it (gui.py and
+# scripts/crypto_spread_census.py do, for the markets view and the spread census).
+# The harvest does NOT consume this: scripts/harvest_crypto_data.py
+# hardcodes its own 6-coin CRYPTO_TICKERS list, which must be
 # updated to this set in the SAME Jetson change (then harvest+retrain, then
 # promote the coins into CRYPTO_SYMBOLS for live trading).
 CRYPTO_POOL = CRYPTO_SYMBOLS + ['AVAX/USD', 'BCH/USD', 'DOT/USD', 'LTC/USD']

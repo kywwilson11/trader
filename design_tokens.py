@@ -2,7 +2,7 @@
 
 PURE module (stdlib only — no PySide6, no `import gui`) that gives gui.py's
 existing color / spacing / type primitives semantic names, per the "Design
-language spec" in `research/gui_review_2026-07.md` (S8, Group F):
+language spec" in `research/reviews_2026-07/gui_review_2026-07.md` (S8, Group F):
 
     color tokens bg.base/raised/overlay/inset, text.hi/mid, accent,
     pnl.up/down, warn (ONE semantic set meant to feed both widgets AND
@@ -98,7 +98,7 @@ RADIUS = {"control": 4, "input": 6, "card": 8, "panel": 10}
 # 3) Color token resolution
 # ---------------------------------------------------------------------------
 # Dark-theme-derived fallback for a source key that is entirely absent from
-# a given theme dict (never triggered by any of today's 10 themes — they all
+# a given theme dict (never triggered by any of today's 12 themes — they all
 # carry all 13 keys — this only guards a future theme that ships incomplete).
 # Values are gui.py THEMES["Dark"][<key>].name() computed by hand, as plain
 # lowercase hex strings: this module never constructs a QColor.

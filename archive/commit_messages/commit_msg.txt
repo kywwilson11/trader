@@ -1,0 +1,16 @@
+feat: 2026-07 group improve campaign (12 groups, v2 pipeline)
+
+- fix: order_utils — keep post-cancel order state on re-fetch failure, guard None current_price in reconstruct, warn on transient get_position errors
+- fix: sentiment/events group — phrase-scan prefilter perf, edgar cache memo, events-calendar fail-closed guards, dotenv/doc hygiene + group tests
+- fix: loop-group hardening — stablecoin-flatten symbol normalization, untracked-buy surfacing, dead-import prune, stop-math/lockout doc contracts + tests
+- fix: macro/vol doc-rot (CAPE 1.6, symmetric EGARCH) + once-per-symbol HAR-gap log, 13 tests
+- docs: risk/cost group — fix liquidity AR-fallback comment rot, document corr-matrix off-diagonal-only contract; add 4 test_grp_risk locks
+- fix: basis sync survives corrupt zip months + staleness observability for funding/SVR/L-S live features (7 tests)
+- fix: models-group hardening — mtime-keyed meta cache, atomic artifact publish, degenerate-calibrator guard, fail-closed bet sizing
+- test: validation-group tripwires (artifact-suffix 3-way sync, panel producer/consumer parity) + DM-HLN/EOD-mask doc pins + panel_ranks groupby hoist
+- test: data group — 16 gap-closing tests (trade_memory locking, gap taxonomy, journal iter) + trade_journal producer-contract schema + data_sources CC-401/yfinance-hazard doc corrections
+- fix: ops hardening — graceful-None on corrupt manifest/meminfo, fees-derived exec-report arithmetic, TRADABLE_POOL doc honesty (+4 tests)
+- fix: training-search hygiene — adaptive-update after study reads, missing-horizon warn, dead holdout params, harvest peak-RSS, source-contract pins
+- fix: gate scripts (ic_by_name/reliability_report/rank_gradient_report) refuse malformed, stale, or empty inputs with named errors instead of crashing or silently misreporting; add tests/test_grp_reports.py (22 subprocess regression tests) for all four activation-gate CLIs
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>

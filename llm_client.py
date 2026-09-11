@@ -37,8 +37,10 @@ tool_choice pins the model to it); OpenAI uses response_format={'type':
 parseable JSON text, so callers are provider-agnostic.
 
 Smart model routing:
-  Selects the best model per role (analyst, sentiment, backfill) based on
-  daily cost spend. Progressively downgrades as daily cost increases.
+  Selects the model per role (analyst, sentiment, backfill) from a daily-cost
+  bracket table. NOTE: as shipped, every role in every bracket of both
+  _PAID_ROUTING and _FREE_ROUTING maps to gemini-2.5-flash-lite, so the
+  cost-bracket downgrade is a no-op placeholder today.
 
 Tier auto-detection:
   Detects free vs paid tier from rate limit headers on first API response.
@@ -1486,8 +1488,9 @@ def probe_available_models() -> dict:
     native provider AND every OpenAI-compatible endpoint expose a
     model-list endpoint, so new releases show up here without a code
     change (route to them via the config model fields / role overrides,
-    and price them via the config "pricing" table). Ops/GUI use only —
-    never called in the trading hot path.
+    and price them via the config "pricing" table). No in-repo caller —
+    reachable only from a REPL / ops session; never called in the trading
+    hot path.
     """
     out: dict[str, list] = {"gemini": [], "anthropic": [], "openai": []}
     config = load_llm_config()

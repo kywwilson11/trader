@@ -88,9 +88,12 @@ def test_last_meta_p_pruned_in_get_predictions():
 
 
 def test_no_bare_skip_rows_in_execute_buys():
+    # 'sentiment_block' dropped 2026-08-22: the unreachable gate<=0 veto
+    # branch was deleted (decision-influence ledger; 08_removed_code.md
+    # IA-1.3), so its skip row can no longer exist.
     body = _method("_execute_buys")
     assert 'log_decision({"symbol": symbol, "action": "skip"' not in body
-    for reason in ("'sentiment_block'", "'llm_veto'", "'q10_tail_veto'"):
+    for reason in ("'llm_veto'", "'q10_tail_veto'"):
         assert f"_journal_skip(symbol, {reason}" in body
 
 

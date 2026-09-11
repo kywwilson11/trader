@@ -376,8 +376,10 @@ def test_record_db_deletion_roundtrip(tmp_path, capsys):
     assert rec['trials_lost'] == 3 and rec['reason'] == '--fresh'
     assert db.exists()                           # it only LOGS, never deletes
     assert 'study-DB deletion logged' in capsys.readouterr().out
-    # never raises, even on garbage input
-    AC.record_db_deletion('testq1', None, reason='x')
+    # never raises, even on garbage input (patched too: record_db_deletion
+    # persists, and BASE_DIR is where adaptive_state_testq1.json lands)
+    with mock.patch('adaptive_config.BASE_DIR', tmp_path):
+        AC.record_db_deletion('testq1', None, reason='x')
 
 
 def test_count_study_trials_fail_soft(tmp_path):

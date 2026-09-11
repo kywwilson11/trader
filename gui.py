@@ -35,7 +35,7 @@ from hw_monitor import get_gpu_temp as hw_get_gpu_temp
 from PySide6.QtCore import (
     Qt, QTimer, QThread, Signal, Slot, QObject, QRectF, QPointF,
 )
-from PySide6.QtGui import QColor, QPalette, QFont, QAction, QPainter, QPixmap, QDesktopServices, QIcon, QPicture, QFontDatabase, QShortcut, QKeySequence
+from PySide6.QtGui import QColor, QPalette, QFont, QPainter, QPixmap, QDesktopServices, QIcon, QPicture, QFontDatabase, QShortcut, QKeySequence
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget,
@@ -1093,7 +1093,7 @@ _THEME_IMAGES = {
 }
 
 
-# (theme_name, size) -> QPixmap. 10 themes x one size = trivial; never cleared.
+# (theme_name, size) -> QPixmap. 12 themes x one size = trivial; never cleared.
 _LOGO_CACHE = {}
 
 
@@ -6919,7 +6919,7 @@ class TradingDashboard(QMainWindow):
                 "Beta Ledger (90d)"))
         self._leadlag_btn.clicked.connect(
             lambda: self._run_report_clicked(
-                ["indicator_leadlag.py", "--data", "crypto_training_data.parquet"],
+                ["indicator_leadlag.py", "--data", "training_data.parquet"],
                 "Indicator Lead/Lag (Crypto)"))
         self._leadlag_stock_btn.clicked.connect(
             lambda: self._run_report_clicked(
@@ -7486,10 +7486,10 @@ class TradingDashboard(QMainWindow):
         # --- Safe mode (shadow-mode state chip + halt-switch mirror) ---
         safe_group = QGroupBox("Safe mode")
         safe_row = QHBoxLayout(safe_group)
-        shadow_on = bool(os.getenv('TRADER_SHADOW_MODE'))
+        shadow_on = os.getenv('TRADER_SHADOW_MODE', '1') != '0'
         self._settings_shadow_chip = QLabel(
-            "SHADOW MODE — orders suppressed" if shadow_on
-            else "Live trading (shadow off)")
+            "SHADOW MODE — weekly retrain saves to the challenger slot"
+            if shadow_on else "Immediate promotion (shadow off)")
         self._settings_shadow_chip.setStyleSheet(
             f"color: {(T['yellow'] if shadow_on else T['muted']).name()};"
             " font-weight: bold; font-size: 12px;")

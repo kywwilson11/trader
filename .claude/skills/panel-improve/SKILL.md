@@ -47,10 +47,13 @@ config lives in a committed JSON file that the workflow loads itself, and `args`
 override. Edit the file, then invoke the workflow with no args at all.
 
 Default path: **`.claude/workflows/modules-v3.run.json`** (override with `args.modules_path`).
+That file is per-batch run state, not a repo asset: create it by copying
+`modules-v3.example.json`, and it is gitignored (`*.run.json`) since 2026-09-08 — the stale
+batch-B5 config that had been committed now lives in `archive/claude_workflow_runs/`.
 
 ```json
 { "campaign_title": "...", "baseline_note": "...", "tree_note": "...",
-  "reviewers": 5, "workers": 3, "report_path": "research/module_improve_v3_report.md",
+  "reviewers": 5, "workers": 3, "report_path": "research/reviews_2026-07/module_improve_v3_report.md",
   "effort_opus": "max", "effort_fable": "xhigh", "effort_sonnet": "max",
   "modules": [ { "id": "...", "mods": "a.py", "test": "tests/test_a_v3.py", "seed": "..." } ] }
 ```

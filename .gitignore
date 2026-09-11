@@ -73,9 +73,11 @@ position_state.json
 *_position_state.json
 account_risk_registry.json
 hard_stop_lockout.json
+*_hard_stop_lockout.json
 llm_eval_report.json
 llm_advisor_report.json
 backtest_*report.json
+backtest_*fee_sweep.json
 *.prev
 execution_report.json
 funding_history.json
@@ -125,3 +127,32 @@ oi_archive.parquet
 oi_history.json
 short_flow.parquet
 decision_report.json
+
+# Added 2026-09-08 (repository cleanup pass) — generated/runtime files that had no rule.
+# Full census of every runtime file: docs/STATE_FILES.md.
+# Champion halves of the model artifact stack (the challenger_* / stock_challenger_*
+# halves were already ignored above; scripts/hypersearch_v2.py writes both).
+*model_v2.manifest.json
+*lgb_model.txt
+*lgb_q10.txt
+*lgb_q10_meta.json
+# Shadow / LLM / GUI / pipeline runtime state
+*shadow_status.json
+llm_analysis.json
+trade_memory.json
+.gpu_lock_info.json
+pipeline_command.json
+command_result.json
+account_baseline.json
+basis_archive.parquet
+options_overlay_verdict.json
+llm_prompt_ab_*
+window_ab_*
+# Lock sidecars and atomic-write staging files
+*.json.lock
+*.tmp
+# Dev-machine noise
+.DS_Store
+.pytest_cache/
+# Per-batch workflow run configs (copy *.example.json → *.run.json; never commit run state)
+.claude/workflows/*.run.json

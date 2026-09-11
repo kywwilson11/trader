@@ -13,8 +13,11 @@ Usage:
     python run_bots.py --crypto-only
     python run_bots.py --stock-only
 
-run_pipeline.py uses this as the default bot launch mode; pass
---separate-bots there to keep the old one-process-per-bot layout.
+run_pipeline.py launches this ONLY with --combined-bots (its own default is
+one process per bot — `_COMBINED_BOTS = False`, set from that flag in main;
+see run_pipeline._launch_bots). The systemd unit written by
+scripts/setup_jetson_system.sh does pass --combined-bots, so production runs
+combined. There is no --separate-bots flag anywhere.
 
 Ops thread (c26 T7 / B19): a standalone `python run_bots.py` also starts a
 daemon ops thread that polls the Telegram kill switch (/halt /resume

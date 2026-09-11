@@ -10,6 +10,7 @@ Usage:
     python backtest.py --prefix stock --days 60          # report only
     python backtest.py --prefix stock --days 60 --gate   # restore .prev model on fail
     python backtest.py --prefix stock --days 60 --gate --model-prefix stock_challenger  # gate the challenger slot
+    python backtest.py --prefix '' --days 180 --fee-sweep '1.0,1.5,2,3,4,6'  # FR-16 breakeven cost sweep (report-only)
 
 The --gate mode is wired into run_pipeline's weekly retrain: if the
 freshly-saved model's policy backtest fails (net Sharpe <= 0 or DSR below
@@ -31,7 +32,10 @@ manifest' warning remain the flag-OFF breadcrumb.
 
 Exit codes (main()): 0 = gate passed, or nothing to gate (no --gate flag,
 or a FileNotFoundError before any model was evaluated); 3 = --gate FAILURE
-— a deterministic policy rejection, the model was rolled back to .prev;
+— a deterministic policy rejection; the model was rolled back to .prev, EXCEPT
+on a fallback-champion replay whose .prev exists, where the established
+champion is HELD and nothing is restored (gate action
+'hold_champion_no_challenger');
 any other nonzero code means the process crashed before reaching a verdict.
 run_pipeline treats 3 specially: it is a final, non-retryable outcome for
 the *_backtest_gate phase (retrying a deterministic rejection is useless),
@@ -175,9 +179,10 @@ def _predict_ticker(model, scaler, config, feature_cols, tdf, lgb_model=None,
                     q10_model=None, legs_out=None):
     """Predictions for every bar of one ticker (CPU, batched).
 
-    Mirrors the LIVE inference path: LSTM prediction, ensembled 0.6/0.4
-    with LightGBM when the booster exists (predict_now.get_live_prediction
-    does the same — the backtest must validate the policy that trades).
+    Mirrors the LIVE inference path: LSTM prediction, ensembled with
+    LightGBM at weight config['lstm_weight'] (default 0.6) when the booster
+    exists (predict_now.get_live_prediction does the same — the backtest
+    must validate the policy that trades).
 
     legs_out (optional dict) is filled with per-bar 'lstm'/'lgb' leg arrays
     (NaN where unavailable); the (preds, q10) return shape is pinned by
@@ -268,8 +273,16 @@ def _entry_window_mask(times) -> np.ndarray:
 
 def simulate_ticker(tdf, preds, asset_type: str, threshold: float,
                     policy: dict, meta_probs=None, q10_preds=None,
-                    q10_floor=None) -> list[dict]:
+                    q10_floor=None, *, fee_mult: float = 1.0) -> list[dict]:
     """Replay the live exit stack on one ticker. Returns trade dicts.
+
+    fee_mult (keyword-only, FR-16 cost-stress replay): scales ONLY the
+    CHARGED round-trip cost legs (rt_cost / rt_cost_arr) on realized net
+    P&L. The entry admission — threshold, edge_floor, entry windows,
+    vetoes — stays at the live policy, so a sweep over fee_mult measures
+    the CURRENT policy's cost headroom (breakeven lambda*), not a
+    re-tuned policy's. At the default 1.0 the branch is never taken and
+    behavior is byte-identical.
 
     The exit walk itself runs in policy_exits.exit_walk — the SAME kernel
     that generates triple-barrier training labels and the meta-labeling
@@ -327,6 +340,12 @@ def simulate_ticker(tdf, preds, asset_type: str, threshold: float,
         except Exception as e:
             print(f"[GATE] per-bar spread cost failed ({e}) — flat-cost fallback")
             rt_cost_arr = None
+    if fee_mult != 1.0:
+        # FR-16: stress ONLY the charged cost legs. edge_floor above stays
+        # on the unscaled cost model deliberately (see docstring).
+        rt_cost = rt_cost * float(fee_mult)
+        if rt_cost_arr is not None:
+            rt_cost_arr = rt_cost_arr * float(fee_mult)
     cooldown_bars = max(1, int(math.ceil(policy['cooldown_min'] / 60)))
     lockout_bars = int(policy['lockout_hours'])
 
@@ -604,8 +623,8 @@ def _resolve_model_slot(data_prefix: str, requested: str,
 
 def _report_slot(data_prefix: str, model_prefix: str) -> str:
     """Report-file identity: challenger-targeted runs write
-    backtest_<slot>_report.json so they never clobber the champion
-    book report the GUI reads."""
+    backtest_<slot>_report.json so they never clobber the operational
+    champion book report."""
     if model_prefix and model_prefix != data_prefix:
         return model_prefix
     return data_prefix
@@ -674,7 +693,8 @@ def restore_previous_model(prefix: str) -> bool:
 def run_backtest(prefix: str = '', days: int = 60,
                  n_search_trials: int = 100, *,
                  model_prefix: str | None = None,
-                 stage0_dump: bool | None = None) -> dict:
+                 stage0_dump: bool | None = None,
+                 fee_mult: float | None = None) -> dict:
     global _TZ_NAIVE_WARNED
     _TZ_NAIVE_WARNED = False
     from data_utils import load_training_data
@@ -684,6 +704,19 @@ def run_backtest(prefix: str = '', days: int = 60,
     if challenger_run:
         print(f"[GATE] scoring MODEL slot '{model_prefix}' on "
               f"{prefix or 'crypto'} book data (challenger policy gate, D03)")
+    # FR-16 cost-stress replay. The None sentinel (not a bare 1.0 default)
+    # keeps the default-path report key-for-key identical (D25 convention):
+    # ONLY an explicitly passed fee_mult — 1.0 included, so every sweep pass
+    # is self-describing — adds the fee_mult / net_pct_by_name keys below.
+    fee_stress = fee_mult is not None
+    _fm = 1.0 if fee_mult is None else float(fee_mult)
+    if fee_stress:
+        if not (math.isfinite(_fm) and _fm > 0):
+            raise ValueError(f'fee_mult must be positive and finite, '
+                             f'got {fee_mult!r}')
+        print(f"[FEE-MULT] cost-stress replay at fee_mult={_fm:g} — charged "
+              f"cost legs scaled; edge_floor/threshold/entries stay at live "
+              f"policy (FR-16, report-only)")
     asset_type = prefix or 'crypto'
     model, scaler, config, feature_cols = _load_artifacts(model_prefix)
     lgb_model = _load_lgb(model_prefix)
@@ -774,7 +807,7 @@ def run_backtest(prefix: str = '', days: int = 60,
                 meta_warned = True
         trades = simulate_ticker(tdf, preds, asset_type, threshold, policy,
                                  meta_probs=meta_probs, q10_preds=q10_preds,
-                                 q10_floor=q10_floor)
+                                 q10_floor=q10_floor, fee_mult=_fm)
         all_trades.extend(trades)
         n_evaluated += 1
         if _s0 is not None:
@@ -801,6 +834,16 @@ def run_backtest(prefix: str = '', days: int = 60,
     metrics['period'] = f"{df.index.min()} .. {df.index.max()}"
     metrics['threshold'] = threshold
     metrics['prefix'] = prefix
+    if fee_stress:
+        # FR-16: mark the stressed report + per-name net totals for the
+        # per-name lambda* interpolation in the --fee-sweep loop. Keys are
+        # ONLY added on explicit fee_mult (default report unchanged).
+        by_name: dict[str, float] = {}
+        for t in all_trades:
+            by_name[t['ticker']] = by_name.get(t['ticker'], 0.0) + t['net_pct']
+        metrics['fee_mult'] = _fm
+        metrics['net_pct_by_name'] = {
+            k: round(v, 4) for k, v in sorted(by_name.items())}
     if challenger_run:
         metrics['model_prefix'] = model_prefix
         metrics['gate_target'] = 'challenger'
@@ -892,7 +935,14 @@ def run_backtest(prefix: str = '', days: int = 60,
             print(f"[GATE] stage0 dump/MTM unavailable ({e}) — measurement "
                   f"only, gate unaffected")
             mtm = None
-    report_path = BASE_DIR / f"backtest_{f'{rslot}_' if rslot else ''}report.json"
+    # FR-16 hardening: a cost-stressed replay (explicit fee_mult — every
+    # --fee-mult run and every --fee-sweep pass) must NOT clobber the
+    # operational book report with stressed numbers, so it writes its own
+    # self-describing backtest_<slot>_stress_report.json. Default runs keep
+    # the legacy filename byte-identically.
+    _stress_tag = 'stress_' if fee_stress else ''
+    report_path = (BASE_DIR /
+                   f"backtest_{f'{rslot}_' if rslot else ''}{_stress_tag}report.json")
     ordered_trades = sorted(all_trades, key=lambda t: t['exit_time'])
     persisted = ordered_trades[-500:]
     tmp = str(report_path) + '.tmp'
@@ -982,6 +1032,123 @@ def _write_policy_gate_sidecar(model_slot: str, data_prefix: str,
         print(f"[GATE] could not write policy-gate sidecar ({e})")
 
 
+def breakeven_fee_mult(mults, nets):
+    """FR-16: lambda* where net replay P&L crosses zero on a fee-mult grid.
+
+    Pure kernel. `mults` must be strictly increasing, `nets` the matching
+    net-P&L values. Returns (lambda_star, status):
+
+      ('crossed')      lambda_star = linear zero-crossing interpolation
+                       between the LAST positive and FIRST non-positive
+                       grid points. Entries/exits are fixed across the
+                       sweep (only charged cost scales), so net is linear
+                       in lambda and the interpolation is exact up to
+                       per-trade rounding.
+      ('below_at_min') net already <= 0 at the smallest multiplier;
+                       lambda_star = mults[0] (an upper bound — no
+                       measurable cost headroom on this grid).
+      ('no_cross')     net > 0 across the whole grid; lambda_star = None
+                       (headroom exceeds the grid).
+    """
+    m = np.asarray(mults, dtype=float)
+    v = np.asarray(nets, dtype=float)
+    if m.size == 0 or m.size != v.size:
+        raise ValueError('mults and nets must be equal-length and non-empty')
+    if not (np.all(np.isfinite(m)) and np.all(np.isfinite(v))):
+        raise ValueError('non-finite sweep values')
+    if m.size > 1 and not np.all(np.diff(m) > 0):
+        raise ValueError('mults must be strictly increasing')
+    if v[0] <= 0.0:
+        return float(m[0]), 'below_at_min'
+    for i in range(1, int(m.size)):
+        if v[i] <= 0.0:
+            lam = m[i - 1] + (m[i] - m[i - 1]) * v[i - 1] / (v[i - 1] - v[i])
+            return float(lam), 'crossed'
+    return None, 'no_cross'
+
+
+def _fmt_lambda(lam, status, mults) -> str:
+    if status == 'no_cross':
+        return f'> {mults[-1]:g} (net never crosses zero on the grid)'
+    if status == 'below_at_min':
+        return (f'<= {mults[0]:g} (net already non-positive at the '
+                f'smallest multiplier)')
+    return f'{lam:.2f}'
+
+
+def _run_fee_sweep(prefix: str, days: int, n_search_trials: int,
+                   mults: list, model_prefix: str | None = None) -> int:
+    """FR-16 breakeven fee-multiplier sweep (report-only, never gates).
+
+    Replays the SAME policy per grid multiplier (entries fixed; only the
+    charged cost legs scale — see simulate_ticker), then reports per-book
+    and per-name lambda* by linear zero-crossing interpolation. The
+    stage-0 dump runs on the first pass only (identical predictions every
+    pass). Every stressed pass writes backtest_<slot>_stress_report.json
+    (the operational book report is never touched by a stressed replay);
+    results also land in backtest_<slot>_fee_sweep.json so
+    champion-vs-challenger lambda* comparisons survive the scrollback.
+    """
+    results = []
+    for k, fm in enumerate(mults):
+        print(f"\n[FEE-SWEEP] pass {k + 1}/{len(mults)}: fee_mult={fm:g}")
+        kw = {'fee_mult': float(fm)}
+        if model_prefix is not None:
+            kw['model_prefix'] = model_prefix
+        if k > 0:
+            kw['stage0_dump'] = False
+        results.append(run_backtest(prefix, days, n_search_trials, **kw))
+
+    book_nets = [float(m.get('net_total_pct', 0.0)) for m in results]
+    lam, status = breakeven_fee_mult(mults, book_nets)
+    names = sorted({n for m in results
+                    for n in m.get('net_pct_by_name', {})})
+    per_name = {}
+    for name in names:
+        nets_n = [float(m.get('net_pct_by_name', {}).get(name, 0.0))
+                  for m in results]
+        per_name[name] = breakeven_fee_mult(mults, nets_n)
+
+    print(f"\n=== FEE-MULT SWEEP ({prefix or 'crypto'}"
+          f"{f', model slot {model_prefix}' if model_prefix else ''}, "
+          f"last {days}d) ===")
+    print(f"  {'lambda':>8}  {'net_total_pct':>14}  {'sharpe':>8}  "
+          f"{'n_trades':>8}")
+    for fm, m in zip(mults, results):
+        print(f"  {fm:>8g}  {float(m.get('net_total_pct', 0.0)):>14.2f}  "
+              f"{float(m.get('sharpe', 0.0)):>8.2f}  "
+              f"{int(m.get('n_trades', 0)):>8}")
+    print(f"  book lambda* = {_fmt_lambda(lam, status, mults)}")
+    print("  per-name lambda*:")
+    for name in names:
+        lam_n, st_n = per_name[name]
+        print(f"    {name or '(unnamed)'}: {_fmt_lambda(lam_n, st_n, mults)}")
+
+    rslot = _report_slot(prefix, model_prefix if model_prefix else prefix)
+    sweep_path = (BASE_DIR /
+                  f"backtest_{f'{rslot}_' if rslot else ''}fee_sweep.json")
+    try:
+        payload = {
+            'prefix': prefix, 'model_prefix': model_prefix, 'days': days,
+            'mults': [float(x) for x in mults],
+            'net_total_pct': book_nets,
+            'book_lambda_star': lam, 'book_status': status,
+            'per_name': {n: {'lambda_star': per_name[n][0],
+                             'status': per_name[n][1]} for n in names},
+            'generated_at': datetime.now(timezone.utc).isoformat(
+                timespec='seconds'),
+        }
+        tmp = str(sweep_path) + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, sweep_path)
+        print(f"  sweep report: {sweep_path}")
+    except Exception as e:
+        print(f"[FEE-SWEEP] could not persist sweep report ({e}) — "
+              f"printed table above is the record")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description='Backtest the actual trading policy')
     ap.add_argument('--prefix', default='', help="'' for crypto, 'stock' for stocks")
@@ -1015,6 +1182,16 @@ def main():
     ap.add_argument('--no-stage0-dump', action='store_true',
                     help='skip the per-bar Stage-0 predictions dump + hourly '
                          'MTM equity (B02, measurement-only; default ON)')
+    ap.add_argument('--fee-mult', type=float, default=None,
+                    help='FR-16 cost-stress replay: scale the CHARGED '
+                         'round-trip cost legs by this factor (edge floor / '
+                         'threshold / entries stay at live policy). '
+                         'Report-only; incompatible with --gate')
+    ap.add_argument('--fee-sweep', default=None, metavar='GRID',
+                    help="FR-16 breakeven sweep: comma grid of fee "
+                         "multipliers, e.g. '1.0,1.5,2,3,4,6'; reports "
+                         "per-book and per-name lambda* (net-P&L zero "
+                         "crossing). Report-only; incompatible with --gate")
     args = ap.parse_args()
 
     global STAGE0_DUMP_DEFAULT
@@ -1024,6 +1201,28 @@ def main():
     if args.days < 1:
         ap.error('--days must be >= 1 (a degenerate window produces a '
                  'zero-trade replay and, with --gate, a spurious rollback)')
+
+    if args.gate and (args.fee_mult is not None or args.fee_sweep is not None):
+        ap.error('--gate cannot be combined with --fee-mult/--fee-sweep '
+                 '(FR-16 is a report-only cost-stress measurement; gate '
+                 'verdicts must use the live cost model)')
+    if args.fee_mult is not None and args.fee_sweep is not None:
+        ap.error('--fee-mult and --fee-sweep are mutually exclusive')
+    if args.fee_mult is not None and not (math.isfinite(args.fee_mult)
+                                          and args.fee_mult > 0):
+        ap.error('--fee-mult must be positive and finite')
+    sweep_mults = None
+    if args.fee_sweep is not None:
+        try:
+            sweep_mults = sorted({float(x) for x in args.fee_sweep.split(',')
+                                  if x.strip()})
+        except ValueError:
+            sweep_mults = []
+        if len(sweep_mults) < 2:
+            ap.error("--fee-sweep needs >= 2 distinct comma-separated "
+                     "multipliers, e.g. '1.0,1.5,2,3,4,6'")
+        if not all(math.isfinite(m) and m > 0 for m in sweep_mults):
+            ap.error('--fee-sweep multipliers must be positive and finite')
 
     # Resolve the deflation pool: an explicit --trials always wins (both
     # modes, operator override). Otherwise read the persisted cumulative
@@ -1065,11 +1264,30 @@ def main():
               f"genuine first deploy (no .prev) — an established champion "
               f"is HELD (D03)")
     p = f'{model_slot}_' if model_slot else ''
+
+    if sweep_mults is not None:
+        # FR-16 sweep: report-only, own driver, exits before any gate
+        # machinery (--gate was refused above).
+        return _run_fee_sweep(
+            args.prefix, args.days, resolved_trials, sweep_mults,
+            model_prefix=(model_slot if targets_challenger else None))
+
     try:
         try:
             if targets_challenger:
+                if args.fee_mult is not None:
+                    metrics = run_backtest(args.prefix, args.days,
+                                           resolved_trials,
+                                           model_prefix=model_slot,
+                                           fee_mult=args.fee_mult)
+                else:
+                    metrics = run_backtest(args.prefix, args.days,
+                                           resolved_trials,
+                                           model_prefix=model_slot)
+            elif args.fee_mult is not None:
+                # FR-16 single-point cost stress (report-only; --gate refused)
                 metrics = run_backtest(args.prefix, args.days, resolved_trials,
-                                       model_prefix=model_slot)
+                                       fee_mult=args.fee_mult)
             else:
                 # Legacy call kept positional-only: model_slot == args.prefix
                 # (run_backtest defaults model_prefix to prefix), and the

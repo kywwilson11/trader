@@ -92,6 +92,12 @@ class StockLoop(BaseTradingLoop):
         self._clock_cache: tuple[float, object] = (0.0, None)
         self._last_preds: dict[str, float] = {}
         self._tp_order_ids: dict[str, str] = {}  # bracket TP-leg ids (c26 D06/B09)
+        # Top-N near-miss substrate (2026-08 influence audit §3.4: "ranks
+        # 8+ never journaled — no counterfactual, ever"): ranks
+        # TOP_N+1..HOLD_RANK stashed by _get_predictions, journaled by
+        # _execute_buys only on cycles where the entry funnel runs.
+        self._near_miss_ranked: list[tuple[int, str, float]] = []
+        self._near_miss_journaled: set[tuple[str, str]] = set()
 
     def get_symbol_universe(self) -> list[str]:
         return [s for s in load_stock_universe() if '/' not in s]
@@ -573,12 +579,26 @@ class StockLoop(BaseTradingLoop):
                 poppers = {s for s, v in rr.items()
                            if v is not None and v >= pop_cut and v > 0}
                 if poppers:
+                    pre_rank = {s: i for i, (s, _) in enumerate(ranked, 1)}
                     window.sort(key=lambda kv: (kv[0] in poppers, -kv[1]))
                     ranked = window + ranked[self.TOP_N + 3:]
                     logger.info("[RR-TIEBREAK] VIX %.0f: demoted recent "
                                 "poppers %s", vix, ', '.join(sorted(poppers)))
+                    # Journal every demotion with pre/post rank + the
+                    # counterfactual admission flag (2026-08 influence
+                    # audit §3.4: "journal every demotion with
+                    # counterfactual rank within one release or delete" —
+                    # this is the release). Measurement-only.
+                    post_rank = {s: i for i, (s, _) in enumerate(ranked, 1)}
+                    self._journal_rr5_demotions(poppers, pre_rank, post_rank,
+                                                rr, vix, preds, snapshots)
         self.top_symbols = [sym for sym, _ in ranked[:self.TOP_N]]
         self.hold_symbols = {sym for sym, _ in ranked[:self.HOLD_RANK]}
+        # Stash ranks TOP_N+1..HOLD_RANK for near-miss skip journaling
+        # (rows written only when the entry funnel actually runs)
+        self._near_miss_ranked = [(r, s, p) for r, (s, p)
+                                  in enumerate(ranked, 1)
+                                  if self.TOP_N < r <= self.HOLD_RANK]
         if self.top_symbols:
             logger.info("[RANK] Top %d: %s", self.TOP_N,
                         ', '.join(f'{s}({preds[s]:+.4f})' for s in self.top_symbols))
@@ -595,6 +615,100 @@ class StockLoop(BaseTradingLoop):
                             mkt['negative_ratio'] * 100)
 
         return preds, snapshots
+
+    def _journal_rr5_demotions(self, poppers, pre_rank, post_rank, rr, vix,
+                               preds, snapshots):
+        """Journal high-VIX RR_5 tiebreak demotions (measurement-only).
+
+        2026-08 influence audit §3.4 (UNPROVEN-suspect, all three judges):
+        the demotion "produces only log lines — structurally unmeasurable
+        forever as built. Journal it within one release or delete it."
+        One 'rr5_demotion' event row per firing (every demoted name with
+        pre/post rank + admission_lost); plus a priced skip row per name
+        the demotion actually pushed OUT of the top-N — names demoted
+        within the window still enter the funnel and journal there.
+        """
+        if not self._conviction_journal_on():
+            return
+        try:
+            from trade_journal import log_decision
+            demos = []
+            for s in sorted(poppers):
+                pre, post = pre_rank.get(s), post_rank.get(s)
+                lost = (pre is not None and post is not None
+                        and pre <= self.TOP_N < post)
+                demos.append({'symbol': s, 'pre_rank': pre,
+                              'post_rank': post, 'admission_lost': lost,
+                              'rr5': (round(float(rr[s]), 4)
+                                      if rr.get(s) is not None else None)})
+            log_decision({'action': 'rr5_demotion', 'asset_type': 'stock',
+                          'vix': round(float(vix), 1),
+                          'demotions': demos})
+            for d in demos:
+                if not d['admission_lost']:
+                    continue
+                s = d['symbol']
+                self._journal_skip(s, 'rr5_demotion', rank=d['post_rank'],
+                                   pred=preds.get(s),
+                                   snapshot=(snapshots or {}).get(s),
+                                   pre_rank=d['pre_rank'],
+                                   post_rank=d['post_rank'],
+                                   rr5=d['rr5'],
+                                   vix=round(float(vix), 1))
+        except Exception:
+            pass
+
+    def _journal_rank_near_misses(self, snapshots):
+        """Journal ranks TOP_N+1..HOLD_RANK as 'rank_near_miss' skip rows.
+
+        2026-08 influence audit §3.4 / open question #5: the N=7 cliff has
+        no counterfactual — "journal ranks 8-15 as skip rows (no
+        counterfactual exists today)". Fields: rank, pred (via
+        _journal_skip) and the would-be size. would_be_base_notional is
+        the PRE-TILT risk base priced from the snapshot's Close/ATR — no
+        quote fetch, no GARCH, no tilt product (a Jetson-cheap proxy, not
+        the full sizing pipeline; would_be_stop_dist journals the stop
+        distance it assumed). Volume discipline: called only on cycles
+        where the entry funnel actually runs, one row per (day, symbol).
+        Measurement-only.
+        """
+        if not self._conviction_journal_on():
+            return
+        seen = getattr(self, '_near_miss_journaled', None)
+        if seen is None:
+            seen = self._near_miss_journaled = set()
+        today = datetime.date.today().isoformat()
+        try:
+            from strategy_config import RISK_PCT_PER_TRADE
+            for r, s, p in getattr(self, '_near_miss_ranked', []):
+                key = (today, s)
+                if key in seen:
+                    continue
+                seen.add(key)
+                snap = (snapshots or {}).get(s) or {}
+                extra = {}
+                close = snap.get('Close')
+                atr = snap.get('ATR')
+                if close and close > 0:
+                    if atr:
+                        raw = (atr * self.ATR_STOP_MULTIPLIER) / close
+                        stop_dist = max(self.ATR_STOP_FLOOR_PCT,
+                                        min(self.ATR_STOP_CEIL_PCT, raw))
+                    else:
+                        stop_dist = self.STOP_LOSS_PCT
+                    base = min(self._equity * RISK_PCT_PER_TRADE
+                               / max(stop_dist, 1e-4),
+                               self.NOTIONAL_PER_SYMBOL)
+                    extra['would_be_base_notional'] = round(base, 2)
+                    extra['would_be_stop_dist'] = round(stop_dist, 5)
+                self._journal_skip(s, 'rank_near_miss', rank=r, pred=p,
+                                   snapshot=snap, **extra)
+            # Bound the dedup set: keep only today's keys once it grows
+            if len(seen) > 2000:
+                self._near_miss_journaled = {k for k in seen
+                                             if k[0] == today}
+        except Exception:
+            pass
 
     def _execute_sells(self, preds: dict):
         """Stock-specific: also sell positions that drop from top N."""
@@ -614,19 +728,68 @@ class StockLoop(BaseTradingLoop):
                 continue
 
             sell_reason = None
+            is_signal_exit = False
             pred = preds.get(symbol)
             if pred is not None and pred < -self.trade_threshold:
                 sell_reason = f"pred={pred:+.4f}%"
+                is_signal_exit = True
             elif (symbol not in self.hold_symbols
                   and pred is not None and pred < 0):
                 sell_reason = (f"fell below hold rank {self.HOLD_RANK} "
                                f"(pred={pred:+.4f}%)")
 
+            # SIGNAL_EXIT_CONFIRM_READS (IA-4, ledger §3.7 — mirrors
+            # base_loop._execute_sells): default 1 = today's single-reading
+            # exit, byte-identical. At 2 the pred-based signal exit arms on
+            # the first reading and confirms on the next; the rank-drop
+            # exit keeps its own hysteresis band (HOLD_RANK) and is never
+            # deferred. Pending survives a missing-pred cycle.
+            pending = getattr(self, '_pending_signal_exit', None)
+            if pending is None:
+                pending = self._pending_signal_exit = {}
+            try:
+                from strategy_config import SIGNAL_EXIT_CONFIRM_READS
+                confirm_reads = int(SIGNAL_EXIT_CONFIRM_READS)
+            except Exception:
+                confirm_reads = 1
+
             if sell_reason is None:
+                # Order matters: a missing pred (data failure) must NOT
+                # clear an armed first reading — only a RECOVERED pred
+                # lapses it (mirrors base_loop, where pred-None `continue`s
+                # before the pending logic). Short-circuit keeps the pop
+                # from running when pred is None.
+                if pred is not None and pending.pop(symbol, None) is not None:
+                    try:
+                        from trade_journal import log_decision
+                        log_decision({'action': 'signal_exit_reading',
+                                      'symbol': symbol, 'event': 'lapsed',
+                                      'pred_return': round(float(pred), 4)})
+                    except Exception:
+                        pass
                 continue
 
-            if not cooldown_ok(self.last_trade_time, symbol, self.COOLDOWN_MINUTES):
+            if is_signal_exit and confirm_reads >= 2 and symbol not in pending:
+                pending[symbol] = getattr(self, 'cycle', 0)
+                logger.info("%s: signal exit reading 1/2 (%s) — awaiting "
+                            "confirmation next cycle", symbol, sell_reason)
+                try:
+                    from trade_journal import log_decision
+                    log_decision({'action': 'signal_exit_reading',
+                                  'symbol': symbol, 'event': 'armed',
+                                  'pred_return': round(float(pred), 4),
+                                  'confirm_reads': confirm_reads})
+                except Exception:
+                    pass
                 continue
+            if is_signal_exit:
+                pending.pop(symbol, None)
+
+            # Exits are NEVER cooldown-gated (2026-08 influence audit §3.4:
+            # an entry throttle delaying risk reduction inverts the tool's
+            # purpose). Marker is measurement only.
+            cooldown_bypassed = not cooldown_ok(
+                self.last_trade_time, symbol, self.COOLDOWN_MINUTES)
 
             logger.info("%s: SELLING (%s)", symbol, sell_reason)
             qty = int(float(pos.qty))
@@ -646,10 +809,17 @@ class StockLoop(BaseTradingLoop):
             order = self.place_sell_order(symbol, qty, quote)
             if order:
                 llm_info = self.llm_scores.get(symbol, {})
-                self._record_confirmed_exit(symbol, info, order, quote,
-                                            exit_reason='signal_sell',
-                                            llm_score=llm_info.get('s'),
-                                            reasoning=llm_info.get('r', ''))
+                extra = {}
+                if cooldown_bypassed:
+                    extra['cooldown_bypassed_exit'] = True
+                if is_signal_exit and confirm_reads >= 2:
+                    extra['signal_exit_readings'] = confirm_reads
+                self._record_confirmed_exit(
+                    symbol, info, order, quote,
+                    exit_reason='signal_sell',
+                    llm_score=llm_info.get('s'),
+                    reasoning=llm_info.get('r', ''),
+                    extra=(extra or None))
                 del self.positions[symbol]
                 self.last_trade_time[symbol] = datetime.datetime.now()
             time.sleep(0.5)
@@ -799,12 +969,22 @@ class StockLoop(BaseTradingLoop):
         from order_utils import should_trade
         from trade_journal import log_decision
         from portfolio import check_portfolio_correlation
+        # IA-4 flag family (all default-OFF/today; see strategy_config).
+        try:
+            from strategy_config import (VIX25_BLOCK_REMOVED,
+                                         CORR_FAMILY_MERGED, CORR_SANITY_MAX)
+        except Exception:
+            VIX25_BLOCK_REMOVED, CORR_FAMILY_MERGED = False, False
+            CORR_SANITY_MAX = 0.85
 
         if self.flattened_today:
             return
 
-        # Macro-event stand-down (FOMC/CPI windows)
+        # Macro-event stand-down (FOMC/CPI windows). Stood-down candidates
+        # journal priced skip rows with window identity (measurement-only;
+        # manual halt journals nothing) — see base_loop.
         if not self._entries_allowed():
+            self._journal_standdown_skips(preds, snapshots)
             return
 
         # Entry windows: predictability lives in the open/close half-hours
@@ -825,6 +1005,9 @@ class StockLoop(BaseTradingLoop):
         vc = Counter()          # veto attribution for the window summary
         admitted = []           # ranked names that cleared every gate
         n_candidates = 0        # ranked candidates evaluated past mechanical gates
+        # The funnel is actually running this cycle: journal ranks
+        # TOP_N+1..HOLD_RANK as near-miss skip rows (once per day/symbol)
+        self._journal_rank_near_misses(snapshots)
         for rank, symbol in enumerate(self.top_symbols, 1):
             if symbol in self.positions:
                 vc['already_held'] += 1
@@ -927,29 +1110,58 @@ class StockLoop(BaseTradingLoop):
                                        pred=pred, snapshot=snapshot)
                     continue
 
-            # Correlation check
+            # Correlation check. CORR_FAMILY_MERGED (IA-4, ledger §3.3
+            # MERGE — mirrors base_loop): ON = ENB budget is the single
+            # correlation consumer; only the CORR_SANITY_MAX sanity block
+            # remains at admission.
             avg_corr = None
             if self.corr_matrix and self.positions:
+                _corr_kw = ({'max_avg_corr': CORR_SANITY_MAX}
+                            if CORR_FAMILY_MERGED else {})
                 allowed, avg_corr = check_portfolio_correlation(
-                    list(self.positions.keys()), symbol, self.corr_matrix)
+                    list(self.positions.keys()), symbol, self.corr_matrix,
+                    **_corr_kw)
                 if not allowed:
                     vc['correlation'] += 1
                     self._journal_skip(symbol, 'correlation', rank=rank,
                                        pred=pred, snapshot=snapshot,
-                                       avg_corr=round(avg_corr, 4))
+                                       avg_corr=round(avg_corr, 4),
+                                       **({'corr_sanity': True}
+                                          if CORR_FAMILY_MERGED else {}))
                     continue
 
-            # Macro regime halt
+            # Macro regime halt. Skip rows journaled as 'vix_halt' (2026-08
+            # influence audit §3.3: keep as THE one extreme VIX read,
+            # "journaled as a priced skip class" — previously the
+            # highest-impact stock gate with the least evidence). vc key
+            # stays 'macro_halt' (entry_window veto_counts back-compat).
             if self.macro_regime and self.macro_regime.should_halt_stocks:
                 logger.info("%s: Halted by VIX > 35", symbol)
                 vc['macro_halt'] += 1
+                _vix = getattr(self.macro_regime, 'vix', None)
+                self._journal_skip(symbol, 'vix_halt', rank=rank, pred=pred,
+                                   snapshot=snapshot,
+                                   vix=(round(_vix, 1) if _vix is not None
+                                        else None))
                 continue
 
-            # VIX > 25: block risky entries, allow safe-havens
-            if self.macro_regime and self.macro_regime.should_block_risky_entries:
+            # VIX > 25: block risky entries, allow safe-havens. Skip rows
+            # journaled as 'vix25_block' + one daily log naming the
+            # SAFE_HAVEN-untradable gap (C3) so the de facto halt is
+            # visible. VIX25_BLOCK_REMOVED (IA-4, ledger §3.3 — mirrors
+            # base_loop): ON skips the block entirely; the graded VIX tier
+            # map owns the 25-35 band.
+            if (not VIX25_BLOCK_REMOVED and self.macro_regime
+                    and self.macro_regime.should_block_risky_entries):
                 if symbol not in SAFE_HAVEN_SYMBOLS:
                     logger.info("%s: Blocked — VIX > 25 defensive (non-safe-haven)", symbol)
                     vc['vix_block'] += 1
+                    _vix = getattr(self.macro_regime, 'vix', None)
+                    self._journal_skip(symbol, 'vix25_block', rank=rank,
+                                       pred=pred, snapshot=snapshot,
+                                       vix=(round(_vix, 1) if _vix is not None
+                                            else None))
+                    self._log_vix25_gap_once(SAFE_HAVEN_SYMBOLS)
                     continue
 
             # SPY below its 200d SMA: block non-safe-haven entries (Faber)
@@ -960,14 +1172,14 @@ class StockLoop(BaseTradingLoop):
                                    pred=pred, snapshot=snapshot)
                 continue
 
-            # Sentiment gate (veto first; multiplier folds into sizing tilt)
+            # Sentiment gate: multiplier only — sentiment.sentiment_gate
+            # clamps to [0.15, 1.5], so a gate<=0 veto branch was
+            # mathematically unreachable and was deleted 2026-08-22 per the
+            # decision-influence ledger (zero behavior change; verbatim code
+            # in research/campaign_2026-08/08_removed_code.md — same removal
+            # as base_loop's, deferred to this packet by IA-1). Making
+            # sentiment a REAL veto remains an owner decision.
             gate, gate_reasons = sentiment_gate(symbol, 'stock')
-            if gate <= 0:
-                vc['sentiment_block'] += 1
-                log_decision({"symbol": symbol, "action": "skip", "skip_reason": "sentiment_block",
-                              "pred_return": pred, "entry_rank": rank,
-                              "sentiment_gate": gate, "sentiment_reasons": gate_reasons})
-                continue
 
             # LLM gate (veto first; multiplier folds into sizing tilt)
             llm_info = self.llm_scores.get(symbol, {})

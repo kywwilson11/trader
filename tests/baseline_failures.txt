@@ -1,5 +1,10 @@
-# Baseline FAILED/ERROR test IDs for the dev Mac (no torch/lightgbm/optuna/joblib/numba/sklearn/dotenv); consumed by scripts/ab_check.sh for the one-command regression check.
+# Baseline FAILED/ERROR test IDs for the dev Mac; consumed by scripts/ab_check.sh, which compares NAMES (never counts) for the one-command regression check.
+# Every name below is a MISSING-DEPENDENCY outcome. The deps actually implicated, with their counts:
+#   pyarrow/fastparquet (12) -> test_data_utils, test_oi_archive, test_wave4::TestShortFlow   |   joblib (3) -> test_conviction_journal, test_predict_now, test_panel_ranks::TestBouncedLoser
+#   hmmlearn (3) -> test_new_modules::TestRegimeDetector + ::TestSharpeWithTxnCosts   |   torch (2) -> test_model_v2, test_hypersearch_v2   |   arch (2) -> test_new_modules::TestVolatility   |   dotenv (1) -> test_asof_universe
+# lightgbm / numba / optuna / sklearn are ALSO absent on this Mac but cause NO name here — those paths are guarded (pytest.importorskip, pure-python fallbacks, or source-text-only tests).
 # Regenerate: PY_COLORS=0 python3 -m pytest tests/ --continue-on-collection-errors -q 2>/dev/null | grep -E '^(FAILED|ERROR)' | sed 's/ - .*//' | sort -u
+#   PY_COLORS=0 is REQUIRED: without it ANSI codes precede FAILED/ERROR and the anchored grep silently returns nothing. The command emits only the name lines, so re-add this header by hand rather than redirecting over the file.
 # MACHINE-SPECIFIC: this is the no-heavy-deps dev-Mac baseline ONLY — on Jetson/CI with full deps the suite is green, so do not port this file there.
 ERROR tests/test_asof_universe.py
 ERROR tests/test_conviction_journal.py

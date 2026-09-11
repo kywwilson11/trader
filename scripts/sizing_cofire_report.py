@@ -195,7 +195,10 @@ def build_report(buys, zero_skips, malformed, n_files, days, book):
     # multiplier on the final tilt — median(tilt / counterfactual tilt
     # with that multiplier removed).
     marginal = {}
-    for key in MULT_KEYS:
+    # kelly_mult and vol_mult are applied to `sized` AFTER the tilt product
+    # (base_loop._compute_position_size) and never enter tilt_raw, so
+    # `raw / m` is meaningless for them — exclude them here.
+    for key in [k for k in MULT_KEYS if k not in ('kelly_mult', 'vol_mult')]:
         ratios = []
         for s in sizings:
             m = s.get(key)

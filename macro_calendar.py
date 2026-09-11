@@ -48,20 +48,50 @@ _WINDOWS = [
 ]
 
 
-def macro_standdown(now: dt.datetime | None = None) -> tuple[bool, str | None]:
-    """True (with a reason) when inside a macro-event entry stand-down."""
+def _active_window(et: dt.datetime):
+    """The stand-down window containing ET-time `et`, as
+    (label, (y, m, d), start, end) — or None outside every window."""
+    today = (et.year, et.month, et.day)
+    for label, days, start, end in _WINDOWS:
+        if today in days and start <= et.time() < end:
+            return label, today, start, end
+    return None
+
+
+def _to_et(now: dt.datetime | None) -> dt.datetime:
     if now is None:
         now = dt.datetime.now(dt.timezone.utc)
     elif now.tzinfo is None:
         now = now.replace(tzinfo=dt.timezone.utc)
-    et = now.astimezone(_ET)
-    today = (et.year, et.month, et.day)
-    for label, days, start, end in _WINDOWS:
-        if today in days and start <= et.time() < end:
-            return True, (f"{label} stand-down "
-                          f"({start.strftime('%H:%M')}-"
-                          f"{end.strftime('%H:%M')} ET)")
+    return now.astimezone(_ET)
+
+
+def macro_standdown(now: dt.datetime | None = None) -> tuple[bool, str | None]:
+    """True (with a reason) when inside a macro-event entry stand-down."""
+    et = _to_et(now)
+    w = _active_window(et)
+    if w is not None:
+        label, _, start, end = w
+        return True, (f"{label} stand-down "
+                      f"({start.strftime('%H:%M')}-"
+                      f"{end.strftime('%H:%M')} ET)")
     return False, None
+
+
+def standdown_window_id(now: dt.datetime | None = None) -> str | None:
+    """Stable identity of the active stand-down window, e.g.
+    'FOMC-2026-09-16' or 'CPI-2026-08-12'; None outside every window.
+
+    Journal hook (2026-08 influence audit §3.2 / open question #4): the
+    stand-down previously fired before any journaling — "structurally
+    unpriceable". The loops key stood-down entry-skip rows on this id so
+    each window's counterfactual is journaled exactly once per candidate.
+    """
+    w = _active_window(_to_et(now))
+    if w is None:
+        return None
+    label, (y, m, d), _, _ = w
+    return f"{label}-{y:04d}-{m:02d}-{d:02d}"
 
 
 def calendar_exhausted(now: dt.datetime | None = None) -> bool:

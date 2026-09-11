@@ -6,12 +6,13 @@ description: Canonical zero-regression check for this repo. Primary method — `
 # /regression-ab — zero-regression check
 
 Proves your uncommitted changes introduce **zero new test failures** on the dev Mac, where a
-fixed set of tests always fails from missing heavy deps (torch / lightgbm / optuna / joblib /
-numba / sklearn / dotenv). **Counts are advisory; the failure-NAME diff is the truth.**
+fixed set of tests always fails from missing heavy deps (pyarrow / joblib / hmmlearn /
+torch / arch / dotenv). **Counts are advisory; the failure-NAME diff is the truth.**
 
-Baseline for orientation (2026-07-15): `1887 passed / 21 failed / 15 skipped / 7 errors` —
-all failures+errors are pre-existing missing-dep noise. Counts drift as tests are added; never
-alarm (or all-clear) on counts alone.
+The authoritative failure NAMES — and the per-dependency attribution — live in
+`tests/baseline_failures.txt`. Current pass/fail counts live in exactly one place,
+`CLAUDE.md` section "Running tests"; they drift as tests are added, so never alarm (or
+all-clear) on counts alone.
 
 ## Primary method — `scripts/ab_check.sh` (one command, no stash)
 

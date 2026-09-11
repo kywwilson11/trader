@@ -12,14 +12,19 @@ Key properties:
   - Risk-adjusted objective: mean fold Sharpe − 0.5·std, cost-aware, holdout
     Deflated-Sharpe gate before any save
   - FP16 mixed precision for ~2x speedup on Jetson tensor cores
-  - Stationary features only (no raw price/volume drift)
+  - Feature set follows the indicator preset: --preset overrides, else
+    indicator_config.load_indicator_config() decides (run_pipeline passes
+    --preset stationary explicitly — stationary features, no raw
+    price/volume drift, on the production path)
 
 Usage:
     python scripts/hypersearch_v2.py --trials 200 --data training_data.csv --preset stationary
     python scripts/hypersearch_v2.py --trials 50 --prefix stock --data stock_training_data.csv
 
-Note: data loads parquet-first via data_utils by --prefix stem; --data is
-only a direct-CSV fallback.
+Note: data loads parquet-first via data_utils, but the STORE is chosen by the
+--data PATH ('stock' in --data selects the stock panel, else crypto — see
+load_data); --data itself is only the direct-CSV fallback. --prefix names the
+OUTPUT artifacts, it does not select the input store.
 """
 import sys; from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -53,7 +58,11 @@ from gpu_lock import acquire_for_training
 from adaptive_config import (load_adaptive_state, get_search_space_for_trial,
                               update_after_search, get_trial_count)
 from objective_utils import (simulate_trades_core, ticker_block_ids,
-                             v3_trade_threshold_range, refit_epoch_budget)
+                             v3_trade_threshold_range, refit_epoch_budget,
+                             lgb_refit_indices, fixed_boost_rounds,
+                             derive_seed, lagged_regime_series,
+                             embargo_end_time, holdout_boundary,
+                             window_cutoff, cs_rank_ic)
 
 _STATUS_FILE = Path(__file__).resolve().parent.parent / 'pipeline_status.json'
 
@@ -122,8 +131,10 @@ def parse_args():
                         help='Save a gated new model as CHALLENGER when a '
                              'champion exists (shadow mode; promotion via '
                              'live DM test in shadow.py)')
-    parser.add_argument('--preset', type=str, default='stationary',
-                        help='Indicator preset (default: stationary)')
+    parser.add_argument('--preset', type=str, default=None,
+                        help='Indicator preset override (default: None = the '
+                             'indicator_config.load_indicator_config() preset; '
+                             'run_pipeline passes "stationary" explicitly)')
     parser.add_argument('--max-rows', type=int, default=500_000,
                         help='Max total rows to load (default: 500000)')
     parser.add_argument('--mode', type=str, default='',
@@ -138,7 +149,8 @@ def parse_args():
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_000):
+def load_data(data_path='training_data.csv', preset_override=None,
+              max_rows=500_000, window_days=None):
     print("Loading data...")
     # Try Parquet first (faster), fall back to CSV
     from data_utils import load_training_data
@@ -190,6 +202,25 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
     if preset_features is not None:
         feature_cols = [c for c in feature_cols if c in preset_features]
     print(f"Preset: {preset_name} ({len(feature_cols)} features)")
+
+    # R2C-05 (FR-02): trailing training-window mask, per ticker — each name
+    # keeps only its last window_days of bars, cutoff anchored to its own
+    # final bar (objective_utils.window_cutoff). None = full history,
+    # byte-identical. Applied BEFORE the --max-rows cap so the cap's
+    # rows/ticker arithmetic sees the windowed panel. Only the FR-02
+    # window_ab.py runner passes this today.
+    if window_days is not None:
+        n_before = len(df)
+        kept = []
+        for ticker in df['Ticker'].unique():
+            tdf = df[df['Ticker'] == ticker]
+            t = tdf.index.view('int64') // 10**9
+            cut = window_cutoff(t, window_days)
+            kept.append(tdf if cut is None else tdf[t >= cut])
+        if kept:
+            df = pd.concat(kept).sort_index()
+        print(f"[WINDOW] window_days={window_days}: {n_before} -> {len(df)} "
+              f"rows (per-ticker trailing mask)")
 
     # Apply --max-rows cap: keep most recent rows per ticker
     tickers = df['Ticker'].unique()
@@ -296,7 +327,10 @@ def load_data(data_path='training_data.csv', preset_override=None, max_rows=500_
 # Walk-forward cross-validation
 # ---------------------------------------------------------------------------
 
-HOLDOUT_FRACTION = 0.12  # final slice of CALENDAR TIME never shown to Optuna
+# Final 12% of the pooled ROW-timestamp distribution (a row quantile — equal to
+# calendar time only on a balanced panel), never shown to Optuna; a fixed trailing
+# span replaces it under FIXED_HOLDOUT_DAYS (R2C-05 / FR-01).
+HOLDOUT_FRACTION = 0.12
 
 
 def _valid_indices(tickers, ticker_boundaries, seq_len):
@@ -309,9 +343,41 @@ def _valid_indices(tickers, ticker_boundaries, seq_len):
     return np.concatenate(all_valid) if all_valid else np.array([], dtype=np.int64)
 
 
+def _fixed_holdout_days():
+    """R2C-05 (FR-01): fixed trailing holdout span in days, or None = legacy
+    proportional holdout.
+
+    TRADER_FIXED_HOLDOUT_DAYS env (numeric) wins over
+    strategy_config.FIXED_HOLDOUT_DAYS; both default None (byte-identical).
+    Flipping changes fold layout AND what the gate scores — rides Chain-2's
+    single gotcha-#2 study reset, never a reset of its own.
+    """
+    v = os.environ.get('TRADER_FIXED_HOLDOUT_DAYS')
+    if v not in (None, ''):
+        try:
+            return float(v)
+        except ValueError:
+            print(f"[HOLDOUT] ignoring non-numeric "
+                  f"TRADER_FIXED_HOLDOUT_DAYS={v!r}")
+    try:
+        from strategy_config import FIXED_HOLDOUT_DAYS
+        return (float(FIXED_HOLDOUT_DAYS)
+                if FIXED_HOLDOUT_DAYS is not None else None)
+    except Exception:
+        return None
+
+
 def get_holdout_boundary(all_times) -> int:
-    """Timestamp separating the search region from the untouched holdout."""
-    return int(np.quantile(all_times, 1.0 - HOLDOUT_FRACTION))
+    """Timestamp separating the search region from the untouched holdout.
+
+    R2C-05 (FR-01): the ONE choke point every consumer inherits — folds,
+    the final-refit purge, the blend M4 guard, the OOF pack and
+    evaluate_on_holdout. Default (FIXED_HOLDOUT_DAYS None) delegates to the
+    legacy 0.12-quantile rule, byte-identical; a fixed span pins successive
+    retrains / FR-02 window arms to comparable-width holdouts.
+    """
+    return holdout_boundary(all_times, fixed_days=_fixed_holdout_days(),
+                            holdout_fraction=HOLDOUT_FRACTION)
 
 
 def get_holdout_indices(all_times, tickers, ticker_boundaries, seq_len):
@@ -339,7 +405,10 @@ def get_walk_forward_folds(all_times, all_label_times, tickers,
       - PURGE: a train row is kept only if its label window (the bar
         max(FORWARD_BARS) steps ahead) completes before the boundary;
       - EMBARGO: validation starts EMBARGO_MULTIPLIER * seq_len hours
-        after the boundary.
+        after the boundary (calendar seconds — legacy); under
+        TRAINING_REPAIRS_V1 (R2C-04 / L6) the embargo counts DISTINCT
+        BARS on the pooled grid instead, so a seq_len=40 stock embargo
+        is 40 RTH bars, not the ~11 the 40-calendar-hour rule yields.
 
     Returns list of (train_indices, val_indices).
     """
@@ -354,6 +423,7 @@ def get_walk_forward_folds(all_times, all_label_times, tickers,
         return []
 
     embargo_seconds = seq_len * EMBARGO_MULTIPLIER * 3600
+    _repairs = _training_repairs()
     folds = []
     for fold_idx in range(n_folds):
         train_end_pct = 0.55 + fold_idx * (0.45 / n_folds)
@@ -364,9 +434,22 @@ def get_walk_forward_folds(all_times, all_label_times, tickers,
 
         # Purge: the LABEL must complete before the boundary, not just the bar
         train_mask = search_mask & (all_label_times[valid] <= t_train_end)
-        val_mask = (search_mask
-                    & (t >= t_train_end + embargo_seconds)
-                    & (t < t_val_end))
+        if _repairs:
+            # TRAINING_REPAIRS_V1 (L6): embargo denominated in BARS of the
+            # actual pooled bar grid. The legacy calendar-seconds rule
+            # shrinks a seq_len=40 stock embargo to ~11 RTH bars (40
+            # calendar hours); counting distinct bar timestamps keeps the
+            # serial-correlation buffer at seq_len bars on both books
+            # (identical to legacy on crypto's continuous hourly grid).
+            _val_start = embargo_end_time(search_times, t_train_end,
+                                          seq_len * EMBARGO_MULTIPLIER)
+            val_mask = (search_mask
+                        & (t >= _val_start)
+                        & (t < t_val_end))
+        else:
+            val_mask = (search_mask
+                        & (t >= t_train_end + embargo_seconds)
+                        & (t < t_val_end))
         if purge_val_labels:
             # OBJECTIVE_V3: val rows whose label windows cross into the
             # holdout previously leaked holdout returns into checkpoint /
@@ -419,6 +502,50 @@ def _objective_v3():
         return bool(OBJECTIVE_V3)
     except Exception:
         return False
+
+
+def _lgb_refit_full():
+    """Read strategy_config.LGB_REFIT_FULL (default False = legacy)."""
+    try:
+        from strategy_config import LGB_REFIT_FULL
+        return bool(LGB_REFIT_FULL)
+    except Exception:
+        return False
+
+
+def _training_repairs():
+    """Read strategy_config.TRAINING_REPAIRS_V1 (default False = legacy).
+
+    R2C-04 bundle of score-changing training-loop repairs (L1 val-loss
+    criterion, L2 regime look-ahead, L5 OOM-probe side effects, L6
+    embargo-in-bars). Rides Chain-2's single gotcha-#2 study reset.
+    """
+    try:
+        from strategy_config import TRAINING_REPAIRS_V1
+        return bool(TRAINING_REPAIRS_V1)
+    except Exception:
+        return False
+
+
+def _trainer_seed():
+    """R2C-04 (L3): base training seed, or None = legacy unseeded.
+
+    TRADER_TRAINER_SEED env (int) wins over strategy_config.TRAINER_SEED;
+    both default to None. Sub-seeds derive via objective_utils.derive_seed
+    from (study_name, trial.number, fold) so folds / trials / sampler /
+    refit never share an RNG stream.
+    """
+    v = os.environ.get('TRADER_TRAINER_SEED')
+    if v not in (None, ''):
+        try:
+            return int(v)
+        except ValueError:
+            print(f"[SEED] ignoring non-integer TRADER_TRAINER_SEED={v!r}")
+    try:
+        from strategy_config import TRAINER_SEED
+        return int(TRAINER_SEED) if TRAINER_SEED is not None else None
+    except Exception:
+        return None
 
 
 def simulate_trades(predictions, actual_returns, threshold, forward_bars,
@@ -501,17 +628,34 @@ def compute_regime_sharpes(predictions, actual_returns, threshold,
     if len(actual_returns) < 60:
         return {'bull': 0.0, 'bear': 0.0, 'sideways': 0.0, 'min': 0.0}
 
-    finite = np.where(np.isfinite(actual_returns), actual_returns, 0.0)
-    window = 50
-    kernel = np.ones(window) / window
-    trailing_mean = np.convolve(finite, kernel, mode='full')[:len(finite)]
-    rolling_ret = trailing_mean * (window / max(forward_bars, 1))
+    if _training_repairs():
+        # TRAINING_REPAIRS_V1 (L2): the mask at t uses only returns
+        # completed by t (the legacy series embedded returns through t+fb
+        # — look-ahead in a selection-shaping penalty) and NaN warmup rows
+        # join NO regime instead of polluting them with under-scaled
+        # partial sums. Known residual (recorded, out of this repair's
+        # scope): boolean-masked subsets concatenate non-adjacent rows, so
+        # the fb-bar hold walk still treats them as contiguous.
+        rolling_ret = lagged_regime_series(actual_returns, forward_bars,
+                                           window=50)
+        known = np.isfinite(rolling_ret)
+        regimes = {
+            'bull': known & (rolling_ret > 2.0),
+            'bear': known & (rolling_ret < -2.0),
+        }
+        regimes['sideways'] = known & ~regimes['bull'] & ~regimes['bear']
+    else:
+        finite = np.where(np.isfinite(actual_returns), actual_returns, 0.0)
+        window = 50
+        kernel = np.ones(window) / window
+        trailing_mean = np.convolve(finite, kernel, mode='full')[:len(finite)]
+        rolling_ret = trailing_mean * (window / max(forward_bars, 1))
 
-    regimes = {
-        'bull': rolling_ret > 2.0,
-        'bear': rolling_ret < -2.0,
-    }
-    regimes['sideways'] = ~regimes['bull'] & ~regimes['bear']
+        regimes = {
+            'bull': rolling_ret > 2.0,
+            'bear': rolling_ret < -2.0,
+        }
+        regimes['sideways'] = ~regimes['bull'] & ~regimes['bear']
 
     result = {}
     for name, mask in regimes.items():
@@ -606,7 +750,8 @@ def average_states(states: list[dict]) -> dict:
 def create_objective(all_features, all_returns_by_fb, all_times, all_label_times,
                      tickers, ticker_boundaries,
                      input_dim, _state_cache, asset_type='crypto',
-                     has_multi_horizon=True, adaptive_space=None):
+                     has_multi_horizon=True, adaptive_space=None,
+                     study_name=''):
 
     MAX_TRIAL_SECONDS = 900
 
@@ -724,6 +869,9 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
         if not folds:
             return 0.0
 
+        _repairs = _training_repairs()  # R2C-04 TRAINING_REPAIRS_V1 (L1/L5)
+        base_seed = _trainer_seed()     # R2C-04 TRAINER_SEED (L3)
+
         offsets = np.arange(-seq_len, 0)
         fold_sharpes = []
         fold_best_epochs = []  # per-fold best-val-loss epoch (instrumentation)
@@ -752,11 +900,23 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
             y_train = trial_returns[train_indices]
             y_val = trial_returns[val_indices]
 
+            # R2C-04 (L3): per-fold derived seed; None = legacy unseeded.
+            # Seeding sits INSIDE the retry loop so an OOM retry replays
+            # the same init/dropout stream instead of continuing it.
+            fold_seed = None
+            fold_rng = None
+            if base_seed is not None:
+                fold_seed = derive_seed(base_seed, study_name, trial.number,
+                                        fold_idx)
+                fold_rng = np.random.default_rng(fold_seed)
+
             # OOM retry: if batch doesn't fit, halve until it does (min 128)
             eff_batch_size = batch_size
             oom_retries = 0
             while True:
                 try:
+                    if fold_seed is not None:
+                        torch.manual_seed(fold_seed)
                     model = RegressionLSTM(input_dim, hidden_dim, num_layers,
                                            dropout, n_heads).to(device)
                     criterion = nn.HuberLoss(delta=huber_delta, reduction='none')
@@ -774,6 +934,14 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                     use_amp = device.type == 'cuda'
                     grad_scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
+                    if _repairs:
+                        # TRAINING_REPAIRS_V1 (L5): snapshot pristine init
+                        # so the memory probe leaves no trace (legacy: the
+                        # probe's unclipped optimizer step trained the
+                        # model before epoch 0).
+                        _init_snap = {k: v.detach().cpu().clone()
+                                      for k, v in model.state_dict().items()}
+
                     # Run one batch to test if this config fits in memory
                     model.train()
                     test_idx = train_indices[:min(eff_batch_size, n_train)]
@@ -789,6 +957,22 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                     grad_scaler.step(optimizer)
                     grad_scaler.update()
                     del xb, yb, pred, raw_loss, weights, loss
+                    if _repairs:
+                        # L5: restore init weights + fresh optimizer /
+                        # scheduler / grad-scaler — epoch 0 starts clean.
+                        model.load_state_dict(_init_snap)
+                        optimizer = optim.Adam(model.parameters(),
+                                               lr=learning_rate,
+                                               weight_decay=weight_decay)
+                        if scheduler_type == 'cosine':
+                            sched = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                                optimizer, T_0=20, T_mult=2)
+                        elif scheduler_type == 'plateau':
+                            sched = optim.lr_scheduler.ReduceLROnPlateau(
+                                optimizer, patience=6, factor=0.5)
+                        grad_scaler = torch.amp.GradScaler('cuda',
+                                                           enabled=use_amp)
+                        del _init_snap
                     break  # fits in memory
                 except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                     # CUDA context recovers after NvMap/INTERNAL ASSERT errors
@@ -821,7 +1005,10 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
 
             for epoch in range(MAX_EPOCHS):
                 model.train()
-                perm = np.random.permutation(n_train)
+                # R2C-04 (L3): fold_rng None = legacy ambient-RNG shuffle
+                perm = (fold_rng.permutation(n_train)
+                        if fold_rng is not None
+                        else np.random.permutation(n_train))
                 for i in range(0, n_train, eff_batch_size):
                     bi = perm[i:i + eff_batch_size]
                     # Gather this batch's windows on the fly (~8MB) instead
@@ -859,7 +1046,20 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                         yvb = torch.from_numpy(y_val[i:i + eff_batch_size]).to(device)
                         with torch.amp.autocast('cuda', enabled=use_amp):
                             vo = model(xvb)
-                        val_loss_sum += nn.functional.huber_loss(vo, yvb).item() * xvb.size(0)
+                        if _repairs:
+                            # TRAINING_REPAIRS_V1 (L1): score checkpoints
+                            # with the TRIAL'S criterion (huber_delta +
+                            # |return|+1 weights). Legacy used default
+                            # huber (delta=1.0, unweighted): soup
+                            # admission, early stopping and the refit
+                            # epoch budget selected on a mismatched loss
+                            # and huber_delta barely influenced selection.
+                            v_raw = criterion(vo, yvb)
+                            v_w = torch.clamp(torch.abs(yvb) + 1.0,
+                                              max=50.0)
+                            val_loss_sum += (v_raw * v_w).sum().item()
+                        else:
+                            val_loss_sum += nn.functional.huber_loss(vo, yvb).item() * xvb.size(0)
                         val_preds.append(vo.cpu().numpy())
 
                 val_loss = val_loss_sum / n_val
@@ -1068,6 +1268,14 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
     caller routes the writes through save_model_atomically's
     extra_artifacts AFTER the holdout gate passes. Total failure returns
     None regardless of save.
+
+    LGB_REFIT_FULL (R2C-03, default OFF = byte-identical): the fold
+    training above becomes round-count discovery only; both legs are
+    RETRAINED on all purged pre-holdout rows at the fixed round count
+    (no early stopping) and the q10 veto floor is recomputed from the
+    refit q10 on the original fold-val rows (in-sample caveat recorded
+    in the q10 meta via the booster's _r2c03_meta_extra attribute, which
+    travels through the unchanged save=False tuple).
     """
     try:
         from model_lgb import train_lgb, save_lgb_model
@@ -1085,9 +1293,20 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
             returns = next(v for k, v in all_returns_by_fb.items()
                            if not isinstance(k, tuple))
 
+        _purge = _objective_v3()
+        if _hypersearch_v3() and not _purge:
+            # M4 guard (R2C-02b): this fold's val slice calibrates the q10
+            # veto floor and (upstream) anchors the blend fit while the
+            # certificate scores the holdout — HYPERSEARCH_V3 without
+            # OBJECTIVE_V3 must still purge val rows whose label windows
+            # cross the holdout boundary (code-couples the runbook's
+            # "flip both flags together" pairing instead of trusting it).
+            _purge = True
+            print("[LGB] M4 guard: HYPERSEARCH_V3 without OBJECTIVE_V3 — "
+                  "forcing purge_val_labels=True for the LGB fold build")
         folds = get_walk_forward_folds(all_times, all_label_times, tickers,
                                        ticker_boundaries, seq_len,
-                                       purge_val_labels=_objective_v3())
+                                       purge_val_labels=_purge)
         if not folds:
             return None
         train_idx, val_idx = folds[-1]  # largest train window, latest val
@@ -1136,8 +1355,14 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
               f"flattened features (fb={fb})")
         booster = train_lgb(X_train, y_train, X_val, y_val,
                             sample_weight=w_train, sample_weight_val=w_val)
-        if save:
+        # R2C-03 (M3/M4-floor): under default-OFF LGB_REFIT_FULL the fold
+        # training above only supplies the fixed round count — the mean
+        # save is deferred until after the full refit below.
+        _refit_full = _lgb_refit_full()
+        _mean_saved = False
+        if save and not _refit_full:
             save_lgb_model(booster, prefix=prefix.rstrip('_'))
+            _mean_saved = True
 
         # Left-tail (q10) quantile model for the entry tail veto: a
         # bullish MEAN prediction can coexist with a fat left tail; the
@@ -1152,21 +1377,119 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
                             params={'objective': 'quantile', 'alpha': 0.10,
                                     'metric': 'quantile'},
                             sample_weight=w_train, sample_weight_val=w_val)
+
+            # --- R2C-03 LGB_REFIT_FULL (default OFF -> block skipped) ---
+            # M3: D22's recency fix is asymmetric — the LSTM final-refits
+            # on ALL purged pre-holdout data while both LGB legs stop at
+            # folds[-1] train (ending at the 0.85 search-region quantile),
+            # shipping blind to the newest ~15% every retrain. Collective-
+            # early-stopping analog: the fold trainings above supply the
+            # round counts; both legs RETRAIN on final_refit's purge
+            # (label window completes on/before the holdout boundary,
+            # NaN-filtered) under the SAME LGB_MAX_ROWS/byte-budget
+            # most-recent-first cap, at those FIXED round counts with no
+            # early stopping (num_iterations in params overrides
+            # train_lgb's num_boost_round; no val set -> no early-stopping
+            # callback). Fail-soft: any refit failure falls back loudly
+            # to the fold boosters (the legacy artifact).
+            if _refit_full:
+                try:
+                    _r_mean = fixed_boost_rounds(
+                        getattr(booster, 'best_iteration', None),
+                        booster.current_iteration())
+                    _r_q10 = fixed_boost_rounds(
+                        getattr(q10, 'best_iteration', None),
+                        q10.current_iteration())
+                    _rf_idx = lgb_refit_indices(
+                        _valid_indices(tickers, ticker_boundaries,
+                                       seq_len),
+                        all_label_times, all_times, returns,
+                        get_holdout_boundary(all_times), max_rows)
+                    if _r_mean and _r_q10 and len(_rf_idx) >= 500:
+                        w_refit = None
+                        if w_train is not None:
+                            from sample_weights import fold_train_weights
+                            w_refit = fold_train_weights(
+                                all_tb_bars_by_fb.get(fb), _rf_idx,
+                                ticker_boundaries)
+                        del X_train
+                        X_train = None  # keeps the shared cleanup valid
+                        gc.collect()
+                        X_refit = gather_windows(
+                            all_scaled, _rf_idx,
+                            offsets).reshape(len(_rf_idx), -1)
+                        y_refit = returns[_rf_idx]
+                        print(f"[LGB-REFIT] full refit on {len(_rf_idx)} "
+                              f"purged pre-holdout rows at fixed rounds "
+                              f"mean={_r_mean} q10={_r_q10}")
+                        _new_mean = train_lgb(
+                            X_refit, y_refit,
+                            params={'num_iterations': _r_mean},
+                            sample_weight=w_refit)
+                        _new_q10 = train_lgb(
+                            X_refit, y_refit,
+                            params={'objective': 'quantile',
+                                    'alpha': 0.10, 'metric': 'quantile',
+                                    'num_iterations': _r_q10},
+                            sample_weight=w_refit)
+                        del X_refit
+                        gc.collect()
+                        # Both-or-nothing rebind: a q10-refit failure
+                        # raises BEFORE this line, so the except path
+                        # below can never ship a refit mean beside a
+                        # fold q10 — the fold pair stays intact unless
+                        # BOTH refits succeeded.
+                        booster, q10 = _new_mean, _new_q10
+                        # M4-floor: the floor below is recomputed from
+                        # the REFIT q10 on the original fold-val rows —
+                        # rows INSIDE the refit train window, so the
+                        # floor is in-sample; the caveat rides the q10
+                        # meta json via _r2c03_meta_extra (both save
+                        # paths). NOTE: q10 holdout coverage has NO
+                        # tool yet — scripts/reliability_report.py is the
+                        # META-calibration Brier/ECE report — so the
+                        # 10% +/- 3pp check is an open Jetson item.
+                        q10._r2c03_meta_extra = {
+                            'refit_full': True,
+                            'floor_source': 'refit_q10_on_fold_val',
+                            'floor_in_sample': True,
+                            'refit_rows': int(len(_rf_idx)),
+                            'fixed_rounds_mean': int(_r_mean),
+                            'fixed_rounds_q10': int(_r_q10)}
+                    else:
+                        print(f"[LGB-REFIT] skipped (rounds "
+                              f"mean={_r_mean} q10={_r_q10}, "
+                              f"{len(_rf_idx)} usable rows) — shipping "
+                              f"the fold boosters")
+                except Exception as e:
+                    print(f"[LGB-REFIT] full refit failed (non-fatal) — "
+                          f"shipping the fold boosters: {e}")
+            if save and _refit_full:
+                save_lgb_model(booster, prefix=prefix.rstrip('_'))
+                _mean_saved = True
+
             q10_val = q10.predict(X_val)
             floor = float(np.percentile(q10_val, 15))
             q10_floor_val = floor
             n_q10_val = int(len(q10_val))
             if save:
                 q10.save_model(f'{prefix}lgb_q10.txt')
+                _meta = {'alpha': 0.10, 'floor': round(floor, 6),
+                         'val_rows': int(len(q10_val))}
+                _meta.update(getattr(q10, '_r2c03_meta_extra', None) or {})
                 with open(f'{prefix}lgb_q10_meta.json', 'w') as f:
-                    json.dump({'alpha': 0.10, 'floor': round(floor, 6),
-                               'val_rows': int(len(q10_val))}, f)
+                    json.dump(_meta, f)
                 print(f"[LGB-Q10] tail model saved (veto floor {floor:+.4f}%)")
             else:
                 print(f"[LGB-Q10] tail model trained, save deferred to the "
                       f"gated atomic save (veto floor {floor:+.4f}%)")
         except Exception as e:
             print(f"[LGB-Q10] quantile training failed (non-fatal): {e}")
+            if save and _refit_full and not _mean_saved:
+                # the mean save was deferred for the refit — never lose it
+                print("[LGB-REFIT] saving the mean booster (deferred "
+                      "save; q10 path failed)")
+                save_lgb_model(booster, prefix=prefix.rstrip('_'))
 
         del X_train, X_val, all_scaled
         gc.collect()
@@ -1180,7 +1503,7 @@ def train_lgb_ensemble(prefix, scaler, cfg, all_features, all_returns_by_fb,
 
 def final_refit(cfg, returns, all_features, all_times, all_label_times,
                 tickers, ticker_boundaries, input_dim, fold_best_epochs,
-                fold_sharpes):
+                fold_sharpes, seed=None):
     """HYPERSEARCH_V3 (D22 / B12.1): ONE final refit of the winning config
     on ALL pre-holdout data.
 
@@ -1192,6 +1515,11 @@ def final_refit(cfg, returns, all_features, all_times, all_label_times,
     SWA tail soup (uniform average of the LAST SOUP_K epoch checkpoints).
     Returns (state, scaler, info) or None — the caller falls back loudly
     to the fold-max checkpoint; a refit failure must NEVER kill the run.
+
+    seed (R2C-04 / L3, None = legacy unseeded): derived TRAINER_SEED
+    sub-seed — seeds torch init/dropout and the epoch batch permutations
+    so two refits at the same seed byte-compare (the FR-02 / FR-13
+    determinism prerequisite; verified as a Jetson step).
     """
     try:
         epochs = refit_epoch_budget(fold_best_epochs, MAX_EPOCHS)
@@ -1226,8 +1554,15 @@ def final_refit(cfg, returns, all_features, all_times, all_label_times,
 
         use_amp = device.type == 'cuda'
         eff_batch_size = cfg['batch_size']
+        _repairs = _training_repairs()  # R2C-04 TRAINING_REPAIRS_V1 (L5)
+        # R2C-04 (L3): None = legacy unseeded; seeding sits INSIDE the
+        # retry loop so an OOM retry replays the same init stream.
+        refit_rng = (np.random.default_rng(int(seed))
+                     if seed is not None else None)
         while True:
             try:
+                if seed is not None:
+                    torch.manual_seed(int(seed))
                 model = RegressionLSTM(input_dim, cfg['hidden_dim'],
                                        cfg['num_layers'], cfg['dropout'],
                                        cfg['n_heads']).to(device)
@@ -1244,6 +1579,14 @@ def final_refit(cfg, returns, all_features, all_times, all_label_times,
                     # exists here, so the refit runs at constant LR.
                     sched = None
                 grad_scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+                if _repairs:
+                    # TRAINING_REPAIRS_V1 (L5): snapshot pristine init so
+                    # the memory probe leaves no trace (legacy: the probe's
+                    # unclipped optimizer step trained the model before
+                    # epoch 0).
+                    _init_snap = {k: v.detach().cpu().clone()
+                                  for k, v in model.state_dict().items()}
 
                 # One probe batch to test if this config fits in memory
                 # (same pattern as the fold loop's first-batch probe)
@@ -1262,6 +1605,19 @@ def final_refit(cfg, returns, all_features, all_times, all_label_times,
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
                 del xb, yb, pred, raw_loss, weights, loss
+                if _repairs:
+                    # L5: restore init weights + fresh optimizer /
+                    # scheduler / grad-scaler — epoch 0 starts clean.
+                    model.load_state_dict(_init_snap)
+                    optimizer = optim.Adam(model.parameters(),
+                                           lr=cfg['learning_rate'],
+                                           weight_decay=cfg['weight_decay'])
+                    if cfg.get('scheduler') == 'cosine':
+                        sched = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                            optimizer, T_0=20, T_mult=2)
+                    grad_scaler = torch.amp.GradScaler('cuda',
+                                                       enabled=use_amp)
+                    del _init_snap
                 break  # fits in memory
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                 try:
@@ -1283,7 +1639,10 @@ def final_refit(cfg, returns, all_features, all_times, all_label_times,
         snaps: list[dict] = []
         for epoch in range(epochs):
             model.train()
-            perm = np.random.permutation(n_train)
+            # R2C-04 (L3): refit_rng None = legacy ambient-RNG shuffle
+            perm = (refit_rng.permutation(n_train)
+                    if refit_rng is not None
+                    else np.random.permutation(n_train))
             for i in range(0, n_train, eff_batch_size):
                 bi = perm[i:i + eff_batch_size]
                 xb = torch.from_numpy(
@@ -1339,7 +1698,10 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                         q10_booster=None, q10_floor=None, lstm_weight=None):
     """Score the winning config ONCE on the untouched final time slice.
 
-    Returns {'sharpe', 'dsr', 'dsr_min', 'n_trades', 'n_rows'} or None.
+    Returns None, or a dict with keys: sharpe, dsr, dsr_min, n_trades,
+    n_eff, n_eff_v2, status, min_trl, n_trials_pool, u_bar_mean,
+    trade_returns, n_rows, hit_rate, pred_deciles — plus certified,
+    lstm_weight, q10_vetoed and cs_rank_ic when the blend path ran.
 
     lgb_booster/q10_booster/q10_floor/lstm_weight (all None = legacy raw-
     LSTM gate, byte-identical): under HYPERSEARCH_V3 the certificate is
@@ -1415,6 +1777,9 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                 if do_q10:
                     long_veto = q10_preds < q10_floor
                     n_vetoed = int(long_veto.sum())
+                # R2C-07 (FR-05): keep the raw-LSTM leg for the
+                # cross-sectional rank-IC certificate lines below.
+                lstm_preds = preds.copy()
                 preds = blend_preds
                 blended = True
             except Exception as e:
@@ -1432,6 +1797,32 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
         trade_returns, entry_pos = simulate_trades(
             preds, y, threshold, fb, TXN_COST_PCT.get(asset_type, 0.6),
             return_entries=True, block_ids=hb, long_veto=long_veto)
+
+        # R2C-05 / FR-01 instrumentation (ships direct): quantile vs fixed
+        # boundary side-by-side with holdout row/trade counts, so the
+        # FIXED_HOLDOUT_DAYS flip can be judged from a legacy run per book
+        # (06 plan §4.2: require >= 10 calendar-effective trades at 60d
+        # before any window experiment). Row counts are pre-NaN-filter
+        # valid rows past each boundary; scored rows/trades are the
+        # ACTIVE boundary's.
+        try:
+            _fd = _fixed_holdout_days()
+            _ref_days = 60.0 if _fd is None else float(_fd)
+            _b_q = holdout_boundary(all_times,
+                                    holdout_fraction=HOLDOUT_FRACTION)
+            _b_f = holdout_boundary(all_times, fixed_days=_ref_days)
+            _valid_t = all_times[_valid_indices(tickers, ticker_boundaries,
+                                                seq_len)]
+            print(f"  [HOLDOUT] FR-01 boundary quantile={_b_q} "
+                  f"({int((_valid_t > _b_q).sum())} rows) vs "
+                  f"fixed-{_ref_days:g}d={_b_f} "
+                  f"({int((_valid_t > _b_f).sum())} rows); active="
+                  f"{'fixed' if _fd is not None else 'quantile'}, "
+                  f"scored rows={len(holdout_idx)}, "
+                  f"trades={len(trade_returns)}")
+        except Exception as _fe:
+            print(f"  [HOLDOUT] FR-01 boundary instrumentation failed "
+                  f"({_fe})")
 
         # Effective-n deflation: the DSR null assumes n INDEPENDENT trade-SR
         # draws. With overlapping forward-window labels the effective count
@@ -1631,6 +2022,52 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
             report['certified'] = 'blend'
             report['lstm_weight'] = round(float(lstm_weight), 4)
             report['q10_vetoed'] = n_vetoed
+            # R2C-07 (FR-05): cross-sectional rank-IC certificate lines
+            # for the LSTM leg, the LGB leg, and the deployed blend —
+            # the go/no-go evidence for FR-06 (strongly-positive LGB
+            # rank IC => deprioritize the LambdaRankIC port; near-zero /
+            # negative => the in-house justification to build it).
+            # Fail-soft: an IC failure never degrades the certificate.
+            try:
+                _gids = all_times[holdout_idx]
+
+                def _ic_round(r):
+                    return {
+                        'mean': (round(r['mean'], 4)
+                                 if r['mean'] is not None else None),
+                        'se': (round(r['se'], 4)
+                               if r['se'] is not None else None),
+                        'n_groups': r['n_groups'],
+                        'n_skipped': r['n_skipped'],
+                        'splits': [{'mean': (round(s['mean'], 4)
+                                             if s['mean'] is not None
+                                             else None),
+                                    'n_groups': s['n_groups']}
+                                   for s in r['splits']],
+                    }
+
+                _cs = {'lstm': _ic_round(cs_rank_ic(lstm_preds, y, _gids)),
+                       'lgb': _ic_round(cs_rank_ic(lgb_preds, y, _gids)),
+                       'blend': _ic_round(cs_rank_ic(preds, y, _gids))}
+                for _leg in ('lstm', 'lgb', 'blend'):
+                    _r = _cs[_leg]
+                    _sub = '/'.join(
+                        ('na' if s['mean'] is None else f"{s['mean']:.3f}")
+                        for s in _r['splits'])
+                    print(f"  [HOLDOUT] FR-05 cs-rank-IC {_leg}: "
+                          f"mean={_r['mean']} se={_r['se']} "
+                          f"n_groups={_r['n_groups']} "
+                          f"(skipped {_r['n_skipped']} thin) "
+                          f"splits=[{_sub}]")
+                if asset_type == 'crypto':
+                    print("  [HOLDOUT] FR-05 caveat: crypto cross-sections "
+                          "are ~6 names — per-timestamp rank ICs carry "
+                          "wide CIs; read the pooled mean/SE and the "
+                          "sub-period signs, never single groups")
+                report['cs_rank_ic'] = _cs
+            except Exception as _ce:
+                print(f"  [HOLDOUT] FR-05 cs-rank-IC failed (non-fatal): "
+                      f"{_ce}")
         return report
     except Exception as e:
         print(f"  [HOLDOUT] evaluation failed: {e} — gate fails closed")
@@ -1763,6 +2200,12 @@ def main():
 
     db_path = f'{prefix}v2_study.db'
     study_name = f'{prefix}v2_search'
+    # R2C-04 (L3): base training seed — None = legacy unseeded everywhere
+    _seed_base = _trainer_seed()
+    if _seed_base is not None:
+        print(f"[SEED] TRAINER_SEED={_seed_base} — torch init/dropout, "
+              f"batch shuffles, TPESampler and the final refit are "
+              f"derived-seeded (objective_utils.derive_seed)")
 
     if args.fresh and os.path.exists(db_path):
         # Instrumentation (B03.2): persist the deletion event — the trials
@@ -1838,7 +2281,7 @@ def main():
                 trials_since_improvement = 0
                 tag = " ** BEST **"
 
-        fb = cfg.get('forward_bars', 12)
+        fb = cfg.get('forward_bars', 24)
         th = cfg.get('trade_threshold', '')
         avg_s = trial.user_attrs.get('avg_sharpe', score)
         std_s = trial.user_attrs.get('std_sharpe', 0)
@@ -1880,7 +2323,11 @@ def main():
         direction='maximize',
         pruner=MedianPruner(n_startup_trials=PRUNE_STARTUP_TRIALS,
                             n_warmup_steps=PRUNE_WARMUP_EPOCHS),
-        sampler=optuna.samplers.TPESampler(n_startup_trials=PRUNE_STARTUP_TRIALS),
+        sampler=optuna.samplers.TPESampler(
+            n_startup_trials=PRUNE_STARTUP_TRIALS,
+            # R2C-04 (L3): seed=None is the constructor default (legacy)
+            seed=(derive_seed(_seed_base, study_name, 'sampler')
+                  if _seed_base is not None else None)),
     )
 
     prior_trials = len(study.trials)
@@ -1916,7 +2363,8 @@ def main():
                                     tickers, ticker_boundaries, input_dim,
                                     _state_cache, asset_type=asset_type,
                                     has_multi_horizon=has_multi_horizon,
-                                    adaptive_space=adaptive_space)
+                                    adaptive_space=adaptive_space,
+                                    study_name=study_name)
     study.optimize(objective_fn, n_trials=num_trials, callbacks=[trial_callback],
                    catch=(Exception,))
 
@@ -2016,7 +2464,9 @@ def main():
                 best_cfg, returns, all_features, all_times, all_label_times,
                 tickers, ticker_boundaries, input_dim,
                 best_state_holder.get('fold_best_epochs') or [],
-                best_state_holder.get('fold_sharpes') or [])
+                best_state_holder.get('fold_sharpes') or [],
+                seed=(derive_seed(_seed_base, study_name, 'refit')
+                      if _seed_base is not None else None))
             if _refit:
                 ship_state, ship_scaler, refit_info = _refit
             else:
@@ -2046,8 +2496,25 @@ def main():
                                            fit_blend_weight_v2,
                                            smooth_across_retrains)
                     _booster = lgb_pack[0]
-                    rows = best_state_holder['oof_rows'][-1]
-                    lstm_oof = best_state_holder['oof_preds'][-1]
+                    rows = np.asarray(best_state_holder['oof_rows'][-1])
+                    lstm_oof = np.asarray(
+                        best_state_holder['oof_preds'][-1])
+                    # M4 guard (R2C-02b): under HYPERSEARCH_V3 without
+                    # OBJECTIVE_V3 the trial folds were built with
+                    # purge_val_labels=False, so folds[-1] val rows can
+                    # carry label windows crossing INTO the holdout the
+                    # certificate then scores — purge them so the
+                    # deployed w is never fitted on holdout returns.
+                    if not _objective_v3():
+                        _hb = get_holdout_boundary(all_times)
+                        _keep = all_label_times[rows] <= _hb
+                        if not np.all(_keep):
+                            print(f"[BLEND] M4 guard: purged "
+                                  f"{int((~_keep).sum())}/{len(rows)} "
+                                  f"blend-fit rows whose label windows "
+                                  f"cross the holdout boundary")
+                            rows = rows[_keep]
+                            lstm_oof = lstm_oof[_keep]
                     y_fit = returns[rows]
                     _sl = best_cfg['seq_len']
                     _off = np.arange(-_sl, 0)
@@ -2060,12 +2527,68 @@ def main():
                         _X = gather_windows(_scaled_fit, _ri,
                                             _off).reshape(len(_ri), -1)
                         lgb_oof[i:i + len(_ri)] = _booster.predict(_X)
+                    # M2 (R2C-02c): the stale fit consumes the fold-souped
+                    # trial checkpoint's val preds under the FOLD scaler,
+                    # while the shipped LSTM is ship_state under
+                    # ship_scaler (lgb_oof above is already ship_scaler-
+                    # based — mixed inputs). Re-predict folds[-1] val rows
+                    # with the SHIPPING state+scaler so both legs' fit
+                    # inputs match the deployed predictor; stale-w vs
+                    # refit-w are logged side by side, and the deployment
+                    # source flips only under default-OFF
+                    # BLEND_FIT_ON_REFIT (Jetson A/B first — 06 plan
+                    # §4.11). Reuses _scaled_fit (one transform).
+                    lstm_oof_refit = None
+                    try:
+                        _rmdl = RegressionLSTM(
+                            input_dim, best_cfg['hidden_dim'],
+                            best_cfg['num_layers'], best_cfg['dropout'],
+                            best_cfg['n_heads']).to(device)
+                        _rmdl.load_state_dict(ship_state)
+                        _rmdl.eval()
+                        _rp = []
+                        _r_amp = device.type == 'cuda'
+                        with torch.inference_mode():
+                            for i in range(0, len(rows), 1024):
+                                _ri = rows[i:i + 1024]
+                                _xb = torch.from_numpy(gather_windows(
+                                    _scaled_fit, _ri, _off)).to(device)
+                                with torch.amp.autocast('cuda',
+                                                        enabled=_r_amp):
+                                    _vo = _rmdl(_xb)
+                                _rp.append(_vo.cpu().numpy())
+                        lstm_oof_refit = np.concatenate(_rp)
+                        del _rmdl, _rp
+                    except Exception as _re:
+                        print(f"[BLEND] refit-state val inference failed "
+                              f"({_re}) — stale-w only")
                     del _scaled_fit
                     gc.collect()
                     # B12 BINDING: shrink_to=0.5, shrink_lambda=0.5 defaults
-                    fit = fit_blend_weight_v2(
+                    fit_stale = fit_blend_weight_v2(
                         lstm_oof, lgb_oof, y_fit,
                         forward_bars=best_cfg.get('forward_bars', 24))
+                    fit_refit = None
+                    if lstm_oof_refit is not None:
+                        fit_refit = fit_blend_weight_v2(
+                            lstm_oof_refit, lgb_oof, y_fit,
+                            forward_bars=best_cfg.get('forward_bars', 24))
+                        print(f"[BLEND] M2 side-by-side: stale-w="
+                              f"{fit_stale['w']:.4f} "
+                              f"(raw={fit_stale['w_raw']}) vs refit-w="
+                              f"{fit_refit['w']:.4f} "
+                              f"(raw={fit_refit['w_raw']})")
+                    try:
+                        from strategy_config import (BLEND_FIT_ON_REFIT
+                                                     as _fit_on_refit)
+                    except Exception:
+                        _fit_on_refit = False
+                    if _fit_on_refit and fit_refit is not None:
+                        fit = fit_refit
+                        print("[BLEND] BLEND_FIT_ON_REFIT ON — deploying "
+                              "the refit-based weight")
+                    else:
+                        fit = fit_stale
                     # Sharpe-grid DIAGNOSTIC (logged only, never deployed)
                     w_grid = fit_blend_weight(
                         lstm_oof, lgb_oof, y_fit, objective='sharpe',
@@ -2089,6 +2612,15 @@ def main():
                         'w_prev': (round(float(w_prev), 4)
                                    if w_prev is not None else None),
                         'w_sharpe_grid': round(float(w_grid), 4),
+                        # R2C-02c instrumentation: both candidate fits +
+                        # which one was deployed (Jetson A/B readout).
+                        'w_stale': round(float(fit_stale['w']), 4),
+                        'w_refit': (round(float(fit_refit['w']), 4)
+                                    if fit_refit is not None else None),
+                        'fit_source': ('refit'
+                                       if (_fit_on_refit
+                                           and fit_refit is not None)
+                                       else 'stale'),
                     }
                     print(f"[BLEND] w_raw={blend_diag['w_raw']} "
                           f"se={blend_diag['se']} "
@@ -2105,13 +2637,92 @@ def main():
                               f"near-encompassed; if this repeats on BOTH "
                               f"books, dropping torch from the live loops "
                               f"is the prize (do not auto-drop)")
+                    # H2 (R2C-02d): the searched trade_threshold was
+                    # scored on raw-LSTM fold preds but serves against
+                    # the variance-compressed blend. Re-score it on the
+                    # BLENDED folds[-1] val preds over the v3 grid; the
+                    # reselected value DEPLOYS (mutating best_cfg before
+                    # certification, so cert == deploy) only under
+                    # default-OFF BLEND_THRESHOLD_RESELECT — otherwise
+                    # this is the side-by-side log the Jetson A/B reads.
+                    try:
+                        from blend_fit import reselect_trade_threshold
+                        _lstm_leg = (lstm_oof_refit
+                                     if lstm_oof_refit is not None
+                                     else lstm_oof)
+                        _blend_val = (float(lstm_weight) * _lstm_leg
+                                      + (1.0 - float(lstm_weight))
+                                      * lgb_oof)
+                        _tt_bids = (ticker_block_ids(rows,
+                                                     ticker_boundaries)
+                                    if _objective_v3() else None)
+                        _old_thr = float(best_cfg['trade_threshold'])
+
+                        def _tt_score(p, yy, th, _b=_tt_bids):
+                            return compute_sharpe(
+                                p, yy, th, forward_bars=_fb,
+                                asset_type=asset_type, block_ids=_b)
+
+                        _new_thr, _new_sc = reselect_trade_threshold(
+                            _blend_val, y_fit,
+                            v3_trade_threshold_range(asset_type),
+                            _old_thr, _tt_score)
+                        _cost = TXN_COST_PCT.get(asset_type, 0.6)
+                        _n_old = len(simulate_trades(
+                            _blend_val, y_fit, _old_thr, _fb, _cost,
+                            block_ids=_tt_bids))
+                        _n_new = len(simulate_trades(
+                            _blend_val, y_fit, _new_thr, _fb, _cost,
+                            block_ids=_tt_bids))
+                        try:
+                            from strategy_config import (
+                                BLEND_THRESHOLD_RESELECT as _tt_deploy)
+                        except Exception:
+                            _tt_deploy = False
+                        print(f"[BLEND] threshold reselect (H2): "
+                              f"searched={_old_thr} "
+                              f"(n_trades={_n_old} on blended val) -> "
+                              f"blend-optimal={_new_thr} "
+                              f"(n_trades={_n_new}, "
+                              f"sharpe={_new_sc:.2f}) "
+                              f"[{'DEPLOYED' if _tt_deploy else 'logged only'}]")
+                        blend_diag['threshold_searched'] = _old_thr
+                        blend_diag['threshold_blend'] = _new_thr
+                        blend_diag['n_trades_searched'] = _n_old
+                        blend_diag['n_trades_blend'] = _n_new
+                        blend_diag['threshold_deployed'] = (
+                            'blend' if _tt_deploy else 'searched')
+                        if _tt_deploy:
+                            best_cfg['trade_threshold'] = float(_new_thr)
+                    except Exception as _te:
+                        print(f"[BLEND] threshold reselect failed "
+                              f"(non-fatal): {_te}")
                 else:
                     print('[BLEND] LGB leg or OOF arrays unavailable — no '
-                          'blend certificate (raw-LSTM gate)')
+                          'fitted blend weight')
             except Exception as e:
                 lstm_weight = None
-                print(f"[BLEND] blend fit failed ({e}) — no blend "
-                      f"certificate (raw-LSTM gate)")
+                print(f"[BLEND] blend fit failed ({e}) — no fitted "
+                      f"blend weight")
+            # H1 (R2C-02a): cert == deploy. Whenever the boosters WILL
+            # ship, predict_now/backtest blend at cfg.get('lstm_weight',
+            # 0.6) even if the fit above failed — so the certificate and
+            # the shipped config must resolve a None weight to the SAME
+            # default (blend_fit.DEFAULT_LSTM_WEIGHT, the certificate-
+            # visible home of the pending B12.2 0.6->0.5 owner question).
+            # Raw-LSTM certificates remain only when NO boosters ship.
+            try:
+                from blend_fit import (effective_lstm_weight,
+                                       DEFAULT_LSTM_WEIGHT)
+                _ship = bool(lgb_pack and lgb_pack[0] is not None)
+                if _ship and lstm_weight is None:
+                    print(f"[BLEND] H1 parity: no fitted weight but "
+                          f"boosters ship — certifying AND deploying the "
+                          f"default w={DEFAULT_LSTM_WEIGHT} "
+                          f"(cert==deploy)")
+                lstm_weight = effective_lstm_weight(lstm_weight, _ship)
+            except Exception as e:
+                print(f"[BLEND] H1 parity resolution failed ({e})")
 
         # Winner's-curse instrumentation (B12, direct-ship)
         _fs = best_state_holder.get('fold_sharpes') or []
@@ -2120,6 +2731,43 @@ def main():
                   f"Sharpe {np.mean(_fs):.2f} (best-fold max "
                   f"{np.max(_fs):.2f} inflates by ~0.85*std="
                   f"{0.85 * np.std(_fs):.2f} over correlated folds)")
+
+        # R2C-07 (FR-05): gate-time per-fold LSTM cross-sectional rank IC
+        # from the winner's OOF fold-val predictions (print-only, ships
+        # direct — no report keys, no flag; works in legacy mode too).
+        try:
+            _oof_rows_ic = best_state_holder.get('oof_rows') or []
+            _oof_preds_ic = best_state_holder.get('oof_preds') or []
+            if _oof_rows_ic and _oof_preds_ic:
+                _fb_ic = best_cfg.get('forward_bars', 24)
+                _rk_ic = (('tb', _fb_ic)
+                          if best_cfg.get('target_kind') == 'tb' else _fb_ic)
+                _ret_ic = all_returns_by_fb.get(_rk_ic)
+                if _ret_ic is None:
+                    _ret_ic = all_returns_by_fb.get(_fb_ic)
+                if _ret_ic is None:
+                    _ret_ic = next(v for k, v in all_returns_by_fb.items()
+                                   if not isinstance(k, tuple))
+                _fold_ids_ic = (best_state_holder.get('oof_fold_ids')
+                                or list(range(len(_oof_rows_ic))))
+                for _fi, _rws, _fps in zip(_fold_ids_ic, _oof_rows_ic,
+                                           _oof_preds_ic):
+                    _rws = np.asarray(_rws)
+                    _ric = cs_rank_ic(np.asarray(_fps), _ret_ic[_rws],
+                                      all_times[_rws])
+                    _m = ('n/a' if _ric['mean'] is None
+                          else f"{_ric['mean']:.4f}")
+                    _s = ('n/a' if _ric['se'] is None
+                          else f"{_ric['se']:.4f}")
+                    print(f"[FR-05] fold {_fi} LSTM cs-rank-IC mean={_m} "
+                          f"se={_s} n_groups={_ric['n_groups']} "
+                          f"(skipped {_ric['n_skipped']} thin groups)")
+                if asset_type == 'crypto':
+                    print("[FR-05] caveat: crypto cross-sections are ~6 "
+                          "names — per-fold rank ICs carry wide CIs; read "
+                          "the mean/SE, not single timestamps")
+        except Exception as _ie:
+            print(f"[FR-05] per-fold cs-rank-IC failed (non-fatal): {_ie}")
 
         # --- FINAL HOLDOUT GATE -------------------------------------------
         # The winner was selected, early-stopped, AND scored on the same
@@ -2173,9 +2821,14 @@ def main():
             }
             # T1: the fitted blend weight ships in the config — the key
             # predict_now.py / backtest.py already read (default 0.6).
+            # R2C-02a: after the H1 parity resolution above, lstm_weight
+            # is non-None whenever boosters ship — the config carries the
+            # SAME effective weight the certificate scored (cert==deploy,
+            # including the blend-fit failure path's default).
             if _v3 and lstm_weight is not None:
                 config['lstm_weight'] = round(float(lstm_weight), 4)
-                config['blend_diag'] = blend_diag
+                if blend_diag is not None:
+                    config['blend_diag'] = blend_diag
             if refit_info:
                 config['refit'] = refit_info
             # Shadow mode: with a champion already deployed, the gated
@@ -2229,11 +2882,19 @@ def main():
                     extra_artifacts[f'{save_prefix}lgb_q10.txt'] = \
                         (lambda p, b=_q10b: b.save_model(p))
 
-                    def _write_q10_meta(p, fl=_q10f, nv=_n_q10):
+                    def _write_q10_meta(p, fl=_q10f, nv=_n_q10,
+                                        extra=getattr(_q10b,
+                                                      '_r2c03_meta_extra',
+                                                      None)):
+                        # R2C-03: under LGB_REFIT_FULL the booster carries
+                        # the in-sample-floor caveat; flag OFF -> extra is
+                        # None and the json is byte-identical to legacy.
+                        _m = {'alpha': 0.10,
+                              'floor': round(fl, 6),
+                              'val_rows': int(nv or 0)}
+                        _m.update(extra or {})
                         with open(p, 'w') as f:
-                            json.dump({'alpha': 0.10,
-                                       'floor': round(fl, 6),
-                                       'val_rows': int(nv or 0)}, f)
+                            json.dump(_m, f)
                     extra_artifacts[f'{save_prefix}lgb_q10_meta.json'] = \
                         _write_q10_meta
 
@@ -2252,6 +2913,28 @@ def main():
                                    all_times, all_label_times,
                                    tickers, ticker_boundaries,
                                    all_tb_bars_by_fb=all_tb_bars_by_fb)
+
+            # R2C-07 (FR-08): retrain-gain ledger — score the incumbent
+            # stack (champion artifacts on a --shadow challenger save,
+            # .prev on a same-slot save) against the fresh stack on the
+            # trailing week of purged bars, appending one paired row to
+            # the adaptive-state ledger. Runs AFTER the boosters land in
+            # both modes. Fail-soft, measurement-only — never blocks a
+            # save; >=12 weekly rows feed the B03.3 IM block-t (owner
+            # cadence decision).
+            try:
+                from retrain_ledger import record_retrain_gain
+                # state=adaptive_state: update_after_search re-saves this
+                # very object further down — appending into a freshly
+                # loaded copy would be clobbered by that later save.
+                record_retrain_gain(
+                    prefix, save_prefix, asset_type,
+                    all_features, feature_cols, all_returns_by_fb,
+                    all_times, tickers, ticker_boundaries,
+                    state=adaptive_state)
+            except Exception as _le:
+                print(f"[LEDGER] retrain-gain recording failed "
+                      f"(non-fatal): {_le}")
     elif best_state_holder['state'] is not None:
         print(f"\nModel NOT saved: new best {new_score:.3f} <= existing {existing_score:.3f}")
         print("Existing model preserved (higher score).")

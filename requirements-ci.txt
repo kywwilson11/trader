@@ -1,6 +1,7 @@
 # Jetson-parity CI dependencies — installed by the py3.10 CI leg via
 #   pip install -r requirements-ci.txt
-# Mirrors requirements-jetson.txt pins so ONE non-Jetson environment runs the
+# Mirrors requirements-jetson.txt pins — one known divergence, numba>=0.60 here vs
+# >=0.63 there — so ONE non-Jetson environment runs the
 # production numpy<2 / pandas 2.x / lightgbm / alpaca-py stack. CPU-only torch
 # is installed by a separate workflow step (--index-url). The py3.12 "modern"
 # leg keeps its own unpinned inline install in ci.yml.
@@ -21,5 +22,6 @@ requests>=2.31
 PyYAML>=6.0
 bidask>=2.1
 lightgbm>=4.0
+pyarrow          # parquet engine: run_pipeline imports it directly, 7 modules read/write parquet
 
 pytest>=7.0

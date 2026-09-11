@@ -20,9 +20,11 @@ Point-in-time discipline: the rolling estimate at bar t uses only bars in
 [t-window+1, t] (pandas .rolling is strictly trailing), so stamping it during
 the harvest introduces no look-ahead — exactly like the _DV30 stamp.
 
-Scope (2026-07): STOCKS ONLY — scripts/harvest_stock_data.py is the sole site
-that stamps Eff_Spread_Pct. The crypto harvest stamps no spread, so the crypto
-book still prices the flat fees.FLAT_SPREAD_PCT['crypto'] haircut in
+Scope: scripts/harvest_stock_data.py is the always-on stamp site. The crypto
+harvest calls liquidity.stamp_crypto_spreads, which is a no-op unless
+TRADER_CRYPTO_SPREAD_STAMP=1, so by DEFAULT the crypto store still carries no
+Eff_Spread_Pct and the crypto book prices the flat
+fees.FLAT_SPREAD_PCT['crypto'] haircut in
 backtest.py and meta_label.py; extending the stamp to crypto is a model-facing
 owner decision (re-harvest + promotion gate). Note also that EDGE estimates
 the EFFECTIVE spread (what trades actually paid) while the live gate prices
@@ -88,7 +90,6 @@ def _finalize_spread_pct(pct, floor_pct, cap_pct, fill_pct):
     BEFORE the inf handling so +inf lands at the CAP, -inf at the floor
     (D40 ordering fix), then NaN -> fill_pct (the flat fallback).
     Returns (pct, raw_nan, at_floor, at_cap)."""
-    import numpy as np
     if SPREAD_FILL_V2:
         raw_nan = int(pct.isna().sum())
         at_floor = int((pct < floor_pct).sum())   # NaN/-inf handled by clip

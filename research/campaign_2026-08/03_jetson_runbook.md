@@ -157,6 +157,11 @@ challenger-targeted policy gate → the v2 shadow test. That chain IS the promot
   adjudicating DERISK_STACK_V2 (min-aggregation does NOT launder it); (4) split the BTC-spillover
   survivor-#10 ruling three ways (alt-alpha lags: NO; crypto_trend gate: wire per B23;
   contemporaneous BTC context columns: preset repair).
+  - *Annotation added 2026-09-08 (the list above is left as written on 2026-08-20):* **ask (3)
+    pseudo-CAPE is RULED and CLOSED as of 2026-08-22** — removal approved and implemented
+    (`macro_indicators.py` now always returns `cape=None`; ruling recorded in
+    `research/KILL_LIST.md` PENDING OWNER ASKS; removed block archived in
+    `08_removed_code.md` IA-1.1). Asks (1), (2), (4) remain open.
 - **Data-feed ask:** BTC-dominance regime input — blocked on your new-data-dependency ruling.
 
 ---

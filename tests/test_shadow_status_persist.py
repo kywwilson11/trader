@@ -1,5 +1,5 @@
 """Tests for shadow-status persistence (Phase 2.2 producer side —
-research/gui_review_2026-07.md §7 challenger cell / promotion story).
+research/reviews_2026-07/gui_review_2026-07.md §7 challenger cell / promotion story).
 
 Exercises evaluate_and_maybe_promote's new {prefix}shadow_status.json
 write on every decision path (insufficient_n from no rows, insufficient_n

@@ -11,8 +11,9 @@ Floors now only guard against degenerate sub-spread stops; ATR does the
 work. TP ratio lowered to 2:1 accordingly.
 
 Related constants defined elsewhere (siblings — check them when editing here):
-  - fees.FLAT_SPREAD_PCT (canonical flat spread) and its copy backtest.SPREAD_PCT
-    (drift guarded by tests/test_review_b10.py).
+  - fees.FLAT_SPREAD_PCT (canonical flat spread) and its TWO copies,
+    backtest.SPREAD_PCT and meta_label._gen_meta_rows' inline spread literal
+    (both drift-guarded by tests/test_review_b10.py).
   - cooldown_bars = max(1, ceil(cooldown_min/60)) is derived verbatim in BOTH
     meta_label.py and backtest.py (drift guarded by tests/test_improve_stratcfg.py).
 """
@@ -181,8 +182,8 @@ KISH_RHO_FLOOR = {'crypto': 0.5, 'stock': 0.25}
 # scores CHALLENGER artifacts on the champion's book data (same thresholds: net Sharpe
 # > 0, DSR >= DSR_MIN, n >= 10); exit 3 then means HOLD the challenger — champion and
 # its .prev are never touched, the challenger keeps shadowing, and the verdict lands in
-# {slot}_policy_gate.json for the shadow-side promotion pre-flight (future shadow.py
-# change; see backtest.py docstring). Gate-behavior change: flip on the Jetson only.
+# {slot}_policy_gate.json for the shadow-side promotion pre-flight (consumed by
+# shadow._gate_preflight). Gate-behavior change: flip on the Jetson only.
 GATE_TARGETS_CHALLENGER = False
 
 # --- Long-only objective scoring (2026-07 review, DEFAULT OFF) ---
@@ -209,7 +210,8 @@ OBJECTIVE_LONG_ONLY = False
 # written to disk until the gate passes; (3) blend_fit.fit_blend_weight_v2 (NNLS
 # estimator + label-overlap SE significance gate + Diebold-Shin shrink 0.5/0.5,
 # cross-retrain smoothing vs the champion's previous weight) writes
-# config['lstm_weight'] — the key predict_now.py:405 / backtest.py already read;
+# config['lstm_weight'] — the key predict_now.get_live_prediction / backtest.py
+# already read;
 # (4) the holdout DSR certificate is issued against the BLENDED predictor with the
 # q10 tail veto applied to long entries — the certified predictor IS the deployed
 # predictor (the ~10-15 min refit runs sequentially under the existing GPU lock;
@@ -222,6 +224,56 @@ OBJECTIVE_LONG_ONLY = False
 # trade_threshold Optuna distribution — reusing an old study DB would make Optuna
 # reject the changed distribution; the study reset is mandatory, not optional.
 HYPERSEARCH_V3 = False
+
+# --- Blend-coherence sub-flags (2026-08 R2-C packet R2C-02, defects M2 + H2) ---
+# Both act ONLY inside the HYPERSEARCH_V3 save path (inert while it is False) and
+# ride Chain-2's single gotcha-#2 study-reset event — never a reset of their own.
+# BLEND_FIT_ON_REFIT — OFF (default): the DEPLOYED lstm_weight comes from the
+#   legacy "stale" fit (the fold-souped trial checkpoint's val preds under the
+#   FOLD scaler vs ship-scaler LGB preds — mixed inputs, defect M2); the
+#   refit-state fit (ship_state + ship_scaler over folds[-1] val rows, both legs
+#   under ONE scaler) is still computed and logged side-by-side ("[BLEND] M2"
+#   line + blend_diag w_stale/w_refit). ON: the refit-based fit becomes the
+#   deployment source. Flip only after one Jetson cycle's side-by-side log and a
+#   non-inferior identical-holdout blend DSR (06 plan §4.11).
+BLEND_FIT_ON_REFIT = False
+# BLEND_THRESHOLD_RESELECT — OFF (default): trade_threshold stays the
+#   Optuna-searched value (selected on raw-LSTM fold predictions — defect H2:
+#   the served blend is variance-compressed, so the searched threshold implies a
+#   different trade frequency than every trial scored); the blend-optimal
+#   threshold and old/new n_trades are still logged ("[BLEND] threshold" line).
+# ON: trade_threshold is re-selected on the BLENDED folds[-1] val predictions
+#   over objective_utils.v3_trade_threshold_range's grid BEFORE certification —
+#   certificate and shipped config carry the reselected value (cert == deploy).
+#   Same flip evidence as BLEND_FIT_ON_REFIT.
+BLEND_THRESHOLD_RESELECT = False
+
+# --- LGB full refit (2026-08 R2-C packet R2C-03, defects M3 + M4-floor) ---
+# OFF (default): both LGB legs (mean + q10 tail veto) ship trained only on
+#   folds[-1] train — a window ENDING at the 0.85 quantile of the search region
+#   — while the LSTM final-refits on ALL purged pre-holdout data (M3: the leg
+#   the code calls "the stronger learner at this data size" deploys blind to
+#   the newest ~15% of the window every retrain), and the q10 veto floor is
+#   calibrated on the same val slice the booster early-stopped on (M4).
+# ON: fold training supplies each leg's best_iteration ONLY; both boosters are
+#   then RETRAINED on all purged pre-holdout rows (final_refit's purge,
+#   NaN-filtered, identical LGB_MAX_ROWS / LGB_X_BYTE_BUDGET most-recent-first
+#   cap) at that FIXED round count with no early stopping — the collective-
+#   early-stopping analog of the LSTM refit. The veto floor is recomputed as
+#   percentile-15 of the REFIT q10's predictions on the original fold-val rows
+#   (in-sample for the refit — caveat recorded in lgb_q10_meta.json; a q10
+#   holdout-coverage check (10% +/- 3pp) has NO tool yet — scripts/reliability_report.py
+#   is the META-calibration Brier/ECE report — so it stays an open Jetson item). Same
+#   caveat for the V3 blend-weight fit: its folds[-1]-val anchor rows sit
+#   inside the refit train window too, so the LGB leg's fit inputs turn
+#   in-sample under this flag — the identical-holdout A/B below is the guard
+#   for BOTH (the holdout stays untouched either way). Acts only
+#   at save time in train_lgb_ensemble — trial scores untouched, so no study
+#   reset of its own; it rides Chain-2's single gotcha-#2 event. Flip only
+#   after the Jetson identical-holdout blend-DSR A/B (fold-LGB vs refit-LGB,
+#   same LSTM, same cum_trials), then backtest.py --gate, challenger -> shadow
+#   (06 plan R2C-03).
+LGB_REFIT_FULL = False
 
 # --- Objective scoring v3 (2026-08 T1, D24-part + D05-threshold / 01_state_map) ---
 # OFF (default): trial scoring BYTE-IDENTICAL. ON: (1) simulate_trades resets the
@@ -237,6 +289,71 @@ HYPERSEARCH_V3 = False
 # above; the adaptive state's own trade_threshold range/edge-expansion is ignored
 # (overridden) while this flag is ON.
 OBJECTIVE_V3 = False
+
+# --- Trainer seed (2026-08 R2-C packet R2C-04, defect L3) ---
+# None (default): legacy fully-unseeded training — torch init/dropout, the
+#   np.random.permutation batch shuffles and the Optuna TPESampler all draw
+#   from ambient RNG state (two identical retrains produce different
+#   artifacts; FR-02's "identical seed" arms and FR-13's seed ensembles are
+#   impossible to run as specced).
+# int: every RNG consumer in scripts/hypersearch_v2.py is seeded via
+#   objective_utils.derive_seed(TRAINER_SEED, study_name, trial.number,
+#   fold) — per-fold torch.manual_seed + np.random.default_rng batch
+#   permutations in _train_walk_forward, a 'refit' sub-seed for
+#   final_refit(seed=), and a 'sampler' sub-seed for the TPESampler.
+#   Opt-in plumbing only: it changes no score MATH, but seeding obviously
+#   changes which draws occur, so leave None except for reproducibility
+#   experiments. Env override: TRADER_TRAINER_SEED (wins over this
+#   constant). The determinism check (two refits at the same seed
+#   byte-compare) is a Jetson step — 06 plan §4.8.
+TRAINER_SEED = None
+
+# --- Training-loop repairs v1 (2026-08 R2-C packet R2C-04, L1+L2+L5+L6) ---
+# OFF (default): trial scoring BYTE-IDENTICAL, including four verified
+#   defects: (L1) validation loss uses default huber_loss (delta=1.0,
+#   unweighted) while training optimizes the trial's huber_delta with
+#   |return|+1 weights — checkpoint soup admission, early stopping and the
+#   refit epoch budget select on a mismatched criterion; (L2) the
+#   regime-penalty "trailing" series is a trailing mean of FORWARD fb-bar
+#   returns, so the bull/bear mask at t embeds returns through t+fb and
+#   rows 0..48 carry under-scaled partial sums; (L5) the OOM probe batch
+#   performs a real unclipped optimizer step before epoch 0; (L6) the
+#   embargo is denominated in calendar seconds — ~11 RTH bars instead of
+#   seq_len bars on the stock book.
+# ON: val loss is computed with the trial's criterion (same delta, same
+#   weights); the regime mask uses objective_utils.lagged_regime_series
+#   (only returns completed by t; NaN warmup rows excluded from every
+#   regime); the OOM probe restores pristine init state + a fresh
+#   optimizer/scheduler/grad-scaler after probing; the embargo counts
+#   DISTINCT bars via objective_utils.embargo_end_time. ALL FOUR change
+#   trial scores and/or fold composition -> old Optuna scores become
+#   incomparable: this flag rides Chain-2's single gotcha-#2 study-reset
+#   event (flip with HYPERSEARCH_V3/OBJECTIVE_V3, delete both study DBs,
+#   reset adaptive best_score + cum_trials) — NEVER a reset of its own.
+TRAINING_REPAIRS_V1 = False
+
+# --- Fixed-calendar holdout span (2026-08 R2-C packet R2C-05, FR-01) ---
+# None (default): legacy PROPORTIONAL holdout — the final 12% of the pooled
+#   calendar span (hypersearch HOLDOUT_FRACTION quantile), byte-identical.
+#   Under it the holdout's calendar width scales with the training span
+#   (a 1Y window arm gets ~44 days, full history ~200), so cross-arm DSRs
+#   are incomparable and the promotion gate's n_eff >= 10 fail-closed floor
+#   flunks short windows on gate MECHANICS, not skill — the FR-02/FR-09
+#   training-window-experiment blocker.
+# float/int days (suggested 60 for crypto): the holdout becomes the fixed
+#   trailing span max_time - days*86400 (objective_utils.holdout_boundary);
+#   every consumer (folds, refit purge, blend M4 guard, OOF pack, the
+#   certificate) inherits through hypersearch's get_holdout_boundary choke
+#   point, so successive retrains certify on a consistent-width holdout.
+#   Changes fold layout AND what the gate scores -> old Optuna scores become
+#   incomparable: activation rides Chain-2's single gotcha-#2 study-reset
+#   event, NEVER a reset of its own. Until then the dual-boundary
+#   instrumentation line prints on every holdout evaluation (06 plan §4.2:
+#   require >= 10 calendar-effective trades at 60d before any window
+#   experiment). Env override: TRADER_FIXED_HOLDOUT_DAYS (wins over this
+#   constant; also the knob for the one-off "re-run evaluate_on_holdout
+#   under both boundaries and report the DSR delta" comparison).
+FIXED_HOLDOUT_DAYS = None
 
 # --- Meta-label probability calibration (wave-9 #1) ---
 # 'legacy'     = original isotonic fit on the same val slice the booster early-
@@ -321,10 +438,11 @@ META_REPLAY_POLICY_PARITY = False
 #       are pure foregone exposure);
 #   (d) crypto book replaces VIX with BTC's own trailing Parkinson-RV percentile
 #       state (volatility.get_crypto_rv_mult; VIX stays stock-only);
-#   (e) pseudo-CAPE multiplier EXCLUDED (KILL_LIST item; code retained pending
-#       owner deletion) and (f) HMM multiplier EXCLUDED (kill-recommended;
-#       inverted smoothing documented in regime_detector.py) — both still
-#       computed and journaled;
+#   (e) pseudo-CAPE multiplier DELETED repo-wide 2026-08-22 (owner ruling on
+#       KILL_LIST ask #3; verbatim code archived in
+#       research/campaign_2026-08/08_removed_code.md) and (f) HMM multiplier
+#       EXCLUDED (kill-recommended; inverted smoothing documented in
+#       regime_detector.py) — HMM still computed and journaled in legacy;
 #   (g) PORTFOLIO_VOL_TARGET applied at exactly ONE scope: the book-level scalar
 #       (portfolio.get_book_vol_scalar_cached, inside the family min); the
 #       per-position GARCH ratio composes at 1.0 (the ATR risk base already
@@ -337,6 +455,115 @@ META_REPLAY_POLICY_PARITY = False
 # MIN_ORDER_NOTIONAL; the 0.1 advisory floor keeps applying ONCE to the composed
 # tilt. Model-facing: changes admitted sizes -> flip on the Jetson only.
 DERISK_STACK_V2 = False
+
+# ============================================================================
+# INFLUENCE-AUDIT FLAG FAMILY (2026-08 packet IA-4 — the decision-influence
+# ledger's split-verdict / behavior-loosening prescriptions made FLIPPABLE).
+# Every flag below defaults to today's behavior (flag-OFF byte-identical,
+# pinned by tests/test_ia4_flagged.py). Each comment records the ledger
+# verdict (research/campaign_2026-08/07_decision_influences.md), the flip
+# criterion, and the instrument that decides it. Flip on the Jetson only.
+# ============================================================================
+
+# --- VIX>25 non-safe-haven block removal (ledger §3.3, 2-1 "NO"/"suspect") ---
+# OFF (default): the block fires exactly as today (journaled as vix25_block
+# skip rows since IA-3). ON: the block is skipped entirely — the 25-35 band
+# is priced ONCE by the graded VIX tier map (a hard block stacked on a graded
+# cut over the same variable double-charges the state; and with no SAFE_HAVEN
+# name in the tradable universe the block is a de facto full book halt nobody
+# designed — gap C3). Flip criterion: one Jetson read of the vix25_block skip
+# rows (decision_report GATE_REASONS) confirming the double-charge and the de
+# facto halt cost. Instrument: decision_report.py gate attribution.
+VIX25_BLOCK_REMOVED = False
+
+# --- Correlation family merge (ledger §3.3 "MERGE -> ENB budget") ---
+# OFF (default): three consumers of one matrix — binary admission gate
+# (>0.7), f_corr sizing haircut, ENB stop-risk budget — all fire as today.
+# ON: the ENB book stop-risk budget is the SINGLE correlation consumer
+# (risk-denominated, continuous, shrink-to-fit); the admission gate loosens
+# to a sanity block at avg|corr| > CORR_SANITY_MAX and the f_corr haircut
+# composes at 1.0 (in legacy AND v2 tilt). Flip criterion: Jetson
+# correlation-skip rows + account_risk journals showing the ENB cap binds
+# first (the gate/f_corr only re-charge what the budget already prices).
+# Instrument: decision_report 'correlation' skips + the account_risk journal.
+CORR_FAMILY_MERGED = False
+CORR_SANITY_MAX = 0.85           # loose admission sanity bar when merged
+
+# --- Daily trade budget -> runaway backstop (ledger §3.4 cooldown+budget
+# MERGE: "keep cooldown; budget as a runaway backstop it should never
+# touch" — two instruments for one churn latent) ---
+# OFF (default): MAX_TRADES_PER_SYMBOL_PER_DAY caps as today. ON: the cap
+# is multiplied by TRADE_BUDGET_BACKSTOP_MULT, leaving cooldown as the ONE
+# churn instrument and the budget as a runaway backstop. Flip criterion:
+# Jetson trade_budget veto counts showing the budget fires on names the
+# cooldown alone would have throttled (double-charging one jitter latent).
+# Instrument: entry_window veto_counts['trade_budget'] + journal_stats churn.
+TRADE_BUDGET_BACKSTOP = False
+TRADE_BUDGET_BACKSTOP_MULT = 3
+
+# --- Crypto fb-anchored vertical barrier (ledger §3.7: "NO (the absence
+# does not belong)" — labels are triple-barrier with an fb vertical; live
+# crypto holds are unlimited, so the meta model learns a horizon the
+# deployed book doesn't enforce) ---
+# OFF (default): no exit fires; the would-fire event is journaled ALWAYS
+# (action='vertical_barrier', fired=false) so the flip has evidence from
+# day one. ON: a crypto position older than the deployed forward_bars
+# horizon (read from the model config, the way the labels read it) whose
+# price sits between the barriers gets a max-hold exit with
+# exit_reason='vertical' — implemented in the LOOP's position-management
+# layer (base_loop._check_vertical_barrier); the policy_exits kernel is
+# UNTOUCHED. Flip criterion: Jetson vertical_barrier would-fire rows
+# showing stale holds with flat/negative drift past fb bars. Instrument:
+# the vertical_barrier journal rows + journal_stats hold-time distribution.
+CRYPTO_VERTICAL_BARRIER = False
+
+# --- Signal-exit confirmation reads (ledger §3.7 KEEP-COND: "reconcile the
+# 1-vs-2-reading asymmetry deliberately" — stops need 2 consecutive
+# readings, the signal exit fires on 1; rev-07-02 conflict #2) ---
+# 1 (default): today's behavior — the signal exit fires on a single
+# reading (the sell row itself is the first-reading record). 2: the signal
+# exit requires two CONSECUTIVE readings (pred < -threshold twice),
+# matching stop-confirmation discipline; armed/lapsed first readings are
+# journaled (action='signal_exit_reading') and confirmed sells carry
+# signal_exit_readings=2. Applies to the pred-based signal exit only —
+# the stock rank-drop exit keeps its own hysteresis band. Flip criterion:
+# Jetson signal_sell outcomes showing sub-hour flip-sells that round-trip
+# fees (see also cooldown_bypassed_exit markers). Instrument:
+# llm_eval/journal_stats signal_sell outcome attribution.
+SIGNAL_EXIT_CONFIRM_READS = 1
+
+# --- Kelly sample gate (ledger §3.5 kelly_mult KEEP-COND: "poisoned sample
+# (D06 winner-censoring — recovery in tree, history still biased to the
+# floor exactly when winning). Hold neutral until ~50 uncensored
+# trades/book rebuild") ---
+# OFF (default): kelly_mult computes from trade_memory as today (the D06
+# recovery writes confirmed rows going forward, but the historical sample
+# is still winner-censored). ON: kelly_mult holds neutral 1.0 until the
+# book has >= KELLY_SAMPLE_MIN_TRADES uncensored (non-estimated) trades
+# recorded on/after KELLY_SAMPLE_SINCE (set this to the Jetson deploy date
+# of the D06-fix wave — rows before it are the censored history). Gate
+# state is journaled in the sizing detail ('kelly_gate') while ON.
+# Flip criterion: immediate on deploy (the gate IS the repair; it releases
+# itself once the clean sample accumulates). Instrument:
+# trading_utils.uncensored_trade_count via the sizing journal.
+KELLY_SAMPLE_GATE = False
+KELLY_SAMPLE_MIN_TRADES = 50
+KELLY_SAMPLE_SINCE = '2026-08-22'   # ISO date; rows with ts >= this count
+
+# --- Per-book circuit-breaker baseline (ledger §3.2 KEEP-COND: "the
+# account-wide scope cross-contaminates books and crypto weekends are
+# judged against Friday's close. Per-book (or weekend-aware) baselines +
+# trip journaling") ---
+# OFF (default): account-wide Alpaca last_equity baseline exactly as today
+# (trip journaling landed in IA-3). ON: each book measures ITS OWN P&L
+# (realized exits + open-position mark drift, accumulated in-loop) against
+# a baseline equity captured at the book's own window roll — crypto rolls
+# at UTC midnight EVERY day (weekend-aware), stock at the ~16:05 ET
+# baseline reset — and halts until its own window end on a trip. Flip
+# criterion: circuit_breaker_trip journal rows (IA-3) showing cross-book
+# contamination or weekend-stale baselines caused/missed trips.
+# Instrument: the circuit_breaker_trip event rows.
+BREAKER_PER_BOOK = False
 
 # BTC trailing-RV regime state constants (read only by volatility.py; B06:
 # enter immediately, exit slowly — asymmetric Schmitt per crypto_trend.py).

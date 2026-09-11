@@ -1,7 +1,9 @@
 """Pre-trade LLM qualitative conviction scorer.
 
-One LLM call per trading cycle (all candidates at once). The LLM evaluates
-ONLY qualitative factors the ML model cannot see:
+One LLM call per gate cycle (all candidates at once) — the gate is throttled to
+base_loop.LLM_INTERVAL_SEC = 600 s, i.e. roughly once per 10 minutes, not once per
+30 s trading cycle. The LLM evaluates ONLY qualitative factors the ML model cannot
+see:
   - News events and catalysts
   - Fundamental context (valuations, growth)
   - Macro environment (Fear & Greed, sector rotation)
@@ -166,9 +168,10 @@ def _sanitize_untrusted(text: str, max_len: int = 220) -> str:
 def _response_schema(symbols: list[str], extended: bool = False) -> dict:
     """Gemini responseSchema: one required entry per symbol.
 
-    Schema enforcement at the API layer replaces ~130 lines of fence
-    stripping, brace counting, truncation repair, and array-format
-    conversion that this file used to need.
+    Schema enforcement at the API layer replaced ~130 lines of brace
+    counting, truncation repair, and array-format conversion that this file
+    used to need. A thin fence-strip is deliberately RETAINED in
+    _parse_response for non-enforced fallback providers.
 
     extended=True (advisor_v2_enabled) adds the v2 shadow-only fields
     (p_up, conviction, abstain, key_risks, event_flags) — ALL appended to

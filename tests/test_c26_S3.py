@@ -152,15 +152,17 @@ def test_family_none_regime_and_cape_never_present(vix_state):
     assert 'cape' not in fam
 
 
-def test_family_cape_exclusion_announced_once(vix_state, monkeypatch, caplog):
-    monkeypatch.setattr(macro_indicators, '_cape_exclusion_logged', False)
-    with caplog.at_level(logging.WARNING, logger='macro_indicators'):
-        macro_indicators.regime_family_mults_v2(_regime(), 'stock',
-                                                announce=True)
-        macro_indicators.regime_family_mults_v2(_regime(), 'stock',
-                                                announce=True)
-    hits = [r for r in caplog.records if 'pseudo-CAPE' in r.getMessage()]
-    assert len(hits) == 1
+def test_family_cape_machinery_fully_deleted(vix_state):
+    # Rewritten 2026-08-22: previously pinned the one-shot pseudo-CAPE
+    # exclusion announce ("code retained pending owner deletion"). The owner
+    # ruled — the code is deleted (ledger §3.5 unanimous NO; KILL_LIST ask #3
+    # RULED; 08_removed_code.md IA-1.1), so the announce machinery and its
+    # `announce` kwarg are gone with it.
+    import inspect
+    sig = inspect.signature(macro_indicators.regime_family_mults_v2)
+    assert 'announce' not in sig.parameters
+    assert not hasattr(macro_indicators, '_cape_exclusion_logged')
+    assert not hasattr(macro_indicators, 'fetch_cape')
 
 
 # ---------------------------------------------------------------------------
@@ -627,9 +629,10 @@ class _StockLoop(_Loop):
 
 def test_off_stock_book_v2_shadow_tier_map_no_btc_rv(monkeypatch, caplog,
                                                      vix_state):
-    """Stock book, flag OFF: v2 family uses the ONE tier map (no btc_rv),
-    get_crypto_rv_mult is never touched, and the CAPE-exclusion announce
-    stays SILENT in shadow mode (it fires only when the flag is ON)."""
+    """Stock book, flag OFF: v2 family uses the ONE tier map (no btc_rv)
+    and get_crypto_rv_mult is never touched. (The CAPE-exclusion announce
+    this test also pinned was deleted with pseudo-CAPE 2026-08-22 —
+    08_removed_code.md IA-1.1.)"""
     _seams(monkeypatch)
     monkeypatch.setattr(market_data, 'fetch_stock_bars_alpaca',
                         lambda *a, **k: _bars_150())
@@ -638,7 +641,6 @@ def test_off_stock_book_v2_shadow_tier_map_no_btc_rv(monkeypatch, caplog,
     monkeypatch.setattr(volatility, 'get_crypto_rv_mult',
                         lambda: (_ for _ in ()).throw(
                             AssertionError('crypto RV read on stock book')))
-    monkeypatch.setattr(macro_indicators, '_cape_exclusion_logged', False)
     inst = object.__new__(_StockLoop)
     for k, v in dict(api=None, trade_threshold=0.15, positions={},
                      macro_regime=_macro(vix=26.0), corr_matrix={'MSFT': {}},
@@ -654,7 +656,6 @@ def test_off_stock_book_v2_shadow_tier_map_no_btc_rv(monkeypatch, caplog,
     assert d['v2']['family'] == {'vix': 0.5, 'stress': 1.0, 'bookvol': 1.0}
     assert d['v2']['min_src'] == 'vix'
     assert 'btc_rv_state' not in d['v2']
-    assert not any('pseudo-CAPE' in r.getMessage() for r in caplog.records)
 
 
 def test_on_activation_warning_logged_once(monkeypatch, caplog):

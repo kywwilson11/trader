@@ -13,6 +13,11 @@ Row schema (one dict per selected symbol-bar):
                       column 'signal' while scripts/ic_by_name.py defaults
                       to 'pred' — one dump feeds both with zero flags
     fwd_return        (close[i+h] - close[i]) / close[i] * 100
+    close             close[i] — the entry-anchor bar close (R2C-06:
+                      makes future dumps self-sufficient for the FR-04
+                      naive-baseline and M1 entry-timing joins; OPTIONAL
+                      for consumers — older dumps lack it, so consumers
+                      must tolerate its absence)
     horizon_bars      h
     lstm_pred/lgb_pred  blend legs when captured (None when unavailable)
     meta_p, q10       gate inputs when available (None otherwise)
@@ -136,6 +141,10 @@ def build_rows(times, symbol, preds, closes, horizon, idx, *, lstm=None,
             # 'signal', ic_by_name defaults to 'pred'
             'signal': round(p, 6),
             'fwd_return': round(fwd, 6),
+            # additive (R2C-06): entry-anchor close so future dumps are
+            # self-sufficient; consumers must tolerate its absence in
+            # older dumps
+            'close': round(c0, 6),
             'horizon_bars': int(h),
             'lstm_pred': _opt(lstm, i, 6),
             'lgb_pred': _opt(lgb, i, 6),

@@ -321,7 +321,17 @@ def test_fanout_uses_bounded_as_completed():
 # base_loop — D01 fan-out timeout (functional)
 # ---------------------------------------------------------------------------
 
-def test_fanout_timeout_partial_harvest_and_pool_rebuild():
+def test_fanout_timeout_partial_harvest_and_pool_rebuild(tmp_path,
+                                                         monkeypatch):
+    # _get_predictions ends with a function-local
+    # `from monitor_drift import log_predictions`, which rebinds the name
+    # inside the exec'd body — the injected globals below cannot intercept
+    # it, so the real writer runs. Redirect monitor_drift's BASE_DIR (read at
+    # call time by history_file()) so the drift log and its .lock sidecar
+    # land in tmp_path instead of <repo>/pred_history.jsonl.
+    import monitor_drift
+    monkeypatch.setattr(monitor_drift, 'BASE_DIR', tmp_path)
+
     resolved = concurrent.futures.Future()
     resolved.set_result(('AAA', 0.5, {'x': 1}))
     stuck = concurrent.futures.Future()   # never resolves
@@ -879,7 +889,15 @@ def test_journal_external_close_prefers_confirmed_recovery(monkeypatch):
 # llm_analyst — D33 metadata passthrough (functional)
 # ---------------------------------------------------------------------------
 
-def test_analyze_trades_sets_last_analysis_meta(monkeypatch):
+def test_analyze_trades_sets_last_analysis_meta(tmp_path, monkeypatch):
+    # analyze_trades -> llm_client.get_routing_info() -> _maybe_reset_quota(),
+    # which PERSISTS the shared spend ledger on the first call of a new
+    # calendar day. Sandbox the constant it writes through so neither
+    # <repo>/llm_cost.json nor its .lock sidecar (derived from the same
+    # global, at call time) is touched.
+    import llm_client
+    monkeypatch.setattr(llm_client, '_COST_FILE',
+                        str(tmp_path / 'llm_cost.json'))
     monkeypatch.setattr(llm_analyst, 'load_llm_config',
                         lambda: {'enabled': True})
     monkeypatch.setattr(llm_analyst, 'get_recommended_model',

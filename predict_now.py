@@ -41,6 +41,22 @@ _sentiment_import_failed = False
 _lgb_models: dict[str, object | None] = {}
 _q10_models: dict[str, tuple[object, float] | None] = {}
 
+# R2C-01 (H3): mtime keys + failure timestamps for the booster caches above,
+# keyed (leg, prefix); serving_cache.cache_get serves an entry only while its
+# booster files' mtimes match the recorded key. Legacy retrains write the
+# manifest BEFORE train_lgb_ensemble, so the hot-reload pops these caches
+# minutes before the fresh booster files land — presence-keyed caching then
+# pinned LAST WEEK's boosters (old-scaler pairing) to the new LSTM until the
+# NEXT retrain, and a transient load failure cached None forever. Values keep
+# their legacy shapes, so base_loop/shadow pops still work unchanged.
+from serving_cache import cache_get as _booster_cache_get
+_booster_keys: dict[tuple[str, str], object] = {}
+_booster_failed_at: dict[tuple[str, str], float] = {}
+
+# Directory the LGB mean booster is saved in (model_lgb._MODEL_DIR is this
+# same repo dir; stat must key the exact path load_lgb_model opens).
+_MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Missing-feature sets already warned about (once per set, not per cycle)
 _warned_missing: set[tuple] = set()
 
@@ -424,15 +440,23 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
 
     lstm_pred = float(output.cpu().item())
 
-    # LightGBM ensemble: combine LSTM and LGB predictions
+    # LightGBM ensemble: combine LSTM and LGB predictions.
+    # mtime-keyed lazy load (R2C-01): reloads the moment a retrain lands a
+    # fresh booster file (legacy order writes it minutes AFTER the manifest
+    # hot-reload) and retries — never permanently caches — a failed load.
+    # on_swap drops the bar-keyed prediction memo so no symbol keeps serving
+    # a result computed under the old booster generation.
     pfx = config.get('prefix', '')
-    if pfx not in _lgb_models:
-        try:
-            from model_lgb import load_lgb_model
-            _lgb_models[pfx] = load_lgb_model(prefix=pfx)
-        except Exception:
-            _lgb_models[pfx] = None
-    lgb_model = _lgb_models[pfx]
+    _p = f'{pfx}_' if pfx else ''
+
+    def _load_lgb():
+        from model_lgb import load_lgb_model
+        return load_lgb_model(prefix=pfx)
+
+    lgb_model = _booster_cache_get(
+        _lgb_models, _booster_keys, _booster_failed_at, 'lgb', pfx,
+        (os.path.join(_MODEL_DIR, f'{_p}lgb_model.txt'),), _load_lgb,
+        on_swap=_PRED_CACHE.clear)
 
     predicted_return = lstm_pred
     flat = None
@@ -448,23 +472,27 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
         except Exception:
             pass  # Fall back to LSTM-only
 
-    # q10 tail prediction (left-tail risk of THIS state; entry veto input)
-    if pfx not in _q10_models:
-        try:
-            import json as _json
-            import lightgbm as _lgb
-            p = f'{pfx}_' if pfx else ''
-            booster = _lgb.Booster(model_file=f'{p}lgb_q10.txt')
-            with open(f'{p}lgb_q10_meta.json') as f:
-                floor = float(_json.load(f)['floor'])
-            _q10_models[pfx] = (booster, floor)
-        except Exception:
-            _q10_models[pfx] = None
+    # q10 tail prediction (left-tail risk of THIS state; entry veto input).
+    # Same mtime-keyed reload semantics as the LGB leg; keyed on BOTH files
+    # (booster + floor meta) so the pair always loads as one generation.
+    # Paths stay cwd-relative — the exact paths the loader opens.
+    def _load_q10():
+        import json as _json
+        import lightgbm as _lgb
+        booster = _lgb.Booster(model_file=f'{_p}lgb_q10.txt')
+        with open(f'{_p}lgb_q10_meta.json') as f:
+            floor = float(_json.load(f)['floor'])
+        return (booster, floor)
+
+    _q10_ent = _booster_cache_get(
+        _q10_models, _booster_keys, _booster_failed_at, 'q10', pfx,
+        (f'{_p}lgb_q10.txt', f'{_p}lgb_q10_meta.json'), _load_q10,
+        on_swap=_PRED_CACHE.clear)
     q10_pred = None
     _q10_floor = None
-    if _q10_models[pfx] is not None:
+    if _q10_ent is not None:
         try:
-            q10_booster, _q10_floor = _q10_models[pfx]
+            q10_booster, _q10_floor = _q10_ent
             if flat is None:
                 from model_lgb import flatten_sequence
                 flat, _ = flatten_sequence(sequence.reshape(seq_len, -1),

@@ -5,8 +5,10 @@ which columns scripts/hypersearch_v2.py uses for training. The existing
 feature_cols.pkl mechanism ensures inference matches training.
 
 Persists to indicator_config.json (gitignored) via an atomic write. Default
-preset: "standard". No heavy imports (json, pathlib, os, tempfile, contextlib
-only) so it's safe for the GUI env.
+preset: "standard". NOTE: run_pipeline passes `--preset stationary` explicitly to
+both hypersearch invocations, so the persisted preset (and the GUI picker) do NOT
+affect the production training path — they apply to manual runs only. No heavy
+imports (json, pathlib, os, tempfile, contextlib only) so it's safe for the GUI env.
 """
 
 import contextlib
@@ -122,8 +124,10 @@ _STANDARD_FEATURES = _MINIMAL_FEATURES + [
 ]
 
 # Stationary features only — no raw prices/volumes that trend over time.
-# Cross-asset columns (BTC_Return_1h, RS_vs_SPY, etc.) are already stationary
-# and get auto-included via asset-type filtering in hypersearch.
+# Cross-asset columns (BTC_Return_1h, RS_vs_SPY, etc.) are already stationary.
+# There is NO asset-type filter: hypersearch intersects the preset with the columns
+# PRESENT in the loaded panel, so a crypto-only column simply is not in the stock
+# store. CRYPTO_ONLY_COLS / STOCK_ONLY_COLS below are GUI display text only.
 _STATIONARY_FEATURES = [
     # Returns (stationary by construction)
     "Return_4h", "Return_12h", "Volatility_12h", "ROC",

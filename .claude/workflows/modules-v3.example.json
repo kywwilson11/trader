@@ -1,6 +1,6 @@
 {
   "campaign_title": "feat: panel-review improvement pass — measurement/reporting layer",
-  "baseline_note": "1887+ passed / 21 failed / 15 skipped / 7 errors — ALL pre-existing missing-dep noise; scripts/ab_check.sh is the authority (diffs failure NAMES, not counts)",
+  "baseline_note": "Pre-existing missing-dep failures only; scripts/ab_check.sh is the authority (it diffs failure NAMES against tests/baseline_failures.txt, never counts). Current counts: CLAUDE.md section 'Running tests'.",
   "tree_note": "Tree carries the uncommitted 2026-07 GUI campaign (gui.py, chart_core.py, the loops, llm_analyst.py, run_pipeline.py, shadow.py + new pure modules). Do NOT touch, revert, or judge those files — they are under separate owner review. Ignore that dirty state entirely.",
   "modules": [
     {

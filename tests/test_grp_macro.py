@@ -93,26 +93,28 @@ def _clean_module_state():
 
 
 # ---------------------------------------------------------------------------
-# EDIT 1: macro_indicators.fetch_cape docstring 1.5 -> 1.6
+# EDIT 1 (superseded 2026-08-22): fetch_cape DELETED by owner ruling.
+# The original tests here pinned fetch_cape's docstring/1.6 multiplier;
+# pseudo-CAPE was removed repo-wide (decision-influence ledger §3.5,
+# unanimous NO; KILL_LIST ask #3 RULED; archive:
+# research/campaign_2026-08/08_removed_code.md IA-1.1) — rewritten to pin
+# the new truth: no CAPE machinery remains in macro_indicators.
 # ---------------------------------------------------------------------------
 
-class TestFetchCapeDocFix:
-    def test_docstring_says_1_6_not_1_5(self):
-        doc = mi.fetch_cape.__doc__ or ''
-        assert '1.6' in doc
-        assert '1.5' not in doc
+class TestPseudoCapeDeleted:
+    def test_fetch_cape_gone(self):
+        assert not hasattr(mi, 'fetch_cape')
 
-    def test_source_has_no_stale_1_5_docstring_text(self):
+    def test_cape_constants_gone(self):
+        for name in ('_CAPE_MEAN', '_CAPE_STD', '_CAPE_CACHE_TTL',
+                     '_cape_exclusion_logged'):
+            assert not hasattr(mi, name), name
+
+    def test_source_free_of_cape_machinery(self):
         src = _src('macro_indicators.py')
-        assert '1.5 adjustment factor' not in src
-
-    def test_fetch_cape_numeric_behavior_unchanged(self, monkeypatch):
-        # Locks the 1.6 multiplier the corrected docstring must match
-        # (docstring-only edit; behavior already covered by
-        # tests/test_review_b07.py::test_fetch_cape_happy_path).
-        monkeypatch.setitem(sys.modules, 'yfinance',
-                             _yfinance_with(info={'trailingPE': 25.0}))
-        assert mi.fetch_cape() == pytest.approx(40.0)  # 25 * 1.6
+        assert 'def fetch_cape' not in src
+        assert 'cape_z' not in src
+        assert "labels.append('overvalued')" not in src
 
 
 # ---------------------------------------------------------------------------

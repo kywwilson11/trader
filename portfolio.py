@@ -339,13 +339,18 @@ def get_correlation_sizing_factor(candidate: str,
 
 
 def avg_book_correlation(symbols: list[str],
-                         corr_matrix: dict[tuple[str, str], float]) -> float:
+                         corr_matrix: dict[tuple[str, str], float],
+                         uncovered: float | None = None) -> float:
     """Average absolute pairwise correlation across a set of symbols.
 
     Missing pairs are EXCLUDED from the mean (unlike the gate/sizing, which
-    default them to 0.0), and a non-empty matrix covering NONE of the book's
-    pairs returns 0.0 — callers guarding only on matrix truthiness never see
-    their no-data prior (owner decision parked). Coverage gaps are warned
+    default them to 0.0). `uncovered` (2026-08 influence audit §3.3, ENB
+    input defect): when the matrix is non-empty but covers NONE of the
+    book's pairs, return this value instead of 0.0 — base_loop's ENB budget
+    guards only on matrix truthiness, so the legacy 0.0 silently bypassed
+    its 0.5 no-data prior and priced a fully-unknown book as perfectly
+    diversifying (the loosest possible budget). Default None preserves the
+    legacy 0.0 (pinned by test_portfolio_v3). Coverage gaps are warned
     below, rate-limited.
     """
     if len(symbols) < 2 or not corr_matrix:
@@ -361,7 +366,12 @@ def avg_book_correlation(symbols: list[str],
                 n_expected += 1
             if c is not None:
                 vals.append(abs(c))
-    rho = float(np.mean(vals)) if vals else 0.0
+    if not vals and n_expected and uncovered is not None:
+        # Fully-uncovered book: honor the caller's no-data prior instead of
+        # fabricating rho=0.0 (perfect diversification) from zero evidence.
+        rho = float(uncovered)
+    else:
+        rho = float(np.mean(vals)) if vals else 0.0
     if n_expected and len(vals) < n_expected:
         global _bookcorr_warn_ts
         now = time.monotonic()
@@ -371,8 +381,8 @@ def avg_book_correlation(symbols: list[str],
                 "[PORTFOLIO] avg_book_correlation: %d of %d pairs missing "
                 "from a %d-entry matrix for %s — rho=%.2f may be spuriously "
                 "low (missing pairs are EXCLUDED here; a fully-uncovered "
-                "book returns 0.0, bypassing the caller's 0.5 no-data "
-                "prior)", n_expected - len(vals), n_expected,
+                "book returns the caller's `uncovered` prior when given, "
+                "else the legacy 0.0)", n_expected - len(vals), n_expected,
                 len(corr_matrix), ','.join(symbols[:8]), rho)
     return rho
 

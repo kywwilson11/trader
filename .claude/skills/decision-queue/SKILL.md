@@ -23,9 +23,11 @@ Run from the repo root (paths are anchored, so any cwd works).
 - Each line: [severity] module: description. `--full` adds the exact code location
   (`where`) and the reviewer's `fix_sketch`.
 - The single P0 (events_calendar trading-day windows) has a placeholder desc in the
-  ledger; its full spec (np.busday_count) lives in the session-state memory and the
-  campaign journals.
+  ledger, but the code is already SHIPPED behind the default-OFF flag
+  `strategy_config.EVENTS_TRADING_DAY_WINDOWS` — what remains open is the owner's
+  flip decision, not the build.
 - When the user picks an item: follow its fix_sketch, and remember model-facing changes
   ship ONLY via the challenger -> shadow -> DM-HLN gate (see CLAUDE.md Conventions).
-- Wave memory files hold each domain's KILL list — check them before proposing
-  alternatives research already rejected.
+- `research/KILL_LIST.md` is the canonical consolidated kill list (the per-wave memory
+  files carry the same verdicts per domain) — check it before proposing alternatives
+  research already rejected.

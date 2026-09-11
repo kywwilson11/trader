@@ -272,6 +272,45 @@ def compute_kelly_fraction(min_trades: int = 50,
     return half_kelly
 
 
+def uncensored_trade_count(asset_type: str | None = None,
+                           since_iso: str = '') -> int:
+    """Count CONFIRMED (non-estimated) trade records for a book.
+
+    The KELLY_SAMPLE_GATE substrate (2026-08 influence audit §3.5): the
+    pre-D06 trade history is winner-censored (server-stop / TP-leg exits
+    journaled only as 'estimated' midpoint rows, which
+    compute_kelly_fraction excludes — so the CONFIRMED sample was biased
+    against winners exactly when winning). This counts the rows that ARE
+    admissible to Kelly's sample, optionally restricted to records stamped
+    on/after since_iso (ISO date/datetime string, lexicographic compare —
+    set it to the Jetson deploy date of the D06-fix wave so the censored
+    history does not count toward the gate). Same book-split convention as
+    compute_kelly_fraction ('/' in symbol = crypto). Returns 0 on any
+    read/parse failure (fail toward holding the gate closed).
+    """
+    try:
+        if not _TRADE_MEMORY_FILE.exists():
+            return 0
+        with open(_TRADE_MEMORY_FILE) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    n = 0
+    for symbol, trades in data.items():
+        is_crypto = '/' in symbol
+        if asset_type == 'crypto' and not is_crypto:
+            continue
+        if asset_type == 'stock' and is_crypto:
+            continue
+        for t in trades:
+            if t.get('estimated'):
+                continue
+            if since_iso and t.get('ts', '') < since_iso:
+                continue
+            n += 1
+    return n
+
+
 def kelly_position_size(base_notional: float, equity: float,
                         min_trades: int = 50) -> float:
     """Compute Kelly-based position size with bounds.

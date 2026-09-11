@@ -2,7 +2,8 @@
 
 The adjudication instrument for EVERY future gate-behavior change to the
 LLM analyst (system-prompt swap, pred-blind scoring, rich-context adoption,
-model-panel dispersion — see CLAUDE.md task PART B). This script NEVER
+model-panel dispersion — see CLAUDE.md section Conventions,
+"Deployment gate"). This script NEVER
 touches llm_analysis.json or any live gate state: every analyze_trades()
 call it makes passes persist=False, and it never runs in the hot trading
 loop.

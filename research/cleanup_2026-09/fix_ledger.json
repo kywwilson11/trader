@@ -1,0 +1,870 @@
+[
+  {
+    "id": "F-001",
+    "file": ".claude/skills/decision-queue/SKILL.md",
+    "anchor_old": "- The single P0 (events_calendar trading-day windows) has a placeholder desc in the\n  ledger; its full spec (np.busday_count) lives in the session-state memory and the\n  campaign journals.",
+    "new": "- The single P0 (events_calendar trading-day windows) has a placeholder desc in the\n  ledger, but the code is already SHIPPED behind the default-OFF flag\n  `strategy_config.EVENTS_TRADING_DAY_WINDOWS` — what remains open is the owner's\n  flip decision, not the build.",
+    "reason": "P0 is implemented behind EVENTS_TRADING_DAY_WINDOWS (strategy_config.py:131 verified); the skill still tells readers the spec lives only in memory.",
+    "source_reports": [
+      "D12#7"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "C"
+  },
+  {
+    "id": "F-002",
+    "file": ".claude/skills/decision-queue/SKILL.md",
+    "anchor_old": "- Wave memory files hold each domain's KILL list — check them before proposing\n  alternatives research already rejected.",
+    "new": "- `research/KILL_LIST.md` is the canonical consolidated kill list (the per-wave memory\n  files carry the same verdicts per domain) — check it before proposing alternatives\n  research already rejected.",
+    "reason": "CLAUDE.md names research/KILL_LIST.md as the canonical consolidated list; the skill points only at out-of-repo memory files.",
+    "source_reports": [
+      "D12#7"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "C"
+  },
+  {
+    "id": "F-003",
+    "file": ".claude/skills/regression-ab/SKILL.md",
+    "anchor_old": "fixed set of tests always fails from missing heavy deps (torch / lightgbm / optuna / joblib /\nnumba / sklearn / dotenv). **Counts are advisory; the failure-NAME diff is the truth.**\n\nBaseline for orientation (2026-07-15): `1887 passed / 21 failed / 15 skipped / 7 errors` —\nall failures+errors are pre-existing missing-dep noise. Counts drift as tests are added; never\nalarm (or all-clear) on counts alone.",
+    "new": "fixed set of tests always fails from missing heavy deps (pyarrow / joblib / hmmlearn /\ntorch / arch / dotenv). **Counts are advisory; the failure-NAME diff is the truth.**\n\nThe authoritative failure NAMES — and the per-dependency attribution — live in\n`tests/baseline_failures.txt`. Current pass/fail counts live in exactly one place,\n`CLAUDE.md` section \"Running tests\"; they drift as tests are added, so never alarm (or\nall-clear) on counts alone.",
+    "reason": "Baseline `1887 passed / 21 failed / 15 skipped / 7 errors` is the 2026-07-15 snapshot, long stale. Dep list is also wrong: tests/baseline_failures.txt (already corrected by S6) states lightgbm/numba/optuna/sklearn cause NO baseline name, while pyarrow/hmmlearn/arch do.",
+    "source_reports": [
+      "D09#9",
+      "D12#4",
+      "D13#7"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "C"
+  },
+  {
+    "id": "F-004",
+    "file": ".claude/workflows/modules-v3.example.json",
+    "anchor_old": "  \"baseline_note\": \"1887+ passed / 21 failed / 15 skipped / 7 errors — ALL pre-existing missing-dep noise; scripts/ab_check.sh is the authority (diffs failure NAMES, not counts)\",",
+    "new": "  \"baseline_note\": \"Pre-existing missing-dep failures only; scripts/ab_check.sh is the authority (it diffs failure NAMES against tests/baseline_failures.txt, never counts). Current counts: CLAUDE.md section 'Running tests'.\",",
+    "reason": "Same 2026-07-15 stale count string; per the layout rule suite counts have ONE home (CLAUDE.md § Running tests), so this note should point rather than restate.",
+    "source_reports": [
+      "D09#9",
+      "D12#4"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "C"
+  },
+  {
+    "id": "F-005",
+    "file": "alpaca_compat.py",
+    "anchor_old": "three exceptions that return raw alpaca-py objects: get_calendar,\nclose_all_positions and cancel_all_orders (surface-parity methods with no\ncurrent callers repo-wide).",
+    "new": "three exceptions that return raw alpaca-py objects: get_calendar,\nclose_all_positions and cancel_all_orders. get_calendar and\nclose_all_positions are surface-parity methods with no current callers\nrepo-wide; cancel_all_orders IS called in production (order_utils.py, twice).",
+    "reason": "cancel_all_orders has two live production callers (order_utils.py:1052, :1250). Only get_calendar/close_all_positions are caller-less (verified by grep). All three names stay in the docstring, which tests/test_review_b03.py::test_compat_snapshot... asserts.",
+    "source_reports": [
+      "D02#1"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-006",
+    "file": "backtest.py",
+    "anchor_old": "or a FileNotFoundError before any model was evaluated); 3 = --gate FAILURE\n— a deterministic policy rejection, the model was rolled back to .prev;",
+    "new": "or a FileNotFoundError before any model was evaluated); 3 = --gate FAILURE\n— a deterministic policy rejection; the model was rolled back to .prev, EXCEPT\non a fallback-champion replay whose .prev exists, where the established\nchampion is HELD and nothing is restored (gate action\n'hold_champion_no_challenger');",
+    "reason": "The exit-code paragraph documents two exit-3 outcomes (rollback, hold-challenger) but not the third, hold_champion_no_challenger (backtest.py:1380, in the fallback_champion branch).",
+    "source_reports": [
+      "D05#6"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-007",
+    "file": "backtest.py",
+    "anchor_old": "    Mirrors the LIVE inference path: LSTM prediction, ensembled 0.6/0.4\n    with LightGBM when the booster exists (predict_now.get_live_prediction\n    does the same — the backtest must validate the policy that trades).",
+    "new": "    Mirrors the LIVE inference path: LSTM prediction, ensembled with\n    LightGBM at weight config['lstm_weight'] (default 0.6) when the booster\n    exists (predict_now.get_live_prediction does the same — the backtest\n    must validate the policy that trades).",
+    "reason": "The blend weight is tunable — `_w = config.get('lstm_weight', 0.6)` at backtest.py:220 (blend_fit writes the key). '0.6/0.4' reads as a hard constant.",
+    "source_reports": [
+      "D05#4"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-008",
+    "file": "backtest.py",
+    "anchor_old": "    \"\"\"Report-file identity: challenger-targeted runs write\n    backtest_<slot>_report.json so they never clobber the champion\n    book report the GUI reads.\"\"\"",
+    "new": "    \"\"\"Report-file identity: challenger-targeted runs write\n    backtest_<slot>_report.json so they never clobber the operational\n    champion book report.\"\"\"",
+    "reason": "gui.py has no reader of backtest_*report.json (verified: gui's report registry lists decision_report / llm_eval / llm_advisor / execution only).",
+    "source_reports": [
+      "D05#3"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-009",
+    "file": "decision_report.py",
+    "anchor_old": "    one ('spread_pct' — both loops journal this on cost_floor skips since\n    2026-07-13, base_loop.py:1751-1753 / stock_loop.py:815); falls back to",
+    "new": "    one ('spread_pct' — both loops journal this on cost_floor skips since\n    2026-07-13, base_loop._execute_buys / stock_loop._execute_buys); falls back to",
+    "reason": "Stale line citations: the cost_floor spread_pct journal calls are now base_loop.py:3024 (_execute_buys) and stock_loop.py:1095 (_execute_buys). Converted to function anchors per the pass's citation rule.",
+    "source_reports": [
+      "D07#4"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-010",
+    "file": "design_tokens.py",
+    "anchor_old": "# a given theme dict (never triggered by any of today's 10 themes — they all",
+    "new": "# a given theme dict (never triggered by any of today's 12 themes — they all",
+    "reason": "gui.THEMES has 12 keys (Terminal + Paper were added). README.md/CLAUDE.md already say 12.",
+    "source_reports": [
+      "D09#2",
+      "D12#2"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-011",
+    "file": "execution_report.py",
+    "anchor_old": "    print(\"Compare against the backtest's assumptions (fees.py spread \"\n          \"haircuts: crypto 10 bps, stock 5 bps round trip). If realized \"",
+    "new": "    print(\"Compare against the backtest's assumptions (backtest.py \"\n          \"SPREAD_PCT haircuts: crypto 10 bps, stock 5 bps round trip). \"\n          \"If realized \"",
+    "reason": "The 10/5 bps haircuts live in backtest.py:88 SPREAD_PCT (fees.FLAT_SPREAD_PCT is the canonical source but is not what the backtest charges by that name); the very next sentence already says 'raise SPREAD_PCT in backtest.py'.",
+    "source_reports": [
+      "D02#7"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-012",
+    "file": "gui.py",
+    "anchor_old": "                [\"indicator_leadlag.py\", \"--data\", \"crypto_training_data.parquet\"],",
+    "new": "                [\"indicator_leadlag.py\", \"--data\", \"training_data.parquet\"],",
+    "reason": "Nothing in the repo writes crypto_training_data.*; the crypto stem is 'training_data' (data_utils._FILE_STEMS). indicator_leadlag's --data is required=True with no fallback, so the 'Indicator Lead/Lag (Crypto)' button always fails. Display/plumbing only. MUST ship with F-019 (docstring) + F-063/F-064 (the two tests pinning the wrong literal).",
+    "source_reports": [
+      "D09#1",
+      "D11#2"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-013",
+    "file": "gui.py",
+    "anchor_old": "        shadow_on = bool(os.getenv('TRADER_SHADOW_MODE'))",
+    "new": "        shadow_on = os.getenv('TRADER_SHADOW_MODE', '1') != '0'",
+    "reason": "Inverted polarity: bool(None)=False reports OFF when unset (the pipeline default is ON), and bool('0')=True reports ON for the documented TRADER_SHADOW_MODE=0. Matches the sole authoritative reader run_pipeline.py:1016 exactly. Display chip only — no order path reads this variable.",
+    "source_reports": [
+      "D03#1"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": [
+      "docs/FLAGS.md (S3) documents this bug at gui.py:7489 — S3 must restate it as fixed"
+    ],
+    "class": "D"
+  },
+  {
+    "id": "F-014",
+    "file": "gui.py",
+    "anchor_old": "        self._settings_shadow_chip = QLabel(\n            \"SHADOW MODE — orders suppressed\" if shadow_on\n            else \"Live trading (shadow off)\")",
+    "new": "        self._settings_shadow_chip = QLabel(\n            \"SHADOW MODE — weekly retrain saves to the challenger slot\"\n            if shadow_on else \"Immediate promotion (shadow off)\")",
+    "reason": "No order-suppression path is keyed to TRADER_SHADOW_MODE anywhere in the repo; the sole reader (run_pipeline.py:1016) only redirects the weekly retrain into the challenger slot. The off-state label was equally wrong (trading is live either way).",
+    "source_reports": [
+      "D03#2"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-015",
+    "file": "gui.py",
+    "anchor_old": "from PySide6.QtGui import QColor, QPalette, QFont, QAction, QPainter, QPixmap, QDesktopServices, QIcon, QPicture, QFontDatabase, QShortcut, QKeySequence",
+    "new": "from PySide6.QtGui import QColor, QPalette, QFont, QPainter, QPixmap, QDesktopServices, QIcon, QPicture, QFontDatabase, QShortcut, QKeySequence",
+    "reason": "QAction occurs exactly once in gui.py — this import. Unused. (gui.py is PySide6-gated: py_compile only on the Mac, real check on the Jetson.)",
+    "source_reports": [
+      "D09#6"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-016",
+    "file": "gui.py",
+    "anchor_old": "# (theme_name, size) -> QPixmap. 10 themes x one size = trivial; never cleared.",
+    "new": "# (theme_name, size) -> QPixmap. 12 themes x one size = trivial; never cleared.",
+    "reason": "gui.THEMES has 12 keys.",
+    "source_reports": [
+      "D09#2",
+      "D12#2"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-017",
+    "file": "indicator_config.py",
+    "anchor_old": "Persists to indicator_config.json (gitignored) via an atomic write. Default\npreset: \"standard\". No heavy imports (json, pathlib, os, tempfile, contextlib\nonly) so it's safe for the GUI env.",
+    "new": "Persists to indicator_config.json (gitignored) via an atomic write. Default\npreset: \"standard\". NOTE: run_pipeline passes `--preset stationary` explicitly to\nboth hypersearch invocations, so the persisted preset (and the GUI picker) do NOT\naffect the production training path — they apply to manual runs only. No heavy\nimports (json, pathlib, os, tempfile, contextlib only) so it's safe for the GUI env.",
+    "reason": "run_pipeline.py:1032 and :1077 hardcode '--preset', 'stationary'; the persisted preset is advisory for production. Documentation only — the split is deliberate (campaign L8).",
+    "source_reports": [
+      "D06#9"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-018",
+    "file": "indicator_config.py",
+    "anchor_old": "# Cross-asset columns (BTC_Return_1h, RS_vs_SPY, etc.) are already stationary\n# and get auto-included via asset-type filtering in hypersearch.",
+    "new": "# Cross-asset columns (BTC_Return_1h, RS_vs_SPY, etc.) are already stationary.\n# There is NO asset-type filter: hypersearch intersects the preset with the columns\n# PRESENT in the loaded panel, so a crypto-only column simply is not in the stock\n# store. CRYPTO_ONLY_COLS / STOCK_ONLY_COLS below are GUI display text only.",
+    "reason": "scripts/hypersearch_v2.py:196-201 filters by preset membership and dtype, never by asset type; CRYPTO_ONLY_COLS/STOCK_ONLY_COLS are consumed only by gui.py:7786-7787 and tests.",
+    "source_reports": [
+      "D06#4"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-019",
+    "file": "indicator_leadlag.py",
+    "anchor_old": "    python indicator_leadlag.py --data crypto_training_data.parquet",
+    "new": "    python indicator_leadlag.py --data training_data.parquet",
+    "reason": "Same nonexistent filename as F-012; the crypto stem is 'training_data'.",
+    "source_reports": [
+      "D09#1",
+      "D11#2"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-020",
+    "file": "journal_stats.py",
+    "anchor_old": "  \"buy\"  (base_loop.py:1950-1961 — crypto AND the shared/base path;\n          stock_loop.py:961-973 — stock's own bracket-order path; both\n          write the identical key set): symbol, action=\"buy\",",
+    "new": "  \"buy\"  (base_loop._place_and_track_buy — crypto AND the shared/base path;\n          stock_loop._execute_buys — stock's own bracket-order path; both\n          write the identical key set): symbol, action=\"buy\",",
+    "reason": "Stale coordinates: the buy rows are written at base_loop.py:3296-3309 (_place_and_track_buy) and stock_loop.py:1352-1364 (_execute_buys). Content still true.",
+    "source_reports": [
+      "D07#5"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-021",
+    "file": "journal_stats.py",
+    "anchor_old": "  \"sell\" (base_loop.py:1080-1086 `_record_confirmed_exit` — used by BOTH\n          books for every signal/stop/TP/EOD-flatten/circuit-breaker exit,\n          e.g. exit_reason values 'signal_sell' base_loop.py:1123,\n          'server_stop' base_loop.py:708, 'circuit_breaker' base_loop.py:477,\n          'eod_flatten' stock_loop.py:387; PLUS stock_loop.py:643-649\n          `_journal_external_close` for broker-side closes the bot didn't",
+    "new": "  \"sell\" (base_loop._record_confirmed_exit — used by BOTH\n          books for every signal/stop/TP/EOD-flatten/circuit-breaker exit,\n          e.g. exit_reason values 'signal_sell' base_loop._execute_sells,\n          'server_stop' base_loop._manage_stops, 'circuit_breaker'\n          base_loop._circuit_breaker_check, 'eod_flatten'\n          stock_loop.flatten_before_close; PLUS\n          stock_loop._journal_external_close for broker-side closes the bot didn't",
+    "reason": "Verified current sites: _record_confirmed_exit base_loop.py:1850; 'signal_sell' :1984 (_execute_sells); 'server_stop' :1265 (_manage_stops); 'circuit_breaker' :775 (_circuit_breaker_check); 'eod_flatten' stock_loop.py:394 (flatten_before_close); _journal_external_close stock_loop.py:827.",
+    "source_reports": [
+      "D07#5"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-022",
+    "file": "journal_stats.py",
+    "anchor_old": "convention used codebase-wide to tell the books apart (order_utils.py:30,\ntrading_utils.py:202, monitor_drift.py:280, gui.py:2560), so one dict keyed",
+    "new": "convention used codebase-wide to tell the books apart (`'/' in symbol`, in\norder_utils.py, trading_utils.py, monitor_drift.py and gui.py), so one dict keyed",
+    "reason": "All four coordinates are stale: order_utils.py:30 is now a flag definition, trading_utils.py:202 a Kelly docstring, monitor_drift.py:280 a PSI return, gui.py:2560 thread wiring. The convention itself is real (order_utils.py:62, trading_utils.py:230/300, monitor_drift.py:313, gui.py:1874 etc.).",
+    "source_reports": [
+      "D07#5"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-023",
+    "file": "journal_stats.py",
+    "anchor_old": "Every row also carries `ts` (offset-aware ISO-8601, stamped once by\ntrade_journal.py:81 for every row type) and lives in a date-named file\n`journals/YYYY-MM-DD.jsonl` (trade_journal.py:82).",
+    "new": "Every row also carries `ts` (offset-aware ISO-8601, stamped once by\ntrade_journal.log_decision for every row type) and lives in a date-named file\n`journals/YYYY-MM-DD.jsonl` (trade_journal.JOURNAL_DIR).",
+    "reason": "ts is stamped at trade_journal.py:104 and JOURNAL_DIR is used at :96 — both inside log_decision; the :81/:82 coordinates are stale.",
+    "source_reports": [
+      "D07#5"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-024",
+    "file": "journal_stats.py",
+    "anchor_old": "buy (base_loop.py:1937-1944) REPLACES entry_price with the latest fill",
+    "new": "buy (base_loop._place_and_track_buy) REPLACES entry_price with the latest fill",
+    "reason": "self.positions[symbol] = Position(...) is at base_loop.py:3283, inside _place_and_track_buy.",
+    "source_reports": [
+      "D07#5"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-025",
+    "file": "liquidity.py",
+    "anchor_old": "Scope (2026-07): STOCKS ONLY — scripts/harvest_stock_data.py is the sole site\nthat stamps Eff_Spread_Pct. The crypto harvest stamps no spread, so the crypto\nbook still prices the flat fees.FLAT_SPREAD_PCT['crypto'] haircut in",
+    "new": "Scope: scripts/harvest_stock_data.py is the always-on stamp site. The crypto\nharvest calls liquidity.stamp_crypto_spreads, which is a no-op unless\nTRADER_CRYPTO_SPREAD_STAMP=1, so by DEFAULT the crypto store still carries no\nEff_Spread_Pct and the crypto book prices the flat\nfees.FLAT_SPREAD_PCT['crypto'] haircut in",
+    "reason": "scripts/harvest_crypto_data.py:180-181 calls liquidity.stamp_crypto_spreads (default-OFF no-op), which the same file documents at :303-320. Runtime behaviour is unchanged; only the 'sole site / stamps no spread' claim is now false as code.",
+    "source_reports": [
+      "D07#9"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-026",
+    "file": "liquidity.py",
+    "anchor_old": "    Returns (pct, raw_nan, at_floor, at_cap).\"\"\"\n    import numpy as np\n    if SPREAD_FILL_V2:",
+    "new": "    Returns (pct, raw_nan, at_floor, at_cap).\"\"\"\n    if SPREAD_FILL_V2:",
+    "reason": "numpy is already imported at module scope (liquidity.py:37); the function-local re-import is a shadowing no-op. Zero behaviour change.",
+    "source_reports": [
+      "D07#3"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-027",
+    "file": "liquidity.py",
+    "anchor_old": "        log.warning(\"edge_spread_series(%s): %d bars < window=%d — no EDGE \"\n                    \"estimate possible, whole series stamped at the %.2f%% \"\n                    \"floor\", name, n, window, fill_pct)",
+    "new": "        log.warning(\"edge_spread_series(%s): %d bars < max(window=%d, 5) — no \"\n                    \"EDGE estimate possible, whole series stamped at the \"\n                    \"%.2f%% no-estimate fill\", name, n, window, fill_pct)",
+    "reason": "Two message defects in one line: the guard is `n < max(window, 5)` (diverges from the printed `< window` for window in {3,4}, which :135 permits), and the value formatted is fill_pct, which under TRADER_SPREAD_FILL_V2 is FLAT_SPREAD_PCT, not the floor. Log text only.",
+    "source_reports": [
+      "D07#6",
+      "D07#8"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-028",
+    "file": "liquidity.py",
+    "anchor_old": "        log.warning(\"edge_spread_series(%s): %d/%d post-warmup bars had no \"\n                    \"EDGE estimate and were stamped at the %.2f%% floor — \"\n                    \"this name's spread stamp is mostly fabricated\",",
+    "new": "        log.warning(\"edge_spread_series(%s): %d/%d post-warmup bars had no \"\n                    \"EDGE estimate and were stamped at the %.2f%% \"\n                    \"no-estimate fill — this name's spread stamp is mostly \"\n                    \"fabricated\",",
+    "reason": "Same 'floor' vs fill_pct mismatch as F-027. Log text only.",
+    "source_reports": [
+      "D07#6"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-029",
+    "file": "llm_analyst.py",
+    "anchor_old": "One LLM call per trading cycle (all candidates at once). The LLM evaluates\nONLY qualitative factors the ML model cannot see:",
+    "new": "One LLM call per gate cycle (all candidates at once) — the gate is throttled to\nbase_loop.LLM_INTERVAL_SEC = 600 s, i.e. roughly once per 10 minutes, not once per\n30 s trading cycle. The LLM evaluates ONLY qualitative factors the ML model cannot\nsee:",
+    "reason": "base_loop.py:94 LLM_INTERVAL_SEC = 600 and the guard at :1666 throttle the gate to ~10 minutes; 'per trading cycle' overstates the call rate by ~20x.",
+    "source_reports": [
+      "D08#9"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-030",
+    "file": "llm_analyst.py",
+    "anchor_old": "    Schema enforcement at the API layer replaces ~130 lines of fence\n    stripping, brace counting, truncation repair, and array-format\n    conversion that this file used to need.",
+    "new": "    Schema enforcement at the API layer replaced ~130 lines of brace\n    counting, truncation repair, and array-format conversion that this file\n    used to need. A thin fence-strip is deliberately RETAINED in\n    _parse_response for non-enforced fallback providers.",
+    "reason": "_parse_response still fence-strips (llm_analyst.py:1071-1073) and says so at :1061-1062; the two docstrings contradicted each other on that one item.",
+    "source_reports": [
+      "D08#10"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-031",
+    "file": "llm_client.py",
+    "anchor_old": "  Selects the best model per role (analyst, sentiment, backfill) based on\n  daily cost spend. Progressively downgrades as daily cost increases.",
+    "new": "  Selects the model per role (analyst, sentiment, backfill) from a daily-cost\n  bracket table. NOTE: as shipped, every role in every bracket of both\n  _PAID_ROUTING and _FREE_ROUTING maps to gemini-2.5-flash-lite, so the\n  cost-bracket downgrade is a no-op placeholder today.",
+    "reason": "_PAID_ROUTING (llm_client.py:279-282) and _FREE_ROUTING (:285-287) return gemini-2.5-flash-lite for every role in every bracket — nothing downgrades.",
+    "source_reports": [
+      "D08#2"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-032",
+    "file": "llm_client.py",
+    "anchor_old": "    and price them via the config \"pricing\" table). Ops/GUI use only —\n    never called in the trading hot path.",
+    "new": "    and price them via the config \"pricing\" table). No in-repo caller —\n    reachable only from a REPL / ops session; never called in the trading\n    hot path.",
+    "reason": "gui.py never calls probe_available_models (repo-wide grep: zero callers outside llm_client.py). Same is true of probe_tier.",
+    "source_reports": [
+      "D08#4"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-033",
+    "file": "macro_indicators.py",
+    "anchor_old": "- VIX: yfinance (already installed)",
+    "new": "- VIX: yfinance primary, FRED VIXCLS CSV fallback",
+    "reason": "get_vix (macro_indicators.py:99) documents and implements a FRED VIXCLS CSV fallback at :123-137; the module's source list omits it.",
+    "source_reports": [
+      "D06#8"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-034",
+    "file": "model_v2.py",
+    "anchor_old": "import torch\nimport torch.nn as nn",
+    "new": "import torch.nn as nn",
+    "reason": "`torch` appears exactly twice in the file: these two import lines. The bare name is never referenced; `import torch.nn as nn` already binds the torch package. Zero behaviour change.",
+    "source_reports": [
+      "D04#5"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-035",
+    "file": "naive_baseline.py",
+    "anchor_old": "    \"\"\"Admitted long-only trade returns: fwd where pred > threshold\n    (STRICT >, the deployed convention — objective_utils.py:67,\n    backtest.py, predict_now.py). Rows with non-finite pred or fwd are\n    dropped. The DSR input for both the blend and the naive rule.\"\"\"",
+    "new": "    \"\"\"Admitted long-only trade returns: fwd where pred > threshold\n    (STRICT >, matching the hypersearch objective —\n    objective_utils.simulate_trades_core — and predict_now's CLI\n    recommendation. NOTE backtest.simulate_ticker and base_loop._execute_buys\n    skip on `pred < threshold`, i.e. they ADMIT pred == threshold; the\n    boundary is measure-zero for float preds). Rows with non-finite pred or\n    fwd are dropped. The DSR input for both the blend and the naive rule.\"\"\"",
+    "reason": "objective_utils.py:67 is embargo_end_time, not the comparison; the strict `p > threshold` is objective_utils.py:146 (simulate_trades_core) and predict_now.py:510. backtest.py:361 and base_loop.py:3028 both use `< threshold` to SKIP, so they admit equality — the citation named them as strict-`>` sites.",
+    "source_reports": [
+      "D05#2"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-036",
+    "file": "oi_archive.py",
+    "anchor_old": "(5-min snapshots, since ~2021-12, free, not geo-blocked). Daily files",
+    "new": "(5-min snapshots; the source reaches back to ~2021-12, though sync() only walks\ndays at/after OI_START = 2023-01-01; free, not geo-blocked). Daily files",
+    "reason": "The docstring's '~2021-12' describes the source while the sync floor is OI_START='2023-01-01' (oi_archive.py:52); readers take it as the archive's coverage.",
+    "source_reports": [
+      "D06#7"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-037",
+    "file": "policy_exits.py",
+    "anchor_old": "    derives from highs through bar j-1; live re-derives the trail from\n    the same-cycle HWM and can exit on an intrabar spike-then-fade that\n    the kernel holds through",
+    "new": "    derives from highs through bar j-1; live re-derives the trail from\n    the same-cycle HWM and can exit on an intrabar spike-then-fade that\n    the kernel holds through\n  - trailing-distance denominator: the kernel scales the trail by ATR/entry\n    (`td`) and enforces hwm*(1 - td), while base_loop._desired_stop_for\n    scales by ATR/hwm — so once the HWM has risen above entry, live's\n    crypto/base trail sits entry/hwm x CLOSER to the HWM than the kernel's.\n    stock_loop._manage_stops divides by entry_price and agrees with the\n    kernel (the underlying base_loop-vs-kernel arithmetic difference is an\n    open OWNER item, not a documentation choice)",
+    "reason": "Kernel: `td = (a * atr_trail_mult) / entry` at policy_exits.py:145 and :251. Live: base_loop.py:1051 divides by hwm; stock_loop.py:1472 divides by entry_price. The NORMATIVE overlay list omitted this. Doc-only addition — the arithmetic itself is E-class. tests/test_policy_exits_v3.py::TestDocstringContracts requires the tokens NORMATIVE, HOLD_RANK, llm_veto, OVERNIGHT_SLEEVE, 'gap asymmetry', 'enforcement lag' — all preserved.",
+    "source_reports": [
+      "D05#5"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-038",
+    "file": "policy_exits.py",
+    "anchor_old": "  - compute_tb_labels: max_hold=fb (12-48), use_signal_exit=False",
+    "new": "  - compute_tb_labels: max_hold=fb (the harvest's adaptive forward_bars list,\n    default 12-48), use_signal_exit=False",
+    "reason": "'(12-48)' reads as a fixed range; it is the harvest's adaptive forward_bars list default.",
+    "source_reports": [
+      "D05#7"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-039",
+    "file": "requirements-ci.txt",
+    "anchor_old": "# Mirrors requirements-jetson.txt pins so ONE non-Jetson environment runs the",
+    "new": "# Mirrors requirements-jetson.txt pins — one known divergence, numba>=0.60 here vs\n# >=0.63 there — so ONE non-Jetson environment runs the",
+    "reason": "The 'mirrors' claim is false for numba (>=0.60 vs >=0.63). Amending the claim is the safe half of the fix; changing the pin is a build decision.",
+    "source_reports": [
+      "D09#8"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "C"
+  },
+  {
+    "id": "F-040",
+    "file": "requirements-ci.txt",
+    "anchor_old": "bidask>=2.1\nlightgbm>=4.0\n\npytest>=7.0",
+    "new": "bidask>=2.1\nlightgbm>=4.0\npyarrow>=14      # parquet engine: run_pipeline imports it directly, 7 modules read/write parquet\n\npytest>=7.0",
+    "reason": "run_pipeline.py:1146 does `import pyarrow.parquet as pq` and seven modules call to_parquet/read_parquet, yet pyarrow appears in no requirements file. Declaring it is objective; the >=14 floor is the conservative pandas-2.x-compatible choice. OWNER CHECK: confirm the Jetson's installed pyarrow version before pinning.",
+    "source_reports": [
+      "D09#4"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "C"
+  },
+  {
+    "id": "F-041",
+    "file": "requirements-jetson.txt",
+    "anchor_old": "bidask>=2.1\nlightgbm>=4.0",
+    "new": "bidask>=2.1\nlightgbm>=4.0\npyarrow>=14      # parquet engine: run_pipeline imports it directly, 7 modules read/write parquet",
+    "reason": "Same undeclared pyarrow. Production writes parquet on the Jetson, so an engine IS installed there — this makes it explicit. OWNER CHECK: confirm the installed version.",
+    "source_reports": [
+      "D09#4"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "C"
+  },
+  {
+    "id": "F-042",
+    "file": "requirements.txt",
+    "anchor_old": "pandas>=2.0",
+    "new": "pandas>=2.0,<3   # pct_change fill_method semantics pinned repo-wide to pandas-2 (c26-T3/B21)",
+    "reason": "Both sibling files pin `pandas>=2.0,<3`; requirements.txt alone would install pandas 3.x, whose pct_change semantics the repo pins against (this dev Mac already runs pandas 3).",
+    "source_reports": [
+      "D09#3"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "C"
+  },
+  {
+    "id": "F-043",
+    "file": "requirements.txt",
+    "anchor_old": "bidask>=2.1\nlightgbm>=4.0",
+    "new": "bidask>=2.1\nlightgbm>=4.0\npyarrow>=14      # parquet engine: run_pipeline imports it directly, 7 modules read/write parquet",
+    "reason": "Same undeclared pyarrow. OWNER CHECK: confirm the installed version before pinning.",
+    "source_reports": [
+      "D09#4"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "C"
+  },
+  {
+    "id": "F-044",
+    "file": "retrain_ledger.py",
+    "anchor_old": "Two-machine reality: the pure kernels (paired_scores, stack_valid_rows,\ntrailing_purged_rows, append_ledger_row, window_gather_plan) are\nnumpy-only and Mac-tested;",
+    "new": "Two-machine reality: the pure kernels (paired_scores, stack_valid_rows,\ntrailing_purged_rows, append_ledger_row, window_gather_plan,\nincumbent_paths) are numpy-only and Mac-tested;",
+    "reason": "incumbent_paths (retrain_ledger.py:159-168) is pure string/dict work with no heavy import, and tests/test_r2c_rankic_ledger.py:382-399 exercises it on the Mac.",
+    "source_reports": [
+      "D04#10"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-045",
+    "file": "scripts/connection_test.py",
+    "anchor_old": "import os\nfrom dotenv import load_dotenv",
+    "new": "from dotenv import load_dotenv",
+    "reason": "`os.` never appears in the file (verified by grep + read). Unused import.",
+    "source_reports": [
+      "D02#2"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-046",
+    "file": "scripts/crypto_spread_census.py",
+    "anchor_old": "        'generated_utc': datetime.datetime.utcnow().isoformat() + 'Z',",
+    "new": "        'generated_utc': (datetime.datetime.now(datetime.timezone.utc)\n                          .replace(tzinfo=None).isoformat() + 'Z'),",
+    "reason": "datetime.utcnow() is deprecated from py3.12 (dev Mac is 3.13) and is the only occurrence in non-test code; the repo convention is now(timezone.utc) (options_overlay.py:338, monitor_drift.py:462). The .replace(tzinfo=None) keeps the emitted string byte-identical (naive ISO + literal 'Z').",
+    "source_reports": [
+      "D07#2"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-047",
+    "file": "scripts/funding_drift_audit.py",
+    "anchor_old": "The Funding_* family (Funding_Rate_Ann/Z/Chg_24h + CS_Rank_Funding_Z)",
+    "new": "The Funding_* family (Funding_Rate_Ann / Funding_Z / Funding_Chg_24h — the audit\nselects every column whose name contains 'Funding'; the researched\nCS_Rank_Funding_Z was never built)",
+    "reason": "CS_Rank_Funding_Z exists nowhere in code (panel_ranks has no Funding column at all; no preset lists it). The audit itself selects `[c for c in df.columns if 'Funding' in c]` (:123), so the docstring promises an audited column the script can never see.",
+    "source_reports": [
+      "D06#3"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-048",
+    "file": "scripts/harvest_stock_data.py",
+    "anchor_old": "MINUTE_EDGE_DAYS = int(os.getenv('TRADER_MINUTE_EDGE_DAYS', '120'))",
+    "new": "try:\n    MINUTE_EDGE_DAYS = int(os.getenv('TRADER_MINUTE_EDGE_DAYS', '120') or '120')\nexcept ValueError:\n    MINUTE_EDGE_DAYS = 120",
+    "reason": "The two structurally identical int-env reads in the repo both guard (run_pipeline.py:119-122, trade_journal.py:62-65); this one crashes the harvest at IMPORT on a non-numeric value. Same default either way, so flag-OFF behaviour is byte-identical.",
+    "source_reports": [
+      "D03#6"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-049",
+    "file": "scripts/hypersearch_v2.py",
+    "anchor_old": "Note: data loads parquet-first via data_utils by --prefix stem; --data is\nonly a direct-CSV fallback.",
+    "new": "Note: data loads parquet-first via data_utils, but the STORE is chosen by the\n--data PATH ('stock' in --data selects the stock panel, else crypto — see\nload_data); --data itself is only the direct-CSV fallback. --prefix names the\nOUTPUT artifacts, it does not select the input store.",
+    "reason": "load_data (scripts/hypersearch_v2.py:150-158) computes `pq_prefix = 'stock' if 'stock' in data_path else 'crypto'` — the --data path, not --prefix, selects the parquet store.",
+    "source_reports": [
+      "D04#1"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-050",
+    "file": "scripts/hypersearch_v2.py",
+    "anchor_old": "                        # paths) and coverage is verified downstream\n                        # (scripts/reliability_report.py, 10% +/- 3pp).",
+    "new": "                        # paths). NOTE: q10 holdout coverage has NO\n                        # tool yet — scripts/reliability_report.py is the\n                        # META-calibration Brier/ECE report — so the\n                        # 10% +/- 3pp check is an open Jetson item.",
+    "reason": "scripts/reliability_report.py's own docstring: 'Calibration before/after gate ... decide whether to flip META_CALIBRATION_MODE'. It computes Brier/ECE over meta probabilities; nothing in the repo measures q10 quantile coverage (grep: no q10 coverage code).",
+    "source_reports": [
+      "D04#2"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-051",
+    "file": "scripts/hypersearch_v2.py",
+    "anchor_old": "    Returns {'sharpe', 'dsr', 'dsr_min', 'n_trades', 'n_rows'} or None.",
+    "new": "    Returns None, or a dict with keys: sharpe, dsr, dsr_min, n_trades,\n    n_eff, n_eff_v2, status, min_trl, n_trials_pool, u_bar_mean,\n    trade_returns, n_rows, hit_rate, pred_deciles — plus certified,\n    lstm_weight, q10_vetoed and cs_rank_ic when the blend path ran.",
+    "reason": "Verified by AST against the report dict at scripts/hypersearch_v2.py:1988-2009 and the blend-only additions at :2012-2014, :2057. The docstring lists 5 of 14 base keys.",
+    "source_reports": [
+      "D04#4"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-052",
+    "file": "scripts/hypersearch_v2.py",
+    "anchor_old": "HOLDOUT_FRACTION = 0.12  # final slice of CALENDAR TIME never shown to Optuna",
+    "new": "# Final 12% of the pooled ROW-timestamp distribution (a row quantile — equal to\n# calendar time only on a balanced panel), never shown to Optuna; a fixed trailing\n# span replaces it under FIXED_HOLDOUT_DAYS (R2C-05 / FR-01).\nHOLDOUT_FRACTION = 0.12",
+    "reason": "get_holdout_boundary is a quantile over pooled row timestamps (the FR-01 instrumentation at :1806-1811 prints it as 'boundary quantile'), and _fixed_holdout_days can replace it with a fixed day span. 'CALENDAR TIME' is misleading on an unbalanced panel.",
+    "source_reports": [
+      "D04#7"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-053",
+    "file": "scripts/hypersearch_v2.py",
+    "anchor_old": "        fb = cfg.get('forward_bars', 12)",
+    "new": "        fb = cfg.get('forward_bars', 24)",
+    "reason": "Every other fallback in the file is 24 (:1282, :1708, :2443, :2560, :2565, :2732, :2805). This one feeds only the per-trial progress print (trial_callback), so the change is display-only and unreachable in practice (a hypersearch-written config always has the key).",
+    "source_reports": [
+      "D04#9"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-054",
+    "file": "scripts/naive_vs_blend.py",
+    "anchor_old": "    \"\"\"Blend admission per deployed convention: pred > threshold, read",
+    "new": "    \"\"\"Blend admission per the hypersearch objective's convention: pred >\n    threshold (STRICT; backtest.simulate_ticker and base_loop._execute_buys\n    admit pred == threshold), read",
+    "reason": "Same imprecision as F-035: 'the deployed convention' papers over the strict-vs-inclusive split between the objective and the two replay/live paths.",
+    "source_reports": [
+      "D05#2"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-055",
+    "file": "scripts/prompt_ab.py",
+    "anchor_old": "model-panel dispersion — see CLAUDE.md task PART B). This script NEVER",
+    "new": "model-panel dispersion — see CLAUDE.md section Conventions,\n\"Deployment gate\"). This script NEVER",
+    "reason": "CLAUDE.md has no 'PART B' section (grep across CLAUDE.md and README.md returns nothing) — it referred to a task prompt that never lived in the repo. The real in-repo home of that rule is CLAUDE.md:176 § Conventions 'Deployment gate' (S8 confirmed this target in their handoff).",
+    "source_reports": [
+      "D12#8"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-056",
+    "file": "scripts/setup.sh",
+    "anchor_old": "echo \"  2. python connection_test.py        # Verify API access\"",
+    "new": "echo \"  2. python scripts/connection_test.py # Verify API access\"",
+    "reason": "There is no root-level connection_test.py; the file is scripts/connection_test.py (verified with ls). The printed command fails as written.",
+    "source_reports": [
+      "D09#5"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "C"
+  },
+  {
+    "id": "F-057",
+    "file": "scripts/sizing_cofire_report.py",
+    "anchor_old": "    marginal = {}\n    for key in MULT_KEYS:\n        ratios = []",
+    "new": "    marginal = {}\n    # kelly_mult and vol_mult are applied to `sized` AFTER the tilt product\n    # (base_loop._compute_position_size) and never enter tilt_raw, so\n    # `raw / m` is meaningless for them — exclude them here.\n    for key in [k for k in MULT_KEYS if k not in ('kelly_mult', 'vol_mult')]:\n        ratios = []",
+    "reason": "Verified: base_loop._compute_position_size accumulates tilt from signal_conf, vix_tilt, dd_mult, macro_mult, corr_mult, hmm_mult, the 0.8 disagree factor, sentiment_mult, llm_mult, meta_mult, extra_tilt, book_vol_mult (:2423-2501) and stamps tilt_raw at :2506; kelly_mult and vol_mult are applied only at :2601 (`sized = base * kelly_mult * vol_mult * tilt`). The correct formula is unambiguous from the section's own comment ('effect of each multiplier on the final tilt'). Measurement-only script; changes only the two bogus rows of the marginal_effect report.",
+    "source_reports": [
+      "D07#1"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "D"
+  },
+  {
+    "id": "F-058",
+    "file": "stock_config.py",
+    "anchor_old": "# The intended full coin set for wave-9 #6 — a DECLARATION ONLY, nothing reads\n# it yet. The harvest does NOT consume this: scripts/harvest_crypto_data.py\n# hardcodes its own 6-coin CRYPTO_TICKERS list (~line 30), which must be",
+    "new": "# The intended full coin set for wave-9 #6 — no TRADING path reads it (gui.py and\n# scripts/crypto_spread_census.py do, for the markets view and the spread census).\n# The harvest does NOT consume this: scripts/harvest_crypto_data.py\n# hardcodes its own 6-coin CRYPTO_TICKERS list, which must be",
+    "reason": "CRYPTO_POOL is imported by gui.py:219 and scripts/crypto_spread_census.py:34, so 'nothing reads it yet' is false. The harvest half of the claim is correct and is kept; the '~line 30' coordinate is also stale (CRYPTO_TICKERS is at :47) so it is dropped. tests/test_review_b20.py::TestCryptoPoolComment requires 'so the harvest can include them' to be ABSENT and 'CRYPTO_TICKERS' to be PRESENT — both still hold.",
+    "source_reports": [
+      "D02#3"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-059",
+    "file": "strategy_config.py",
+    "anchor_old": "  - fees.FLAT_SPREAD_PCT (canonical flat spread) and its copy backtest.SPREAD_PCT\n    (drift guarded by tests/test_review_b10.py).",
+    "new": "  - fees.FLAT_SPREAD_PCT (canonical flat spread) and its TWO copies,\n    backtest.SPREAD_PCT and meta_label._gen_meta_rows' inline spread literal\n    (both drift-guarded by tests/test_review_b10.py).",
+    "reason": "meta_label.py:720 (`spread = 0.10 if asset_type == 'crypto' else 0.05`, inside _gen_meta_rows) is a third copy, guarded by tests/test_review_b10.py::test_meta_label_copy_agrees. The note listed only two.",
+    "source_reports": [
+      "D05#8"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-060",
+    "file": "strategy_config.py",
+    "anchor_old": "# {slot}_policy_gate.json for the shadow-side promotion pre-flight (future shadow.py\n# change; see backtest.py docstring). Gate-behavior change: flip on the Jetson only.",
+    "new": "# {slot}_policy_gate.json for the shadow-side promotion pre-flight (consumed by\n# shadow._gate_preflight). Gate-behavior change: flip on the Jetson only.",
+    "reason": "shadow._gate_preflight exists at shadow.py:887 and is consulted at :1098 — the change is no longer 'future'.",
+    "source_reports": [
+      "D05#1"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-061",
+    "file": "strategy_config.py",
+    "anchor_old": "# config['lstm_weight'] — the key predict_now.py:405 / backtest.py already read;",
+    "new": "# config['lstm_weight'] — the key predict_now.get_live_prediction / backtest.py\n# already read;",
+    "reason": "The live read is predict_now.py:471 (inside get_live_prediction), not :405.",
+    "source_reports": [
+      "D04#12"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-062",
+    "file": "strategy_config.py",
+    "anchor_old": "#   (in-sample for the refit — caveat recorded in lgb_q10_meta.json; verify q10\n#   holdout coverage 10% +/- 3pp via scripts/reliability_report.py). Same",
+    "new": "#   (in-sample for the refit — caveat recorded in lgb_q10_meta.json; a q10\n#   holdout-coverage check (10% +/- 3pp) has NO tool yet — scripts/reliability_report.py\n#   is the META-calibration Brier/ECE report — so it stays an open Jetson item). Same",
+    "reason": "Same false claim as F-050: reliability_report.py measures meta-probability Brier/ECE, not q10 quantile coverage.",
+    "source_reports": [
+      "D04#2"
+    ],
+    "touches_uncommitted": true,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-063",
+    "file": "tests/test_c26_U1.py",
+    "anchor_old": "    assert '\"indicator_leadlag.py\", \"--data\", \"crypto_training_data.parquet\"' \\",
+    "new": "    assert '\"indicator_leadlag.py\", \"--data\", \"training_data.parquet\"' \\",
+    "reason": "Pins the wrong filename literal — it currently locks the gui.py bug in place. Must be applied in the SAME change as F-012.",
+    "source_reports": [
+      "D09#1"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "B"
+  },
+  {
+    "id": "F-064",
+    "file": "tests/test_gui_contracts.py",
+    "anchor_old": "        assert ('\"indicator_leadlag.py\", \"--data\", '\n                '\"crypto_training_data.parquet\"') in body",
+    "new": "        assert ('\"indicator_leadlag.py\", \"--data\", '\n                '\"training_data.parquet\"') in body",
+    "reason": "Same wrong pinned literal. Must be applied in the SAME change as F-012.",
+    "source_reports": [
+      "D09#1"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "B"
+  },
+  {
+    "id": "F-065",
+    "file": "validation.py",
+    "anchor_old": "    DIAGNOSTIC ONLY: logged NEXT TO the analytic DSR (research/\n    campaign_2026-08 idea #3); it feeds no promotion verdict, and every",
+    "new": "    DIAGNOSTIC ONLY; INTENDED to be logged next to the analytic DSR\n    (research/campaign_2026-08 idea #3) but NOT YET WIRED — no production\n    caller exists, only tests. It feeds no promotion verdict, and every",
+    "reason": "stationary_bootstrap_sharpe_pvalue has no caller outside tests/test_c26_V4.py (repo-wide grep); the present tense 'logged NEXT TO' claims a wiring that does not exist.",
+    "source_reports": [
+      "D04#3"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  },
+  {
+    "id": "F-066",
+    "file": "volatility.py",
+    "anchor_old": "# DEAD in live paths: stops are ATR-based (base_loop) and this floor/ceil\n# does not track strategy_config stop policy. Kept only because\n# base_loop.py:40 still imports the name — delete both together.",
+    "new": "# DEAD in live paths: stops are ATR-based (base_loop) and this floor/ceil\n# does not track strategy_config stop policy. It has NO non-test consumer —\n# base_loop no longer imports it (tests/test_grp_loops.py::test_dead_imports_pruned\n# asserts the name is absent from base_loop); the only exercise is\n# tests/test_new_modules.py.",
+    "reason": "base_loop.py:40 is `from trade_journal import log_decision`, and get_garch_stop appears nowhere in base_loop.py; tests/test_grp_loops.py:22 actively asserts its absence. The comment's stated precondition for deletion is already met, which makes the comment actively misleading.",
+    "source_reports": [
+      "D06#1"
+    ],
+    "touches_uncommitted": false,
+    "collides_with": null,
+    "class": "A"
+  }
+]

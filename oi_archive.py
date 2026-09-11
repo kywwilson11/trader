@@ -7,7 +7,8 @@ mark deleveraging events. Funding (already a feature) prices crowded
 positioning; OI measures its SIZE.
 
 Training side: data.binance.vision serves DAILY metrics zips per perp
-(5-min snapshots, since ~2021-12, free, not geo-blocked). Daily files
+(5-min snapshots; the source reaches back to ~2021-12, though sync() only walks
+days at/after OI_START = 2023-01-01; free, not geo-blocked). Daily files
 are numerous, so sync() walks newest-first with a per-run cap — the
 most recent (most training-relevant) history lands first and older
 days back-fill across subsequent harvests. Rows are resampled to

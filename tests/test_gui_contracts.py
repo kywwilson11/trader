@@ -166,7 +166,7 @@ class TestU5Reports:
         assert '"decision_report.py", "--days", "30"' in body
         assert '"beta_ledger.py", "--days", "90"' in body
         assert ('"indicator_leadlag.py", "--data", '
-                '"crypto_training_data.parquet"') in body
+                '"training_data.parquet"') in body
 
     def test_run_report_uses_engine_pattern(self):
         body = _method_source("_run_report_clicked")

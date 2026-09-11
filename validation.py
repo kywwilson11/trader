@@ -710,8 +710,9 @@ def stationary_bootstrap_sharpe_pvalue(returns, n_boot: int = 1000,
     needs a per-replicate HAC variance estimate); LW-2008 studentization
     is the upgrade path if this ever feeds a gate.
 
-    DIAGNOSTIC ONLY: logged NEXT TO the analytic DSR (research/
-    campaign_2026-08 idea #3); it feeds no promotion verdict, and every
+    DIAGNOSTIC ONLY; INTENDED to be logged next to the analytic DSR
+    (research/campaign_2026-08 idea #3) but NOT YET WIRED — no production
+    caller exists, only tests. It feeds no promotion verdict, and every
     failure path is fail-open — a degenerate input returns a status dict
     with p_value None, never an exception.
 

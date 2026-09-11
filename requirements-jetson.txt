@@ -24,3 +24,4 @@ requests>=2.31
 PyYAML>=6.0
 bidask>=2.1
 lightgbm>=4.0
+pyarrow          # parquet engine: run_pipeline imports it directly, 7 modules read/write parquet
