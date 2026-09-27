@@ -72,6 +72,76 @@ STOP_CLASSIFY_V2 = os.environ.get(
 STREAM_STOP_DETECT = os.environ.get(
     'TRADER_STREAM_STOP_DETECT', '0').strip().lower() in ('1', 'true', 'yes')
 
+
+def _breaker_server_fill_attrib() -> bool:
+    """ENGINE r3 O3: strategy_config.BREAKER_SERVER_FILL_ATTRIB (default
+    False), read at CALL time. TRADER_BREAKER_SERVER_FILL_ATTRIB
+    ('1'/'true'/'yes'/'on'; any other non-empty value = off) wins over the
+    constant when set. Never raises — anything unreadable is OFF."""
+    v = os.environ.get('TRADER_BREAKER_SERVER_FILL_ATTRIB')
+    if v not in (None, ''):
+        return v.strip().lower() in ('1', 'true', 'yes', 'on')
+    try:
+        import strategy_config as _sc
+        return bool(getattr(_sc, 'BREAKER_SERVER_FILL_ATTRIB', False))
+    except Exception:
+        return False
+
+
+# client_order_id is deliberately NOT journaled yet: make_client_order_id
+# mints a uuid4 tail, which breaks the replay harness's journal-determinism
+# pins (tests/test_engine_r2_replay_harness.py *_is_deterministic); the
+# broker order (GET /v2/orders/{order_id}) carries it for any join.
+_JOURNAL_ID_FIELDS = (('id', 'order_id'),)
+
+
+def _order_journal_ids(order, keep_none=True) -> dict:
+    """ENGINE r4 R4-a (measurement-only): the broker order id behind a
+    journal row, {'order_id': str} (None when the object lacks one).
+    keep_none=False drops an unknown id — sell rows keep their pinned
+    legacy key-set when no order object is in hand. Lets
+    scripts/fill_venue_slippage_report.py join live rows to broker fills.
+    Never raises."""
+    out = {}
+    for attr, key in _JOURNAL_ID_FIELDS:
+        try:
+            v = getattr(order, attr, None)
+            v = None if v is None else str(v)
+        except Exception:
+            v = None
+        if v is not None or keep_none:
+            out[key] = v
+    return out
+
+
+def _decision_quote_journal_keys(quote) -> dict:
+    """ENGINE r4 R4-a (measurement-only): the quote the entry decision used
+    (no new fetch) — decision_bid / decision_ask, and decision_quote_ts =
+    the epoch-seconds fetch stamp the buy row's quote_age_s is measured
+    from ('_fetched_ts', else get_quote's 'fetched_ts'); ENGINE r5:
+    decision_quote_t = get_quote's 'quote_t', the EXCHANGE quote time
+    (epoch s). None when unknown. Never raises."""
+    out = {'decision_bid': None, 'decision_ask': None,
+           'decision_quote_ts': None, 'decision_quote_t': None}
+    try:
+        if isinstance(quote, dict):
+            out['decision_bid'] = quote.get('bid')
+            out['decision_ask'] = quote.get('ask')
+            out['decision_quote_ts'] = (quote.get('_fetched_ts')
+                                        or quote.get('fetched_ts'))
+            out['decision_quote_t'] = quote.get('quote_t')
+    except Exception:
+        pass
+    return out
+
+
+# Log labels per _breaker_record_server_fill call site (ENGINE r4 R4-b).
+_SERVER_FILL_SITES = {
+    'breaker': ('[CIRCUIT BREAKER]', 'breaker flatten'),
+    'remote_flatten': ('[FLATTEN]', 'remote flatten'),
+    'stablecoin_flatten': ('[CONTAGION]', 'stablecoin flatten'),
+}
+
 # c26 S3: one-time DERISK_STACK_V2 activation announcement (per process).
 _derisk_v2_logged = False
 
@@ -443,6 +513,23 @@ class BaseTradingLoop(ABC):
         except FileNotFoundError:
             logger.warning("Model files not found. Buys are DISABLED until a model exists "
                            "(fail closed); exits and stops still run.")
+        except Exception as e:
+            # A corrupt/mismatched artifact must fail CLOSED like the FNF
+            # branch, not escape run() — in combined mode that crash took
+            # the healthy book down too (2026-09 G1 F2). Retry is handed to
+            # _hot_reload_check's existing >=300 s backoff: model_mtime=None
+            # differs from the reload key, and _failed_reload holds it.
+            logger.error("Model load FAILED (%s: %s) — buys DISABLED (fail closed); "
+                         "exits and stops still run; retrying via hot-reload backoff",
+                         type(e).__name__, e)
+            self.model = None
+            self.config = {}
+            self.scaler_X = None
+            self.feature_cols = None
+            from trading_utils import model_reload_key
+            self._failed_reload = (model_reload_key(self.MODEL_PREFIX), time.time())
+            self.model_mtime = None
+            return
 
         from trading_utils import model_reload_key
         self.model_mtime = model_reload_key(self.MODEL_PREFIX)
@@ -534,6 +621,15 @@ class BaseTradingLoop(ABC):
         saved_hwm = saved.get('hwm', {})
         saved_trailing = saved.get('trailing', {})
         for sym, info in raw_positions.items():
+            if not info['entry_price'] > 0:
+                # Log-only (the consequences are owner items, ENGINE r1 W1):
+                # with no basis the entry-anchored stop/TP/risk math degrades.
+                logger.warning("[RECONSTRUCT] %s: cost basis unknown "
+                               "(avg_entry_price=%s) — hard stop and TP "
+                               "disabled, protection is a pure %.0f%% trail "
+                               "from the high-water mark, book stop-risk "
+                               "counts it as 0", sym, info['entry_price'],
+                               self.TRAIL_PCT * 100)
             entry_atr = get_live_atr(self.api, sym, asset_type=self.get_asset_type())
             tp_price = None
             if entry_atr is not None and info['entry_price'] > 0:
@@ -764,9 +860,18 @@ class BaseTradingLoop(ABC):
             # Kelly's sample by compute_kelly_fraction — these rows feed
             # the trade log/GUI, not sizing (the old comment claimed the
             # opposite).
+            # BREAKER_SERVER_FILL_ATTRIB (ENGINE r3 O3, default OFF): this
+            # check runs BEFORE _manage_stops, so on a gap the resting
+            # server stops may already be FILLED — ON, such a position is
+            # journaled as the server_stop it was (real fill, lockout)
+            # instead of an estimated row. Checked only AFTER the flatten:
+            # zero added latency to the liquidation.
+            _attrib = _breaker_server_fill_attrib()
             for sym, pos in pre_flatten.items():
                 if sym in self.positions:
                     continue    # flatten failed/unknown — still open, no exit row
+                if _attrib and self._breaker_record_server_fill(sym, pos):
+                    continue
                 quote = self.get_quote(sym)
                 px = quote['midpoint'] if quote else pos.entry_price
                 pnl = ((px - pos.entry_price) / pos.entry_price * 100
@@ -781,6 +886,59 @@ class BaseTradingLoop(ABC):
 
         self._buys_allowed = True
         return False
+
+    def _breaker_record_server_fill(self, sym, pos, site='breaker') -> bool:
+        """BREAKER_SERVER_FILL_ATTRIB ON only (ENGINE r3 O3).
+
+        site (ENGINE r4 R4-b): the flatten that released the position —
+        'breaker' (default, byte-identical), 'remote_flatten' or
+        'stablecoin_flatten'; sets detect_source and the log labels.
+
+        True iff pos.stop_order_id is 'filled' at the broker and the exit
+        was journaled through the SAME calls as _manage_stops' server-fill
+        branch (_classify_server_stop -> _record_confirmed_exit
+        'server_stop' -> last_trade_time -> _apply_server_stop_lockout),
+        plus detect_source='breaker'. False (caller writes today's
+        estimated circuit_breaker row) when there is no id, get_order
+        raises, the status is anything but 'filled', or the journal write
+        raises. Never raises: the breaker's halt latch is set after the
+        caller's loop.
+        """
+        tag, what = _SERVER_FILL_SITES.get(site, (f'[{site}]', site))
+        oid = getattr(pos, 'stop_order_id', None)
+        if not oid:
+            return False
+        try:
+            so = self.api.get_order(oid)
+        except Exception as e:
+            logger.debug("%s %s: stop %s status check failed "
+                         "(%s) — estimated exit row", tag, sym, oid, e)
+            return False
+        if getattr(so, 'status', None) != 'filled':
+            return False
+        logger.info("[STOP-FILL] %s: resting stop filled at $%s before the "
+                    "%s — journaled as server_stop", sym,
+                    getattr(so, 'filled_avg_price', None), what)
+        llm_info = (getattr(self, 'llm_scores', None) or {}).get(sym, {})
+        kind, stop_px = self._classify_server_stop(sym, pos, so)
+        try:
+            self._record_confirmed_exit(
+                sym, pos, so, None, exit_reason='server_stop',
+                llm_score=llm_info.get('s'),
+                reasoning=llm_info.get('r', ''),
+                extra={'server_stop_kind': kind, 'stop_px': stop_px,
+                       'detect_source': site})
+        except Exception as e:
+            logger.error("%s %s: server_stop journal failed "
+                         "(%s) — estimated exit row instead", tag, sym, e)
+            return False
+        self.last_trade_time[sym] = datetime.datetime.now()
+        try:
+            self._apply_server_stop_lockout(sym, kind)
+        except Exception as e:
+            logger.error("%s %s: lockout write failed (%s)",
+                         tag, sym, e)
+        return True
 
     @staticmethod
     def _next_baseline_reset() -> datetime.datetime:
@@ -950,6 +1108,7 @@ class BaseTradingLoop(ABC):
             if self.macro_regime.stablecoin_alert and self.get_asset_type() == 'crypto':
                 if self.macro_regime.sizing_mult == 0:
                     logger.warning("[CONTAGION] Stablecoin emergency! Flattening crypto...")
+                    pre_flatten = dict(self.positions)
                     failures = emergency_flatten(self.api, symbols=self.get_symbol_universe())
                     # Same failure-tracking contract as the circuit-breaker
                     # branch (2026-07 review P1): failures come back
@@ -964,6 +1123,32 @@ class BaseTradingLoop(ABC):
                                           if s.replace('/', '') in failed_norm}
                     else:
                         self.positions.clear()
+                    # ENGINE r4 R4-b (journal/state only; no order-flow
+                    # change): persist the release and journal each released
+                    # position like the breaker/remote-flatten sites — an
+                    # estimated row at the quote mid (excluded from Kelly),
+                    # or, BREAKER_SERVER_FILL_ATTRIB ON, the server_stop its
+                    # already-filled resting stop was. Was: no exit row and
+                    # no state save.
+                    self._save_position_state()
+                    _attrib = _breaker_server_fill_attrib()
+                    for sym, pos in pre_flatten.items():
+                        if sym in self.positions:
+                            continue    # flatten failed/unknown — still open
+                        try:
+                            if _attrib and self._breaker_record_server_fill(
+                                    sym, pos, site='stablecoin_flatten'):
+                                continue
+                            q = self.get_quote(sym)
+                            px = q['midpoint'] if q else pos.entry_price
+                            pnl = ((px - pos.entry_price) / pos.entry_price * 100
+                                   if pos.entry_price > 0 else 0.0)
+                            record_trade(sym, 'sell', pos.entry_price, px, pnl,
+                                         exit_reason='stablecoin_flatten',
+                                         estimated=True)
+                        except Exception as je:
+                            logger.error("[CONTAGION] %s: exit journal "
+                                         "failed (%s)", sym, je)
         except Exception as e:
             # Escalated from debug (2026-07 panel): a silent failure here
             # freezes sizing_mult/stop_mult/vix at the LAST GOOD read, and
@@ -1508,14 +1693,19 @@ class BaseTradingLoop(ABC):
         slippage_bps = None
         if decision_price and decision_price > 0 and not estimated:
             slippage_bps = round((decision_price - fill_price) / decision_price * 1e4, 2)
-        log_decision({"symbol": symbol, "action": "sell",
-                      "exit_reason": stop_reason,
-                      "pnl_pct": round(pnl_pct, 4),
-                      "decision_price": decision_price,
-                      "fill_price": fill_price,
-                      "slippage_bps": slippage_bps,
-                      "quote_age_s": _quote_age_s(),
-                      "estimated": estimated})
+        stop_row = {"symbol": symbol, "action": "sell",
+                    "exit_reason": stop_reason,
+                    "pnl_pct": round(pnl_pct, 4),
+                    "decision_price": decision_price,
+                    "fill_price": fill_price,
+                    "slippage_bps": slippage_bps,
+                    "quote_age_s": _quote_age_s(),
+                    "estimated": estimated}
+        # ENGINE r4 R4-a: broker ids, additive and only when known.
+        for k, v in _order_journal_ids(result if result is not None
+                                       else order, keep_none=False).items():
+            stop_row.setdefault(k, v)
+        log_decision(stop_row)
         self.positions.pop(symbol, None)
         self.last_trade_time[symbol] = datetime.datetime.now()
         if stop_reason == 'hard_stop':
@@ -1686,13 +1876,32 @@ class BaseTradingLoop(ABC):
         except Exception:
             pass
 
-        new_scores = analyze_trades(
-            candidates, self.get_asset_type(), equity=self._equity,
-            positions=list(self.positions.keys()),
-            position_details={s: p.to_dict() for s, p in self.positions.items()},
-            fng_value=fng_value,
-            model_config=self.config,
-        )
+        _call_t0 = time.time()
+        try:
+            new_scores = analyze_trades(
+                candidates, self.get_asset_type(), equity=self._equity,
+                positions=list(self.positions.keys()),
+                position_details={s: p.to_dict() for s, p in self.positions.items()},
+                fng_value=fng_value,
+                model_config=self.config,
+            )
+        except Exception as e:
+            # SCOUT_E A1, ENGINE half (measurement-only): an exception that
+            # escapes analyze_trades (e.g. _parse_response's OverflowError on
+            # a huge-integer "s") used to leave no journal row. Journal the
+            # attempt, then RE-RAISE unchanged — run()'s handling of the
+            # cycle is untouched (fail-open here is an owner decision).
+            try:
+                log_decision({'action': 'llm_error',
+                              'asset_type': self.get_asset_type(),
+                              'outcome': 'exception',
+                              'error_type': type(e).__name__,
+                              'n_symbols_sent': len(candidates),
+                              'latency_ms': int(round(
+                                  (time.time() - _call_t0) * 1000))})
+            except Exception:
+                pass
+            raise
         self._last_llm_symbols = {c.get('symbol') for c in candidates}
         if new_scores:
             self.llm_scores = new_scores
@@ -1709,6 +1918,13 @@ class BaseTradingLoop(ABC):
                     self._veto_strikes[sym] = self._veto_strikes.get(sym, 0) + 1
                 else:
                     self._veto_strikes.pop(sym, None)
+            # A symbol SENT this analysis but omitted from the (partial)
+            # response reads as s=0.5 (no veto) — its strike must reset too,
+            # or veto -> omitted -> veto liquidates on two NON-consecutive
+            # vetoes (D13 scope A). Symbols never sent (stock top-N misses)
+            # keep their strikes: see _get_predictions (owner decision).
+            for sym in self._last_llm_symbols.difference(new_scores):
+                self._veto_strikes.pop(sym, None)
             logger.info("[LLM] Scores: %s",
                         ", ".join(f"{s}={v.get('s', 0.5):.2f}" for s, v in self.llm_scores.items()))
             # Journal every scored candidate (not just traded ones) so
@@ -1719,10 +1935,16 @@ class BaseTradingLoop(ABC):
                 "action": "llm_analysis",
                 "asset_type": self.get_asset_type(),
                 "forward_bars": self.config.get('forward_bars', 24) if self.config else 24,
-                # s journaled as null when the provider omitted it — a
-                # fabricated 0.5 pollutes llm_eval's sample (c26 D33).
+                # s is null only if a result dict lacks 's' (c26 D33). The
+                # live parser never produces that: _parse_response writes
+                # 0.5 for a missing/non-numeric/non-finite s, and a symbol
+                # the provider omitted is simply absent here. s_defaulted
+                # (SCOUT_E A3, measurement-only) flags that 0.5 fallback:
+                # True/False from get_last_analysis_meta()['parse_flags'],
+                # None when unknown (dedup hit, no flags).
                 "scores": {sym: {"s": v.get('s'),
-                                 "pred": preds_by_symbol.get(sym)}
+                                 "pred": preds_by_symbol.get(sym),
+                                 "s_defaulted": None}
                            for sym, v in new_scores.items()},
             }
             try:
@@ -1732,6 +1954,13 @@ class BaseTradingLoop(ABC):
                           'latency_ms', 'cost_usd'):
                     if meta.get(k) is not None:
                         row[k] = meta[k]
+                pf = meta.get('parse_flags')
+                if isinstance(pf, dict):
+                    for sym, sc in row['scores'].items():
+                        f = pf.get(sym)
+                        if isinstance(f, dict) and isinstance(
+                                f.get('s_defaulted'), bool):
+                            sc['s_defaulted'] = f['s_defaulted']
             except Exception:
                 pass    # metadata is best-effort — never blocks the journal
             log_decision(row)
@@ -1750,10 +1979,17 @@ class BaseTradingLoop(ABC):
             logger.warning("[LLM] consecutive failures=%d — next attempt in"
                            " %.0fs", self._llm_fail_count, backoff)
             try:
+                # outcome / n_symbols_sent / latency_ms: SCOUT_E A1, ENGINE
+                # half (measurement-only, appended). The failure CLASS
+                # (transport/parse/refusal) is llm_analyst's llm_calls row.
                 log_decision({'action': 'llm_backoff',
                               'asset_type': self.get_asset_type(),
                               'consecutive_failures': self._llm_fail_count,
-                              'backoff_s': round(backoff, 1)})
+                              'backoff_s': round(backoff, 1),
+                              'outcome': 'no_scores',
+                              'n_symbols_sent': len(candidates),
+                              'latency_ms': int(round(
+                                  (time.time() - _call_t0) * 1000))})
             except Exception:
                 pass
 
@@ -1897,6 +2133,9 @@ class BaseTradingLoop(ABC):
                "estimated": estimated}
         if extra:
             row.update(extra)
+        # ENGINE r4 R4-a: broker ids, additive and only when known.
+        for k, v in _order_journal_ids(order, keep_none=False).items():
+            row.setdefault(k, v)
         log_decision(row)
 
     def _execute_sells(self, preds: dict):
@@ -2653,7 +2892,7 @@ class BaseTradingLoop(ABC):
         # --- 5. Hard caps including the NEW order ---
         existing_value = 0.0
         if symbol in self.positions:
-            existing_value = self.positions[symbol].qty * self.positions[symbol].entry_price
+            existing_value = self._cap_value(self.positions[symbol])
         room = self.MAX_NOTIONAL_PER_SYMBOL - existing_value
         sized = min(sized, max(room, 0))
 
@@ -2666,6 +2905,21 @@ class BaseTradingLoop(ABC):
         if sized < MIN_ORDER_NOTIONAL:
             return 0
         return int(sized)
+
+    @staticmethod
+    def _cap_value(pos) -> float:
+        """Notional a held position counts against MAX_NOTIONAL_PER_SYMBOL.
+
+        Cost basis (qty * entry_price) exactly as before whenever
+        entry_price > 0. An unknown basis (entry_price <= 0 — the Alpaca
+        paper avg_entry_price=0 quirk on inherited positions) valued the
+        position at $0, so the cap admitted add-ons on a $21k position
+        every cycle (ENGINE r1 W1); value it at the high-water mark (the
+        tracked mark, >= the last quote) instead.
+        """
+        if pos.entry_price > 0:
+            return pos.qty * pos.entry_price
+        return pos.qty * pos.high_water_mark
 
     def _load_hard_stop_lockout(self):
         """Load hard-stop lockout state from disk (survive restarts).
@@ -2709,8 +2963,10 @@ class BaseTradingLoop(ABC):
         try:
             data = {}
             for symbol, lockout_time in self.hard_stop_lockout.items():
-                expiry_ts = (lockout_time + datetime.timedelta(
-                    hours=self.HARD_STOP_LOCKOUT_HOURS)).timestamp()
+                # epoch + seconds, not naive wall-clock + timedelta: the
+                # latter is 23 h / 25 h of real time across DST (G2-3).
+                expiry_ts = (lockout_time.timestamp()
+                             + self.HARD_STOP_LOCKOUT_HOURS * 3600)
                 data[symbol] = expiry_ts
             # Final paths are per-book now (2026-08 influence audit), but
             # the per-book TEMP suffix stays: combined-bots mode runs both
@@ -2759,7 +3015,11 @@ class BaseTradingLoop(ABC):
         """Check if symbol is in hard-stop lockout period."""
         if symbol not in self.hard_stop_lockout:
             return False
-        elapsed = (datetime.datetime.now() - self.hard_stop_lockout[symbol]).total_seconds()
+        # .timestamp() difference, not naive local subtraction: stamps are
+        # naive LOCAL wall-clock (now()/fromtimestamp set .fold), so this is
+        # true elapsed seconds across a DST transition (2026-09 G2-3).
+        elapsed = (datetime.datetime.now().timestamp()
+                   - self.hard_stop_lockout[symbol].timestamp())
         if elapsed >= self.HARD_STOP_LOCKOUT_HOURS * 3600:
             del self.hard_stop_lockout[symbol]
             self._save_hard_stop_lockout()
@@ -2835,8 +3095,19 @@ class BaseTradingLoop(ABC):
             # Journal only the positions the flatten actually released
             # (estimated fills; excluded from Kelly). A remote flatten
             # previously produced zero trade records at all.
+            # BREAKER_SERVER_FILL_ATTRIB ON (ENGINE r4 R4-b): this check
+            # runs FIRST in the cycle, before _manage_stops — a resting
+            # stop the broker already FILLED is journaled as the
+            # server_stop it was (detect_source='remote_flatten'), same
+            # helper as the breaker; OFF = no extra broker call.
+            _attrib = _breaker_server_fill_attrib()
+            _attributed = False
             for sym, pos in pre_flatten.items():
                 if sym in self.positions:
+                    continue
+                if _attrib and self._breaker_record_server_fill(
+                        sym, pos, site='remote_flatten'):
+                    _attributed = True
                     continue
                 q = self.get_quote(sym)
                 px = q['midpoint'] if q else pos.entry_price
@@ -2844,6 +3115,8 @@ class BaseTradingLoop(ABC):
                        if pos.entry_price > 0 else 0.0)
                 record_trade(sym, 'sell', pos.entry_price, px, pnl,
                              exit_reason='remote_flatten', estimated=True)
+            if _attributed:
+                self._save_position_state()   # persist the new cooldown stamps
             if self.positions:
                 notify(f"FLATTEN {self.get_asset_type()}: INCOMPLETE — "
                        f"{len(self.positions)} position(s) STILL OPEN and "
@@ -2866,6 +3139,59 @@ class BaseTradingLoop(ABC):
             except Exception:
                 pass
 
+    def _halt_cancel_working_buys(self, halted: bool) -> None:
+        """strategy_config.HALT_CANCELS_WORKING_BUYS (default OFF — no-op).
+
+        ON: the first halted cycle cancels this book's open BUY orders
+        (symbol in this bot's universe, side 'buy', not a stop type) once
+        per halt epoch; an un-halted cycle re-arms. A halt otherwise blocks
+        only NEW entries — a working buy left by an unconfirmed cancel
+        (maker rung 'maker_unknown', lifecycle give-up, stock 'day' parent)
+        keeps working and can fill during the halt. SELL / stop orders are
+        never touched (exits are never gated). The epoch is marked done
+        only when the listing and every cancel succeeded — anything that
+        raised retries on the next halted cycle. Never raises.
+        """
+        try:
+            from strategy_config import HALT_CANCELS_WORKING_BUYS
+        except ImportError:
+            return
+        if not HALT_CANCELS_WORKING_BUYS:
+            return
+        if not halted:
+            self._halt_buys_cancelled = False
+            return
+        if getattr(self, '_halt_buys_cancelled', False):
+            return
+        try:
+            from order_utils import _list_open_orders, _symbol_variants
+            allowed = set()
+            for s in self.get_symbol_universe():
+                allowed |= _symbol_variants(s)
+            orders = _list_open_orders(self.api, symbols=sorted(allowed)) or []
+        except Exception as e:
+            logger.warning("[HALT] open-order listing failed (%s) — working"
+                           " buys NOT cancelled, retrying next cycle", e)
+            return
+        ok = True
+        n = 0
+        for o in orders:
+            if (getattr(o, 'symbol', None) not in allowed
+                    or str(getattr(o, 'side', '')).lower() != 'buy'
+                    or 'stop' in str(getattr(o, 'type', '')).lower()):
+                continue
+            try:
+                self.api.cancel_order(o.id)
+                n += 1
+            except Exception as e:
+                ok = False
+                logger.warning("[HALT] cancel %s %s failed: %s — retrying"
+                               " next cycle", o.symbol, o.id, e)
+        if n:
+            logger.warning("[HALT] cancelled %d working buy order(s) for the"
+                           " %s book", n, self.get_asset_type())
+        self._halt_buys_cancelled = ok
+
     def _entries_allowed(self) -> bool:
         """Book-level entry gate shared by both loops (exits never gated).
 
@@ -2882,7 +3208,12 @@ class BaseTradingLoop(ABC):
         self._entries_block_info = None
         try:
             from notify import halt_active
-            if halt_active():
+            halted = halt_active()
+            try:    # never lets the cancel path decide whether halt blocks
+                self._halt_cancel_working_buys(halted)
+            except Exception as e:
+                logger.warning("[HALT] working-buy cancel failed: %s", e)
+            if halted:
                 self._entries_block_info = ('halt', 'trading_halt.flag', None)
                 if self.cycle % 10 == 1:
                     logger.warning("[HALT] trading_halt.flag active — "
@@ -2976,7 +3307,7 @@ class BaseTradingLoop(ABC):
 
             # Position cap check
             if symbol in self.positions:
-                existing_value = self.positions[symbol].qty * self.positions[symbol].entry_price
+                existing_value = self._cap_value(self.positions[symbol])
                 if existing_value >= self.MAX_NOTIONAL_PER_SYMBOL:
                     vc['position_cap'] += 1
                     continue
@@ -3226,10 +3557,30 @@ class BaseTradingLoop(ABC):
         acquired = result is not None and (
             getattr(result, 'status', None) == 'filled' or partial_qty > 0)
         if acquired:
-            from order_utils import verify_position
+            from order_utils import verify_position, _basis_or_zero
             pos = verify_position(self.api, symbol)
             if pos:
-                fill_price = float(pos.avg_entry_price)
+                # A null basis (not "0") raised here AFTER a real fill and
+                # left the position untracked with no stop; it now takes
+                # the zero-basis fallback below (ENGINE r7 H5).
+                fill_price = _basis_or_zero(pos.avg_entry_price)
+                if not fill_price > 0:
+                    # Paper zero-basis quirk: the position reports
+                    # avg_entry_price=0 for a filled buy. Entry 0 put the
+                    # resting stop at 0*(1-d) = $0 (broker-rejected) and
+                    # journaled fill_price 0 (ENGINE r1 W1). The order's
+                    # own filled_avg_price is the honest basis; unchanged
+                    # whenever the broker reports a positive average.
+                    try:
+                        ofp = float(getattr(result, 'filled_avg_price', 0) or 0)
+                    except (TypeError, ValueError):
+                        ofp = 0.0
+                    if ofp > 0:
+                        logger.warning("[BUY] %s: broker avg_entry_price=%s —"
+                                       " using the order fill price $%s as the"
+                                       " entry basis", symbol,
+                                       pos.avg_entry_price, ofp)
+                        fill_price = ofp
                 total_qty = float(pos.qty)
                 entry_atr = get_live_atr(self.api, symbol, asset_type=self.get_asset_type())
 
@@ -3316,6 +3667,14 @@ class BaseTradingLoop(ABC):
                 sizing_detail = getattr(self, '_last_sizing_detail', None)
                 if sizing_detail:
                     buy_rec['sizing'] = sizing_detail
+                # ENGINE r4 R4-a (measurement-only, additive; entry_tactic
+                # above already names the tactic): broker ids of the order
+                # that ACQUIRED the fill (maker ladder: the rung returned as
+                # acquisition evidence) and the decision quote's bid/ask/
+                # fetch stamp — joins the row to broker fills.
+                for k, v in {**_order_journal_ids(result),
+                             **_decision_quote_journal_keys(quote)}.items():
+                    buy_rec.setdefault(k, v)
                 log_decision(buy_rec)
                 self.last_trade_time[symbol] = datetime.datetime.now()
                 self._count_trade(symbol)

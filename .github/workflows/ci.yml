@@ -47,7 +47,7 @@ jobs:
         run: |
           pip install python-dotenv numpy pandas scikit-learn joblib \
             optuna yfinance numba finnhub-python beautifulsoup4 \
-            requests PyYAML pytest bidask
+            requests PyYAML pytest bidask hmmlearn arch
 
       - name: Compile all .py files (syntax check)
         run: |

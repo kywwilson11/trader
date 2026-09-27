@@ -607,10 +607,16 @@ def _parse_scores(result, n):
         if key_str in data or i in data:
             raw = data.get(key_str, data.get(i))
             try:
-                scores.append(max(-1.0, min(1.0, float(raw))))
-                matched += 1
+                val = float(raw)
             except (TypeError, ValueError):
-                scores.append(None)  # malformed value → KW fallback
+                val = None
+            if val is not None and math.isfinite(val):
+                scores.append(max(-1.0, min(1.0, val)))
+                matched += 1
+            else:
+                # malformed OR non-finite (G4-07: NaN clamped to +1.0) →
+                # None sentinel → KW fallback, never counted as matched
+                scores.append(None)
         else:
             # Missing article — use None sentinel so caller can KW-fallback
             scores.append(None)
@@ -927,10 +933,13 @@ def _try_llm_retry():
     was already updated by a newer call. On LLM success, updates the cache.
     On failure, pushes the item back to the front of the queue.
     """
-    if not _llm_retry_queue:
+    # Combined-bot mode: two loop threads can both pass an emptiness check
+    # and race to popleft() (G4-09 sibling). popleft itself is atomic, so
+    # EAFP on IndexError closes the check-then-act window.
+    try:
+        cache_key, articles, queued_at = _llm_retry_queue.popleft()
+    except IndexError:
         return
-
-    cache_key, articles, queued_at = _llm_retry_queue.popleft()
     now = time.time()
 
     # Stale: cache will be refreshed by normal flow anyway
@@ -1079,8 +1088,8 @@ def get_news_sentiment(symbol, asset_type='crypto'):
             articles = client.general_news('crypto', min_id=0)
             base = symbol.replace('/USD', '').replace('-USD', '').lower()
             relevant = [a for a in articles
-                        if base in a.get('headline', '').lower()
-                        or base in a.get('summary', '').lower()]
+                        if base in (a.get('headline') or '').lower()
+                        or base in (a.get('summary') or '').lower()]
             # Fall back to all crypto news if not enough symbol-specific
             if len(relevant) < 3:
                 relevant = articles[:20]

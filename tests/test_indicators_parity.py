@@ -1,8 +1,10 @@
 """Kernel-vs-fallback parity harness for indicators.py.
 
 indicators.py has THREE possible backends per function: a C extension
-(`indicators_c`), a numba-jitted kernel, and a pure-pandas/pure-numpy
-fallback (dispatch priority: C > numba > pure). Train/serve parity across
+(`indicators_c` — archived 2026-09-26 and opt-in only via
+TRADER_INDICATORS_C=1, see archive/README.md), a numba-jitted kernel, and a
+pure-pandas/pure-numpy fallback (dispatch priority when the C ext is opted
+in: C > numba > pure; by default numba > pure). Train/serve parity across
 machines (this dev Mac has neither C ext nor numba; Jetson/CI have numba)
 depends on the kernel and the fallback agreeing bit-for-bit-ish on real
 inputs. This module asserts that agreement directly, by forcing each
@@ -31,6 +33,10 @@ exercised on a NaN-free OHLCV panel; a *separate* NaN-patched derived
 series is used only for the two documented NaN-related divergences
 (Stochastic, rolling-percentile).
 """
+import platform
+import sys
+
+import math
 import numpy as np
 import pandas as pd
 import pytest
@@ -184,6 +190,17 @@ def test_hurst_kernel_matches_fallback():
 
 @needs_numba
 def test_rsi_kernel_matches_fallback_clean_data():
+    """Kernel vs fallback RSI agree ONLY from bar 270 on — deliberately.
+
+    This test compares bars 270-299 and nothing earlier. Over the warm-up
+    (first valid bar 13 for the kernel vs 14 for the fallback, then up to
+    ~10-15 RSI points apart, decaying at (13/14) per bar) the two backends
+    DIFFER; that gap is a known, model-facing owner item (the `_rsi_core`
+    gain[0]/loss[0]=0 seed vs pandas' NaN diff at index 0), queued for a
+    retrain-bundled change, not something this test certifies as equal.
+    `test_compute_stock_features_golden_fingerprint` pins the resulting
+    per-backend RSI / RSI_Divergence column sums and first-valid indices.
+    """
     # Clean-data RSI, after fix #1 (fallback now uses adjust=False). Uses
     # the panel's pre-rally slice (bars 0-299) so avg_loss never hits the
     # exact-zero degenerate case exercised deliberately below.
@@ -259,13 +276,28 @@ def test_rolling_percentile_kernel_vs_fallback_nan_patch_diverges():
 # ── compute_stock_features golden/regression fingerprint ────────────────
 #
 # Written BEFORE decomposing compute_stock_features into private helpers
-# (spec step 4) so that refactor is provably bit-identical: any change to
-# output — even a single float ULP, a reordered column, or a dtype change —
-# trips this. Runs entirely on pure pandas/numpy (no numba/torch needed),
-# so it's fully exercised on this dev Mac too, not just Jetson/CI.
+# (spec step 4) so that refactor is provably bit-identical. The golden
+# column sums were recorded on the dev Mac's PURE pandas/numpy path; the
+# Jetson and both CI legs have numba, so the test now forces each backend
+# explicitly (C ext always off) instead of running whatever dispatch picks:
+#   - "numba": the PRODUCTION pin (harvest + predict_now run this path).
+#     Skipped where numba is absent (dev Mac).
+#   - "pure":  the fallback; runs everywhere, the Mac's only leg.
+# Exactly three columns differ numba-vs-pure on this fixture — the known,
+# model-facing warm-up divergences (rolling-percentile valid-count warm-up
+# through ATR's 13-bar NaN lead; RSI gain/loss seeding) — pinned by
+# _NUMBA_COL_SUM_OVERRIDES and _WARMUP_PINS below. Everything else must
+# match _GOLDEN_COL_SUMS on both backends.
 #
-# If this ever needs regenerating, that means whatever changed was NOT
-# bit-identical to the previous behavior — don't just update the literals
+# The 64-bit hash_pandas_object fingerprint is ulp- and signed-zero
+# sensitive (round(10) does not quantize OBV/Volume-scale columns; a 1-ulp
+# input nudge flips it with zero column-sum change), so it is only a
+# platform-keyed refactor tripwire: asserted when (platform, machine,
+# pandas major, backend) matches a recorded key, otherwise skipped.
+# (Evidence: 2026-09-26 Jetson campaign, audit report A.)
+#
+# If a column sum ever needs regenerating, that means whatever changed was
+# NOT equivalent to the previous behavior — don't just update the literals
 # to match, go find out why first.
 
 def _golden_stock_frame(days=45, bars_per_day=7, seed=2026):
@@ -294,7 +326,15 @@ def _golden_stock_frame(days=45, bars_per_day=7, seed=2026):
     return df, spy_close
 
 
-_GOLDEN_FINGERPRINT = 8972321854121808304
+# Platform-keyed fingerprint tripwires:
+#   (sys.platform, platform.machine() or None=any, pandas major, backend)
+_GOLDEN_FINGERPRINTS = {
+    # dev Mac, pure path (the original 2026-07-13 golden; pandas 3.x there).
+    ("darwin", None, 3, "pure"): 8972321854121808304,
+    # Jetson Orin Nano, numba path (production), numpy 1.26.1 and 2.2.6
+    # both give this value with pandas 2.3.3 (verified 2026-09-26).
+    ("linux", "aarch64", 2, "numba"): 422055739916008620,
+}
 
 _GOLDEN_COL_SUMS = {
     'ATR': 172.762803,
@@ -363,19 +403,85 @@ _GOLDEN_COL_SUMS = {
 }
 
 
-def test_compute_stock_features_golden_fingerprint():
+# numba-path column sums that legitimately differ from the pure golden
+# (measured on the Jetson, numba 0.63.1; every other column is identical).
+_NUMBA_COL_SUM_OVERRIDES = {
+    'ATR_Percentile': 117.441678,
+    'RSI': 16356.790603,
+    'RSI_Divergence': -9.780238,
+}
+
+# Per-backend (NaN count, first-valid index) for the three divergent
+# columns. The fixture has no interior NaN, so NaN count == first-valid.
+_WARMUP_PINS = {
+    "pure": {'ATR_Percentile': (112, 112), 'RSI': (14, 14),
+             'RSI_Divergence': (18, 18)},
+    "numba": {'ATR_Percentile': (99, 99), 'RSI': (13, 13),
+              'RSI_Divergence': (17, 17)},
+}
+
+
+def _golden_result(backend, monkeypatch):
+    """Run compute_stock_features on the golden frame with the C ext forced
+    off and the requested backend forced on ("numba" skips if absent)."""
+    monkeypatch.setattr(indicators, "_HAS_C", False)
+    if backend == "numba":
+        pytest.importorskip("numba")
+        if not indicators._HAS_NUMBA:
+            pytest.skip("numba importable but indicators' kernels not built")
+        monkeypatch.setattr(indicators, "_HAS_NUMBA", True)
+    else:
+        monkeypatch.setattr(indicators, "_HAS_NUMBA", False)
     df, spy = _golden_stock_frame()
-    result = compute_stock_features(df.copy(), spy_close=spy, symbol="GOLDTEST")
+    return compute_stock_features(df.copy(), spy_close=spy, symbol="GOLDTEST")
+
+
+@pytest.mark.parametrize("backend", ["numba", "pure"])
+def test_compute_stock_features_golden_fingerprint(backend, monkeypatch):
+    result = _golden_result(backend, monkeypatch)
 
     cols = sorted(result.columns.tolist())
     assert cols == sorted(_GOLDEN_COL_SUMS.keys()), (
         "compute_stock_features' column set changed — that's a behavior "
         "change, not a pure structural refactor")
 
-    fingerprint = int(pd.util.hash_pandas_object(result[cols].round(10)).sum())
-    assert fingerprint == _GOLDEN_FINGERPRINT
-
+    expected = dict(_GOLDEN_COL_SUMS)
+    if backend == "numba":
+        expected.update(_NUMBA_COL_SUM_OVERRIDES)
     for c in cols:
-        actual = round(float(result[c].sum(skipna=True)), 6)
-        assert actual == _GOLDEN_COL_SUMS[c], (
-            f"column {c!r} drifted: {actual} != {_GOLDEN_COL_SUMS[c]}")
+        actual = float(result[c].sum(skipna=True))
+        # 2026-09-27: compare with a relative tolerance instead of exact 6-dp equality. The goldens were
+        # recorded on ARM (Mac / Jetson); a real kernel change moves a column sum by orders of magnitude
+        # more than the ~1e-12 relative float noise between ARM and x86 (CI), which exact equality
+        # would turn into a permanent CI red. rel 1e-9 on a ~1.6e4 sum is ~1.6e-5 absolute.
+        assert math.isclose(actual, expected[c], rel_tol=1e-9, abs_tol=1e-6), (
+            f"[{backend}] column {c!r} drifted: {actual!r} != {expected[c]!r}")
+
+    for c, (n_nan, first_valid) in _WARMUP_PINS[backend].items():
+        valid = result[c].notna().to_numpy()
+        assert int((~valid).sum()) == n_nan, (
+            f"[{backend}] {c!r} NaN count {int((~valid).sum())} != {n_nan}")
+        assert int(np.flatnonzero(valid)[0]) == first_valid, (
+            f"[{backend}] {c!r} first-valid index changed")
+
+
+@pytest.mark.parametrize("backend", ["numba", "pure"])
+def test_compute_stock_features_fingerprint_tripwire(backend, monkeypatch):
+    """Bit-level refactor tripwire: asserted only on a recorded
+    (platform, machine, pandas major, backend) key, skipped elsewhere."""
+    result = _golden_result(backend, monkeypatch)
+    cols = sorted(result.columns.tolist())
+    fingerprint = int(pd.util.hash_pandas_object(result[cols].round(10)).sum())
+    pd_major = int(pd.__version__.split(".")[0])
+    for (plat, mach, pmaj, be), golden in _GOLDEN_FINGERPRINTS.items():
+        if (plat == sys.platform and mach in (None, platform.machine())
+                and pmaj == pd_major and be == backend):
+            assert fingerprint == golden, (
+                f"[{backend}] bit-level fingerprint changed on the recorded "
+                f"platform: {fingerprint} != {golden}")
+            return
+    pytest.skip(
+        f"no recorded fingerprint for ({sys.platform}, {platform.machine()}, "
+        f"pandas {pd_major}, {backend}) — got {fingerprint}; the column-sum "
+        "and warm-up pins are asserted by "
+        "test_compute_stock_features_golden_fingerprint")

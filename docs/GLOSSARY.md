@@ -57,7 +57,7 @@ Conventions:
 
 - **`b2`** — the coefficient on the z-scored LLM conviction score in
   `realized = a + b1·pred + b2·z_s`. Its significance under Driscoll-Kraay standard errors at
-  n ≥ 60 IS the keep-or-kill-the-LLM-spend verdict. Lives in: `llm_eval.py`.
+  ≥120 distinct hourly t0 clusters and n_eff ≥ 20 (≈20+ days of LLM cycles) IS the keep-or-kill-the-LLM-spend verdict. Lives in: `llm_eval.py`.
   See also: echo gap, `s`, LLM roles.
 - **backfill role** — the batched historical article-scoring LLM role. It is pinned to Gemini's
   Batch API (50% price, separate quota) and does not follow the provider switch.
@@ -67,7 +67,7 @@ Conventions:
   Lives in: `market_data._filter_bad_prints`. See also: closed bar, harvest.
 - **baseline_failures.txt** — the committed list of dev-Mac-only failing test NAMES (the
   missing-heavy-dependency set). It is machine-specific by design and is deliberately not
-  portable to the Jetson or CI, where the suite is green.
+  portable to the Jetson or CI (their current suite state: `CLAUDE.md` § Running tests).
   Lives in: `tests/baseline_failures.txt`. See also: ab_check, two-machine reality.
 - **Batch API** — Gemini's batched generation endpoint (half price, its own quota). The only
   role wired to it is backfill; no other provider has a batch path.

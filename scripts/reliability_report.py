@@ -82,10 +82,19 @@ def main() -> int:
     # Unrounded metrics via the SAME functions the gate uses — rep's values are
     # display-rounded, and the tie/label decisions must match the <= criterion
     # compare_calibrations actually gated on.
+    # Scored on compare_calibrations' OWN row set (jointly-finite rows): the
+    # per-arm functions drop non-finite rows per arm, so with NaN p_purged
+    # rows the arms were scored on different rows and "(better)" could print
+    # beside a strictly larger gated Brier (G6 B-1, 2026-09-26).
     y_arr = np.asarray(y, float)
-    bl, bp = brier(p_legacy, y_arr), brier(p_purged, y_arr)
-    el = expected_calibration_error(p_legacy, y_arr, args.bins)
-    ep = expected_calibration_error(p_purged, y_arr, args.bins)
+    pl_arr = np.asarray(p_legacy, float)
+    pp_arr = np.asarray(p_purged, float)
+    jm = np.isfinite(pl_arr) & np.isfinite(pp_arr) & np.isfinite(y_arr)
+    bl, bp = brier(pl_arr[jm], y_arr[jm]), brier(pp_arr[jm], y_arr[jm])
+    el = expected_calibration_error(pl_arr[jm], y_arr[jm], args.bins)
+    ep = expected_calibration_error(pp_arr[jm], y_arr[jm], args.bins)
+    if not jm.any():          # nothing jointly scored: labels are n/a
+        bl = bp = el = ep = None
     tied = identical or (bp == bl and el is not None and ep == el)
 
     verdict = rep['verdict']

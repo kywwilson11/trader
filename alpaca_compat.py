@@ -57,12 +57,20 @@ def _shim_order(o):
 
 
 def _shim_position(p):
+    # avg_entry_price is the shim's ONLY cost-basis field (cost_basis is not
+    # exposed). A null/garbage basis maps to 0.0 — the value the paper
+    # zero-basis quirk already reports — instead of raising inside
+    # get_position, where verify_position read the raise as "no position"
+    # and every rejected exit became a false DESYNC of a live position
+    # (ENGINE r7 H5). qty is deliberately still float(): a null qty is a bad
+    # payload. Lazy import: this module stays importable without order_utils.
+    from order_utils import _basis_or_zero
     return SimpleNamespace(
         symbol=p.symbol,
         qty=float(p.qty),
         side=getattr(getattr(p, 'side', None), 'value',
                      str(getattr(p, 'side', ''))),
-        avg_entry_price=float(p.avg_entry_price),
+        avg_entry_price=_basis_or_zero(p.avg_entry_price),
         current_price=(float(p.current_price)
                        if getattr(p, 'current_price', None) is not None else None),
         market_value=(float(p.market_value)

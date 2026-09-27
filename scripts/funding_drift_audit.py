@@ -49,6 +49,35 @@ MIN_SIDE = 50            # min rows per window for PSI/KS
 MIN_IC_N = 20            # min anchors per side for a split IC
 
 
+def _projected_columns(book, keep):
+    """Store columns to request from data_utils.load_training_data: 'Ticker'
+    plus every column whose name satisfies keep(name), read from the parquet
+    SCHEMA (no data). None (= the full load, today's behaviour) whenever the
+    loader would not serve that parquet — absent, CSV fresher
+    (data_utils._csv_is_fresher), or no pyarrow — so the CSV path is never
+    narrowed by a stale parquet's schema. The DatetimeIndex is restored from
+    the parquet's pandas metadata either way, so the loaded frame differs
+    only in the columns this script never reads (output sha-identical)."""
+    try:
+        import contextlib
+        import io
+        import data_utils
+        import pyarrow.parquet as pq
+        stem = data_utils._stem(book)
+        pqp = data_utils._BASE_DIR / f'{stem}.parquet'
+        csvp = data_utils._BASE_DIR / f'{stem}.csv'
+        if not pqp.exists():
+            return None
+        with contextlib.redirect_stdout(io.StringIO()):   # loader re-prints
+            if data_utils._csv_is_fresher(pqp, csvp):
+                return None
+        cols = [c for c in pq.read_schema(pqp).names
+                if c == 'Ticker' or keep(c)]
+        return cols if 'Ticker' in cols and len(cols) > 1 else None
+    except Exception:
+        return None
+
+
 def psi_from_train_deciles(ref, live, eps=_EPS):
     """PSI of `live` against deciles of `ref` — the monitor_drift
     convention (10 equal-mass ref bins, outer edges widened to +-inf so
@@ -210,7 +239,11 @@ def main():
     args = ap.parse_args()
 
     from data_utils import load_training_data
-    df = load_training_data('crypto')
+    # Column projection (G6 C-1): audit_frame reads only Ticker, *Funding*
+    # and Target_Return_* columns.
+    df = load_training_data('crypto', columns=_projected_columns(
+        'crypto',
+        lambda c: 'Funding' in c or c.startswith('Target_Return_')))
     if df.empty:
         sys.exit('no crypto training data — run the harvest first')
     split_ts = pd.Timestamp(args.split)

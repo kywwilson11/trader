@@ -32,7 +32,7 @@ _CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _REFRESH_SEC = 24 * 3600
 _lock = threading.Lock()
 _mem: dict | None = None
-_last_attempt = 0.0
+_last_attempt = -float('inf')  # monotonic clock starts near 0 at boot (mirrors edgar_events)
 
 # --- Trading-day windows (D07, flag strategy_config.EVENTS_TRADING_DAY_WINDOWS) ---
 # Static NYSE full-closure days, current + next year, refreshed annually by
@@ -92,7 +92,9 @@ def _load_cache() -> dict:
         try:
             with open(_CACHE_FILE) as f:
                 _mem = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
+            # ValueError covers JSONDecodeError AND the UnicodeDecodeError a
+            # binary-garbage file raises (same guard as risk_budget.read_registry).
             _mem = {}
         if not isinstance(_mem, dict):
             # Corrupt-but-parseable file (e.g. a JSON list): reset — the

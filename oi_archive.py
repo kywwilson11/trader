@@ -35,6 +35,7 @@ long/short ratios so future features need no re-download.
 import datetime as dt
 import io
 import json
+import math
 import os
 import sys
 import threading
@@ -261,9 +262,26 @@ def oi_features_for_index(alpaca_symbol: str, index):
     s = get_oi_series(alpaca_symbol)
     if s is None or len(s) < 200:
         return None
+    # FIX-R1 (2026-09): the Binance metrics archive carries glitch prints
+    # with sum_open_interest_value == 0.0 (125 rows across 10 perps on the
+    # 2026-09 archive, e.g. every perp at 2023-04-10 09:00 UTC and a burst
+    # on BTC 2024-07-09..15). A zero OI notional on a live perp is
+    # physically impossible, so it is a MISSING print, not a value. Left
+    # in, it served OI_Chg_24h = -100% at the glitch hour, x/0 = +inf
+    # exactly 24 rows later (the 74 inf rows validate_training_data
+    # flagged) and dragged OI_Z's 30-day mean/std for a month. Mask it to
+    # NaN IN PLACE (the positional 24-row grid is kept, so no neighbour
+    # shifts): the change then ffills over the prior print, the z reads
+    # NaN at the glitch hour, and the harvest's _fill_archive_features
+    # neutral 0.0 applies -- the same 0.0 live serves when it has no
+    # usable reference (live_oi_features' `ref > 0` guard).
+    s = s.where(s > 0)
     # pandas pin (c26-T3/B21): explicit ffill + fill_method=None ==
     # pandas-2 pad semantics, pandas-3-proof
     chg = s.ffill().pct_change(24, fill_method=None) * 100
+    # A % change over a zero/NaN denominator is NaN, never +-inf (the
+    # mask above removes the only known source; this is the backstop).
+    chg = chg.replace([np.inf, -np.inf], np.nan)
     roll = s.rolling(720, min_periods=168)
     mu, sd = roll.mean(), roll.std()
     z = ((s - mu) / sd).replace([np.inf, -np.inf], np.nan)
@@ -349,6 +367,12 @@ _live_cache: dict[str, tuple[float, float]] = {}
 _fail_cache: dict[tuple[str, str], float] = {}  # (endpoint, symbol) -> mono ts
 _hist_read_warned = False
 _hist_write_warned = False
+# G5-9: parsed oi_history.json kept in memory, keyed on (path, st_mtime_ns,
+# st_size). This process is the file's only writer; the memo is refreshed
+# from the just-written tmp's stamp after each successful os.replace and
+# dropped before any in-place mutation, so a hit is always byte-for-byte
+# what json.load of the file on disk would return. Guarded by _live_lock.
+_hist_memo: tuple | None = None   # (key, hist_all)
 
 
 def _neg_cached(endpoint: str, symbol: str, now: float) -> bool:
@@ -374,6 +398,13 @@ def _fetch_okx_oi(symbol: str) -> float | None:
         req = urllib.request.Request(url, headers={'User-Agent': 'trader/1.0'})
         data = json.loads(urllib.request.urlopen(req, timeout=10).read())
         oi = float(data['data'][0]['oiCcy'])  # coin units (venue-local)
+        # FIX-R1: a zero / negative / non-finite OI print is a missing
+        # print (same rule as the offline mask in oi_features_for_index).
+        # float() happily parses 'NaN'/'inf'; accepting one would serve it
+        # AND persist it into oi_history.json, poisoning the live z for
+        # the whole ~35-day window.
+        if not (math.isfinite(oi) and oi > 0):
+            raise ValueError(f'unusable OI print {oi!r}')
     except Exception as e:
         _fail_cache[('oi', symbol)] = now
         logger.debug('[OI] %s: OKX OI fetch failed: %s', symbol, e)
@@ -382,14 +413,29 @@ def _fetch_okx_oi(symbol: str) -> float | None:
     return oi
 
 
+def _hist_stamp(path) -> tuple:
+    st = os.stat(path)
+    return (str(path), st.st_mtime_ns, st.st_size)
+
+
 def _load_live_history() -> dict:
-    global _hist_read_warned
+    """Parsed oi_history.json. Callers that MUTATE the returned dict must
+    first drop the memo (live_oi_features does, under _live_lock)."""
+    global _hist_read_warned, _hist_memo
     try:
+        key = _hist_stamp(_LIVE_HISTORY_FILE)
+        if _hist_memo is not None and _hist_memo[0] == key:
+            return _hist_memo[1]
         with open(_LIVE_HISTORY_FILE) as f:
-            return json.load(f)
+            hist_all = json.load(f)
+        if isinstance(hist_all, dict):
+            _hist_memo = (key, hist_all)
+        return hist_all
     except FileNotFoundError:
         return {}  # cold start — expected
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError) as e:
+        # ValueError covers JSONDecodeError AND the UnicodeDecodeError a
+        # binary-garbage file raises (same guard as risk_budget.read_registry)
         # Corrupt/unreadable history silently restarts a week-long z
         # warm-up — say so once
         if not _hist_read_warned:
@@ -406,7 +452,7 @@ def live_oi_features(symbol: str) -> dict | None:
     trailing window (same relative-dynamics semantics the model trained
     on). Features read 0.0 until local history accumulates.
     """
-    global _hist_write_warned
+    global _hist_write_warned, _hist_memo
     oi = _fetch_okx_oi(symbol)
     if oi is None:
         return None
@@ -418,10 +464,14 @@ def live_oi_features(symbol: str) -> dict | None:
     with _live_lock:
         hist_all = _load_live_history()
         hist = hist_all.get(symbol, [])
+        # FIX-R1: ignore unusable samples a pre-fix build may have
+        # persisted (same missing-print rule as the offline mask)
+        usable = [(ts, v) for ts, v in hist
+                  if isinstance(v, (int, float)) and math.isfinite(v) and v > 0]
 
         chg = 0.0
         target = now - 86400
-        candidates = [(abs(ts - target), v) for ts, v in hist
+        candidates = [(abs(ts - target), v) for ts, v in usable
                       if abs(ts - target) <= 3 * 3600]
         if candidates:
             _, ref = min(candidates)
@@ -429,16 +479,25 @@ def live_oi_features(symbol: str) -> dict | None:
                 chg = (oi - ref) / ref * 100
 
         z = 0.0
-        vals = [v for _, v in hist]
+        vals = [v for _, v in usable]
         if len(vals) >= 168:
             import statistics
             mu = statistics.fmean(vals)
             sd = statistics.pstdev(vals)
             if sd > 1e-12:
                 z = (oi - mu) / sd
+        # Backstop: never serve a non-finite feature (0.0 = the neutral
+        # value the harvest's _fill_archive_features writes for NaN)
+        if not math.isfinite(chg):
+            chg = 0.0
+        if not math.isfinite(z):
+            z = 0.0
 
         # Thin to ~hourly samples; persist
         if not hist or (now - hist[-1][0]) >= _LIVE_THIN_SEC:
+            # The dict may BE the memo: drop it before mutating so a failed
+            # persist leaves nothing in memory that is not on disk.
+            _hist_memo = None
             hist.append([now, oi])
             if len(hist) > _LIVE_MAX_SAMPLES:
                 del hist[:len(hist) - _LIVE_MAX_SAMPLES]
@@ -447,7 +506,13 @@ def live_oi_features(symbol: str) -> dict | None:
                 tmp = str(_LIVE_HISTORY_FILE) + '.tmp'
                 with open(tmp, 'w') as f:
                     json.dump(hist_all, f)
+                # os.replace keeps the tmp inode, so its stamp IS the new
+                # file's stamp (a later foreign writer still changes it)
+                st = os.stat(tmp)
                 os.replace(tmp, _LIVE_HISTORY_FILE)
+                if isinstance(hist_all, dict):
+                    _hist_memo = ((str(_LIVE_HISTORY_FILE), st.st_mtime_ns,
+                                   st.st_size), hist_all)
             except OSError as e:
                 # Disk full/read-only silently freezes accumulation
                 if not _hist_write_warned:

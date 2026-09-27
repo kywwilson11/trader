@@ -1,0 +1,149 @@
+{
+  "schema": "llm_eprocess_params/1",
+  "registration_id": null,
+  "signed_by": null,
+  "signed_at": null,
+  "registration_sha": null,
+  "start": {
+    "value": {
+      "rule": "first_buy_after",
+      "not_before_utc": null,
+      "git_sha": null
+    },
+    "reason": "Row 1. Start at the first post-retrain buy under the current gate code (s<0.15 veto only, base_loop.py:3307-3315); the owner records not_before_utc and the git sha at activation."
+  },
+  "legacy_exclusion": {
+    "value": {
+      "exclude_on_or_before_utc": "2026-05-07",
+      "removed_gate": "llm_below_buy_min (s<0.60)",
+      "observed_window_utc": [
+        "2026-04-06",
+        "2026-05-07"
+      ]
+    },
+    "reason": "Brief constraint 5. The Apr-May journals ran a since-removed s<0.60 gate (first llm_below_buy_min skip in journals/2026-04-06.jsonl, still 1213 in 2026-05-07.jsonl, the last journal on disk): not the same policy, so every row dated on or before the boundary is dropped regardless of start."
+  },
+  "unit_day": {
+    "value": {
+      "unit": "bp_of_prior_equity",
+      "day": "UTC",
+      "books": "combined"
+    },
+    "reason": "Row 2. Spend is shared across both books (llm_client.py daily cap); E_{t-1} = prior daily equity."
+  },
+  "statistic": {
+    "value": "daily_mtm_tilt_pnl_net_fees_cost",
+    "reason": "Row 3. Day-disjoint mark-to-market keeps the lag at 1 day, so the martingale-difference structure holds."
+  },
+  "m_bar": {
+    "value": {
+      "primary": "burn_in_mean",
+      "secondary": 1.0
+    },
+    "reason": "Row 4. Budget-neutral primary values the reallocation, not leverage; 1.0 mirrors llm_eval's neutral baseline (report only)."
+  },
+  "fees": {
+    "value": {
+      "source": "fees.round_trip_cost_pct",
+      "entry_share": 0.5,
+      "exit_share": 0.5,
+      "spread_fallback": "fees.FLAT_SPREAD_PCT"
+    },
+    "reason": "Row 5. One cost model (fees.py:187), split half/half."
+  },
+  "cost": {
+    "value": {
+      "c_hi_usd_per_day": 1.0,
+      "c_lo": "sum_journaled_llm_analysis_cost_usd"
+    },
+    "reason": "Row 6. llm_cost.json keeps today only; KEEP is charged the $1.00 cap, KILL the journaled analyst-role spend."
+  },
+  "burn_in": {
+    "value": {
+      "days": 10
+    },
+    "reason": "Row 7. Freezes m_bar and B without look-ahead; untested."
+  },
+  "clip": {
+    "value": {
+      "delta_mult": 2.5,
+      "mad_mult": 5.0,
+      "mad_scale": 1.4826,
+      "max_favouring_clip_rate": 0.05
+    },
+    "reason": "Row 8. Bounded-mean betting needs a range; the 2.5*delta floor keeps every null point strictly inside (0,1)."
+  },
+  "delta_bp_per_day": {
+    "value": 1.0,
+    "reason": "Row 9. Futility margin ~ $10/day at $100k, 10x the spend cap."
+  },
+  "bet": {
+    "value": {
+      "kind": "aGRAPA",
+      "c": 0.5,
+      "mu_prior": 0.5,
+      "var_prior": 0.25
+    },
+    "reason": "Row 10. WSR 2024 aGRAPA; simple and fixed."
+  },
+  "alpha": {
+    "value": {
+      "sequential_per_direction": 0.025,
+      "threshold": 40.0,
+      "fallback": 0.025
+    },
+    "reason": "Row 11. Union bound 0.025 + 0.025 = 0.05 per direction; threshold = 1/alpha_seq (Ville)."
+  },
+  "first_look": {
+    "value": {
+      "cs_day": 10,
+      "min_lots": 30
+    },
+    "reason": "Row 12. Robustness only; validity holds at any time."
+  },
+  "horizon": {
+    "value": {
+      "cs_day": 180,
+      "interim_status_cs_day": 90
+    },
+    "reason": "Row 13. Scout C sim: 90 days gives 43% KEEP power at +1 bp/day, 180 days 91%."
+  },
+  "fallback": {
+    "value": {
+      "test": "one_sided_t",
+      "alpha": 0.025,
+      "im_blocks": 8,
+      "rho1_abs_max": 0.2
+    },
+    "reason": "Row 14. Fixed-N read at the horizon (Koning-van Meer embedding logic); IM K-block t when lag-1 autocorr is material."
+  },
+  "veto": {
+    "value": "KILL ends the spend only if decision_report's llm_veto CI does not exclude > 0; otherwise 'kill the tilt, keep the veto'",
+    "reason": "Row 15. The veto is part of what the spend buys; not evaluated by this module (owner reads decision_report)."
+  },
+  "llm_eval_b2": {
+    "value": "diagnostic_non_voting",
+    "reason": "Row 16. One alpha per decision."
+  },
+  "inconclusive_default": {
+    "value": null,
+    "allowed": [
+      "KEEP",
+      "KILL_FUTILITY"
+    ],
+    "reason": "Row 17. Owner fixes it ex ante; null -> CONTINUE at horizon."
+  },
+  "cs_display": {
+    "value": {
+      "alpha": 0.05,
+      "theta": 0.5,
+      "c": 0.5,
+      "grid": 1001
+    },
+    "reason": "Design A text: two-sided hedged-capital CS, display only."
+  },
+  "capital_basis": {
+    "value": "paper_equity",
+    "reason": "Owner ask 4 default: normalise to paper equity."
+  }
+}

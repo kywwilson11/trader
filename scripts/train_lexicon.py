@@ -35,6 +35,10 @@ def main(argv=None):
         'Jetson-local data (sentiment_cache.db, stock training parquet).'))
     p.add_argument('--db', default=str(_REPO / 'sentiment_cache.db'))
     p.add_argument('--data', default=str(_REPO / 'stock_training_data.parquet'))
+    p.add_argument('--session-tz', default='America/New_York',
+                   help='zone whose calendar date buckets hourly bars into '
+                        'trading days (default America/New_York = the US '
+                        'equity session; pass UTC for a 24/7 crypto store)')
     p.add_argument('--horizons', default='1,3,5')
     p.add_argument('--fit-horizon', type=int, default=3)
     p.add_argument('--start', default=None, help='ISO date (optional)')
@@ -88,13 +92,16 @@ def main(argv=None):
         for c in ('Ticker', 'Close'):
             if c not in df.columns:
                 raise ValueError(f'{args.data} missing column {c!r}')
+        # Trading days = SESSION-zone calendar dates. Bucketing by the UTC
+        # date made every EST-month 19:00 ET post-market bar (00:00 UTC) the
+        # first bar of the NEXT day — phantom Saturdays and a prior-evening
+        # `open` on ~23% of days (G6 C-2, 2026-09-26).
         idx = df.index
-        if getattr(idx, 'tz', None) is not None:
-            dates = idx.tz_convert('UTC').date
-        else:
+        if getattr(idx, 'tz', None) is None:
             print('[TRAIN-LEXICON] warning: naive datetime index — '
-                  'assuming it is already UTC')
-            dates = idx.date
+                  'assuming it is UTC')
+            idx = idx.tz_localize('UTC')
+        dates = idx.tz_convert(args.session_tz).date
         df = df.assign(_date=dates)
         df = df[df['Ticker'].isin(set(articles['symbol'].unique()))]
         g = df.groupby(['Ticker', '_date'], sort=True)

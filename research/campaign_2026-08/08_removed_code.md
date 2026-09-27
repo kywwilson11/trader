@@ -541,3 +541,77 @@ wired to DERISK_STACK_V2) — not duplicated.
 ---
 
 *(End of IA-4 section. Later packets append below this line.)*
+
+
+---
+
+## 2026-09-26 — Jetson test & improvement campaign removals
+
+Removals made during the 2026-09-26/27 Jetson campaign (hunt → implement), archived verbatim per the delete-nothing rule.
+
+### G5-8 — `volatility.get_garch_stop` + its two tests (removed 2026-09-27)
+
+**Why removed.** Zero production callers. Stops are ATR-based (`base_loop._desired_stop_for` /
+`_manage_stops`, `stock_loop._manage_stops`), and this floor/ceil did not track the
+`strategy_config` stop policy. The 2026-07 review deferred the removal only because
+`base_loop` still imported the name then ("must be done together with a base_loop-owning
+change"). That blocker is gone: `base_loop` no longer imports it, and
+`tests/test_grp_loops.py::test_dead_imports_pruned` asserts that. The function already
+carried a "DEAD" comment.
+
+**Zero-caller proof (2026-09-27, Jetson tree).** `grep -rn get_garch_stop --include=*.py .`
+before the removal found these hits only:
+- `volatility.py:107`, the definition.
+- `tests/test_new_modules.py:96-105`, the two tests below.
+- `tests/test_grp_loops.py:22`, which asserts the name is ABSENT from base_loop.
+- `archive/jetson_residue_2026-03/manual_expanded.py:658,945`, manual prose (untracked residue).
+
+It has no importer in any root module or `scripts/`, and `docs/graphs/import_graph.json` lists
+`base_loop` (which imports `compute_vol_adjusted_size` + `get_sigma`) as the only non-test importer
+of `volatility`.
+
+**Re-adding.** It is a pure function with no state. Restore both blocks verbatim if a GARCH-based
+stop is ever wanted. It would be model-/policy-facing, so it would need the challenger → shadow
+path and a `strategy_config` stop-policy tie-in.
+
+#### Removed block — volatility.py:102-122 (pre-removal numbering; HEAD `438f56a` :107 def)
+
+```python
+# DEAD in live paths: stops are ATR-based (base_loop) and this floor/ceil
+# does not track strategy_config stop policy. It has NO non-test consumer —
+# base_loop no longer imports it (tests/test_grp_loops.py::test_dead_imports_pruned
+# asserts the name is absent from base_loop); the only exercise is
+# tests/test_new_modules.py.
+def get_garch_stop(entry_price: float, sigma: float, multiplier: float = 2.0,
+                   floor_pct: float = 0.03, ceil_pct: float = 0.10) -> float:
+    """Compute stop-loss price using GARCH volatility.
+
+    Args:
+        entry_price: Entry price
+        sigma: GARCH sigma (decimal, e.g. 0.02 = 2%)
+        multiplier: Number of sigmas for stop distance
+        floor_pct: Minimum stop distance as fraction of price
+        ceil_pct: Maximum stop distance as fraction of price
+
+    Returns:
+        Stop price (below entry for long positions).
+    """
+    stop_dist = max(floor_pct, min(ceil_pct, sigma * multiplier))
+    return entry_price * (1 - stop_dist)
+```
+
+#### Retired tests — tests/test_new_modules.py:96-105 (`TestVolatility`)
+
+```python
+    def test_get_garch_stop(self):
+        from volatility import get_garch_stop
+        stop = get_garch_stop(100.0, 0.05, multiplier=2.0)
+        assert stop < 100.0
+        assert stop > 80.0  # not more than 20% away
+
+    def test_get_garch_stop_floor(self):
+        from volatility import get_garch_stop
+        # Very low sigma should be floored
+        stop = get_garch_stop(100.0, 0.001, multiplier=2.0, floor_pct=0.03)
+        assert stop == pytest.approx(97.0, abs=0.01)
+```

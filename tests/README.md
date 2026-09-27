@@ -1,8 +1,10 @@
 # `tests/` — how the suite is organized and how to run it
 
-200 `.py` files: **198 `test_*.py`**, plus `tests/__init__.py` (empty) and `tests/conftest.py`.
-197 of the 198 are collected by pytest — `test_sentiment_headlines.py` is a standalone runner
-(see below). The suite is prefix-organized by *provenance*: each campaign or research wave
+**219 `test_*.py` inventoried** (as of 2026-09-27), plus `tests/__init__.py` (empty) and
+`tests/conftest.py`. 218 of the 219 are collected by pytest — `test_sentiment_headlines.py` is a
+standalone runner (see below). The 2026-09 Jetson campaign is still landing files; any
+`test_*_2026_09.py` not in the appendix below is in flight and not yet inventoried.
+The suite is prefix-organized by *provenance*: each campaign or research wave
 dropped its own family of files rather than editing the older ones, so a file's prefix tells you
 which pass wrote it and what contract it was pinning.
 
@@ -42,10 +44,12 @@ file's header comment by hand instead of redirecting straight over the file (`ab
 `^#`, so a header-less file still *works* — you would just lose the machine-specificity warning).
 
 **Configuration.** `pyproject.toml` sets `testpaths = ["tests"]` and `addopts = "-v --tb=short"`.
-`tests/conftest.py` does four things and nothing else: puts `<repo>` and `<repo>/scripts` on
-`sys.path` (anchored to `__file__`, never to cwd), sets `collect_ignore` for the headline runner,
-and provides the two shared fixtures `sample_ohlcv_df` (120-row seeded OHLCV frame) and
-`tmp_json_file` (dict → temp JSON factory).
+`tests/conftest.py` puts `<repo>` and `<repo>/scripts` on `sys.path` (anchored to `__file__`,
+never to cwd), sets `collect_ignore` for the headline runner, provides the two shared fixtures
+`sample_ohlcv_df` (120-row seeded OHLCV frame) and `tmp_json_file` (dict → temp JSON factory), and
+installs the **repo-root hygiene instrument** (session hooks — see *Conventions → Tests must leave
+the repo clean*). Its first statement after `import os` points `TRADER_LOG_DIR` at a per-session
+temp dir so no test process writes the production `logs/trader.log` (*Known hygiene items* → 2).
 
 **Single-file runs are not baseline-reproducible** — see *Known hygiene items* below.
 
@@ -55,7 +59,7 @@ and provides the two shared fixtures `sample_ohlcv_df` (120-row seeded OHLCV fra
 
 23 names (7 `ERROR`, 16 `FAILED`) across 10 files. **Every one is a missing-dependency outcome**,
 reproduced by running each file standalone and reading the actual exception. On the Jetson and in
-CI, where the full stack is installed, the suite is green — this file is dev-Mac-only and must
+CI, where the full stack is installed, the suite state is recorded in `CLAUDE.md` § Running tests — this file is dev-Mac-only and must
 never be ported.
 
 | Missing dep | Names | Where | Why |
@@ -115,8 +119,11 @@ python3 tests/test_sentiment_headlines.py
 | `test_ia1_*` … `test_ia4_*` | 4 | 111 | **2026-08 decision-influence audit**: ia1 removals (16), ia2 safety (24), ia3 gate-pricing (28), ia4 flagged behaviour (43). Spec: `research/campaign_2026-08/07_decision_influences.md` + `08_removed_code.md`. Currently **uncommitted**. |
 | `test_improve_*.py` | 5 | 39 | An **earlier 2026-07 per-module improvement pass** ("spec stage 3"): harvest, indcfg, pbacktest, stratcfg, sweights. Landed in the same commit as the module review (`6bb38e7`). Note: this is *not* `module-improve-v3` — that family is the `_v3` **suffix** above. |
 | `test_wave4.py` | 1 | 14 | The only surviving `waveN`-named file (wave 4: HAR-RV, JKX/HZZ/session/reversal features, FINRA short flow). Committed 2026-06-12. |
+| `test_*_2026_09.py` — `2026_09` | 18 | 409 (625 collected) | **2026-09 Jetson test & improvement campaign** — suffix `_2026_09`. Producers: hunts G1–G8 + FIX_A–H / R1–R5, plus the INTEL W1 test-architecture file; docs in `research/campaign_2026-09_jetson/`. First family written *on the Jetson* against the full stack. Currently **uncommitted**. |
 
-*Counts are `def test*` **definitions** counted by an AST walk — 198 files / 3739 definitions.
+*Counts are `def test*` **definitions** counted by an AST walk — 198 files / 3739 definitions for
+the rows above the `2026_09` row (that row and `test_repo_graph.py`, 4 definitions, were added on
+2026-09-27; `core` still reads 88 files).
 `@pytest.mark.parametrize` expands some of these at run time, which is why the collected count is
 higher; see `CLAUDE.md` § Running tests for the run result.*
 
@@ -168,6 +175,66 @@ touched: `touch /tmp/marker`, run it with `-p no:cacheprovider`, then
 `find <repo> -maxdepth 1 -newer /tmp/marker -type f` must list nothing. Watch for lock sidecars
 too — they are derived from the same constant at call time, so patching the constant catches both.
 
+**The LLM cost ledger is sandboxed suite-wide (`tests/conftest.py`, 2026-09 INTEL W13).** An
+autouse, function-scoped fixture, `_llm_cost_ledger_sandbox`, monkeypatches
+`llm_client._COST_FILE` into a fresh, **existing** per-test directory under pytest's basetemp
+(`<basetemp>/llm_cost_ledger/t*/`, deliberately *not* the test's `tmp_path`, so `tmp_path`
+listings are unchanged) and resets `_daily_cost` / `_cost_reset_date` to `0.0` / `''`. That
+redirects every ledger file, because each one is derived from the constant at call time:
+`llm_cost.json`, its `.lock` and `.tmp` siblings, and the rollover's `llm_cost_history.jsonl`.
+It also swaps in a fresh `llm_client._call_meta_tls` (`threading.local`, INTEL W19's per-attempt
+transport meta), so `get_last_call_meta()` starts at `None` in every thread of every test and a
+stubbed test never reads meta left by an earlier real-client test.
+Everything goes through monkeypatch, so it is restored after each test. The ledger code
+still runs for real, and writes land in the sandbox and read back. Request the fixture by name to
+get the directory, or use `Path(llm_client._COST_FILE).parent`.
+
+A test, a module fixture or a requested fixture that sets `_COST_FILE` itself runs *after* the
+autouse fixture, so its value wins. `test_intel_ledger_sandbox_2026_09.py` pins that, plus
+readback, an untouched production root, and no state leaking between tests.
+
+The real module is captured when conftest is imported. That import is stdlib plus `llm_config`
+only, with no file, network or subprocess activity. As a result, a stub placed in
+`sys.modules['llm_client']` cannot divert the sandbox. If `llm_client` cannot be imported, the
+fixture returns `None` and collection is unaffected.
+
+Two limits:
+- Only the in-process module object is covered. A spawned Python subprocess, or a re-imported
+  fresh module object, is not; no test does either today.
+- **Opting out:** no test needs the real root ledger (none found, 2026-09-27). A test that ever
+  truly did would re-point `_COST_FILE` itself, via monkeypatch in the test body. That requires a
+  review note, because it writes the production spend ledger.
+
+**The repo-root hygiene instrument (`tests/conftest.py`, 2026-09).** Every pytest session now
+snapshots the regular files directly in `<repo>/` and directly in `<repo>/tests/` (no recursion;
+`__pycache__`, `.pytest_cache`, `*.pyc` and symlinks skipped) at session start and again at
+session finish, and prints a terminal section just before the short test summary:
+
+```
+============================== repo-root hygiene ===============================
+clean                               <- or one line per file:
+NEW <path>                          <- created during the session
+MOD <path>                          <- mtime or size changed during the session
+```
+
+Deleted files are ignored; subdirectories (`logs/`, `models/`, `journals/` …) are **out of scope**
+of the NEW/MOD list; the production `logs/trader.log` has its own two closing lines instead
+(`test logs: …`, `production log untouched: …` — hygiene item 2). The allowlist
+(`_HYGIENE_ALLOWLIST`) is **empty** — an entry needs a file:line citation of a writer a test
+legitimately must reach, and even then it prints as `ALW <path>` rather than disappearing.
+Two env vars:
+
+- `TRADER_TESTS_HYGIENE_JSON=<path>` — also write the result (`root`, `watched`, `clean`, `strict`,
+  `exitstatus_forced`, `entries`) as JSON. Point it **outside** the repo; unset = nothing on disk.
+- `TRADER_TESTS_STRICT_CLEAN=1` — **opt-in** enforcement: a dirty root turns an otherwise-passing
+  session (`OK` / `NO_TESTS_COLLECTED`) into exit status **1** (`pytest.ExitCode.TESTS_FAILED`) and
+  says so in the section. Unset (the default) = report-only; the exit status is never touched.
+
+`scripts/ab_check.sh` echoes the section after its suite summary. Its verdict is still failure
+**names** vs the baseline; only when the caller sets `TRADER_TESTS_STRICT_CLEAN=1` does a `NEW`/`MOD`
+line also make it exit 1. **Read it under quiescence:** the snapshot sees the whole shared tree,
+so a concurrent pytest or bot writing into the root shows up as this session's `MOD`/`NEW`.
+
 **No test reads anything under `research/`.** The seven `research/…` references in `tests/` are all
 docstring/comment pointers to the spec a file implements; moving `research/` breaks no test.
 
@@ -203,17 +270,37 @@ order-independent**: `-p xdist`, `-k` and single-file runs give different failur
 leak is objectively correct but would **add 5 names to `tests/baseline_failures.txt`** — it must
 be one atomic change (fix + regenerate the baseline + re-run `ab_check.sh`) and is the owner's
 call, not a cleanup-pass edit.
+*2026-09 Jetson re-measurement* (dotenv blocked via a `sitecustomize` to mimic the Mac; T2/T3
+fixed copies in scratch, not applied): in isolated pairs the leak masks **7** names, not 5 —
+`test_new_modules.py::TestKelly` (3) + `::TestKellyScoping` (2), `test_gpu_lock.py::test_choose_inference_device_always_cpu`,
+`test_wave4.py::TestWarmupFill::test_long_warmup_features_survive_dropna` — and, from reading
+`test_imports.py:44-52` (not measured), dotenv-only skips there become passes. The exact full-suite delta must be taken on the Mac with `ab_check.sh`. The
+Jetson and CI have `python-dotenv`, so the stub never installs there (zero blast radius).
+*If the owner approves:* the copy-paste Mac procedure is
+`research/campaign_2026-09_jetson/mac_dotenv_fix_runbook.md`. It applies both diffs verbatim, checks that the
+delta is exactly the 7 names, regenerates the baseline with its header kept, runs `ab_check.sh`, updates the docs
+and gives a rollback. Nothing has been applied. This item stays an OWNER DECISION until the owner runs it.
 
-**2. `logs/trader.log` is written by the test suite (production-code smell).**
+**2. `logs/trader.log` was written by the test suite — fixed 2026-09-27 (INTEL W18).**
 `log_config._setup()` runs on the first `get_logger()` call, and 22 modules call it at *module*
-scope. Merely importing any of them — which most test files do — `mkdir`s `logs/` and opens
-`logs/trader.log` for append; every later `logger.*` call in every test appends to it. Deliberate
-fault-injection output therefore lands in the production log the Jetson forensics rely on and
-counts against the 5 × 10 MB rotation budget. `logs/` is gitignored, which is why it went
-unnoticed. `test_review_b20.py` shows the per-file fix (`monkeypatch.setattr(log_config,
-'_LOG_DIR'/'_LOG_FILE', …)`); a suite-wide fix needs a **module-level** redirect in
-`tests/conftest.py` that runs before the first repo import, which touches every test's logging and
-so has not been made.
+scope, so merely importing any of them used to open the **production** `<repo>/logs/trader.log`
+for append; fault-injection output then landed in the log the Jetson forensics and live bots use
+(33,452 fake lines in one night) and counted against the 5 × 10 MB rotation budget. Now
+`tests/conftest.py` sets `TRADER_LOG_DIR` at **module scope, right after `import os`** — before its
+own `import llm_client` and every other repo import — to a per-session
+`tempfile.mkdtemp(prefix='trader-test-logs-')`; `log_config._log_paths()` (`log_config.py:102-135`)
+reads it at the first `_setup()`, so every record of the test process (and of subprocesses that
+inherit the environment) goes there. A **non-empty** caller value wins; an empty one counts as
+unset. The directory is left in `$TMPDIR`; the repo-root hygiene section ends with
+`test logs: <dir> (TRADER_LOG_DIR, set by conftest|caller)` and
+`production log untouched: yes | no (...) | unattributable (...)` — the session-start
+(inode, mtime, size) of `logs/trader.log` vs finish; `unattributable` = it changed while other
+processes (the live bots on the Jetson) held it open and this process has no handler on it.
+Report-only: the exit status is never touched, and `ab_check.sh`'s block filter does not echo
+these two lines. Per-test `_LOG_DIR`/`_LOG_FILE` monkeypatches (`test_review_b20.py`,
+`test_g3_ops_2026_09.py`) still win over the variable. **Production is unchanged**: nothing outside
+tests sets it, so bots and the pipeline log to `<repo>/logs/trader.log` exactly as before. Not
+covered: a subprocess started with a scrubbed environment. Pinned by `test_intel_logdir_2026_09.py`.
 
 **3. `llm_client._COST_FILE` is order-dependent.** `_maybe_reset_quota()` persists the shared spend
 ledger on the first call of a new calendar day, and it is reached from six *read-shaped* functions
@@ -222,13 +309,22 @@ Whichever unsandboxed test reaches one of them first becomes the writer of `<rep
 `test_c26_P1.py::test_analyze_trades_sets_last_analysis_meta` (today's first caller) now
 monkeypatches the constant, as do `test_c26_S2.py`, `test_llm_claude.py` and
 `test_llm_providers.py`; `test_llm_routing.py` closes the gate by setting `_cost_reset_date`.
-A future test that reaches a cost getter without sandboxing will re-open the hole. The durable fix
-is a session-scoped autouse fixture in `tests/conftest.py` repointing `_COST_FILE` at a tmp dir.
+A future test that reaches a cost getter without sandboxing will re-open the hole. **Re-opened
+2026-09:** the hygiene instrument reports `MOD llm_cost.json.lock` for
+`test_g4b_fixes_2026_09.py::test_analyze_trades_conviction_infinity_does_not_raise` (via
+`llm_analyst.analyze_trades` → `get_routing_info` → `_maybe_reset_quota` → `_cost_file_lock`,
+which opens `<repo>/llm_cost.json.lock` for write). Static candidates with no `_COST_FILE` /
+`_cost_reset_date` sandbox: `test_llm_advice.py`, `test_llm_client.py`,
+`test_llm_dossier_persist.py`, `test_llm_advisor.py`. **Closed 2026-09-27 (INTEL W13):** the suite-wide
+autouse fixture `_llm_cost_ledger_sandbox` in `tests/conftest.py` (see *Conventions*) now repoints
+`_COST_FILE` per test. The per-file copies of the fixture in the five `test_llm_*` files and in `test_g4b_fixes_2026_09.py` are
+redundant but kept, because they are harmless and override it. Measured before the change: only `test_llm_batch_scoring.py` still
+reached the root ledger (`get_recommended_model` → `_maybe_reset_quota`). Measured after: 0 root touches.
 
-**4. Gitignore gaps for two sidecars.** `.gpu_lock_info.json` (`gpu_lock`) and `llm_cost.json.lock`
-(`llm_client`) are not ignored — `.gitignore` covers `.gpu.lock` and `*.jsonl.lock`, and
-`*.jsonl.lock` does not match `.json.lock`. Neither exists today, but an interrupted unsandboxed
-run would leave one as an untracked file.
+**4. Gitignore gaps for two sidecars — resolved.** `.gitignore` now lists `.gpu_lock_info.json` and
+`*.json.lock` (checked 2026-09-27 with `git check-ignore -v`). Historical note: `.gpu_lock_info.json` (`gpu_lock`) and `llm_cost.json.lock`
+(`llm_client`) were not ignored (`.gitignore` then covered only `.gpu.lock` and `*.jsonl.lock`).
+`llm_cost.json.lock` does exist in the Jetson root — ignored now, but see item 3 for why.
 
 **5. One genuinely environment-dependent test.** `test_c26_W1.py` pins module source via
 `git show HEAD:<path>` — it needs a git worktree and compares against the **committed** version,
@@ -314,6 +410,7 @@ One row per `test_*.py`, grouped by family. **Mac** = `yes` (green on the dev Ma
 | `test_predict_now.py` | 11 | BASELINE — joblib (collection ERROR: predict_now -> joblib) | `model_v2`, `predict_now` | Tests for predict_now.py — path generation and model loading. |
 | `test_prediction_cache.py` | 9 | yes | `predict_now`, `prediction_cache` | Wave-8 #5: bar-keyed prediction cache semantics. |
 | `test_prediction_cache_context.py` | 4 | yes | `crypto_loop`, `stock_loop` | GUI review 2026-07 §5/§11 Phase 2.3 (producer side): prediction-cache decision-context enrichment (meta_p, conviction, regime, llm_gate, rank). |
+| `test_repo_graph.py` | 4 | yes | `repo_graph` | Tests for scripts/repo_graph.py — one subprocess covers `--summary`, `--json`, `--check` (added 2026-09, not in the 88-file core count above). |
 | `test_rank_gradient.py` | 5 | yes | `rank_gradient` | Wave-9 #4/#5 gate: rank-gradient Stage-0 verdict (holdout + live). |
 | `test_risk_budget.py` | 17 | yes | `portfolio`, `risk_budget` | Wave-6 Tier-2: cross-book account risk cap + two-book equity simulator. |
 | `test_risk_budget_gate1.py` | 6 | yes | `risk_budget` | Wave-8 #7: cross-book account stop-risk GATE-1 measurement. |
@@ -538,3 +635,35 @@ One row per `test_*.py`, grouped by family. **Mac** = `yes` (green on the dev Ma
 | File | # | Mac | Modules under test | Purpose |
 |---|---:|---|---|---|
 | `test_wave4.py` | 14 | BASELINE — pyarrow/fastparquet (short_flow FINRA parquet archive) | `harvest_stock_data`, `indicators`, `short_flow`, `volatility` | Tests for wave 4: HAR-RV, feature suite, shorting flow, sleeve blend. |
+
+### Family `2026_09` — `_2026_09` suffix — 2026-09 Jetson test & improvement campaign
+
+*20 files, 697 collected tests (453 `def test*`). Unlike the rest of this appendix, **#** here is the
+`pytest --collect-only` count on the Jetson (parametrize expanded). **Mac** = `claimed` (docstring
+says Mac-safe, not re-run on the Mac), `partial` (module-level `importorskip`), `unverified`. Producers:
+hunts G1–G8 + FIX_A–H / R1–R5, docs in `research/campaign_2026-09_jetson/`.*
+
+| File | # | Mac | Modules under test | Purpose |
+|---|---:|---|---|---|
+| `test_exec_fixes_2026_09.py` | 21 | claimed | `llm_analyst`, `order_utils`, `trading_utils` | Execution fixes (hunt G2-1, G2-3, G1 F3); stub broker objects only, no network/orders/LLM calls. |
+| `test_g3_ops_2026_09.py` | 43 | partial — importorskip run_pipeline | `crypto_loop`, `log_config`, `run_bots`, `run_pipeline`, `stock_loop` | G3 ops & orchestration fixes; every file a test writes is redirected into a tmp dir. |
+| `test_g4_fixes_2026_09.py` | 11 | claimed | `llm_client`, `llm_config`, `novelty`, `sentiment`, `sentiment_history` | G4 hunt, batch 1: LLM + sentiment-layer robustness (e.g. per-window SQLite commits in sentiment history). |
+| `test_g4b_fixes_2026_09.py` | 46 | claimed | `llm_analyst`, `llm_config`, `sentiment`, `sentiment_history`, `volatility` | G4 hunt, batch 2: non-finite fundamentals/LLM fields coerced safely; retry-queue race. Used to write `<repo>/llm_cost.json.lock` (hygiene item 3, closed by the suite-wide sandbox). |
+| `test_g5_fixes_2026_09.py` | 61 | partial — importorskip arch, pyarrow | `edgar_events`, `events_calendar`, `funding`, `funding_archive`, `macro_indicators`, `oi_archive`, `short_flow`, `stock_config` +1 | G5 risk / non-model-gate fixes (HAR-RV truncated-day merge, funding/OI/short-flow/events guards). |
+| `test_g6_fixes_2026_09.py` | 29 | partial — importorskip pyarrow | `decision_report`, `execution_report`, `llm_eval`, `market_data`, `data_utils`, `wave6_stage0` + 8 report scripts | G6 measurement-shelf fixes (llm_eval bar windows, report-script correctness). |
+| `test_g8_fixes_2026_09.py` | 69 | claimed | `gui`, `strategy_config`, `tax_lots` | G8 operator-console fixes; gui pieces tested as pure helpers / AST-extracted methods (no PySide6). |
+| `test_gui_fixes_2026_09.py` | 44 | partial — importorskip pandas | `gui` | GUI fixes from the headless audit (F_gui D1/D2/D3/D4/D5/D10), PySide6-free. |
+| `test_jetson_ops_2026_09.py` | 36 | partial — importorskip fundamentals | `run_pipeline` (+ `scripts/setup_jetson_system.sh` as text) | Jetson ops audit fixes as source/AST contracts. |
+| `test_llm_fixes_2026_09.py` | 96 | unverified | `llm_analyst`, `llm_client` | FIX_G LLM transport/accounting fixes (Anthropic temperature gating and peers); sandboxes `_COST_FILE`. |
+| `test_loop_fixes_2026_09.py` | 23 | claimed | `base_loop`, `order_utils`, `run_bots`, `stock_loop` | Live-loop fixes (G1 F1/F2/F4, G2-3, G2-4) via extract-and-exec of the real loop source. |
+| `test_market_data_sip_clamp_2026_09.py` | 30 | claimed | `market_data` | Stock historical harvest clamps `end` outside the 15-min SIP delay (Alpaca Basic plan). |
+| `test_measurement_fixes_2026_09.py` | 30 | claimed | `beta_ledger`, `chart_core`, `decision_report`, `execution_report`, `gui`, `llm_eval`, `sizing_cofire_report` | D_measurement fixes: honest drop counts / replay windows, vendor spike filtering in beta_ledger. |
+| `test_oi_inf_2026_09.py` | 23 | partial — importorskip joblib, pyarrow, torch | `oi_archive`, `harvest_crypto_data`, `data_utils`, `indicator_config`, `hypersearch_v2`, `predict_now` | FIX-R1: `OI_Chg_24h` +inf rows (zero-OI glitch prints) + the non-finite parity guard. |
+| `test_raw_sidecar_reload_2026_09.py` | 12 | claimed | `data_utils`, `harvest_crypto_data`, `harvest_stock_data` | R5: raw-OHLCV sidecar reload hands `compute_features` a tz-aware UTC DatetimeIndex. |
+| `test_sentiment_pit_2026_09.py` | 25 | claimed | `harvest_stock_data`, `sentiment_history` | PIT repair of Daily_Sentiment (FnG publication-date migration, marker-keyed, one-time). |
+| `test_tb_restamp_2026_09.py` | 14 | claimed | `harvest_crypto_data`, `harvest_stock_data`, `panel_ranks`, `policy_exits`, `strategy_config` | R4: triple-barrier labels stamped AFTER every row filter (L7 full fix; TB-GUARD re-harvest finding). |
+| `test_intel_testarch_2026_09.py` | 12 | claimed (pytest + stdlib; loads conftest → numpy/pandas) | `tests/conftest.py` (hygiene hooks), `scripts/ab_check.sh` | INTEL W1: repo-root hygiene instrument — pure helpers, subprocess mini-project NEW/MOD/strict, ab_check echo + strict passthrough. |
+| `test_evidence_reads_2026_09.py` | 47 | claimed | `scripts/evidence_reads` (stubbed subprocess instruments) | INTEL R1: one-command runbook Phase 0/1 evidence reads — step table, parsers, readiness verdicts, exit codes, dry-run. |
+| `test_intel_gui_2026_09.py` | 25 | claimed | `gui` (AST-extracted, PySide6-free) | INTEL R1: Cockpit/Trading `_scroll_wrap` + indexOf(page) invariant; off-thread optuna best-score load (cache key, routing). |
+| `test_intel_ledger_sandbox_2026_09.py` | 10 | claimed (pytest + stdlib; loads conftest → numpy/pandas) | `tests/conftest.py` (`_llm_cost_ledger_sandbox`), `llm_client` | INTEL W13: suite-wide LLM cost-ledger sandbox. Real ledger writes land in the sandbox and read back; the production-root ledger is unchanged; per-test isolation; a test's own `_COST_FILE` wins; conftest is a no-op without llm_client (subprocess mini-project). |
+| `test_intel_logdir_2026_09.py` | 10 | claimed (pytest + stdlib; loads conftest → numpy/pandas) | `tests/conftest.py` (`TRADER_LOG_DIR` block, production-log guard, sandbox meta reset), `log_config` | INTEL W18: test logging goes to the per-session `trader-test-logs-*` dir, never `<repo>/logs/trader.log` — effective dir, source-order guard, production-log snapshot/verdict, a real record lands in the temp file, subprocess mini-project (env set before the first repo import; caller value wins; `production log untouched:` line); per-test `get_last_call_meta()` reset. |

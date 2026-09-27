@@ -271,7 +271,9 @@ def test_save_failure_logged_rate_limited_and_no_raise(nov_sandbox, monkeypatch,
     assert n1 == 1.0 and n2 > 0.9                 # scoring unaffected by dead disk
     warns = [r for r in caplog.records if 'save failed' in r.getMessage()]
     assert len(warns) == 1                        # rate-limited (one per hour)
-    assert not (nov_sandbox / 'store.json.tmp').exists()  # tmp cleaned up
+    # tmp cleaned up: writers use per-writer names (store.json.<pid>.<tid>.tmp)
+    # since G4-04, so the retired fixed name would pass vacuously — glob all.
+    assert sorted(p.name for p in nov_sandbox.glob('*.tmp')) == []
 
 
 # ===========================================================================

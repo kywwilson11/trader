@@ -35,11 +35,43 @@ import horizon_transfer as ht        # noqa: E402
 from stage0_preds import index_ns    # noqa: E402
 
 
+def _projected_columns(book, keep):
+    """Store columns to request from data_utils.load_training_data: 'Ticker'
+    plus every column whose name satisfies keep(name), read from the parquet
+    SCHEMA (no data). None (= the full load, today's behaviour) whenever the
+    loader would not serve that parquet — absent, CSV fresher
+    (data_utils._csv_is_fresher), or no pyarrow — so the CSV path is never
+    narrowed by a stale parquet's schema. The DatetimeIndex is restored from
+    the parquet's pandas metadata either way, so the loaded frame differs
+    only in the columns this script never reads (output sha-identical)."""
+    try:
+        import contextlib
+        import io
+        import data_utils
+        import pyarrow.parquet as pq
+        stem = data_utils._stem(book)
+        pqp = data_utils._BASE_DIR / f'{stem}.parquet'
+        csvp = data_utils._BASE_DIR / f'{stem}.csv'
+        if not pqp.exists():
+            return None
+        with contextlib.redirect_stdout(io.StringIO()):   # loader re-prints
+            if data_utils._csv_is_fresher(pqp, csvp):
+                return None
+        cols = [c for c in pq.read_schema(pqp).names
+                if c == 'Ticker' or keep(c)]
+        return cols if 'Ticker' in cols and len(cols) > 1 else None
+    except Exception:
+        return None
+
+
 def load_per_name(prefix_key):
     """{name: (fwd_by_h, times_ns)} from the training store's
     Target_Return_{h} columns; also returns the sorted horizon list."""
     from data_utils import load_training_data
-    df = load_training_data(prefix_key)
+    # Column projection (G6 C-1): only Ticker + Target_Return_* are read —
+    # the full stock store is ~110 columns / >3 GB in RAM on the 8 GB Jetson.
+    df = load_training_data(prefix_key, columns=_projected_columns(
+        prefix_key, lambda c: c.startswith('Target_Return_')))
     if df.empty or 'Ticker' not in df.columns:
         sys.exit(f"no training data with a Ticker column for "
                  f"'{prefix_key}' — run the harvest first")

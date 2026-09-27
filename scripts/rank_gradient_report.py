@@ -17,8 +17,9 @@ LIVE side: feed decision_report's rank buckets directly:
 PASS on BOTH the holdout panel AND >=20-30d of live journals before shipping the
 conviction flagship (CONCENTRATION_ENABLED) or edge-Kelly (EDGE_KELLY_ENABLED).
 Exit status: 0 only when the verdict CONFIRMS the gradient, 1 on a ran-but-no-go
-verdict, and 2 when the --buckets input cannot be gated at all (a STALE
-decision_report placeholder, or a payload that is not a JSON object) — so
+verdict, and 2 when the input cannot be gated at all (a STALE
+decision_report placeholder, a --buckets payload that is not a JSON object,
+or an EMPTY --preds dump — backtest.py writes `[]` when no row qualifies) — so
 scripted use can tell "gate ran and said no" apart from both "gate confirmed"
 and "input unusable / not trustworthy".
 
@@ -43,9 +44,16 @@ sys.path.insert(0, str(BASE_DIR))
 from rank_gradient import (MIN_BUCKET_N, rank_gradient_from_panel,  # noqa: E402
                            rank_gradient_verdict)
 
+EXIT_CODES_EPILOG = (
+    'exit status:\n'
+    '  0  the verdict CONFIRMS the rank gradient\n'
+    '  1  the gate ran and said no (no / insufficient gradient)\n'
+    '  2  input unusable: bad arguments, a STALE decision_report, a --buckets\n'
+    '     payload that is not a JSON object, or an empty --preds dump (no rows)')
+
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
+    ap = argparse.ArgumentParser(description=__doc__, epilog=EXIT_CODES_EPILOG,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument('--preds', help='predictions frame JSON/CSV (ts, symbol, signal, fwd_return)')
@@ -73,8 +81,23 @@ def main() -> int:
         import pandas as pd
         from portfolio_backtest import panel_from_frame
         p = Path(args.preds)
-        df = (pd.read_csv(p) if p.suffix.lower() == '.csv'
-              else pd.DataFrame(json.loads(p.read_text())))
+        try:
+            df = (pd.read_csv(p) if p.suffix.lower() == '.csv'
+                  else pd.DataFrame(json.loads(p.read_text())))
+        except pd.errors.EmptyDataError:      # a 0-byte CSV dump
+            df = pd.DataFrame()
+        if df.empty:
+            # backtest.py legitimately writes `[]` when no row qualifies; that
+            # is "nothing to gate" (2), not a ran-but-no-go verdict (1).
+            print(f"no rows: {args.preds} is an empty Stage-0 dump — nothing "
+                  f"to gate (re-run backtest.py over a window with qualifying "
+                  f"rows)", file=sys.stderr)
+            return 2
+        if 'ts' not in df.columns:
+            print(f"ERROR: {args.preds} has no 'ts' column (need ts, symbol, "
+                  f"signal, fwd_return); got {list(df.columns)[:8]}",
+                  file=sys.stderr)
+            return 2
         df = df.set_index(pd.to_datetime(df['ts']))
         # The documented frame names the ticker column 'symbol' (shared with
         # ic_by_name); tolerate a repo-internal 'Ticker'-style dump too.

@@ -348,9 +348,11 @@ class StockLoop(BaseTradingLoop):
                     # (429/timeout/5xx) treated as "gone" would drop
                     # tracking, mark the flatten done, and let the REAL
                     # position ride overnight with day-TIF legs expired.
-                    err_str = str(e).lower()
-                    if ('not found' in err_str or '404' in err_str
-                            or 'no position' in err_str):
+                    # Shared classifier (2026-09 G2-4): the legacy SDK's
+                    # unheld-position text is 'position does not exist',
+                    # which the old inline copy missed.
+                    from order_utils import _is_not_found
+                    if _is_not_found(e):
                         info = self.positions.get(symbol)
                         if info is not None:
                             self._journal_external_close(symbol, info)
@@ -428,7 +430,10 @@ class StockLoop(BaseTradingLoop):
         positions unprotected overnight. (Implementation used by the
         overnight sleeve, Phase 3c.)
         """
-        for symbol in keepers:
+        # Iterate a snapshot: the except branch below discards failed
+        # keepers from the caller's set (routing them to the flatten), and
+        # mutating a set mid-iteration raises RuntimeError (2026-09 G1 F1).
+        for symbol in list(keepers):
             info = self.positions.get(symbol)
             if info is None:
                 continue
@@ -718,8 +723,9 @@ class StockLoop(BaseTradingLoop):
             try:
                 pos = self.api.get_position(symbol)
             except Exception as e:
-                err_str = str(e).lower()
-                if 'not found' in err_str or '404' in err_str or 'no position' in err_str:
+                # Shared classifier (2026-09 G2-4) — see flatten_before_close.
+                from order_utils import _is_not_found
+                if _is_not_found(e):
                     # Position closed at the broker outside our tracking
                     # (e.g. TP leg filled between cycles) — journal it so
                     # the Kelly sample isn't censored of these exits
@@ -894,7 +900,11 @@ class StockLoop(BaseTradingLoop):
                             ts = datetime.datetime.fromisoformat(
                                 ts.replace('Z', '+00:00'))
                         if ts.tzinfo is not None:
-                            ts = ts.astimezone().replace(tzinfo=None)
+                            # fromtimestamp (not astimezone().replace)
+                            # keeps .fold for the repeated DST hour, so
+                            # .timestamp() below round-trips exactly.
+                            ts = datetime.datetime.fromtimestamp(
+                                ts.timestamp())
                         return ts
                     except Exception:
                         return None
@@ -926,8 +936,10 @@ class StockLoop(BaseTradingLoop):
                     if entry_ref is not None:
                         if ots < entry_ref - datetime.timedelta(minutes=5):
                             continue
-                    elif (datetime.datetime.now() - ots) \
-                            > datetime.timedelta(hours=24):
+                    elif (datetime.datetime.now().timestamp()
+                          - ots.timestamp()) > 24 * 3600:
+                        # .timestamp() difference, not naive wall-clock
+                        # subtraction: DST-safe elapsed seconds (G2-3).
                         continue
                     order, reason = o, 'external_close'
                     break
@@ -1372,6 +1384,19 @@ class StockLoop(BaseTradingLoop):
                     sizing_detail = getattr(self, '_last_sizing_detail', None)
                     if sizing_detail:
                         buy_rec['sizing'] = sizing_detail
+                    # ENGINE r5 R5-a (measurement-only, additive): the same
+                    # join keys base _place_and_track_buy appends (order_id
+                    # of the acquiring parent + the decision quote's bid/
+                    # ask/fetch stamp) — journal_stats' one-buy-key-set
+                    # contract. setdefault: legacy keys/order untouched.
+                    try:
+                        from base_loop import (_order_journal_ids,
+                                               _decision_quote_journal_keys)
+                        for k, v in {**_order_journal_ids(result),
+                                     **_decision_quote_journal_keys(quote)}.items():
+                            buy_rec.setdefault(k, v)
+                    except Exception:
+                        pass    # join keys are best-effort — never block the row
                     log_decision(buy_rec)
                     self.last_trade_time[symbol] = datetime.datetime.now()
                     self._count_trade(symbol)
@@ -1474,9 +1499,16 @@ class StockLoop(BaseTradingLoop):
             else:
                 trail_pct = self.TRAIL_PCT
 
+            # Not after the EOD flatten (ENGINE r2 W6): the only positions
+            # left are overnight keepers whose stop_order_id is the GTC stop
+            # _prepare_overnight_keepers placed moments earlier in this same
+            # cycle (it also resets trailing_activated) — upgrading would
+            # cancel it for a DAY trailing stop that expires at the close,
+            # leaving the keeper with no server-side stop overnight.
             if (not info.trailing_activated
                     and current_price >= entry_price * (1 + self.ATR_TRAIL_ACTIVATE_PCT)
-                    and info.stop_order_id):
+                    and info.stop_order_id
+                    and not getattr(self, 'flattened_today', False)):
                 try:
                     # Canceling one bracket leg cancels the whole OCO group;
                     # wait for confirmation or the trailing submit rejects
@@ -1589,18 +1621,28 @@ class StockLoop(BaseTradingLoop):
         without re-placement, positions would depend on 30s software
         polling — i.e. on this process staying alive — for protection.
         """
+        import strategy_config
+        anchor_desired = getattr(strategy_config,
+                                 'RESTART_STOP_ANCHOR_DESIRED', False)
         for symbol, info in self.positions.items():
             try:
-                entry_atr = info.entry_atr
-                if entry_atr is not None and info.entry_price > 0:
-                    raw = (entry_atr * self.ATR_STOP_MULTIPLIER) / info.entry_price
-                    stop_dist = max(self.ATR_STOP_FLOOR_PCT, min(self.ATR_STOP_CEIL_PCT, raw))
+                if anchor_desired:
+                    # ENGINE-R3 O2+J11: exactly the software stop. A PLAIN
+                    # stop even when trailing_activated=True was restored
+                    # (J2): a native trailing_stop re-anchors at the submit
+                    # price and cannot equal _desired_stop_for.
+                    stop_price = round(self._desired_stop_for(info)[0], 2)
                 else:
-                    stop_dist = self.STOP_LOSS_PCT
-                # Anchor to the HWM so a restart doesn't widen an
-                # already-tightened trail back to entry-based distance
-                anchor = max(info.entry_price, info.high_water_mark)
-                stop_price = round(anchor * (1 - stop_dist), 2)
+                    entry_atr = info.entry_atr
+                    if entry_atr is not None and info.entry_price > 0:
+                        raw = (entry_atr * self.ATR_STOP_MULTIPLIER) / info.entry_price
+                        stop_dist = max(self.ATR_STOP_FLOOR_PCT, min(self.ATR_STOP_CEIL_PCT, raw))
+                    else:
+                        stop_dist = self.STOP_LOSS_PCT
+                    # Anchor to the HWM so a restart doesn't widen an
+                    # already-tightened trail back to entry-based distance
+                    anchor = max(info.entry_price, info.high_water_mark)
+                    stop_price = round(anchor * (1 - stop_dist), 2)
                 qty = int(float(info.qty))
                 if qty <= 0:
                     continue

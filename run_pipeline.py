@@ -49,10 +49,36 @@ COMMAND_RESULT_FILE = os.path.join(BASE_DIR, 'command_result.json')
 _STDOUT_IS_TTY = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
 
 
-def _print(*args, **kwargs):
-    """Print only when stdout is a terminal (avoids doubling when redirected to log)."""
-    if _STDOUT_IS_TTY:
+def _print(*args, always=False, **kwargs):
+    """Print only when stdout is a terminal (avoids doubling when redirected to log).
+
+    always=True prints regardless — only for lines that are NOT also written
+    to log_fh (use _announce, which adds flush + trader.log).
+    """
+    if _STDOUT_IS_TTY or always:
         print(*args, **kwargs)
+
+
+def _announce(msg, level='warning'):
+    """Emit a line that is NOT also written to log_fh, in every launch mode.
+
+    _print() is TTY-only because its callers also write the same line to
+    log_fh; a message that never reaches log_fh must use this instead, or it
+    is dropped under systemd (stdout = journal) and the GUI launcher
+    (stdout = pipeline_output.log) — 2026-09-26 Jetson campaign G3-6. The
+    line also goes to logs/trader.log (file handler only: a root/console
+    copy would land on stderr, which both launchers merge into the same
+    sink as stdout). Never raises.
+    """
+    try:
+        _print(msg, always=True, flush=True)  # == print(msg, flush=True)
+    except Exception:
+        pass
+    try:
+        from log_config import get_file_logger
+        getattr(get_file_logger('run_pipeline'), level)(str(msg).strip())
+    except Exception:
+        pass
 
 
 def _sd_notify(msg: bytes):
@@ -285,6 +311,25 @@ ENV = {
     'PYTHONUNBUFFERED': '1',
 }
 
+
+def _training_env(base_env):
+    """Env for TRAINING phase children (harvest/hypersearch/meta_label/backtest).
+
+    An inherited EMPTY CUDA_VISIBLE_DEVICES (e.g. from an old systemd unit's
+    ``Environment=CUDA_VISIBLE_DEVICES=``) hides the GPU from hypersearch,
+    which then silently trains on CPU (~820 s/epoch on the Orin Nano). Drop
+    the key when it is '' so training sees the GPU; an explicit non-empty
+    value (e.g. '0') passes through untouched. Bots keep BOT_ENV's ''.
+    Pure: returns a new dict, never mutates ``base_env``.
+    """
+    env = dict(base_env)
+    if env.get('CUDA_VISIBLE_DEVICES') == '':
+        del env['CUDA_VISIBLE_DEVICES']
+    return env
+
+
+TRAIN_ENV = _training_env(ENV)
+
 # Bots use CPU-only inference — hide GPU so PyTorch doesn't reserve CUDA memory.
 # This frees ~600MB for training (each CUDA context costs ~300MB on Jetson).
 # OMP/torch thread caps stop tiny-LSTM inference stealing cores from training.
@@ -343,8 +388,8 @@ def _bounded_thermal_wait(max_temp=70, deadline_sec=1800, poll_interval=30):
         if temp is None or temp < max_temp:
             return
         if time.time() >= deadline:
-            _print(f"[HW] GPU still hot ({temp:.0f}C) after {deadline_sec}s"
-                   f" wait, proceeding anyway")
+            _announce(f"[HW] GPU still hot ({temp:.0f}C) after {deadline_sec}s"
+                      f" wait, proceeding anyway")
             return
         time.sleep(poll_interval)
 
@@ -384,13 +429,27 @@ def write_status(status, force=False):
     except (ValueError, TypeError):
         pass
     status['elapsed_sec'] = int(elapsed)
-    tmp = STATUS_FILE + f'.tmp.{os.getpid()}'
+    # Per-THREAD tmp path (2026-09-26 Jetson campaign G3-4): the heartbeat
+    # thread and the main thread both write here, the main thread without
+    # _heartbeat_lock. A shared '.tmp.<pid>' let both open() the SAME inode —
+    # the first os.replace published it, then the second writer's bytes
+    # landed at offset 0 of the published file (torn JSON -> GUI saw {}).
+    # One inode per writer keeps os.replace atomic; last writer wins.
+    tmp = STATUS_FILE + f'.tmp.{os.getpid()}.{threading.get_ident()}'
     try:
         with open(tmp, 'w') as f:
             json.dump(status, f, indent=2)
         os.replace(tmp, STATUS_FILE)
     except OSError:
         pass  # Non-fatal — status file is informational only
+    except BaseException:
+        # e.g. the heartbeat's RuntimeError (dict mutated mid-dump): drop
+        # the partial tmp, then let the caller handle it as before.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _write_command_result(command, crypto, stock, result, reason=''):
@@ -417,6 +476,31 @@ def _write_command_result(command, crypto, stock, result, reason=''):
         os.replace(tmp, COMMAND_RESULT_FILE)
     except Exception:
         pass  # Non-fatal — ack file is informational only, must never break dispatch
+
+
+def _drain_phase_output(proc):
+    """Read a phase child's stdout to EOF, discarding it (G3-3).
+
+    Called when run_phase's read loop has died: the child must still be able
+    to write (a full 64 KiB pipe blocks it in write() forever, and our
+    proc.wait() with it) so its exit code can decide retry/success. Reads the
+    raw byte buffer, so no decoding can fail here. Draining is liveness, so it
+    stamps mark_progress(). If even draining fails, kill the child — a -9
+    retry beats a permanent deadlock with the bots stopped.
+    """
+    stream = proc.stdout
+    if stream is None:
+        return
+    raw = getattr(stream, 'buffer', stream)
+    read = getattr(raw, 'read1', None) or raw.read
+    try:
+        while read(65536):
+            mark_progress()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 def run_phase(phase, log_fh, status):
@@ -460,10 +544,13 @@ def run_phase(phase, log_fh, status):
         phase['cmd'],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        env=ENV,
+        env=TRAIN_ENV,
         cwd=BASE_DIR,
         bufsize=1,
         text=True,
+        # Output is decoded only for logging + progress regexes; one
+        # undecodable byte must not kill the read loop (G3-3).
+        errors='replace',
     )
     global _current_phase_proc
     _current_phase_proc = proc
@@ -546,7 +633,17 @@ def run_phase(phase, log_fh, status):
 
             write_status(status, force=force)
     except Exception as e:
-        _print(f"\n[PIPELINE] Error reading phase output: {e}")
+        # Never let a logging/parsing failure become a deadlock: keep the
+        # child's pipe drained so proc.wait() returns and the child's own
+        # exit code still decides (G3-3).
+        _announce(f"\n[PIPELINE] Error reading phase output: {e!r} — "
+                  f"draining the rest of the phase output unlogged")
+        try:
+            log_fh.write(f"\n[PIPELINE] Error reading phase output: {e!r}\n")
+            log_fh.flush()
+        except Exception:
+            pass
+        _drain_phase_output(proc)
     finally:
         proc.wait()
         _current_phase_proc = None
@@ -561,8 +658,11 @@ def run_phase(phase, log_fh, status):
         pass
 
     footer = f"\n--- Phase complete (exit {proc.returncode}){elapsed} ---\n"
-    log_fh.write(footer)
-    log_fh.flush()
+    try:
+        log_fh.write(footer)
+        log_fh.flush()
+    except Exception:
+        pass  # a broken log must not turn a finished phase into a crash
     _print(footer, end='')
 
     write_status(status, force=True)
@@ -655,6 +755,23 @@ def _stop_bots(bots, log_fh):
 _COMBINED_BOTS = False  # set from --combined-bots in main()
 
 
+def _drop_dead_entries(bots, names):
+    """Remove exited entries named in `names` from `bots` (closing their log
+    handles) right before a launch of those books. Otherwise the next
+    _check_restart_bots pass ALSO restarts the dead entry and one book
+    trades from two processes (start_bot inside the <= 60 s window between
+    a crash and the monitor pass; ENGINE R5 W15 F1)."""
+    for j in range(len(bots) - 1, -1, -1):
+        n, p, fh = bots[j]
+        if n in names and p.poll() is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            _untrack_handle(fh)
+            bots.pop(j)
+
+
 def _launch_bots(bots, log_fh, run_crypto, run_stock, verb='started'):
     """Launch trading bots — combined single process or one per bot.
 
@@ -664,6 +781,7 @@ def _launch_bots(bots, log_fh, run_crypto, run_stock, verb='started'):
     process in that mode.
     """
     if _COMBINED_BOTS and (run_crypto or run_stock):
+        _drop_dead_entries(bots, ('Bots',))
         cmd = [PYTHON, '-u', 'run_bots.py']
         if run_crypto and not run_stock:
             cmd.append('--crypto-only')
@@ -679,6 +797,7 @@ def _launch_bots(bots, log_fh, run_crypto, run_stock, verb='started'):
         return
 
     if run_crypto:
+        _drop_dead_entries(bots, ('Crypto',))
         proc, bot_fh = _start_bot([PYTHON, '-u', 'crypto_loop.py'], CRYPTO_BOT_LOG)
         bots.append(('Crypto', proc, bot_fh))
         _all_handles.append(bot_fh)
@@ -688,6 +807,7 @@ def _launch_bots(bots, log_fh, run_crypto, run_stock, verb='started'):
         _print(msg, end='')
 
     if run_stock:
+        _drop_dead_entries(bots, ('Stock',))
         proc, bot_fh = _start_bot([PYTHON, '-u', 'stock_loop.py'], STOCK_BOT_LOG)
         bots.append(('Stock', proc, bot_fh))
         _all_handles.append(bot_fh)
@@ -699,6 +819,8 @@ def _launch_bots(bots, log_fh, run_crypto, run_stock, verb='started'):
 
 def _restart_bots(bots, log_fh, run_crypto, run_stock):
     """Restart bot processes after training completes."""
+    if BOT_RESTART_BACKOFF:
+        _backoff_release(bots)  # explicit relaunch clears the give-up latch
     _launch_bots(bots, log_fh, run_crypto, run_stock, verb='restarted')
 
 
@@ -733,7 +855,17 @@ def _stop_single_bot(bots, name, log_fh):
 
 
 def _start_single_bot(bots, name, log_fh):
-    """Start a single bot by name if not already running."""
+    """Start a single bot by name if not already running (split mode only)."""
+    if _COMBINED_BOTS:
+        # A per-book loop next to (or later joined by) the combined
+        # run_bots.py process would trade that book twice (G3-1). Every
+        # combined-mode start goes through _start_bots_now instead.
+        msg = (f"  Refusing per-book {name} start in combined mode"
+               f" (would duplicate order flow)\n")
+        log_fh.write(msg)
+        log_fh.flush()
+        _print(msg, end='')
+        return
     for bot_name, proc, fh in bots:
         if bot_name == name and proc.poll() is None:
             return
@@ -745,6 +877,7 @@ def _start_single_bot(bots, name, log_fh):
         log_path = STOCK_BOT_LOG
     else:
         return
+    _drop_dead_entries(bots, (name,))
     proc, bot_fh = _start_bot(cmd, log_path)
     bots.append((name, proc, bot_fh))
     _all_handles.append(bot_fh)
@@ -758,9 +891,78 @@ def _update_per_bot_status(bots, status):
     """Update per-bot running flags in the status dict."""
     crypto_running = any(n == 'Crypto' and p.poll() is None for n, p, _ in bots)
     stock_running = any(n == 'Stock' and p.poll() is None for n, p, _ in bots)
+    # Combined mode (--combined-bots, the systemd default): ONE 'Bots'
+    # process runs every book in _BOT_SCOPE — alive means those books trade.
+    if any(n == 'Bots' and p.poll() is None for n, p, _ in bots):
+        crypto_running = crypto_running or _BOT_SCOPE[0]
+        stock_running = stock_running or _BOT_SCOPE[1]
     status['crypto_bot_running'] = crypto_running
     status['stock_bot_running'] = stock_running
     status['bots_running'] = crypto_running or stock_running
+
+
+# Phases in which no training runs, so a bot may be started (start_bot's
+# guard) and a suspend request has nothing to suspend.
+_IDLE_PHASES = ('trading', 'idle', 'failed', 'complete', 'suspended', '')
+
+
+def _start_bots_now(bots, log_fh, want_crypto, want_stock):
+    """Start the requested bots with the mode-correct semantics.
+
+    Returns (result, reason) for the command ack. Combined mode launches ONE
+    run_bots.py for the configured _BOT_SCOPE (never a per-book loop, whatever
+    book was asked for) unless a combined process is already alive; split
+    mode starts the requested per-book loops. Shared by start_bot, a
+    suspend_and_start_bot that arrives with nothing to suspend (G3-2), and
+    the post-suspend start in main() (G3-1).
+    """
+    if _COMBINED_BOTS:
+        combined_alive = any(n == 'Bots' and p.poll() is None
+                             for n, p, _ in bots)
+        if combined_alive:
+            # Starting a per-book loop here would duplicate order flow
+            # alongside the already-running combined process.
+            msg = ("  Cannot start per-book bot: combined 'Bots' process"
+                   " is already running\n")
+            log_fh.write(msg)
+            log_fh.flush()
+            _print(msg, end='')
+            return 'rejected', "combined 'Bots' process is already running"
+        run_crypto, run_stock = _BOT_SCOPE
+        _manually_stopped.discard('Crypto')
+        _manually_stopped.discard('Stock')
+        if BOT_RESTART_BACKOFF:
+            _backoff_release(bots, ('Bots',))  # operator start clears the latch
+        _launch_bots(bots, log_fh, run_crypto, run_stock, verb='started')
+        return 'accepted', ''
+    if want_crypto:
+        _manually_stopped.discard('Crypto')
+        if BOT_RESTART_BACKOFF:
+            _backoff_release(bots, ('Crypto',))
+        _start_single_bot(bots, 'Crypto', log_fh)
+    if want_stock:
+        _manually_stopped.discard('Stock')
+        if BOT_RESTART_BACKOFF:
+            _backoff_release(bots, ('Stock',))
+        _start_single_bot(bots, 'Stock', log_fh)
+    return 'accepted', ''
+
+
+def _start_pending_bots(bots, log_fh, pending):
+    """Start the bots a mid-phase suspend_and_start_bot asked for (G3-1).
+
+    Used by both post-suspend blocks in main(). The old per-book
+    _start_single_bot calls spawned a split crypto_loop.py even in combined
+    mode; a later GUI start_bot then added run_bots.py (both books) beside
+    it, so crypto traded in two processes and "Stop Crypto" could not stop
+    the split one.
+    """
+    pending = pending or {}
+    want_crypto = bool(pending.get('crypto'))
+    want_stock = bool(pending.get('stock'))
+    if not (want_crypto or want_stock):
+        return
+    _start_bots_now(bots, log_fh, want_crypto, want_stock)
 
 
 def _handle_command(cmd, bots, log_fh, status):
@@ -805,39 +1007,30 @@ def _handle_command(cmd, bots, log_fh, status):
 
     elif command == 'start_bot':
         phase = status.get('phase', '')
-        if phase not in ('trading', 'idle', 'failed', 'complete', 'suspended', ''):
+        if phase not in _IDLE_PHASES:
             msg = "  Cannot start bot: training in progress\n"
             log_fh.write(msg)
             log_fh.flush()
             _write_command_result(command, want_crypto, want_stock,
                                   'rejected', 'training in progress')
             return
-        result, reason = 'accepted', ''
-        if _COMBINED_BOTS:
-            combined_alive = any(n == 'Bots' and p.poll() is None
-                                 for n, p, _ in bots)
-            if combined_alive:
-                # Starting a per-book loop here would duplicate order flow
-                # alongside the already-running combined process.
-                msg = ("  Cannot start per-book bot: combined 'Bots' process"
-                       " is already running\n")
-                log_fh.write(msg)
-                log_fh.flush()
-                _print(msg, end='')
-                result, reason = ('rejected',
-                                  "combined 'Bots' process is already running")
-            else:
-                run_crypto, run_stock = _BOT_SCOPE
-                _manually_stopped.discard('Crypto')
-                _manually_stopped.discard('Stock')
-                _launch_bots(bots, log_fh, run_crypto, run_stock, verb='started')
-        else:
-            if want_crypto:
-                _manually_stopped.discard('Crypto')
-                _start_single_bot(bots, 'Crypto', log_fh)
-            if want_stock:
-                _manually_stopped.discard('Stock')
-                _start_single_bot(bots, 'Stock', log_fh)
+        result, reason = _start_bots_now(bots, log_fh, want_crypto, want_stock)
+        _update_per_bot_status(bots, status)
+        write_status(status, force=True)
+        _write_command_result(command, want_crypto, want_stock, result, reason)
+
+    elif (command == 'suspend_and_start_bot'
+          and status.get('phase', '') in _IDLE_PHASES):
+        # Nothing to suspend (G3-2): this handler only runs from the trading
+        # wait loops. Latching _suspend_requested here armed a trap that
+        # aborted the NEXT training phase (the weekly retrain, days later) at
+        # its first output line. Handle it as start_bot; ack the original name.
+        msg = ("  No training phase is running — handling"
+               " suspend_and_start_bot as start_bot\n")
+        log_fh.write(msg)
+        log_fh.flush()
+        _print(msg, end='')
+        result, reason = _start_bots_now(bots, log_fh, want_crypto, want_stock)
         _update_per_bot_status(bots, status)
         write_status(status, force=True)
         _write_command_result(command, want_crypto, want_stock, result, reason)
@@ -865,10 +1058,216 @@ def _handle_command(cmd, bots, log_fh, status):
                               'rejected', f'unknown command: {command}')
 
 
+# ---------------------------------------------------------------------------
+# Crash-loop backoff + give-up latch (ENGINE R5 / E6; default OFF)
+# ---------------------------------------------------------------------------
+# April 2026: the stock bot crashed 1,778 times at startup with ONE signature
+# (median lifetime 42 s) and _check_restart_bots restarted it on every 60 s
+# monitor pass, forever (research_engine.md "R4 scout — E6"). ON: the k-th
+# identical crash waits next_restart_delay(k) (60 s doubling to 960 s,
+# counted from the pass BEFORE the detection pass = the earliest possible
+# crash time, so k=0 restarts on the detection pass exactly as today), and
+# GIVEUP_N identical crashes inside GIVEUP_WINDOW_SEC latch that bot down with
+# ONE critical notify until the operator's start_bot (_start_bots_now) or the
+# weekly retrain's _restart_bots clears it. Acts only on already-exited
+# processes; never signals a running bot, never touches orders.
+BOT_RESTART_BACKOFF = os.getenv('TRADER_BOT_RESTART_BACKOFF', '0').strip().lower() in ('1', 'true', 'yes')
+BACKOFF_BASE_SEC = 60      # = one monitor pass (12 x 5 s command polls)
+BACKOFF_CAP_SEC = 960
+GIVEUP_WINDOW_SEC = 3600
+GIVEUP_N = 5
+_CRASH_TAIL_BYTES = 16384
+_TB_HEAD = 'Traceback (most recent call last)'
+_TB_FRAME_RE = re.compile(r'^\s*File "([^"]+)", line (\d+), in ')
+
+
+def crash_signature(stderr_tail):
+    """Signature of the LAST traceback in a log/stderr tail (pure).
+
+    'innermost_file:line | exception line' (digit runs in the exception line
+    masked to '#', 160 chars max). The innermost frame, not the first: every
+    April crash shared the first frame stock_loop.py:574. 'unknown' when the
+    input is empty, not a str, or holds no complete traceback.
+    """
+    try:
+        if not isinstance(stderr_tail, str) or not stderr_tail:
+            return 'unknown'
+        lines = stderr_tail.splitlines()
+        start = None
+        for j, ln in enumerate(lines):
+            if ln.startswith(_TB_HEAD):
+                start = j
+        if start is None:
+            return 'unknown'
+        frame = None
+        for ln in lines[start + 1:]:
+            m = _TB_FRAME_RE.match(ln)
+            if m:
+                frame = f"{os.path.basename(m.group(1))}:{m.group(2)}"
+                continue
+            if not ln.strip() or ln[:1].isspace():
+                continue  # source line / caret marker under a frame
+            if frame is None:
+                return 'unknown'
+            exc = re.sub(r'\d+', '#', ln.strip())[:160]
+            return f"{frame} | {exc}"
+        return 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+def next_restart_delay(consecutive_same, base=BACKOFF_BASE_SEC,
+                       cap=BACKOFF_CAP_SEC):
+    """Seconds from the (earliest possible) crash time to the restart (pure).
+
+    consecutive_same = how many crashes immediately before this one had the
+    same signature (0 for a first or distinct-signature crash -> base, i.e.
+    the next monitor pass, as today). Doubles per repeat, capped at `cap`.
+    """
+    k = max(0, int(consecutive_same))
+    if k >= 32:
+        return int(cap)
+    return int(min(cap, base * (2 ** k)))
+
+
+def consecutive_same(history, now, window_sec=GIVEUP_WINDOW_SEC):
+    """Crashes immediately preceding the latest that share its signature,
+    counting only crashes inside [now - window_sec, now] (pure). history is
+    [(t, sig), ...] oldest first; a quiet window resets the escalation."""
+    if not history:
+        return 0
+    sig = history[-1][1]
+    n = 0
+    for t, s in reversed(history[:-1]):
+        if s != sig or now - t > window_sec:
+            break
+        n += 1
+    return n
+
+
+def should_give_up(history, now, window_sec=GIVEUP_WINDOW_SEC, n=GIVEUP_N):
+    """True iff >= n crashes with the SAME signature as the latest fall
+    inside [now - window_sec, now] (pure; history [(t, sig)], oldest first)."""
+    if not history:
+        return False
+    sig = history[-1][1]
+    return sum(1 for t, s in history
+               if s == sig and 0 <= now - t <= window_sec) >= n
+
+
+_backoff_clock = time.monotonic  # patchable; one clock for every backoff time
+_backoff_state = {}      # bot name -> {'hist', 'proc', 'offset', 'crash_proc', 'due'}
+_restart_giveup = set()  # bot names latched down after GIVEUP_N identical crashes
+
+
+def _bot_log_path(name):
+    return STOCK_BOT_LOG if name == 'Stock' else CRYPTO_BOT_LOG
+
+
+def _backoff_note_proc(name, proc):
+    """Remember a live bot process + its log size, so the crash tail is read
+    from that process's own output (older in-cycle tracebacks excluded)."""
+    try:
+        st = _backoff_state.setdefault(name, {'hist': []})
+        if st.get('proc') is not proc:
+            st['proc'] = proc
+            st['offset'] = os.path.getsize(_bot_log_path(name))
+    except Exception:
+        pass
+
+
+def _read_crash_tail(name, proc):
+    """Last <= _CRASH_TAIL_BYTES of the bot log written by `proc` (stderr is
+    merged into it by _start_bot). Whole tail when the start offset is
+    unknown or the log was rotated since."""
+    path = _bot_log_path(name)
+    size = os.path.getsize(path)
+    st = _backoff_state.get(name) or {}
+    off = st.get('offset') if st.get('proc') is proc else None
+    if off is None or off > size:
+        off = 0
+    off = max(off, size - _CRASH_TAIL_BYTES)
+    with open(path, 'rb') as f:
+        f.seek(off)
+        return f.read().decode('utf-8', 'replace')
+
+
+def _backoff_verdict(bots, i, name, proc, bot_fh, log_fh):
+    """ON-path decision for one exited bot: 'restart' | 'wait' | 'gave_up'.
+    Any internal error fails OPEN to 'restart' (= today's behaviour)."""
+    try:
+        now = _backoff_clock()
+        st = _backoff_state.setdefault(name, {'hist': []})
+        if st.get('crash_proc') is not proc:  # first pass that sees this exit
+            try:
+                sig = crash_signature(_read_crash_tail(name, proc))
+            except Exception:
+                sig = 'unknown'
+            if sig == 'unknown':
+                sig = f'exit_rc_{proc.returncode}'
+            hist = [h for h in st['hist'] if now - h[0] <= GIVEUP_WINDOW_SEC]
+            hist.append((now, sig))
+            st['hist'] = hist
+            st['crash_proc'] = proc
+            if should_give_up(hist, now):
+                n_same = sum(1 for _, s in hist if s == sig)
+                _restart_giveup.add(name)
+                msg = (f"[BOTS] giving up on {name} after {n_same} identical"
+                       f" crashes ({sig})\n")
+                log_fh.write(msg)
+                log_fh.flush()
+                _print(msg, end='')
+                try:
+                    from notify import notify
+                    notify(f"{name} bot: auto-restart GIVEN UP after {n_same}"
+                           f" identical crashes in {GIVEUP_WINDOW_SEC // 60}"
+                           f" min ({sig}). Start it manually once fixed.",
+                           level='critical', dedupe_key=f'bot-giveup-{name}')
+                except Exception:
+                    pass
+                try:
+                    bot_fh.close()
+                except Exception:
+                    pass
+                _untrack_handle(bot_fh)
+                bots.pop(i)
+                return 'gave_up'
+            k = consecutive_same(hist, now)
+            wait = next_restart_delay(k) - BACKOFF_BASE_SEC
+            st['due'] = now + wait
+            if wait > 0:
+                msg = (f"[BOTS] {name} bot crashed (exit {proc.returncode},"
+                       f" {sig}); identical crash #{k + 1} — restart"
+                       f" deferred {wait}s\n")
+                log_fh.write(msg)
+                log_fh.flush()
+                _print(msg, end='')
+        return 'restart' if now >= st.get('due', now) else 'wait'
+    except Exception:
+        return 'restart'
+
+
+def _backoff_release(bots, names=None):
+    """Clear crash history + give-up latch for `names` (None = every bot) on
+    an explicit launch, and drop those bots' still-dead entries so a deferred
+    restart cannot run beside the freshly launched process."""
+    try:
+        for n in (list(_backoff_state) + list(_restart_giveup)
+                  if names is None else names):
+            _backoff_state.pop(n, None)
+            _restart_giveup.discard(n)
+        _drop_dead_entries(bots, ('Bots', 'Crypto', 'Stock')
+                           if names is None else names)
+    except Exception:
+        pass
+
+
 def _check_restart_bots(bots, log_fh):
     """Check for crashed bots and restart them (skips manually stopped)."""
     mark_progress()  # each monitor cycle proves the main loop is alive
     for i, (name, proc, bot_fh) in enumerate(bots):
+        if BOT_RESTART_BACKOFF and proc.poll() is None:
+            _backoff_note_proc(name, proc)
         if proc.poll() is not None:
             if name in _manually_stopped:
                 try:
@@ -878,6 +1277,12 @@ def _check_restart_bots(bots, log_fh):
                 _untrack_handle(bot_fh)
                 bots.pop(i)
                 return  # List modified; next cycle will re-check
+            if BOT_RESTART_BACKOFF:
+                verdict = _backoff_verdict(bots, i, name, proc, bot_fh, log_fh)
+                if verdict == 'wait':
+                    continue
+                if verdict == 'gave_up':
+                    return  # List modified; next cycle will re-check
             # Close the old log file handle before opening a new one
             try:
                 bot_fh.close()
@@ -899,6 +1304,8 @@ def _check_restart_bots(bots, log_fh):
             new_proc, new_fh = _start_bot(cmd, log_path)
             _all_handles.append(new_fh)
             bots[i] = (name, new_proc, new_fh)
+            if BOT_RESTART_BACKOFF:
+                _backoff_note_proc(name, new_proc)
             msg = (f"{name} bot crashed (exit {proc.returncode}),"
                    f" restarted as PID {new_proc.pid}\n")
             log_fh.write(msg)
@@ -956,7 +1363,8 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock, force=False):
     if train_crypto:
         age_h = None if force else _get_data_age_hours('crypto')
         if age_h is not None and age_h < 24:
-            _print(f"Crypto training data is {age_h:.1f}h old, skipping harvest")
+            _announce(f"Crypto training data is {age_h:.1f}h old, skipping harvest",
+                      level='info')
         else:
             phases.append({
                 'id': 'crypto_harvest',
@@ -967,7 +1375,8 @@ def _build_harvest_phases(skip_harvest, train_crypto, train_stock, force=False):
     if train_stock:
         age_h = None if force else _get_data_age_hours('stock')
         if age_h is not None and age_h < 24:
-            _print(f"Stock training data is {age_h:.1f}h old, skipping harvest")
+            _announce(f"Stock training data is {age_h:.1f}h old, skipping harvest",
+                      level='info')
         else:
             phases.append({
                 'id': 'stock_harvest',
@@ -1022,10 +1431,10 @@ def _build_training_phases(trials, train_crypto, train_stock, mode='',
         gate_chall = False
         gate_v2 = False
     if shadow and not gate_chall and (train_crypto or train_stock):
-        _print("[GATE] D03: shadow mode is ON but GATE_TARGETS_CHALLENGER is "
-               "OFF — the weekly policy gate will replay the CHAMPION while "
-               "the freshly-trained model deploys from the challenger slot "
-               "UNGATED, and a gate failure would roll back the live champion")
+        _announce("[GATE] D03: shadow mode is ON but GATE_TARGETS_CHALLENGER is "
+                  "OFF — the weekly policy gate will replay the CHAMPION while "
+                  "the freshly-trained model deploys from the challenger slot "
+                  "UNGATED, and a gate failure would roll back the live champion")
 
     if train_crypto:
         cmd = [PYTHON, '-u', os.path.join('scripts', 'hypersearch_v2.py'),
@@ -1627,10 +2036,7 @@ def main():
                         # thread's concurrent json.dump(status).
                         pending = status.get('_pending_bot_start') or {}
                         status['_pending_bot_start'] = None
-                        if pending.get('crypto'):
-                            _start_single_bot(bots, 'Crypto', log_fh)
-                        if pending.get('stock'):
-                            _start_single_bot(bots, 'Stock', log_fh)
+                        _start_pending_bots(bots, log_fh, pending)
                     else:
                         # Restart all bots after normal training completion
                         _restart_bots(bots, log_fh, run_crypto, run_stock)
@@ -1802,10 +2208,7 @@ def main():
                 # heartbeat thread's concurrent json.dump(status).
                 pending = status.get('_pending_bot_start') or {}
                 status['_pending_bot_start'] = None
-                if pending.get('crypto'):
-                    _start_single_bot(bots, 'Crypto', log_fh)
-                if pending.get('stock'):
-                    _start_single_bot(bots, 'Stock', log_fh)
+                _start_pending_bots(bots, log_fh, pending)
             else:
                 # Restart all bots after normal training completion
                 _restart_bots(bots, log_fh, run_crypto, run_stock)

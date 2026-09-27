@@ -156,3 +156,10 @@ window_ab_*
 .pytest_cache/
 # Per-batch workflow run configs (copy *.example.json → *.run.json; never commit run state)
 .claude/workflows/*.run.json
+
+# Added 2026-09-26 — March-2026 Jetson model/Optuna-study backups moved (not deleted) into
+# archive/local_residue/ (see archive/README.md); their root names matched no rule.
+archive/local_residue/*.backup_score10
+archive/local_residue/*_study.db.bak*
+# 2026-09-27 (INTEL R3): daily LLM cost rollover history — runtime ledger, never committed
+llm_cost_history.jsonl

@@ -32,3 +32,7 @@ pyqtgraph>=0.13
 # PyTorch — install separately per platform:
 #   pip:    pip install torch torchvision
 #   Jetson: see requirements-jetson.txt
+# 2026-09-27: declared at last — imported by regime_detector.py (hmmlearn) and volatility.py (arch);
+# docs/MAP.md §9 item 19 recorded them as 'declared nowhere', which made CI/dev-Mac runs red on their tests.
+hmmlearn>=0.3
+arch>=6.0

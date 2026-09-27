@@ -212,7 +212,7 @@ def test_pricing_config_override_wins(lc, monkeypatch):
         lc, 'load_llm_config',
         lambda: _cfg(pricing={'claude-haiku-4-5': [2.0, 10.0]}))
     assert lc._pricing('claude-haiku-4-5') == (2.0, 10.0)
-    assert lc._pricing('claude-sonnet-5') == (3.0, 15.0)   # table
+    assert lc._pricing('claude-sonnet-5') == (2.0, 10.0)   # table (list price, audit D1)
     assert lc._pricing('unknown-model') == (1.25, 10.0)    # conservative
 
 

@@ -18,10 +18,24 @@ trap 'rm -rf "$STAGE"' EXIT
 
 cd "$TRADER_DIR"
 
-# 1. SQLite: online-consistent snapshots
+# 1. SQLite: online-consistent snapshots. The sqlite3 CLI is NOT installed
+#    on the prod Jetson (2026-09-26 Jetson campaign G3-7) — fall back to the
+#    stdlib online-backup API (sqlite3.Connection.backup: same page-level
+#    .backup semantics, WAL-safe) in the jetson python. A bare `import
+#    sqlite3` needs no LD_PRELOAD (the CXXABI clash needs torch/pandas first).
+PYBIN="${TRADER_PYBIN:-/home/kyle/miniforge3/envs/jetson/bin/python}"
+sqlite_backup() {  # $1 = source db, $2 = destination file
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$1" ".backup '$2'"
+  else
+    "$PYBIN" -c 'import sqlite3, sys
+s = sqlite3.connect(sys.argv[1]); d = sqlite3.connect(sys.argv[2])
+s.backup(d); d.close(); s.close()' "$1" "$2"
+  fi
+}
 for db in v2_study.db stock_v2_study.db; do
   if [[ -f "$db" ]]; then
-    sqlite3 "$db" ".backup '$STAGE/$db'" \
+    sqlite_backup "$db" "$STAGE/$db" \
       || echo "WARN: sqlite backup failed for $db"
   fi
 done

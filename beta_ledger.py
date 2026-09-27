@@ -46,6 +46,18 @@ MIN_BUCKET_OBS = 15            # per-bucket floor shared by up/down and conditio
 FLAT_RETURN_EPS = 1e-9         # |daily return| below this => flat/uninvested day
 OUTLIER_DAILY_RETURN = 0.15    # |daily return| above this => deposit/reset warning
 ROLLING_BETA_WINDOW = 30       # hedge-sizing window reported per benchmark
+# Vendor bad-print exclusion (2026-09, measurement-only). Alpaca portfolio
+# history printed equity $93.63 on 2026-08-13 (the position value was dropped:
+# 93.63 == the account's cash) between ~$83k days, and profit_loss mirrors the
+# glitch (-83,180 / +82,683), so the transfer-clean leg cannot remove it. One
+# such day turned a ~+38%/yr book into "+127,789%/yr". A glitch day is one
+# whose equity leaves the band [1-X, 1/(1-X)] relative to the last good day
+# AND comes back inside that band within N days (a spike that reverts); a
+# genuine crash does not revert and is kept. Per-day cash is NOT in the
+# portfolio-history payload, so an "equity == cash" test cannot be applied
+# historically — the spike-and-revert rule is the one the evidence supports.
+GLITCH_MAX_MOVE = 0.50         # X: one-day move beyond -50% / +100% vs last good day
+GLITCH_REVERT_DAYS = 3         # N: must re-enter the band within this many days
 RESERVED_REPORT_KEYS = {'period', 'strategy', 'joint', 'joint_active', 'joint_clean',
                         'warnings', 'data_quality', 'excluded_benchmarks',
                         'schema_version', '_y'}
@@ -131,6 +143,95 @@ def clean_returns_from_pl(equity: pd.Series, profit_loss: pd.Series) -> pd.Serie
     r = pl / prev.where(prev > 0)
     r = r.mask(~np.isfinite(r.values.astype(float)))
     return r.rename('clean_ret')
+
+
+def drop_glitch_days(equity: pd.Series, profit_loss: pd.Series | None = None,
+                     max_move: float = GLITCH_MAX_MOVE,
+                     revert_days: int = GLITCH_REVERT_DAYS):
+    """Drop vendor bad-print days: equity leaves [last_good*(1-max_move),
+    last_good/(1-max_move)] and re-enters that band within `revert_days`
+    observations. Returns (equity_kept, profit_loss_kept_or_None,
+    dropped_dates). The dropped days' profit_loss is folded into the next
+    kept day, so the transfer-clean return of that day spans the whole gap
+    (pl of a glitch pair nets to the true P&L: -83,180 + 82,683 = -497).
+    A move that never reverts (a real crash / reset) is KEPT — it is
+    still flagged by the |r| > OUTLIER_DAILY_RETURN warning.
+
+    Window-start glitch (REVIEW L6): the first observation has no prior good
+    day, so a bad print THERE used to become the reference and every later
+    normal day "failed to revert" — never dropped. Now a positive FIRST
+    observation outside the band of the next day, where the day after that
+    confirms the next day's level (the next good day), is dropped instead.
+    Only the single first day is treated so: a longer leading run has the
+    same shape as a genuine level change a few days into the window (which
+    must be kept), and a genuine >max_move move between days 0 and 1 is
+    indistinguishable from a day-0 glitch and IS dropped (one point).
+    Non-positive first values (pre-funding zeros) are left alone.
+    A non-finite profit_loss on a dropped day carries forward as 0 with a
+    stderr WARNING (it used to turn the next kept day's pl into NaN)."""
+    if not 0 < max_move < 1:
+        raise ValueError('max_move must be in (0, 1)')
+    eq = equity.dropna()
+    eq = eq[~eq.index.duplicated(keep='last')].sort_index()
+    vals = eq.values.astype(float)
+    lo_f, hi_f = 1.0 - max_move, 1.0 / (1.0 - max_move)
+
+    def _in_band(v, ref):
+        return ref > 0 and lo_f <= v / ref <= hi_f
+
+    drop = np.zeros(len(vals), dtype=bool)
+    start = 0
+    if (len(vals) >= 3 and vals[0] > 0 and not _in_band(vals[0], vals[1])
+            and _in_band(vals[2], vals[1])):
+        drop[0] = True          # window-start bad print; day 1 is the anchor
+        start = 1
+    i, last_good = start + 1, start
+    while i < len(vals):
+        ref = vals[last_good]
+        ok = ref > 0 and lo_f <= vals[i] / ref <= hi_f
+        if ok or not (ref > 0):
+            last_good = i
+            i += 1
+            continue
+        # outside the band: does it come back within revert_days?
+        back = None
+        for k in range(i + 1, min(len(vals), i + 1 + revert_days)):
+            if lo_f <= vals[k] / ref <= hi_f:
+                back = k
+                break
+        if back is None:        # no reversion -> a real level change; keep it
+            last_good = i
+            i += 1
+            continue
+        drop[i:back] = True
+        last_good = back
+        i = back + 1
+    dropped = [str(d.date()) for d in eq.index[drop]]
+    eq_kept = eq[~drop]
+    pl_kept = None
+    if profit_loss is not None:
+        pl = profit_loss.reindex(eq.index)
+        pl_vals = pl.values.astype(float).copy()
+        carry = 0.0
+        carrying = False
+        bad_pl = []
+        for j in range(len(pl_vals)):
+            if drop[j]:
+                if np.isfinite(pl_vals[j]):
+                    carry += pl_vals[j]
+                else:           # NaN would poison the next kept day's pl
+                    bad_pl.append(str(eq.index[j].date()))
+                carrying = True
+            elif carrying:
+                pl_vals[j] = pl_vals[j] + carry
+                carry, carrying = 0.0, False
+        pl_kept = pd.Series(pl_vals, index=eq.index,
+                            name=profit_loss.name)[~drop]
+        if bad_pl:
+            print(f"[beta_ledger] WARNING: non-finite profit_loss on "
+                  f"{len(bad_pl)} dropped glitch day(s) carried forward as 0: "
+                  f"{', '.join(bad_pl)}", file=sys.stderr)
+    return eq_kept, pl_kept, dropped
 
 
 def lagged_beta_regression(strat_ret: pd.Series,
@@ -281,6 +382,143 @@ def rolling_beta(strat_ret: pd.Series, bench_ret: pd.Series,
     cov = df['y'].rolling(window, min_periods=max(10, window // 2)).cov(df['x'])
     var = df['x'].rolling(window, min_periods=max(10, window // 2)).var()
     return (cov / var.replace(0.0, np.nan)).rename('rolling_beta')
+
+
+# --- robust beta leg (INTEL W16, 2026-09; REPORT-ONLY, additive keys) ---
+# Welch, "Simply Better Market Betas", Critical Finance Review 11 (2022):
+# SLOPE WINSORIZATION — each day's strategy return r_t is clipped to the band
+# spanned by (1-delta)*m_t and (1+delta)*m_t, m_t the SAME day's benchmark
+# return (bounds swap when m_t < 0; m_t == 0 clips r_t to 0), then the
+# market-model slope is estimated on the clipped returns. The paper's
+# recommended band is delta=3, i.e. [-2, +4] x m_t, optionally with
+# exponentially decaying weights (Welch: ~4-month half-life). One bad print
+# can move r_t by at most (1+delta)*|m_t| of leverage-weighted slope instead
+# of by its full size. Univariate by construction (the band is anchored on ONE
+# contemporaneous benchmark return), so it is compared against the
+# UNIVARIATE contemporaneous OLS beta, not the joint lagged one. Pre-registered
+# stability rule (Scout B E4): |beta_OLS - beta_winsor| < 0.15 at n >= 60.
+# Nothing in the repo reads these keys.
+WELCH_DELTA = 3.0              # band [(1-d), (1+d)] x m_t = [-2, +4] x m_t
+WELCH_HALF_LIFE_OBS = 120.0    # exponential-WLS half-life, in grid observations
+BETA_STABLE_TOL = 0.15         # |beta_OLS - beta_winsor| below this => stable
+BETA_STABLE_MIN_OBS = 60       # ... and only at n >= this many observations
+MINTRL_T_STAR = 2.0            # t* in MinTRL = (t*/SR_annual)^2 years
+
+
+def welch_winsorize(strat: np.ndarray, bench: np.ndarray,
+                    delta: float = WELCH_DELTA) -> np.ndarray:
+    """Welch (2022) slope winsorization: clip strat[t] into the band between
+    (1-delta)*bench[t] and (1+delta)*bench[t] (endpoints ordered per day)."""
+    if not delta >= 0:
+        raise ValueError('delta must be >= 0')
+    y = np.asarray(strat, dtype=float)
+    x = np.asarray(bench, dtype=float)
+    a = (1.0 - delta) * x
+    b = (1.0 + delta) * x
+    return np.clip(y, np.minimum(a, b), np.maximum(a, b))
+
+
+def half_life_weights(n: int, half_life: float | None) -> np.ndarray:
+    """Exponential-decay weights for n chronological observations, newest
+    last: w_t proportional to 0.5 ** (age_t / half_life), normalised to sum
+    to 1. half_life=None -> equal weights (plain OLS)."""
+    if n <= 0:
+        return np.zeros(0)
+    if half_life is None:
+        return np.full(n, 1.0 / n)
+    if not half_life > 0:
+        raise ValueError('half_life must be > 0')
+    age = np.arange(n - 1, -1, -1, dtype=float)
+    w = 0.5 ** (age / float(half_life))
+    return w / w.sum()
+
+
+def wls_slope(y: np.ndarray, x: np.ndarray,
+              w: np.ndarray | None = None) -> float:
+    """Slope of the (weighted) least-squares fit y = a + b*x; equal weights
+    give the plain OLS slope. nan when x has no (weighted) variance."""
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    n = len(y)
+    if n < 3:
+        return float('nan')
+    w = np.full(n, 1.0 / n) if w is None else np.asarray(w, dtype=float)
+    w = w / w.sum()
+    dx = x - float(w @ x)
+    sxx = float(w @ (dx * dx))
+    if not (np.isfinite(sxx) and sxx > 0):
+        return float('nan')
+    return float(w @ (dx * (y - float(w @ y))) / sxx)
+
+
+def robust_betas(strat_ret: pd.Series, bench_ret: pd.Series,
+                 delta: float = WELCH_DELTA,
+                 half_life: float = WELCH_HALF_LIFE_OBS) -> dict:
+    """Univariate OLS beta vs the Welch (2022) slope-winsorized beta (equal
+    weights and half-life WLS) for ONE benchmark, plus the pre-registered
+    stability flag. Same dropna alignment as up_down_betas."""
+    df = pd.concat([strat_ret.rename('y'), bench_ret.rename('x')],
+                   axis=1, sort=False).dropna()
+    x = df['x'].values.astype(float)
+    y = df['y'].values.astype(float)
+    n = len(y)
+    yw = welch_winsorize(y, x, delta)
+    b_ols = wls_slope(y, x)
+    b_w = wls_slope(yw, x)
+    b_wls = wls_slope(yw, x, half_life_weights(n, half_life))
+    diff = abs(b_ols - b_w)
+    stable = bool(n >= BETA_STABLE_MIN_OBS and np.isfinite(diff)
+                  and diff < BETA_STABLE_TOL)
+    return {'beta_ols_univariate': b_ols,
+            'beta_winsor': b_w,
+            'beta_winsor_wls': b_wls,
+            'beta_stable': stable,
+            'winsor': {'method': 'welch2022_slope_winsorization',
+                       'delta': float(delta),
+                       'band_mult': [float(1.0 - delta), float(1.0 + delta)],
+                       'wls_half_life_obs': float(half_life),
+                       'n_obs': int(n),
+                       'n_clipped': int((yw != y).sum()),
+                       'abs_diff_ols_winsor': float(diff),
+                       'stable_tol': BETA_STABLE_TOL,
+                       'stable_min_obs': BETA_STABLE_MIN_OBS}}
+
+
+def alpha_mintrl_years(sharpe_annual: float,
+                       t_star: float = MINTRL_T_STAR) -> float:
+    """Minimum track record (years of ANNUALIZATION_DAYS observations) for a
+    Sharpe of this size to reach |t| = t_star under iid returns:
+    (t_star / SR_annual)^2 — the t = SR_daily * sqrt(n) identity (Bailey &
+    Lopez de Prado's MinTRL without the skew/kurtosis terms). The sign is
+    ignored (time to become decisive either way); inf when SR is 0/nan."""
+    s = float(sharpe_annual)
+    if not math.isfinite(s) or s == 0.0:
+        return float('inf')
+    return float((t_star / abs(s)) ** 2)
+
+
+def _add_robust_leg(report: dict, strat_ret: pd.Series,
+                    bench_ret: pd.DataFrame) -> None:
+    """Additive report-only keys: per-benchmark robust betas in report[col],
+    MinTRL in report['strategy']. Never touches a pre-existing key; a failure
+    is recorded under report[col]['robust_beta_error'], never raised."""
+    for col in bench_ret.columns:
+        diag = report.get(col)
+        if not isinstance(diag, dict):
+            continue
+        try:
+            diag.update(robust_betas(strat_ret, bench_ret[col]))
+        except (ValueError, FloatingPointError, ZeroDivisionError) as e:
+            diag['robust_beta_error'] = str(e)
+    s = report['strategy']
+    n = int(len(strat_ret))
+    window_years = n / ANNUALIZATION_DAYS
+    mintrl = alpha_mintrl_years(s.get('sharpe', float('nan')))
+    s['alpha_mintrl_years'] = mintrl
+    s['alpha_mintrl_obs'] = float(mintrl * ANNUALIZATION_DAYS)
+    s['alpha_mintrl_t_star'] = MINTRL_T_STAR
+    s['alpha_mintrl_window_years'] = float(window_years)
+    s['alpha_estimable'] = bool(mintrl <= window_years)
 
 
 def beta_report(equity: pd.Series, bench_prices: pd.DataFrame,
@@ -497,6 +735,9 @@ def beta_report(equity: pd.Series, bench_prices: pd.DataFrame,
     }
     report['excluded_benchmarks'] = excluded
     report['schema_version'] = 1
+    # additive, report-only robust-beta + MinTRL leg (W16) — runs last so
+    # every pre-existing key and its insertion order are untouched
+    _add_robust_leg(report, strat_ret, bench_ret)
     return report
 
 
@@ -569,7 +810,51 @@ def format_report(report: dict) -> str:
         lines.append(
             f"  variance share of the factor block: R^2 = {j['r2']:.2f}; the"
             f" review's structural estimate while invested was ~0.85-0.95.")
+    # --- robust-beta + MinTRL leg (W16, report-only) — appended AFTER every
+    # pre-existing line, so the old output is an exact prefix ---
+    verdicts = []
+    for name in j['betas']:
+        d = report.get(name, {})
+        if 'beta_winsor' not in d:
+            continue
+        wz = d.get('winsor', {})
+        bm = wz.get('band_mult') or [None, None]
+        lines.append(
+            f"  {name} robust beta (Welch 2022 slope-winsorized"
+            f" {_fnum(bm[0], '+.0f')}/{_fnum(bm[-1], '+.0f')}x):"
+            f" OLS {_fnum(d.get('beta_ols_univariate'), '+.3f')} /"
+            f" winsor {_fnum(d.get('beta_winsor'), '+.3f')} /"
+            f" winsor-WLS(hl {_fnum(wz.get('wls_half_life_obs'), '.0f')})"
+            f" {_fnum(d.get('beta_winsor_wls'), '+.3f')}"
+            f"  (n {wz.get('n_obs', '?')}, clipped {wz.get('n_clipped', '?')})")
+        if d.get('beta_stable'):
+            verdicts.append(f"{name} STABLE")
+        elif int(wz.get('n_obs') or 0) < BETA_STABLE_MIN_OBS:
+            verdicts.append(f"{name} UNSTABLE (n < {BETA_STABLE_MIN_OBS})")
+        else:
+            verdicts.append(f"{name} UNSTABLE")
+    if verdicts:
+        lines.append(f"  beta stability (|OLS - winsor| < {BETA_STABLE_TOL}"
+                     f" at n >= {BETA_STABLE_MIN_OBS}): {', '.join(verdicts)}"
+                     f"   (size no hedge on an UNSTABLE beta)")
+    if 'alpha_mintrl_years' in s:
+        m = _fnum(s.get('alpha_mintrl_years'), '.1f')
+        w = _fnum(s.get('alpha_mintrl_window_years'), '.1f')
+        t_star = _fnum(s.get('alpha_mintrl_t_star'), 'g')
+        if s.get('alpha_estimable'):
+            lines.append(f"  alpha MinTRL (t*={t_star}): {m} y <= window {w} y")
+        else:
+            lines.append(f"  alpha not estimable in this horizon (MinTRL {m} y"
+                         f" > window {w} y) — beta only (t*={t_star})")
     return '\n'.join(lines)
+
+
+def _fnum(v, fmt: str) -> str:
+    """format a possibly-None/non-numeric value; 'nan'/'inf' pass through."""
+    try:
+        return format(float(v), fmt)
+    except (TypeError, ValueError):
+        return 'nan'
 
 
 # --- data loaders (network / broker; not exercised by unit tests) ---
@@ -699,6 +984,19 @@ if __name__ == '__main__':
     ap.add_argument('--benchmarks-csv',
                     help='offline benchmark PRICES (date,SPY,BTC)')
     ap.add_argument('--json', help='also write the report dict to this path')
+    ap.add_argument('--drop-glitch-days', dest='drop_glitch_days',
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help=f'(default ON) drop vendor bad-print days: equity '
+                         f'moves beyond -{GLITCH_MAX_MOVE:.0%}/+'
+                         f'{1 / (1 - GLITCH_MAX_MOVE) - 1:.0%} vs the last good '
+                         f'day AND reverts within --glitch-revert-days days '
+                         f'(e.g. Alpaca 2026-08-13 $93.63). Dropped dates are '
+                         f'printed and recorded under data_quality. Use '
+                         f'--no-drop-glitch-days for the un-dropped figures.')
+    ap.add_argument('--glitch-max-move', type=float, default=GLITCH_MAX_MOVE,
+                    help=f'X for --drop-glitch-days (default {GLITCH_MAX_MOVE})')
+    ap.add_argument('--glitch-revert-days', type=int, default=GLITCH_REVERT_DAYS,
+                    help=f'N for --drop-glitch-days (default {GLITCH_REVERT_DAYS})')
     args = ap.parse_args()
 
     days = args.days if args.days is not None else 90
@@ -706,6 +1004,10 @@ if __name__ == '__main__':
         ap.error('--days must be >= 2')
     if not 0 <= args.lags <= 10:
         ap.error('--lags must be between 0 and 10')
+    if not 0 < args.glitch_max_move < 1:
+        ap.error('--glitch-max-move must be in (0, 1)')
+    if args.glitch_revert_days < 1:
+        ap.error('--glitch-revert-days must be >= 1')
 
     pl = None
     if args.equity_csv:
@@ -723,12 +1025,28 @@ if __name__ == '__main__':
     if bench.empty:
         raise SystemExit('no benchmark data available')
 
+    glitch_dates: list[str] = []
+    if args.drop_glitch_days:
+        equity, pl, glitch_dates = drop_glitch_days(
+            equity, pl, max_move=args.glitch_max_move,
+            revert_days=args.glitch_revert_days)
+        if glitch_dates:
+            print(f"[beta_ledger] dropped {len(glitch_dates)} glitch day(s) "
+                  f"(spike beyond {args.glitch_max_move:.0%} that reverted "
+                  f"within {args.glitch_revert_days}d): "
+                  f"{', '.join(glitch_dates)}  (--no-drop-glitch-days to keep)")
+
     clean = clean_returns_from_pl(equity, pl) if pl is not None else None
 
     try:
         rep = beta_report(equity, bench, lags=args.lags, clean_ret=clean)
     except ValueError as e:
         raise SystemExit(f'[beta_ledger] {e}')
+    rep['data_quality']['drop_glitch_days'] = bool(args.drop_glitch_days)
+    rep['data_quality']['glitch_days_dropped'] = glitch_dates
+    if glitch_dates:
+        rep['warnings'].insert(0, f"{len(glitch_dates)} vendor bad-print day(s) "
+                                  f"EXCLUDED: {', '.join(glitch_dates)}")
 
     if args.json:
         tmp = args.json + '.tmp'

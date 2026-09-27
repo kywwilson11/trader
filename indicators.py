@@ -1,3 +1,4 @@
+import os
 import threading
 
 import pandas as pd
@@ -8,12 +9,15 @@ try:
 except ImportError:
     HURST_ON_RETURNS = False
 
-# Priority: C extension > Numba > pure numpy
-try:
-    import indicators_c as _ic
-    _HAS_C = True
-except ImportError:
-    _HAS_C = False
+# Priority: Numba > pure numpy. C ext is OPT-IN (TRADER_INDICATORS_C=1), archived 2026-09-26 (archive/README.md
+# c_ext row: short-frame heap overflow + ref leak). Not model-facing: bit-identical/float-noise vs numba.
+_HAS_C = False
+if os.environ.get('TRADER_INDICATORS_C') == '1':
+    try:
+        import indicators_c as _ic
+        _HAS_C = True
+    except ImportError:
+        _HAS_C = False
 
 try:
     from numba import njit

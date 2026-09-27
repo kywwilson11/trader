@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from trading_utils import get_api
-from tax_lots import estimate_taxes
+from tax_lots import estimate_taxes, order_has_fill
 import notify
 from notify import halt_active, set_halt, clear_halt, request_flatten
 from strategy_config import (CRYPTO_POLICY, STOCK_POLICY,
@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
     QSplitter, QGroupBox, QProgressBar, QToolBar,
     QSizePolicy, QLineEdit, QPushButton, QSpinBox,
     QScrollArea, QMessageBox, QDialog,
-    QListWidget, QListWidgetItem,
+    QListWidget, QListWidgetItem, QMenu,
 )
 import pyqtgraph as pg
 import numpy as np
@@ -63,11 +63,21 @@ class NumericTableItem(QTableWidgetItem):
         super().__init__(*args, **kwargs)
         self.setFont(QFont(design_tokens.NUMERIC_FAMILY))
     def __lt__(self, other):
+        # Never delegate to super().__lt__: on PySide6 6.8 that call dispatches
+        # straight back into this Python override -> RecursionError (which
+        # broke every text-column sort and aborted _sync_stock_table/_restyle
+        # mid-way). Numeric payloads compare numerically when both present;
+        # otherwise compare the display text, as Qt's default operator< does.
         v1 = self.data(Qt.UserRole)
-        v2 = other.data(Qt.UserRole) if other else None
+        v2 = other.data(Qt.UserRole) if other is not None else None
         if v1 is not None and v2 is not None:
-            return float(v1) < float(v2)
-        return super().__lt__(other)
+            try:
+                return float(v1) < float(v2)
+            except (TypeError, ValueError):
+                pass
+        t1 = self.text() or ""
+        t2 = (other.text() if other is not None else "") or ""
+        return t1 < t2
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -104,9 +114,52 @@ def _engine_env(cusparselt=False):
             paths.append(
                 _JETSON_PREFIX
                 + "/lib/python3.10/site-packages/nvidia/cusparselt/lib")
-        env["LD_LIBRARY_PATH"] = (
-            ":".join(paths) + ":" + os.environ.get("LD_LIBRARY_PATH", ""))
+        # Drop empty elements: a trailing ':' (parent has no LD_LIBRARY_PATH)
+        # would put the cwd on the shared-library search path.
+        inherited = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":")
+                     if p]
+        env["LD_LIBRARY_PATH"] = ":".join(paths + inherited)
     return env
+
+
+def _alpaca_until(ts):
+    """Format an order timestamp as the RFC3339 UTC cursor Alpaca's
+    ``list_orders(until=...)`` accepts ('2006-01-02T15:04:05Z').
+
+    Accepts a datetime / pandas Timestamp (a datetime subclass) / ISO string
+    ('2026-04-07 19:45:17.419822+00:00', '...Z', nanosecond fractions);
+    naive values are taken as UTC. ``str(pandas.Timestamp)`` has a space
+    separator and Alpaca rejects it. Sub-second parts are rounded UP to the
+    next whole second: ``until`` is exclusive, so truncating would silently
+    skip older orders submitted earlier within that same second; the one-page
+    overlap this re-fetches is removed by the caller's order-id dedupe.
+    Returns None when ``ts`` is empty or unparseable.
+    """
+    if ts is None:
+        return None
+    if isinstance(ts, dt.datetime):
+        d = ts
+        if getattr(ts, "nanosecond", 0) and not d.microsecond:
+            d = d.replace(microsecond=1)  # keep a pure-ns fraction non-zero
+    else:
+        s = str(ts).strip()
+        if not s:
+            return None
+        s = s.replace("Z", "+00:00").replace("z", "+00:00")
+        # py3.10 fromisoformat wants exactly 3 or 6 fractional digits
+        s = re.sub(r"\.(\d+)",
+                   lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
+        try:
+            d = dt.datetime.fromisoformat(s)
+        except ValueError:
+            return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    d = d.astimezone(dt.timezone.utc)
+    if d.microsecond:
+        d = d.replace(microsecond=0) + dt.timedelta(seconds=1)
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 LOG_FILES = {
     "Pipeline": BASE_DIR / "pipeline_output.log",
@@ -130,6 +183,132 @@ def _trim_to_newline(text, maxlen=LOG_BUFFER_MAXLEN):
     tail = text[-maxlen:]
     nl = tail.find("\n")
     return tail[nl + 1:] if nl != -1 else tail
+
+def _utf8_complete_len(data):
+    """Length of the longest prefix of `data` (bytes) that does not end inside
+    an incomplete UTF-8 multibyte sequence. A writer caught mid-character at a
+    read boundary leaves 1-3 lead/continuation bytes at the end; holding them
+    back until the next read keeps the character intact instead of decoding
+    it as U+FFFD twice. Invalid bytes are NOT held back (they decode to U+FFFD
+    exactly as a text-mode read would)."""
+    n = len(data)
+    # Walk back over at most 3 continuation bytes to the candidate lead byte.
+    i = n - 1
+    while i >= 0 and n - i <= 4 and (data[i] & 0xC0) == 0x80:
+        i -= 1
+    if i < 0 or n - i > 4:
+        return n
+    lead = data[i]
+    if lead > 0xF4:
+        return n  # never a valid UTF-8 lead byte
+    if lead >= 0xF0:
+        need = 4
+    elif lead >= 0xE0:
+        need = 3
+    elif lead >= 0xC2:
+        need = 2
+    else:
+        return n  # ASCII / invalid lead (0xC0, 0xC1): nothing to hold back
+    return i if (n - i) < need else n
+
+
+def _decode_log_bytes(data):
+    """Decode log bytes like a text-mode read of the file does here: UTF-8 with
+    errors='replace', universal newlines (CRLF and a lone CR -> LF)."""
+    return (data.decode("utf-8", errors="replace")
+            .replace("\r\n", "\n").replace("\r", "\n"))
+
+
+def _read_log_increment(path, last_pos, size):
+    """Bytes [last_pos, size) of `path` decoded as text -> (text, new_pos).
+
+    Reads EXACTLY the byte range the caller stat()ed (a byte cursor, never a
+    char count derived from a byte count — the old text-mode `f.read(size -
+    last_pos)` read CHARACTERS, over-ran `size` whenever the log held multibyte
+    UTF-8 and a writer appended between stat() and read(), and the next tick
+    re-read those bytes -> a corrupted/duplicated line). A trailing incomplete
+    UTF-8 sequence is held back (new_pos stops before it) so a character split
+    across two ticks is decoded whole on the next one."""
+    with open(path, "rb") as f:
+        f.seek(last_pos)
+        data = f.read(max(0, size - last_pos))
+    keep = _utf8_complete_len(data)
+    return _decode_log_bytes(data[:keep]), last_pos + keep
+
+
+def _read_text_tail(path, maxchars):
+    """Decoded text of a bounded window at the END of `path` whose last
+    `maxchars` characters equal `path.read_text(encoding='utf-8',
+    errors='replace')[-maxchars:]`, and whose length exceeds `maxchars` iff the
+    whole file's text does. Reads at most 4*maxchars+8 bytes (a UTF-8 character
+    is <= 4 bytes; the slack covers a resync on a split sequence at the window
+    start and a split CRLF), instead of the whole file."""
+    window = 4 * int(maxchars) + 8
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        start = max(0, size - window)
+        f.seek(start)
+        data = f.read(size - start)
+    return _decode_log_bytes(data)
+
+
+def _read_log_tail(path, maxlen=LOG_BUFFER_MAXLEN):
+    """== _trim_to_newline(path.read_text(errors='replace'), maxlen) on a UTF-8
+    log, byte for byte, but reads only the file's last ~4*maxlen bytes: the
+    first view of a quiet 115 MB bot log used to read the whole file on the UI
+    thread (~0.4 s freeze, +0.5 GB transient RSS) to keep a 200 KB tail."""
+    return _trim_to_newline(_read_text_tail(path, maxlen), maxlen)
+
+
+def _llm_entry_ts(entry):
+    """Aware-UTC datetime of an llm_analysis entry's 'timestamp', or None when
+    missing/unparseable (naive values are taken as UTC; a trailing 'Z' is
+    accepted on py3.10)."""
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get("timestamp")
+    if not raw:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def _merge_llm_sections(doc):
+    """Flatten llm_analysis.json's {"crypto": {...}, "stock": {...}} sections
+    into one {symbol: entry} dict, keeping the entry with the NEWEST timestamp
+    when a symbol appears in more than one section.
+
+    A stale batch once left crypto symbols in the 'stock' section; the naive
+    `dict.update` per section (file order: crypto then stock) let that stale
+    copy overwrite the fresh crypto-section entry, so "Refresh Selected" (which
+    writes the crypto section) looked broken and the LLM Age cell showed the
+    old analysis. Rules: a missing/unparseable timestamp loses to a parseable
+    one; on a tie (equal, or both missing) the later section wins — exactly the
+    old file-order behaviour, so every non-duplicated symbol is unchanged.
+    Non-dict sections are skipped (as before); a non-dict doc yields {}."""
+    out = {}
+    if not isinstance(doc, dict):
+        return out
+    for section in doc.values():
+        if not isinstance(section, dict):
+            continue
+        for sym, entry in section.items():
+            if sym not in out:
+                out[sym] = entry
+                continue
+            new_t, old_t = _llm_entry_ts(entry), _llm_entry_ts(out[sym])
+            if new_t is None:
+                replace = old_t is None          # both missing -> later wins
+            else:
+                replace = old_t is None or new_t >= old_t
+            if replace:
+                out[sym] = entry
+    return out
+
 
 CONFIG_FILES = {
     "Crypto": BASE_DIR / "config_v2.pkl",
@@ -192,6 +371,14 @@ REPORT_FRESHNESS_ITEMS = [
     ("promotion_ledger", BASE_DIR / "promotion_ledger.jsonl", None),
     ("drift_state", DRIFT_STATE_FILE, 2 * 86400),
 ]
+# Content-aware freshness (INTEL W8): strip label -> chart_core.artifact_validity
+# kind. Labels not listed have no content contract and age by mtime only.
+REPORT_VALIDITY_KINDS = {"decision_report": "decision_report",
+                         "llm_eval": "llm_eval", "llm_advisor": "llm_advisor",
+                         "execution": "execution", "beta": "beta"}
+# Evidence-readiness panel source: scripts/evidence_reads.py default out dir
+# (logs/evidence_reads/<UTC ts>/summary.json); newest run is rendered.
+EVIDENCE_READS_DIR = BASE_DIR / "logs" / "evidence_reads"
 
 STUDY_DBS = {
     "Crypto": ("v2_study.db", "v2_search"),
@@ -237,6 +424,37 @@ def _build_crypto_symbol_set():
 CRYPTO_SYMBOL_SET = _build_crypto_symbol_set()
 
 
+def _is_crypto_symbol(symbol, crypto_set=None):
+    """True for a crypto symbol in EITHER spelling ('BTC/USD' or Alpaca's
+    slash-less position form 'BTCUSD'): any '/' pair, or membership in the
+    (upper-cased, both-spellings) crypto universe set."""
+    s = str(symbol or "")
+    if "/" in s:
+        return True
+    cs = CRYPTO_SYMBOL_SET if crypto_set is None else crypto_set
+    return s.upper() in cs
+
+
+def _lookup_position_state(pstates, symbol):
+    """position_state entry for `symbol`, slash- and case-insensitively:
+    base_loop keys position_state.json by universe symbol ('BTC/USD') while
+    Alpaca positions arrive as 'BTCUSD'. An exact key match wins; otherwise
+    the first key whose slash-less upper form matches. {} when absent."""
+    if not pstates:
+        return {}
+    st = pstates.get(symbol)
+    if isinstance(st, dict):
+        return st
+    want = str(symbol or "").replace("/", "").upper()
+    if not want:
+        return {}
+    for key, val in pstates.items():
+        if (isinstance(val, dict)
+                and str(key).replace("/", "").upper() == want):
+            return val
+    return {}
+
+
 def _model_deployed_ts(name):
     """Champion deployment timestamp (epoch seconds) or None.
 
@@ -276,11 +494,14 @@ def _model_deployed_ts(name):
 # The study db only changes when a trial completes, so key the cached score by
 # the file's stat signature and reload only when it moves.
 _BEST_SCORE_CACHE = {}
+# Models-table score cell while the first background load is in flight.
+BEST_SCORE_PENDING = "\u2026"
 
 
-def _get_best_score(name):
-    """Read best Optuna score for a model (mtime-cached). Returns None on
-    failure."""
+def _best_score_sig(name):
+    """(sig, db_path, study_name) for a book's study db, or None when the book
+    has no study db / it cannot be stat'ed (score shows '\u2014', nothing to
+    load). sig = (path, mtime, size) is the _BEST_SCORE_CACHE key."""
     db_file, study_name = STUDY_DBS.get(name, (None, None))
     if not db_file:
         return None
@@ -289,20 +510,74 @@ def _get_best_score(name):
         st = db_path.stat()
     except OSError:
         return None
-    sig = (str(db_path), st.st_mtime, st.st_size)
+    return (str(db_path), st.st_mtime, st.st_size), db_path, study_name
+
+
+def _peek_best_score(name):
+    """Non-blocking cache probe for the UI thread (one stat(), no optuna).
+    (True, value) when the answer is current: the cached score of an unchanged
+    db, or None when there is no db. (False, None) when the db moved or was
+    never loaded, i.e. a background _load_best_score is needed."""
+    probe = _best_score_sig(name)
+    if probe is None:
+        return True, None
     cached = _BEST_SCORE_CACHE.get(name)
-    if cached is not None and cached[0] == sig:
-        return cached[1]
+    if cached is not None and cached[0] == probe[0]:
+        return True, cached[1]
+    return False, None
+
+
+def _load_best_score(name):
+    """Blocking optuna.load_study (0.1-1.6 s on the Jetson) -> (sig, value).
+    value is None on any failure; sig is the stat signature taken BEFORE the
+    load, so a db that moves mid-load is simply reloaded on the next refresh.
+    Never touches _BEST_SCORE_CACHE (the caller stores via _store_best_score),
+    so it is safe on a worker thread. The storage string is unchanged (rw
+    sqlite): a mode=ro URI is NOT equivalent (it fails where rw rolls back a
+    crashed writer's hot journal)."""
+    probe = _best_score_sig(name)
+    if probe is None:
+        return None, None
+    sig, db_path, study_name = probe
     try:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         study = optuna.load_study(study_name=study_name,
                                   storage=f"sqlite:///{db_path}")
-        value = study.best_value
+        return sig, study.best_value
     except Exception:
-        return None
-    _BEST_SCORE_CACHE[name] = (sig, value)
+        return sig, None
+
+
+def _store_best_score(name, sig, value):
+    """Cache a successful load under its stat signature. Failures are not
+    cached (as before): the next refresh retries."""
+    if sig is not None and value is not None:
+        _BEST_SCORE_CACHE[name] = (sig, value)
+
+
+def _get_best_score(name):
+    """Read best Optuna score for a model (mtime-cached). Returns None on
+    failure. BLOCKING on a cache miss \u2014 the Models tab uses the
+    _peek_best_score / _load_best_score split instead (off the UI thread)."""
+    known, value = _peek_best_score(name)
+    if known:
+        return value
+    sig, value = _load_best_score(name)
+    _store_best_score(name, sig, value)
     return value
+
+
+def _best_score_display(known, value, shown, name):
+    """(cell text, value for colouring) of a Models-table score cell. When the
+    answer is not current (a background load is in flight) keep the value last
+    delivered for this book (no flicker while a hypersearch moves the db every
+    trial), or BEST_SCORE_PENDING on first paint."""
+    if not known:
+        if name not in shown:
+            return BEST_SCORE_PENDING, None
+        value = shown[name]
+    return (f"{value:.3f}" if value is not None else "\u2014"), value
 
 # Persistence files
 NEWS_CACHE_FILE = BASE_DIR / "news_cache.json"
@@ -321,11 +596,33 @@ def _load_gui_settings():
     return {}
 
 
-def _save_gui_settings(settings):
-    """Save GUI settings to disk."""
+def _atomic_write_json(path, obj, **dump_kw):
+    """json.dump `obj` to `path` via a per-writer tmp file + os.replace, so a
+    failure mid-dump (ENOSPC, kill, power loss) leaves the PREVIOUS file intact
+    instead of a truncated one that the loaders would silently read as {}.
+    The tmp name is unique per path, process and thread (two writers can't
+    clobber each other's tmp). Raises on failure — callers keep their own
+    swallow; the tmp file is removed on the failure path."""
+    import threading
+    path = Path(path)
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        with open(GUI_SETTINGS_FILE, 'w') as f:
-            json.dump(settings, f, indent=2)
+        with open(tmp, 'w') as f:
+            json.dump(obj, f, **dump_kw)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _save_gui_settings(settings):
+    """Save GUI settings to disk (atomic: tmp + os.replace)."""
+    try:
+        _atomic_write_json(GUI_SETTINGS_FILE, settings, indent=2)
     except Exception:
         pass
 
@@ -397,12 +694,11 @@ def _save_news_cache(articles, fng):
                 '_sent_method': a.get('_sent_method', ''),
                 '_scored_by_model': a.get('_scored_by_model', ''),
             })
-        with open(NEWS_CACHE_FILE, 'w') as f:
-            json.dump({
-                'articles': clean,
-                'fng': fng,
-                'cached_at': dt.datetime.now().timestamp(),
-            }, f)
+        _atomic_write_json(NEWS_CACHE_FILE, {
+            'articles': clean,
+            'fng': fng,
+            'cached_at': dt.datetime.now().timestamp(),
+        })
     except Exception:
         pass
 
@@ -1307,6 +1603,16 @@ def _write_pipeline_command(command, crypto=False, stock=False):
         return str(e)
 
 
+# Orders-stream Alpaca load (review M3, 2026-09-26). The GUI shares the bots'
+# API key (Alpaca: 200 req/min). The paginated order-history walk (up to
+# ~11 x 100-order pages, for the tax cost basis) runs only at boot and then
+# every ORDERS_FULL_WALK_SEC; every other `orders` tick (DEFAULT_CADENCES,
+# 30 s) fetches just the newest ORDERS_REFRESH_PAGES page(s) and merges them
+# into the cached list by order id. ~20 req/min -> ~2-3 req/min at 30 s.
+ORDERS_FULL_WALK_SEC = 600
+ORDERS_REFRESH_PAGES = 1
+
+
 # ---------------------------------------------------------------------------
 # Data Fetcher Thread
 # ---------------------------------------------------------------------------
@@ -1505,15 +1811,16 @@ class DataFetcher(QObject):
 
     @Slot()
     def fetch_orders(self):
-        # Paginate backward (newest-first) so the tax cost-basis sees older buy
-        # lots too: a single limit=100 window silently truncated basis beyond
-        # ~100 orders. Walk `until` back one page at a time, accumulating until
-        # a short page (history exhausted), the clean-slate cutoff, or a hard
-        # cap (1000 orders / 365 days lookback) — emitting `truncated` True only
-        # when a cap cut history short so the tax card can flag incomplete basis.
-        PAGE = 100
-        HARD_ORDER_CAP = 1000
-        LOOKBACK_DAYS = 365
+        # Tax cost basis needs older buy lots, so the order history is walked
+        # backward page by page (_walk_orders_pages). That full walk costs up
+        # to ~11 Alpaca requests on the key the bots share (review M3), so it
+        # runs only at boot, every ORDERS_FULL_WALK_SEC, when the clean-slate
+        # cutoff changes, or when a page-1 refresh can't be stitched onto the
+        # cache (more new orders than the refresh window). Every other tick
+        # fetches the newest ORDERS_REFRESH_PAGES page(s) and merges them into
+        # the cached list by order id (fresh rows win: status/fill updates).
+        # `truncated` is the last full walk's flag. Errors keep the existing
+        # per-stream timer back-off; a warm cache is kept on a failed walk.
         try:
             # Only count orders after the clean-slate cutoff (if set)
             after = None
@@ -1521,65 +1828,118 @@ class DataFetcher(QObject):
             if slate.exists():
                 after = slate.read_text().strip() or None
 
-            oldest_allowed = (dt.datetime.now(dt.timezone.utc)
-                              - dt.timedelta(days=LOOKBACK_DAYS))
-            data = []
-            seen_ids = set()
-            until = None
-            prev_until = object()  # sentinel so first compare never matches
-            truncated = False
-            while True:
-                batch = list(self.api.list_orders(
-                    status="all", limit=PAGE, after=after, until=until,
-                    direction="desc"))
-                if not batch:
-                    break
-                for o in batch:
-                    oid = getattr(o, "id", None)
-                    if oid is not None:
-                        if oid in seen_ids:
-                            continue  # boundary-overlap dupe
-                        seen_ids.add(oid)
-                    data.append({
-                        "id": str(oid) if oid is not None else "",
-                        "symbol": o.symbol,
-                        "side": o.side,
-                        "qty": o.qty,
-                        "type": o.type,
-                        "status": o.status,
-                        "submitted_at": str(o.submitted_at) if o.submitted_at else "",
-                        "filled_at": str(o.filled_at) if o.filled_at else "",
-                        "filled_avg_price": o.filled_avg_price,
-                        "notional": getattr(o, "notional", None),
-                        "filled_qty": o.filled_qty,
-                    })
-                if len(batch) < PAGE:
-                    break  # history exhausted since the cutoff
-                if len(data) >= HARD_ORDER_CAP:
-                    truncated = True
-                    break
-                oldest = batch[-1]
-                new_until = str(oldest.submitted_at) if oldest.submitted_at else None
-                # 365-day lookback backstop on a still-full page
-                if oldest.submitted_at is not None:
-                    try:
-                        ots = dt.datetime.fromisoformat(
-                            str(oldest.submitted_at).replace("Z", "+00:00"))
-                        if ots < oldest_allowed:
-                            truncated = True
-                            break
-                    except (TypeError, ValueError):
-                        pass
-                # Can't advance the cursor (no ts, or a page of identical
-                # timestamps) — stop rather than loop forever
-                if new_until is None or new_until == prev_until:
-                    break
-                prev_until = until = new_until
-            self.orders_updated.emit(data, truncated)
+            now = time.monotonic()
+            cache = getattr(self, "_orders_cache", None)
+            if cache is not None and after != getattr(self, "_orders_after", None):
+                cache = None  # cutoff moved: the cached window is wrong
+            full = (cache is None
+                    or now >= getattr(self, "_orders_next_full", 0.0))
+            if not full:
+                fresh, _tr, exhausted = self._walk_orders_pages(
+                    after, max_pages=ORDERS_REFRESH_PAGES)
+                fresh_ids = {o["id"] for o in fresh if o["id"]}
+                if (not exhausted and fresh
+                        and not fresh_ids & {o["id"] for o in cache}):
+                    full = True  # gap between the refresh and the cache
+                else:
+                    # Refresh rows first (newest-first), then cached rows the
+                    # refresh didn't return. id-less cached rows can't be
+                    # matched, so they wait for the next full walk.
+                    data = fresh + [o for o in cache
+                                    if o["id"] and o["id"] not in fresh_ids]
+                    truncated = getattr(self, "_orders_truncated", False)
+            if full:
+                if cache is not None:
+                    # A failing walk with a warm cache retries on the full
+                    # cadence, not every tick (the refresh keeps it current).
+                    self._orders_next_full = now + ORDERS_FULL_WALK_SEC
+                data, truncated, _ex = self._walk_orders_pages(after)
+                self._orders_truncated = truncated
+                self._orders_next_full = now + ORDERS_FULL_WALK_SEC
+            self._orders_cache = data
+            self._orders_after = after
+            self.orders_updated.emit(list(data), truncated)
             self._stream_result("orders", True)
         except Exception as e:
             self.error_occurred.emit("orders", f"Orders fetch: {e}")
             self._stream_result("orders", False)
+
+    def _walk_orders_pages(self, after, max_pages=None):
+        """Paginate list_orders backward (newest-first) from now.
+
+        Walks `until` back one page at a time, accumulating until a short page
+        (history exhausted), the clean-slate cutoff, a hard cap (1000 orders /
+        365 days lookback) or `max_pages` pages. Returns (orders, truncated,
+        exhausted): `truncated` is True only when a cap cut history short (the
+        tax card flags incomplete basis); `exhausted` is True when history
+        ended inside the walk. Raises on an API error (the caller backs off).
+        """
+        PAGE = 100
+        HARD_ORDER_CAP = 1000
+        LOOKBACK_DAYS = 365
+        oldest_allowed = (dt.datetime.now(dt.timezone.utc)
+                          - dt.timedelta(days=LOOKBACK_DAYS))
+        data = []
+        seen_ids = set()
+        until = None
+        prev_until = object()  # sentinel so first compare never matches
+        truncated = False
+        exhausted = False
+        pages = 0
+        while True:
+            batch = list(self.api.list_orders(
+                status="all", limit=PAGE, after=after, until=until,
+                direction="desc"))
+            pages += 1
+            if not batch:
+                exhausted = True
+                break
+            for o in batch:
+                oid = getattr(o, "id", None)
+                if oid is not None:
+                    if oid in seen_ids:
+                        continue  # boundary-overlap dupe
+                    seen_ids.add(oid)
+                data.append({
+                    "id": str(oid) if oid is not None else "",
+                    "symbol": o.symbol,
+                    "side": o.side,
+                    "qty": o.qty,
+                    "type": o.type,
+                    "status": o.status,
+                    "submitted_at": str(o.submitted_at) if o.submitted_at else "",
+                    "filled_at": str(o.filled_at) if o.filled_at else "",
+                    "filled_avg_price": o.filled_avg_price,
+                    "notional": getattr(o, "notional", None),
+                    "filled_qty": o.filled_qty,
+                })
+            if len(batch) < PAGE:
+                exhausted = True
+                break  # history exhausted since the cutoff
+            if len(data) >= HARD_ORDER_CAP:
+                truncated = True
+                break
+            oldest = batch[-1]
+            new_until = (_alpaca_until(oldest.submitted_at)
+                         if oldest.submitted_at else None)
+            # 365-day lookback backstop on a still-full page
+            if oldest.submitted_at is not None:
+                try:
+                    ots = dt.datetime.fromisoformat(
+                        str(oldest.submitted_at).replace("Z", "+00:00"))
+                    if ots < oldest_allowed:
+                        truncated = True
+                        break
+                except (TypeError, ValueError):
+                    pass
+            # Can't advance the cursor (no ts, or a page of identical
+            # timestamps) — stop rather than loop forever
+            if new_until is None or new_until == prev_until:
+                break
+            if max_pages is not None and pages >= max_pages:
+                break
+            prev_until = until = new_until
+        return data, truncated, exhausted
 
     @Slot(str, str)
     def fetch_history(self, period="1M", timeframe="1D"):
@@ -2053,10 +2413,10 @@ class DataFetcher(QObject):
                 if analysis_file.exists():
                     with open(analysis_file) as f:
                         raw = json.load(f)
-                    # Merge crypto + stock sections into flat dict
-                    for section in raw.values():
-                        if isinstance(section, dict):
-                            llm_analysis.update(section)
+                    # Merge crypto + stock sections into a flat dict, NEWEST
+                    # timestamp wins per symbol (a stale crypto copy in the
+                    # stock section must not shadow the fresh one).
+                    llm_analysis = _merge_llm_sections(raw)
             except (OSError, json.JSONDecodeError):
                 pass
 
@@ -2194,10 +2554,13 @@ class LogTailer(QObject):
             if size < last_pos:
                 last_pos = 0
             if size > last_pos:
-                with open(path, "r", errors="replace") as f:
-                    f.seek(last_pos)
-                    text = f.read(size - last_pos)
-                self._positions[name] = size
+                # Byte cursor + byte read + UTF-8 decode (errors='replace'):
+                # never a char count derived from a byte count (G8-7).
+                try:
+                    text, new_pos = _read_log_increment(path, last_pos, size)
+                except OSError:
+                    continue
+                self._positions[name] = new_pos
                 if text.strip():
                     self.new_lines.emit(name, text)
 
@@ -2420,6 +2783,9 @@ class TradingDashboard(QMainWindow):
     # Journal-analytics worker result (compute_stats dict, or None on failure)
     # delivered back to the UI thread from the off-thread load_trades worker.
     _journal_stats_ready = Signal(object)
+    # Optuna best-score worker result {book: (sig, value)} -> UI thread (the
+    # blocking optuna.load_study never runs on the UI thread).
+    _best_scores_ready = Signal(object)
     # Notification self-test result (ok, detail) from the off-thread notify send.
     _notify_test_done = Signal(bool, str)
 
@@ -2595,6 +2961,12 @@ class TradingDashboard(QMainWindow):
         self._tailer.new_lines.connect(self.on_log_lines)
         self._tailer_thread.started.connect(self._tailer.start_timer)
         self._tailer_thread.start()
+
+        # Best-score loads run off-thread (_start_best_score_load); the cells
+        # show BEST_SCORE_PENDING until the first result lands.
+        self._best_score_busy = False
+        self._best_score_shown = {}
+        self._best_scores_ready.connect(self._on_best_scores_ready)
 
         # Model refresh timer (cadence from Settings ops page; default 60s)
         self._model_timer = QTimer(self)
@@ -3394,9 +3766,12 @@ class TradingDashboard(QMainWindow):
         # position_state.json (gui_review_2026-07 §4, Phase 2.4); the Close
         # button stays last (now col 11).
         self._positions_table = QTableWidget(0, 12)
+        # Two-line labels for the long headers: at 1280x800 the 11 stretch
+        # columns got ~60 px each, which clipped "Current Price" (82 px) and
+        # "Unrealized P&L" (93 px) to "rrent Pr" / "ealized".
         self._positions_table.setHorizontalHeaderLabels(
-            ["Symbol", "Qty", "Side", "Avg Entry", "Current Price",
-             "Mkt Value", "Unrealized P&L", "P&L %",
+            ["Symbol", "Qty", "Side", "Avg\nEntry", "Current\nPrice",
+             "Mkt\nValue", "Unrealized\nP&L", "P&L %",
              "Stop", "TP", "%→Stop", ""]
         )
         header = self._positions_table.horizontalHeader()
@@ -3407,14 +3782,31 @@ class TradingDashboard(QMainWindow):
         self._positions_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._positions_table.setAlternatingRowColors(True)
         self._positions_table.setSortingEnabled(True)
+        # The page scrolls now (_scroll_wrap): keep the header + ~5 rows
+        # visible instead of letting the table collapse to its ~70 px hint.
+        self._positions_table.setMinimumHeight(200)
         left_col.addWidget(self._positions_table)
-        two_col.addLayout(left_col, stretch=3)
+        # 2:1 (was 3:2) — the 12-column table needs the width more than the
+        # alert / recent-trade feeds, whose one-line rows fit in ~1/3.
+        two_col.addLayout(left_col, stretch=2)
 
         right_col = QVBoxLayout()
         alerts_group = QGroupBox("Alerts")
         ag_v = QVBoxLayout(alerts_group)
         self._alerts_list = QListWidget()
         self._alerts_list.setObjectName("feed_list")
+        self._alerts_list.setMinimumHeight(70)
+        # Alarm hierarchy (INTEL W11): click a collapsed/shelved row to
+        # expand/unshelve, double-click to ack, right-click ack/shelve menu.
+        self._alerts_list.setToolTip(
+            "[P1] act now · [P2] degraded · [P3] info — click a collapsed row "
+            "to expand, double-click to acknowledge, right-click to shelve")
+        self._alerts_list.itemClicked.connect(self._on_alert_clicked)
+        self._alerts_list.itemDoubleClicked.connect(
+            self._on_alert_double_clicked)
+        self._alerts_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._alerts_list.customContextMenuRequested.connect(
+            self._on_alert_menu)
         ag_v.addWidget(self._alerts_list)
         right_col.addWidget(alerts_group, stretch=1)
 
@@ -3422,13 +3814,16 @@ class TradingDashboard(QMainWindow):
         act_v = QVBoxLayout(actions_group)
         self._last_actions_list = QListWidget()
         self._last_actions_list.setObjectName("feed_list")
+        self._last_actions_list.setMinimumHeight(70)
         act_v.addWidget(self._last_actions_list)
         right_col.addWidget(actions_group, stretch=1)
-        two_col.addLayout(right_col, stretch=2)
+        two_col.addLayout(right_col, stretch=1)
 
         layout.addLayout(two_col, stretch=1)
 
-        self.tabs.addTab(tab, "Cockpit")
+        # Scroll instead of clip below ~1280x800 (the Performance recipe).
+        # Nothing looks the Cockpit up by widget: it is tab 0 by position.
+        self.tabs.addTab(self._scroll_wrap(tab), "Cockpit")
 
     # ---- Cockpit refresh helpers -----------------------------------------
     def _chip_style(self, color):
@@ -3449,23 +3844,114 @@ class TradingDashboard(QMainWindow):
             return T['green']
         return T['white']
 
+    def _alert_ledger_get(self):
+        """The cockpit's in-memory chart_core.AlertLedger (created lazily)."""
+        led = getattr(self, '_alert_ledger', None)
+        if led is None:
+            led = self._alert_ledger = chart_core.AlertLedger()
+        return led
+
     def _push_alert(self, kind, text):
-        """Prepend a timestamped alert to the cockpit feed (newest-first, capped
-        100). Deduped: skipped if an identical kind+text is already the newest
-        entry, so an edge condition that stays true across ticks pushes once."""
+        """Record a timestamped alert in the cockpit feed (newest-first,
+        capped 100) via chart_core.AlertLedger (INTEL W11): a text priority
+        tag '[P1]'..'[P3]' (chart_core.alert_priority), per-kind+text dedupe
+        over 10 min (a repeat shows ' ×N' on one row instead of N rows —
+        this subsumes the old identical-newest skip), flood collapse at >10
+        alerts / 10 min, ack/shelve. Display-only, in-memory. With no
+        collision the row reads '[Pn] <ts>  <text>' (the old row + tag)."""
         lst = getattr(self, '_alerts_list', None)
         if lst is None:
             return
-        top = lst.item(0)
-        if top is not None and top.data(Qt.UserRole) == (kind, text):
-            return
         ts = dt.datetime.now(TZ_CENTRAL).strftime("%H:%M:%S")
-        item = QListWidgetItem(f"{ts}  {text}")
-        item.setData(Qt.UserRole, (kind, text))
-        item.setForeground(self._alert_color(kind))
-        lst.insertItem(0, item)
-        while lst.count() > 100:
-            lst.takeItem(lst.count() - 1)
+        self._alert_ledger_get().push(kind, text, time.time(), ts)
+        self._render_alerts()
+
+    def _render_alerts(self, force=False):
+        """Rebuild the alerts list from the ledger when the visible rows (or
+        the theme colours) changed. Colour = kind colour (_alert_color), bold
+        for an un-acked P1, muted once acked/shelved; the [Pn] text tag is the
+        non-colour channel. Called on push, on every ack/shelve/click and on
+        each _refresh_cockpit tick (shelf expiry, flood decay, theme)."""
+        lst = getattr(self, '_alerts_list', None)
+        if lst is None:
+            return
+        rows = self._alert_ledger_get().rows(time.time())
+        muted = T.get('muted', T['white'])
+        sig = (tuple((r['label'], r['acked'], r['key']) for r in rows),
+               muted.name(), T['red'].name(), T['white'].name())
+        if not force and sig == getattr(self, '_alert_render_sig', None):
+            return
+        self._alert_render_sig = sig
+        self._alert_rows = rows
+        lst.clear()
+        for i, r in enumerate(rows):
+            item = QListWidgetItem(r['label'])
+            item.setData(Qt.UserRole, i)
+            item.setForeground(muted if (r['acked'] or r['kind'] is None)
+                               else self._alert_color(r['kind']))
+            if r['prio'] == 'P1' and not r['acked']:
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+            if r['detail']:
+                item.setToolTip(r['detail'])
+            lst.addItem(item)
+
+    def _alert_row_of(self, item):
+        """Ledger display row behind a list item, or None."""
+        if item is None:
+            return None
+        try:
+            return self._alert_rows[int(item.data(Qt.UserRole))]
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return None
+
+    def _on_alert_clicked(self, item):
+        """Click: toggle a flood-collapse row, or unshelve a shelf row."""
+        row = self._alert_row_of(item)
+        if row is None:
+            return
+        led = self._alert_ledger_get()
+        if row['key'] == chart_core.AlertLedger.COLLAPSED_KEY:
+            led.expanded = not led.expanded
+        elif row['key'][0] == chart_core.AlertLedger.SHELVED:
+            led.unshelve(row['key'][1])
+        else:
+            return
+        self._render_alerts()
+
+    def _on_alert_double_clicked(self, item):
+        """Double-click: acknowledge (the row stays; its highlight goes)."""
+        row = self._alert_row_of(item)
+        if row is None or row['kind'] is None:
+            return
+        self._alert_ledger_get().ack(row['key'], time.time())
+        self._render_alerts()
+
+    def _alert_shelve(self, kind):
+        self._alert_ledger_get().shelve(kind, time.time())
+        self._render_alerts()
+
+    def _alert_ack_all(self):
+        self._alert_ledger_get().ack_all()
+        self._render_alerts()
+
+    def _on_alert_menu(self, pos):
+        """Right-click: Acknowledge / Shelve '<kind>' 30 min / Acknowledge all."""
+        lst = self._alerts_list
+        row = self._alert_row_of(lst.itemAt(pos))
+        menu = QMenu(lst)
+        if row is not None and row['kind'] is not None:
+            a = menu.addAction("Acknowledge")
+            a.triggered.connect(lambda _=False, it=lst.itemAt(pos):
+                                self._on_alert_double_clicked(it))
+            if row['key'] != chart_core.AlertLedger.COLLAPSED_KEY:
+                k = row['kind']
+                s = menu.addAction(f"Shelve '{k}' for 30 min")
+                s.triggered.connect(lambda _=False, k=k: self._alert_shelve(k))
+        a = menu.addAction("Acknowledge all")
+        a.triggered.connect(lambda _=False: self._alert_ack_all())
+        menu.exec(lst.viewport().mapToGlobal(pos))
 
     def _refresh_last_actions(self):
         """Render the 10 most recent closed round-trips (last 7d) in the cockpit
@@ -3769,7 +4255,8 @@ class TradingDashboard(QMainWindow):
         no new timer. Each section is independently guarded so one bad read never
         blanks the rest."""
         for fn in (self._refresh_cockpit_banner, self._refresh_heartbeats,
-                   self._refresh_risk_gauge, self._refresh_dd_badge):
+                   self._refresh_risk_gauge, self._refresh_dd_badge,
+                   self._render_alerts):
             try:
                 fn()
             except Exception:
@@ -3854,6 +4341,9 @@ class TradingDashboard(QMainWindow):
         # lifecycle): rebuilt only when the visible row->id order changes.
         self._open_order_cancel_btn = {}
         self._open_order_btn_order = None
+        # The page scrolls now (_scroll_wrap): floors instead of the 1-row
+        # squeeze at 1280x800 (header + ~2 rows here, ~5 rows for fills).
+        self._open_orders_table.setMinimumHeight(120)
         layout.addWidget(self._open_orders_table)
 
         fills_label = QLabel("Recent Fills")
@@ -3867,6 +4357,7 @@ class TradingDashboard(QMainWindow):
         self._fills_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._fills_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._fills_table.setAlternatingRowColors(True)
+        self._fills_table.setMinimumHeight(200)
         layout.addWidget(self._fills_table)
 
         # --- Gate attribution + journal analytics (gui_review_2026-07 §4,
@@ -3910,6 +4401,7 @@ class TradingDashboard(QMainWindow):
         self._journal_view = QPlainTextEdit()
         self._journal_view.setReadOnly(True)
         self._journal_view.setFont(QFont("Monospace", 10))
+        self._journal_view.setMinimumHeight(100)
         journal_v.addWidget(self._journal_view)
         analytics_split.addWidget(journal_group)
 
@@ -3921,8 +4413,11 @@ class TradingDashboard(QMainWindow):
         self._journal_loaded = False
         self._journal_busy = False
 
-        self.tabs.addTab(tab, "Trading")
-        self._trading_tab_index = self.tabs.indexOf(tab)
+        trading_page = self._scroll_wrap(tab)  # scroll instead of clip
+        self.tabs.addTab(trading_page, "Trading")
+        # indexOf the widget actually added (the scroll page), else -1 and the
+        # lazy first paint in _on_tab_changed never fires.
+        self._trading_tab_index = self.tabs.indexOf(trading_page)
 
     def _refresh_gate_attribution(self):
         """Render decision_report.json (gates + conviction + admitted_k) into
@@ -4472,6 +4967,18 @@ class TradingDashboard(QMainWindow):
             self._push_alert('order-error', f"{symbol} close error: {e}")
 
     # ---- Tab 3: Performance ----------------------------------------------
+    @staticmethod
+    def _scroll_wrap(inner):
+        """Host a tab page in a frameless, widget-resizable QScrollArea (the
+        Settings-tab recipe): the page fills the viewport when it fits and
+        scrolls — rather than squashing children into clipped/overlapping
+        text — when its minimum size exceeds the window."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(inner)
+        return scroll
+
     def _build_performance_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -4488,7 +4995,9 @@ class TradingDashboard(QMainWindow):
         self._perf_history_cache = {}  # period -> data dict
         for label in ["1A", "6M", "3M", "1M", "1W"]:
             btn = QPushButton(label)
-            btn.setFixedWidth(36)
+            # 2026-09-27: a fixed 36 px clipped two-character labels under the themes' button
+            # padding ("3M" showed as "3"); size from the font metrics instead.
+            btn.setMinimumWidth(btn.fontMetrics().horizontalAdvance(label) + 28)
             btn.setCheckable(True)
             btn.setChecked(label == self._perf_zoom)
             btn.clicked.connect(lambda checked, z=label: self._on_perf_zoom_clicked(z))
@@ -4543,6 +5052,9 @@ class TradingDashboard(QMainWindow):
         _eqvb.setAutoVisible(y=True)
         _eqvb.enableAutoRange(x=False, y=True)
         _eqvb.sigRangeChangedManually.connect(self._on_perf_manual_range)
+        # The page scrolls now (_scroll_wrap), so give the plots a usable
+        # floor instead of letting them collapse to ~30 px at 1280x800.
+        self._equity_plot.setMinimumHeight(220)
         layout.addWidget(self._equity_plot, stretch=1)
 
         pnl_axis = pg.DateAxisItem(orientation='bottom')
@@ -4555,6 +5067,7 @@ class TradingDashboard(QMainWindow):
         self._pnl_plot.addItem(self._pnl_bars_neg)
         self._pnl_plot.setXLink(self._equity_plot.getPlotItem())
         self._pnl_plot.setMouseEnabled(x=False, y=False)
+        self._pnl_plot.setMinimumHeight(130)
         layout.addWidget(self._pnl_plot, stretch=1)
 
         stats_group = QGroupBox("Performance Stats")
@@ -4597,7 +5110,9 @@ class TradingDashboard(QMainWindow):
         # Apply the persisted log-scale state now that the plot + fill exist.
         self._apply_perf_logscale(self._perf_log_check.isChecked())
 
-        self.tabs.addTab(tab, "Performance")
+        # Scroll instead of squash at the default 1280x800 (stat-card values
+        # were clipped); same QScrollArea recipe as the Settings tab.
+        self.tabs.addTab(self._scroll_wrap(tab), "Performance")
 
     def _perf_api_period(self, zoom=None):
         """Map zoom label to Alpaca API period and timeframe."""
@@ -4931,7 +5446,7 @@ class TradingDashboard(QMainWindow):
         self._stock_zoom_buttons = {}
         for label in ["1Y", "3M", "1M", "1W", "1D"]:
             btn = QPushButton(label)
-            btn.setFixedWidth(36)
+            btn.setMinimumWidth(btn.fontMetrics().horizontalAdvance(label) + 28)  # 2026-09-27: was a clipping fixed 36 px
             btn.setCheckable(True)
             btn.setChecked(label == self._stock_zoom)
             btn.clicked.connect(lambda checked, z=label: self._on_zoom_clicked(z))
@@ -4951,12 +5466,12 @@ class TradingDashboard(QMainWindow):
         top_layout.addWidget(self._stock_add_input)
 
         add_btn = QPushButton("+")
-        add_btn.setFixedWidth(30)
+        add_btn.setMinimumWidth(30)
         add_btn.clicked.connect(self._on_stock_add)
         top_layout.addWidget(add_btn)
 
         remove_btn = QPushButton("\u2212")  # minus sign
-        remove_btn.setFixedWidth(30)
+        remove_btn.setMinimumWidth(30)
         remove_btn.setToolTip("Remove selected symbol from universe")
         remove_btn.clicked.connect(self._on_stock_remove)
         top_layout.addWidget(remove_btn)
@@ -5024,7 +5539,12 @@ class TradingDashboard(QMainWindow):
         self._atr_fill = pg.FillBetweenItem(
             self._atr_upper_line, self._atr_lower_line, brush=pg.mkBrush(_atr_fc))
         self._atr_fill.setZValue(-10)  # behind the candles
-        self._stock_chart.addItem(self._atr_fill)
+        # An empty FillBetweenItem reports a bounding rect at the origin, which
+        # pinned the price y-axis autorange to 0 (BTC squashed into the top 5%).
+        # The fill always lies between the two band lines, which already feed
+        # autorange, so exclude it from bounds and keep it hidden while empty.
+        self._stock_chart.addItem(self._atr_fill, ignoreBounds=True)
+        self._atr_fill.hide()
         # Surface-colored ring separates markers from candles beneath them;
         # re-themed in _restyle alongside every other chart pen. The exit
         # scatter is hoverable — per-point fill by win/loss, tooltip via tip().
@@ -5198,8 +5718,9 @@ class TradingDashboard(QMainWindow):
         self._stock_data_cache = {}  # latest data from fetch_stocks
         self._llm_analysis_cache = {}  # latest llm analysis (MERGED, never wiped)
         self._stocks_row_by_sym = {}  # stable sym -> row map for diff updates
-        self.tabs.addTab(tab, "Markets")
-        self._markets_tab_index = self.tabs.indexOf(tab)
+        markets_page = self._scroll_wrap(tab)  # scroll instead of clip
+        self.tabs.addTab(markets_page, "Markets")
+        self._markets_tab_index = self.tabs.indexOf(markets_page)
 
     def _set_add_status(self, msg, color):
         """Colored one-line feedback next to the watchlist add box."""
@@ -5325,6 +5846,7 @@ class TradingDashboard(QMainWindow):
         for ln in (self._sma20_line, self._sma50_line,
                    self._atr_upper_line, self._atr_lower_line):
             ln.setData([], [])
+        self._atr_fill.hide()
         for il in (self._pos_entry_line, self._pos_stop_line,
                    self._pos_tp_line, self._last_price_line):
             il.hide()
@@ -5710,9 +6232,8 @@ class TradingDashboard(QMainWindow):
             if analysis_file.exists():
                 with open(analysis_file) as f:
                     raw = json.load(f)
-                for section in raw.values():
-                    if isinstance(section, dict):
-                        self._llm_analysis_cache.update(section)
+                # Same newest-timestamp-wins flatten as DataFetcher.fetch_stocks.
+                self._llm_analysis_cache.update(_merge_llm_sections(raw))
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -5946,6 +6467,9 @@ class TradingDashboard(QMainWindow):
         else:
             self._atr_upper_line.setData([], [])
             self._atr_lower_line.setData([], [])
+        self._atr_fill.setVisible(
+            band is not None and len(view.t) > 0 and all(
+                b is not None and len(b) for b in band))
 
         if view.has_volume:
             # Volume is a magnitude, not a direction: one recessive hue.
@@ -6937,13 +7461,19 @@ class TradingDashboard(QMainWindow):
             lambda: self._run_report_clicked(
                 ["execution_report.py", "--days", "14"],
                 "Execution Report (14d)"))
-        for btn in self._report_btns:
-            reports_layout.addWidget(btn)
+        # Two rows of four: one row of eight needed ~1300 px, wider than the
+        # default 1280 window (the labels were clipped, then — once the tab
+        # scrolled — it forced a horizontal scrollbar).
+        reports_row2 = QHBoxLayout()
+        for i, btn in enumerate(self._report_btns):
+            (reports_layout if i < 4 else reports_row2).addWidget(btn)
         self._reports_status = QLabel("")
         self._reports_status.setStyleSheet("font-size: 11px;")
         reports_layout.addWidget(self._reports_status)
         reports_layout.addStretch()
+        reports_row2.addStretch()
         reports_v.addLayout(reports_layout)
+        reports_v.addLayout(reports_row2)
         # Freshness strip (c26 U1): one line of artifact ages, filled in
         # _refresh_reports_freshness (60s piggyback + after every report run).
         self._reports_fresh_label = QLabel("—")
@@ -6951,10 +7481,18 @@ class TradingDashboard(QMainWindow):
         self._reports_fresh_label.setTextFormat(Qt.RichText)
         self._reports_fresh_label.setStyleSheet("font-size: 11px;")
         reports_v.addWidget(self._reports_fresh_label)
+        # Evidence-readiness panel (INTEL W8): newest evidence_reads summary,
+        # one row per read; _refresh_evidence_panel on the same 60s timer.
+        self._evidence_label = QLabel("—")
+        self._evidence_label.setWordWrap(True)
+        self._evidence_label.setTextFormat(Qt.RichText)
+        self._evidence_label.setStyleSheet("font-size: 11px;")
+        reports_v.addWidget(self._evidence_label)
 
         layout.addWidget(reports_group)
         layout.addStretch()
-        self.tabs.addTab(tab, "Models")
+        # Scroll instead of crushing the boxes into overlapping text (D5).
+        self.tabs.addTab(self._scroll_wrap(tab), "Models")
 
     # ---- Tab 7: Logs -----------------------------------------------------
     def _build_logs_tab(self):
@@ -7914,12 +8452,16 @@ class TradingDashboard(QMainWindow):
             return None, None, None
         if not (entry > 0):
             return None, None, None
-        pol = CRYPTO_POLICY if "/" in str(symbol) else STOCK_POLICY
+        # Alpaca reports crypto POSITIONS slash-less ('BTCUSD') while the
+        # chart combo and position_state.json use 'BTC/USD': classify and look
+        # up state slash-insensitively so both spellings get the crypto policy
+        # and the persisted trailing ratchet (G8-2).
+        pol = CRYPTO_POLICY if _is_crypto_symbol(symbol) else STOCK_POLICY
         floor = pol.get("stop_floor_pct")
         tp_rr = pol.get("tp_rr")
         if not floor or floor <= 0:
             return entry, None, None
-        st = pstates.get(symbol, {})
+        st = _lookup_position_state(pstates, symbol)
         est_stop = entry * (1 - floor)
         if st.get("trailing"):
             try:
@@ -8751,7 +9293,9 @@ class TradingDashboard(QMainWindow):
 
         open_orders = [o for o in orders if o["status"] in
                        ("new", "accepted", "partially_filled", "pending_new")]
-        filled_orders = [o for o in orders if o["status"] == "filled"]
+        # Same fill predicate as the tax kernel: a canceled/expired/partially-
+        # filled order with filled_qty > 0 is a real execution too (G8-3).
+        filled_orders = [o for o in orders if order_has_fill(o)]
 
         self._open_orders_view = open_orders  # row->order for the Cancel column
         self._open_orders_table.setUpdatesEnabled(False)
@@ -8882,8 +9426,11 @@ class TradingDashboard(QMainWindow):
             path = LOG_FILES.get(name)
             if path and path.exists():
                 try:
-                    # Newline-aligned trim (was a mid-line byte slice).
-                    text = _trim_to_newline(path.read_text(errors="replace"))
+                    # Newline-aligned trim (was a mid-line byte slice), read
+                    # from a bounded window at the end of the file — identical
+                    # buffer, but a 115 MB log is no longer read whole on the
+                    # UI thread (G8-4).
+                    text = _read_log_tail(path)
                     self._log_buffers[name] = text
                 except OSError:
                     pass
@@ -9152,16 +9699,45 @@ class TradingDashboard(QMainWindow):
         dlg.exec()
 
     def _run_gap_audit_clicked(self):
-        """Launch gap_audit.py over the live stock universe. gap_audit needs
-        --symbols and the overnight sleeve is chosen dynamically, so the
-        universe is the honest candidate set. Resolved fresh at click time."""
+        """Launch gap_audit.py over the names the overnight sleeve could
+        actually hold. gap_audit sums EVERY --symbols name into its "SLEEVE
+        TOTAL", but the sleeve holds at most OVERNIGHT_SLEEVE_MAX_POSITIONS
+        (stock_loop._select_overnight_keepers), so passing the whole 56-name
+        universe (crypto included) inflated the go/no-go total ~23x (2026-09
+        measurement audit). Candidate pool = the stock loop's own universe
+        rule (StockLoop.get_symbol_universe: no '/') minus the sleeve's
+        leveraged-ETF exclusion (stock_config.LEVERAGED_ETFS); ranked by the
+        sleeve's primary key, the model pred from stock_predictions.json
+        (names at/above OVERNIGHT_SLEEVE_MIN_PRED first), capped at the
+        sleeve size. Resolved fresh at click time."""
         try:
-            from stock_config import load_stock_universe
-            symbols = [str(s) for s in load_stock_universe() if s]
+            from stock_config import load_stock_universe, LEVERAGED_ETFS
+            from strategy_config import (OVERNIGHT_SLEEVE_MAX_POSITIONS,
+                                         OVERNIGHT_SLEEVE_MIN_PRED)
+            pool = [str(s) for s in load_stock_universe()
+                    if s and '/' not in str(s)
+                    and LEVERAGED_ETFS.get(str(s), 1) <= 1]
+            preds = {}
+            try:
+                with open(BASE_DIR / "stock_predictions.json") as f:
+                    for sym, d in (json.load(f) or {}).items():
+                        try:
+                            preds[str(sym)] = float((d or {}).get('pred'))
+                        except (TypeError, ValueError, AttributeError):
+                            continue
+            except (OSError, json.JSONDecodeError, AttributeError):
+                preds = {}
+            pos = {s: i for i, s in enumerate(pool)}
+            ranked = sorted(
+                pool, key=lambda s: (
+                    s not in preds,
+                    not (s in preds and preds[s] >= OVERNIGHT_SLEEVE_MIN_PRED),
+                    -preds.get(s, 0.0), pos[s]))
+            symbols = ranked[:max(1, int(OVERNIGHT_SLEEVE_MAX_POSITIONS))]
         except Exception:
             symbols = []
         if not symbols:
-            self._reports_status.setText("Gap Audit: no stock universe")
+            self._reports_status.setText("Gap Audit: no stock sleeve candidates")
             self._reports_status.setStyleSheet(
                 f"color: {T['yellow'].name()}; font-size: 11px;")
             return
@@ -9919,12 +10495,21 @@ class TradingDashboard(QMainWindow):
         segs = []
         for row in chart_core.artifact_freshness(REPORT_FRESHNESS_ITEMS):
             name = row['name']
-            if not row['exists']:
+            validity = self._report_validity(row)
+            state = chart_core.freshness_state(row, validity)
+            if state == 'missing':
                 segs.append(f"<span style='color:{muted}'>{name}: —</span>")
-            elif row['stale']:
+            elif state == 'aged':
                 segs.append(
                     f"{name}: <span style='color:{T['yellow'].name()}'>"
                     f"{chart_core.format_age(row['age_s'])} STALE</span>")
+            elif state == chart_core.VOID:
+                # Fresh by mtime but the report's own flags say it carries
+                # no usable read: the text carries the state, not colour.
+                segs.append(
+                    f"{name}: <span style='color:{muted}'>"
+                    f"{chart_core.format_age(row['age_s'])} · <b>VOID</b> "
+                    f"({html.escape(str(validity.get('reason')))})</span>")
             else:
                 segs.append(
                     f"{name}: <span style='color:{T['green'].name()}'>"
@@ -9940,6 +10525,158 @@ class TradingDashboard(QMainWindow):
                 segs.append(f"<span style='color:{muted}'>meta_refused "
                             f"{book}: none</span>")
         self._reports_fresh_label.setText("  ·  ".join(segs))
+
+    def _report_validity(self, row):
+        """chart_core.artifact_validity for one freshness row, re-parsed only
+        when (mtime_ns, size) changed — the strip refreshes every 60s."""
+        kind = REPORT_VALIDITY_KINDS.get(row.get('name'))
+        if kind is None or not row.get('exists'):
+            return None
+        cache = self.__dict__.setdefault('_validity_cache', {})
+        try:
+            st = os.stat(row['path'])
+            sig = (st.st_mtime_ns, st.st_size)
+        except (OSError, TypeError, ValueError):
+            return None
+        hit = cache.get(row['path'])
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+        v = chart_core.artifact_validity(row['path'], kind)
+        cache[row['path']] = (sig, v)
+        return v
+
+    def _refresh_evidence_panel(self):
+        """Evidence-readiness panel (INTEL W8): the newest
+        logs/evidence_reads/*/summary.json as one row per read — verdict
+        chip, observed/threshold, rule source. The file is re-parsed only
+        when its (path, mtime_ns, size) changes; the run age re-renders."""
+        if not hasattr(self, '_evidence_label'):
+            return
+        muted = T.get("muted", T["white"]).name()
+        path = chart_core.newest_evidence_summary(EVIDENCE_READS_DIR)
+        if path is None:
+            self._evidence_cache = None
+            self._evidence_label.setText(
+                f"<span style='color:{muted}'>Evidence readiness: no run yet "
+                f"— run <code>scripts/evidence_reads.py</code></span>")
+            return
+        try:
+            st = os.stat(path)
+            sig = (path, st.st_mtime_ns, st.st_size)
+        except OSError:
+            sig = (path, None, None)
+        cache = getattr(self, '_evidence_cache', None)
+        if cache is None or cache[0] != sig:
+            try:
+                with open(path, encoding='utf-8') as f:
+                    summary = json.load(f)
+                if not isinstance(summary, dict):
+                    raise ValueError("summary.json is not an object")
+                cache = (sig, {'rows': chart_core.evidence_readiness_rows(
+                                   summary, with_eta=True),
+                               'summary': {k: summary.get(k) for k in
+                                           ('generated_at', 'exit_code',
+                                            'days', 'failed_steps')},
+                               'mtime': sig[1] / 1e9 if sig[1] else None,
+                               'error': None})
+            except (OSError, ValueError, TypeError) as e:
+                cache = (sig, {'rows': [], 'summary': {}, 'mtime': None,
+                               'error': f"{type(e).__name__}: {e}"})
+            self._evidence_cache = cache
+        model = cache[1]
+        run = os.path.basename(os.path.dirname(path))
+        age = chart_core.evidence_run_age_s(model['summary'], model['mtime'])
+        # ETA column (INTEL W11): W12's per-row eta_days/eta_basis; a summary
+        # without them keeps the 'no ETA projection' header and '—' cells.
+        has_eta = any(r[7] is not None for r in model['rows'])
+        head = (f"<b>Evidence readiness</b> <span style='color:{muted}'>"
+                f"(run {html.escape(run)} · "
+                f"{chart_core.format_age(age) + ' ago' if age is not None else 'age n/a'}"
+                f" · --days {html.escape(str(model['summary'].get('days')))}"
+                f" · exit {html.escape(str(model['summary'].get('exit_code')))}"
+                + ("; ETA = accrual projection, basis in tooltip" if has_eta
+                   else "; no ETA projection")
+                + ")</span>")
+        if model['error']:
+            self._evidence_label.setText(
+                head + f"<br><span style='color:{T['red'].name()}'>"
+                f"unreadable summary.json: {html.escape(model['error'])}</span>")
+            return
+        chip_color = {'READY': T['green'].name(), 'NOT YET': T['yellow'].name(),
+                      'FAILED': T['red'].name(),
+                      'PARSE FAILED': T['red'].name()}
+        trs = []
+        for read, cls, text, obs, kind, src, eta, _basis in model['rows']:
+            col = chip_color.get(cls, muted)
+            detail = text[len(cls):].strip() if text.upper().startswith(cls) else text
+            trs.append(
+                f"<tr><td>{html.escape(read)}</td>"
+                f"<td style='color:{col}'><b>[{html.escape(cls)}]</b>&nbsp;&nbsp;</td>"
+                f"<td>{html.escape(obs)}</td>"
+                f"<td>{html.escape(eta)}&nbsp;&nbsp;</td>"
+                f"<td style='color:{muted}'>{html.escape(kind)}</td>"
+                f"<td style='color:{muted}'>{html.escape(detail)}</td></tr>")
+        if not trs:
+            trs.append(f"<tr><td style='color:{muted}'>no readiness rows"
+                       f"</td></tr>")
+        self._evidence_label.setToolTip("\n".join(
+            f"{r[0]}: {r[5]}" + (f" · ETA basis: {r[7]}" if r[7] else "")
+            for r in model['rows']))
+        self._evidence_label.setText(
+            head + "<table cellspacing='0' cellpadding='2'>"
+            "<tr><th align='left'>read</th><th align='left'>verdict</th>"
+            "<th align='left'>observed/threshold</th>"
+            "<th align='left'>ETA</th>"
+            "<th align='left'>rule source</th><th align='left'>detail</th></tr>"
+            + "".join(trs) + "</table>")
+
+    def _start_best_score_load(self, names):
+        """Run the blocking optuna.load_study for `names` on a daemon worker
+        (the file's threading.Thread+Signal idiom, cf. _refresh_journal_
+        analytics) — NOT the slow DataFetcher, whose multi-minute news path
+        would queue it. One load in flight; the next refresh tick retries
+        whatever is still stale. The result lands in _on_best_scores_ready."""
+        if self._best_score_busy:
+            return
+        self._best_score_busy = True
+        names = list(names)
+
+        import threading
+
+        def worker():
+            results = {}
+            for name in names:
+                try:
+                    results[name] = _load_best_score(name)
+                except Exception:
+                    results[name] = (None, None)
+            try:
+                self._best_scores_ready.emit(results)
+            except RuntimeError:
+                pass  # window closed mid-load
+
+        threading.Thread(target=worker, daemon=True,
+                         name="best-score").start()
+
+    @Slot(object)
+    def _on_best_scores_ready(self, results):
+        """UI thread: cache the worker's (sig, value) per book (same key and
+        invalidation as before) and repaint just the score cells."""
+        self._best_score_busy = False
+        for name, (sig, value) in results.items():
+            _store_best_score(name, sig, value)
+            self._best_score_shown[name] = value
+            score_str, _ = _best_score_display(
+                True, value, self._best_score_shown, name)
+            for row in range(self._model_table.rowCount()):
+                cell = self._model_table.item(row, 0)
+                if cell is None or cell.text() != name:
+                    continue
+                item = QTableWidgetItem(score_str)
+                item.setTextAlignment(Qt.AlignCenter)
+                if value is not None:
+                    item.setForeground(T["green"] if value > 3 else T["yellow"])
+                self._model_table.setItem(row, 2, item)
 
     def _refresh_models_tab(self):
         now_ts = dt.datetime.now().timestamp()
@@ -9960,6 +10697,7 @@ class TradingDashboard(QMainWindow):
             chal_str = self._shadow_cell_text(name)
             configs.append((name, cfg, mod_time, age_hours, chal_str))
 
+        pending_scores = []
         self._model_table.setUpdatesEnabled(False)
         self._model_table.setRowCount(len(configs))
         for row, (name, cfg, mod_time, age_hours, chal_str) in enumerate(configs):
@@ -9979,8 +10717,15 @@ class TradingDashboard(QMainWindow):
                 age_str = f"{age_hours / 24:.0f}d"
                 status_color = T["red"]
 
-            best_score = _get_best_score(name)
-            score_str = f"{best_score:.3f}" if best_score is not None else "\u2014"
+            # Non-blocking: a stale/missing cache entry is loaded off-thread
+            # (optuna.load_study took 1.2-1.6 s here on the UI thread).
+            known, best_score = _peek_best_score(name)
+            if known:
+                self._best_score_shown[name] = best_score
+            else:
+                pending_scores.append(name)
+            score_str, best_score = _best_score_display(
+                known, best_score, self._best_score_shown, name)
 
             if cfg:
                 vals = [name, status, score_str, mod_time, age_str,
@@ -10004,6 +10749,8 @@ class TradingDashboard(QMainWindow):
                     item.setForeground(T["yellow"])
                 self._model_table.setItem(row, col, item)
         self._model_table.setUpdatesEnabled(True)
+        if pending_scores:
+            self._start_best_score_load(pending_scores)
 
         # --- Pipeline Status (from pipeline_status.json) ---
         pinfo = _read_pipeline_status()
@@ -10414,6 +11161,10 @@ class TradingDashboard(QMainWindow):
             pass
         try:
             self._refresh_reports_freshness()
+        except Exception:
+            pass
+        try:
+            self._refresh_evidence_panel()
         except Exception:
             pass
 

@@ -1082,9 +1082,13 @@ def _run_fee_sweep(prefix: str, days: int, n_search_trials: int,
 
     Replays the SAME policy per grid multiplier (entries fixed; only the
     charged cost legs scale — see simulate_ticker), then reports per-book
-    and per-name lambda* by linear zero-crossing interpolation. The
-    stage-0 dump runs on the first pass only (identical predictions every
-    pass). Every stressed pass writes backtest_<slot>_stress_report.json
+    and per-name lambda* by linear zero-crossing interpolation. NO pass
+    writes the stage-0 dump (SIG-R2-2): {slot}_stage0_preds.json is the
+    weekly --gate replay's measurement artifact (ic_by_name /
+    rank_gradient_report / naive_vs_blend / evidence_reads read it), and a
+    sweep's own --days window (180 in the documented example) would
+    silently replace it with a different, mostly in-search-region window.
+    Every stressed pass writes backtest_<slot>_stress_report.json
     (the operational book report is never touched by a stressed replay);
     results also land in backtest_<slot>_fee_sweep.json so
     champion-vs-challenger lambda* comparisons survive the scrollback.
@@ -1095,8 +1099,9 @@ def _run_fee_sweep(prefix: str, days: int, n_search_trials: int,
         kw = {'fee_mult': float(fm)}
         if model_prefix is not None:
             kw['model_prefix'] = model_prefix
-        if k > 0:
-            kw['stage0_dump'] = False
+        # SIG-R2-2: never the Stage-0 dump, on ANY pass (was: pass 1 kept
+        # the module default ON and overwrote the gate's dump).
+        kw['stage0_dump'] = False
         results.append(run_backtest(prefix, days, n_search_trials, **kw))
 
     book_nets = [float(m.get('net_total_pct', 0.0)) for m in results]

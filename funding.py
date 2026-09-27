@@ -25,6 +25,9 @@ logger = get_logger(__name__)
 _HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              'funding_history.json')
 _CACHE_TTL = 900  # 15 min — funding updates on 8h cycles; this is plenty
+_NEG_TTL = 300    # failed fetch: no retry sooner than this (== oi_archive._NEG_TTL;
+                  # an OKX outage would otherwise re-pay the 10s urlopen timeout
+                  # per symbol per prediction cycle AND per sized candidate)
 _MAX_SAMPLES = 270  # ~90 days at one sample/8h — TRUE only with time
                     # thinning ON; the default value-change guard admits
                     # ~96 samples/day, spanning ~2.8 days (D28)
@@ -59,7 +62,10 @@ CROWDED_Z = 2.0
 EXTREME_Z = 3.0
 
 _lock = threading.Lock()
-_cache: dict[str, tuple[float, float]] = {}   # symbol -> (ts, 8h rate)
+# symbol -> (mono ts, 8h rate) on success, (mono ts, None) on a failed fetch
+# (the negative-cache entry, honoured for _NEG_TTL; kept in the SAME dict so
+# anything that resets _cache also resets the negative entries)
+_cache: dict[str, tuple[float, float | None]] = {}
 # {symbol: [rates...]}; under FUNDING_Z_TIME_THINNING also the _TS_KEY
 # sidecar dict — never iterate .items() assuming list values
 _history: dict | None = None
@@ -75,7 +81,9 @@ def _load_history() -> dict:
         try:
             with open(_HISTORY_FILE) as f:
                 _history = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
+            # ValueError covers JSONDecodeError AND the UnicodeDecodeError a
+            # binary-garbage file raises (same guard as risk_budget.read_registry)
             _history = {}
     return _history
 
@@ -103,8 +111,8 @@ def get_funding_rate(symbol: str) -> float | None:
     now = time.monotonic()
     with _lock:
         hit = _cache.get(symbol)
-        if hit and (now - hit[0]) < _CACHE_TTL:
-            return hit[1]
+        if hit and (now - hit[0]) < (_NEG_TTL if hit[1] is None else _CACHE_TTL):
+            return hit[1]           # positive hit, or a recent failure -> None
     try:
         url = f"https://www.okx.com/api/v5/public/funding-rate?instId={inst}"
         req = urllib.request.Request(url, headers={'User-Agent': 'trader/1.0'})
@@ -112,6 +120,10 @@ def get_funding_rate(symbol: str) -> float | None:
             data = json.loads(resp.read())
         rate = float(data['data'][0]['fundingRate'])
     except Exception as e:
+        # Negative cache (mirrors oi_archive._neg_cached): an outage costs
+        # one attempt per symbol per _NEG_TTL, not one per call.
+        with _lock:
+            _cache[symbol] = (now, None)
         logger.debug('[FUNDING] %s: fetch failed: %s', symbol, e)
         return None
     global _thin_advice_logged

@@ -25,6 +25,7 @@ import datetime as dt
 import io
 import os
 import sys
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -78,14 +79,41 @@ def _parse_file(text: str, keep: set[str]):
     return df.groupby(['date', 'symbol'], as_index=False).sum()
 
 
+# G5-4: the live feature injectors call this once per symbol per 30 s cycle
+# (predict_now re-predicts every symbol every cycle), and a full parquet decode
+# per call cost ~12 ms x 46 stock names. The parsed frame is memoized on
+# (path, st_mtime_ns, st_size) and the per-symbol derived series on top of it;
+# a sync() rewrite (os.replace) or an ARCHIVE_FILE repoint changes the stamp,
+# so the memo self-invalidates across processes. Outputs are the SAME objects a
+# fresh read would compute (bit-identical); every caller is read-only on them.
+# A failed read is never memoized (it retries and reports every call, as before).
+_memo_lock = threading.Lock()
+_memo: dict = {'key': None, 'df': None, 'by_sym': {}}
+
+
+def _archive_stamp():
+    try:
+        st = os.stat(ARCHIVE_FILE)
+    except OSError:
+        return None
+    return (str(ARCHIVE_FILE), st.st_mtime_ns, st.st_size)
+
+
 def load_archive():
     import pandas as pd
-    if ARCHIVE_FILE.exists():
-        try:
-            return pd.read_parquet(ARCHIVE_FILE)
-        except Exception as e:
-            logger.warning("[SHORT-FLOW] archive read failed (%s) — serving "
-                           "no SVR features until the next sync rebuilds it", e)
+    key = _archive_stamp()
+    if key is not None:
+        with _memo_lock:
+            if _memo['key'] == key:
+                return _memo['df']
+            try:
+                df = pd.read_parquet(ARCHIVE_FILE)
+            except Exception as e:
+                logger.warning("[SHORT-FLOW] archive read failed (%s) — serving "
+                               "no SVR features until the next sync rebuilds it", e)
+            else:
+                _memo.update(key=key, df=df, by_sym={})
+                return df
     return pd.DataFrame(columns=['date', 'symbol', 'short_vol', 'total_vol'])
 
 
@@ -151,9 +179,24 @@ def svr_series(symbol: str):
     """(SVR_21, SVR_Z) daily Series for one symbol, or None.
 
     Both are indexed by the PRINT date — callers shift(1) for training
-    bars; live uses .iloc[-1] (latest completed day)."""
-    import pandas as pd
+    bars; live uses .iloc[-1] (latest completed day). Memoized per symbol
+    against the archive stamp (G5-4) — treat the result as read-only."""
+    sym = symbol.upper()
     arc = load_archive()
+    with _memo_lock:
+        memo_ok = _memo['df'] is arc     # arc is the memoized frame of _memo['key']
+        if memo_ok and sym in _memo['by_sym']:
+            return _memo['by_sym'][sym]
+    out = _svr_series_from(arc, symbol)
+    if memo_ok:
+        with _memo_lock:
+            if _memo['df'] is arc:
+                _memo['by_sym'][sym] = out
+    return out
+
+
+def _svr_series_from(arc, symbol: str):
+    """svr_series body on an already-loaded archive frame (unchanged math)."""
     if arc.empty:
         return None
     sub = arc[arc['symbol'] == symbol.upper()]

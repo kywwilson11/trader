@@ -5,6 +5,7 @@ Written 2026-09-08 by the cleanup/map pass. **Facts have one home**; these files
 
 | File | What it owns | Read it when |
 |---|---|---|
+| [`book/`](book/README.md) | **The explanatory book** (being written 2026-09-27): a guided, prose walk through what the system is, how it works and why it was designed this way, for the founder and new readers; it explains and points, the files below own the facts | before `MAP.md`, when you want the why rather than the reference |
 | [`MAP.md`](MAP.md) | **The repository map** — the ultimate goal and the honest distance from it, layout, the full lifecycle (harvest → train → certify → gate → serve → decide → execute → exit → journal → measure → retrain), the goal of each of the 16 subsystems, the invariants, the two-machine reality, the state of play, known gaps, a "where is…?" index, the document map | first, always |
 | [`MODULES.md`](MODULES.md) | Per-module reference for all 113 Python modules (goal, API, imports/imported-by, reads/writes, flags, status, known issues) + Appendix A the CLI census (every entry point's argparse flags) + Appendix B the import layers | before touching a module |
 | [`FLAGS.md`](FLAGS.md) | Every feature flag, policy constant and environment variable: where defined, default, what it gates, readers, facing (model / gate / measurement / ops), the test that pins its OFF path, dead flags, the SSOT exceptions | before flipping or adding a flag |

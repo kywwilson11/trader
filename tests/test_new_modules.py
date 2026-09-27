@@ -93,17 +93,9 @@ class TestVolatility:
         from volatility import forecast_volatility
         assert forecast_volatility(None) is None
 
-    def test_get_garch_stop(self):
-        from volatility import get_garch_stop
-        stop = get_garch_stop(100.0, 0.05, multiplier=2.0)
-        assert stop < 100.0
-        assert stop > 80.0  # not more than 20% away
-
-    def test_get_garch_stop_floor(self):
-        from volatility import get_garch_stop
-        # Very low sigma should be floored
-        stop = get_garch_stop(100.0, 0.001, multiplier=2.0, floor_pct=0.03)
-        assert stop == pytest.approx(97.0, abs=0.01)
+    # test_get_garch_stop / test_get_garch_stop_floor RETIRED 2026-09-27 (G5-8)
+    # with volatility.get_garch_stop (zero production callers); both tests are
+    # archived verbatim in research/campaign_2026-08/08_removed_code.md.
 
     def test_compute_vol_adjusted_size(self):
         """Target is now derived from ANNUALIZED portfolio vol converted to

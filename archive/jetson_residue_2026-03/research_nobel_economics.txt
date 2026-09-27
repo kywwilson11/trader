@@ -1,0 +1,1773 @@
+================================================================================
+    NOBEL ECONOMICS PRIZE WINNERS (2005-2025) AND THEIR RELEVANCE
+              TO ALGORITHMIC TRADING: A COMPREHENSIVE ANALYSIS
+================================================================================
+
+Research compiled: 2026-02-21
+Target system: Python trading bot on Jetson Orin Nano (8GB, ARM64)
+Trading context: Alpaca paper trading, $100k account, LSTM regression model,
+                 LLM conviction scoring, ATR-based risk management
+
+This document examines every Nobel Memorial Prize in Economic Sciences from
+2005 through 2025, plus foundational pre-2005 laureates, assessing each for
+actionable insights applicable to our specific algorithmic trading system.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+  PART I   - YEAR-BY-YEAR ANALYSIS (2005-2025)
+  PART II  - FOUNDATIONAL PRE-2005 LAUREATES
+  PART III - PRIORITY-RANKED IMPLEMENTATION ROADMAP
+  PART IV  - CROSS-CUTTING THEMES AND SYNTHESIS
+
+================================================================================
+PART I: YEAR-BY-YEAR ANALYSIS (2005-2025)
+================================================================================
+
+------------------------------------------------------------------------
+2005: ROBERT AUMANN & THOMAS SCHELLING
+"For having enhanced our understanding of conflict and cooperation
+through game-theory analysis"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Aumann formalized repeated game theory, showing how cooperation emerges
+in repeated interactions even among self-interested agents. Schelling
+introduced focal points and strategic behavior analysis with minimal
+mathematical formalism, explaining how coordination happens in conflict
+and cooperation scenarios.
+
+RELEVANCE TO TRADING: LOW-MODERATE
+Game theory has indirect relevance to order execution strategy. When our
+bot places orders, it participates in a repeated game with other market
+participants (other algos, market makers, institutional traders). Key
+insights:
+
+  - REPEATED GAMES: Our bot trades the same symbols daily. Other
+    participants may detect and front-run predictable patterns. Aumann
+    showed that in repeated games, strategies should incorporate
+    randomization to avoid being exploited.
+
+  - FOCAL POINTS (Schelling): In thin markets (crypto especially),
+    round numbers ($50,000 BTC, $100 SOL) act as Schelling focal points
+    where liquidity clusters. Our limit order logic could target prices
+    near these psychological levels.
+
+POTENTIAL IMPLEMENTATION:
+  - Add small random jitter to order timing (currently fixed 30s loops)
+  - Randomize limit order offset (currently fixed 5bps in order_utils.py)
+  - Detect round-number support/resistance levels in price data
+  Data needed: None beyond current data
+  Complexity: Low
+  Impact: Marginal improvement in execution quality
+  Feasibility on Jetson: Trivial
+
+------------------------------------------------------------------------
+2006: EDMUND PHELPS
+"For his analysis of intertemporal tradeoffs in macroeconomic policy"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Phelps formalized the expectations-augmented Phillips curve, showing
+that there is no long-run tradeoff between inflation and unemployment.
+Central bank policy can only temporarily reduce unemployment below its
+"natural rate" by creating unexpected inflation. Once expectations
+adjust, unemployment returns to its natural level.
+
+RELEVANCE TO TRADING: MODERATE
+The key insight is that INFLATION EXPECTATIONS drive market behavior
+more than current inflation. This has direct implications for our
+macro-environment assessment:
+
+  - When inflation expectations are rising (breakeven rates, TIPS
+    spreads), risk assets face headwinds from anticipated tightening.
+  - When expectations are falling, looser future policy is anticipated,
+    supporting risk assets.
+  - The natural rate of unemployment serves as a benchmark: employment
+    data significantly below it signals overheating and potential
+    tightening.
+
+POTENTIAL IMPLEMENTATION:
+  - Add inflation expectations data (TIPS breakeven rates) as an input
+    to the LLM analyst's macro context
+  - Use FRED API to fetch 5Y and 10Y breakeven inflation rates
+  - When breakevens are rising sharply, increase the LLM's bearish bias
+  Data needed: FRED API (free, public)
+  Complexity: Low (API call + pass to LLM prompt)
+  Impact: Better macro regime awareness in LLM scoring
+  Feasibility on Jetson: Trivial (HTTP request)
+
+------------------------------------------------------------------------
+2007: LEONID HURWICZ, ERIC MASKIN & ROGER MYERSON
+"For having laid the foundations of mechanism design theory"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Mechanism design is "reverse game theory" -- instead of analyzing
+existing games, it asks how to design rules/mechanisms to achieve
+desired outcomes. Key concepts include incentive compatibility (making
+truthful behavior optimal) and the revelation principle.
+
+RELEVANCE TO TRADING: LOW-MODERATE
+Mechanism design is foundational to understanding market microstructure:
+
+  - ORDER TYPES AS MECHANISMS: Different order types (limit, market,
+    stop, trailing stop) are mechanisms that reveal different amounts
+    of information to the market. Our bot's use of limit orders with
+    market fallback is a mechanism design choice -- it initially hides
+    urgency (limit) then reveals it if needed (market fallback).
+
+  - AUCTION FORMATS: Stock exchanges use continuous double auctions,
+    while crypto exchanges may use different matching engines. The
+    choice of venue/exchange affects execution quality.
+
+  - INFORMATION REVELATION: Every order we place reveals information
+    about our model's predictions. In thin crypto markets, large
+    orders can move prices against us (adverse selection).
+
+POTENTIAL IMPLEMENTATION:
+  - Implement order splitting for larger positions to reduce market
+    impact (currently, NOTIONAL_PER_SYMBOL = $1000-5000 goes as single
+    orders)
+  - Add adaptive order type selection based on spread/liquidity
+  - Consider iceberg orders if Alpaca supports them
+  Data needed: Current spread data (already collected in order_utils.py)
+  Complexity: Moderate
+  Impact: Better execution prices, especially in illiquid crypto
+  Feasibility on Jetson: Easy (logic changes, no compute overhead)
+
+------------------------------------------------------------------------
+2008: PAUL KRUGMAN
+"For his analysis of trade patterns and location of economic activity"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Krugman's "New Trade Theory" and "New Economic Geography" showed how
+economies of scale and transport costs explain trade patterns and the
+geographic concentration of economic activity. Industries cluster
+together due to positive feedback loops.
+
+RELEVANCE TO TRADING: LOW
+Krugman's work is primarily about international trade and industrial
+geography, which has limited direct application to our bot. However:
+
+  - SECTOR CONCENTRATION: Understanding which sectors dominate which
+    economies can inform macro risk assessment. Tech concentration in
+    the US, manufacturing in China, etc.
+
+  - TRADE POLICY SIGNALS: Trade war announcements, tariff changes,
+    and supply chain disruptions create tradeable volatility events
+    that our LLM analyst could flag.
+
+POTENTIAL IMPLEMENTATION:
+  - Enhance LLM analyst prompts to specifically consider trade policy
+    developments and their sector-level impact
+  Data needed: Already available through news headlines
+  Complexity: Low
+  Impact: Marginal
+  Feasibility on Jetson: Trivial
+
+------------------------------------------------------------------------
+2009: ELINOR OSTROM & OLIVER WILLIAMSON
+"For analysis of economic governance" (commons / firm boundaries)
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Ostrom showed that common-pool resources can be effectively managed
+without privatization or central regulation through community
+governance. Williamson analyzed transaction costs as the key
+determinant of whether activities are organized within firms or
+through markets.
+
+RELEVANCE TO TRADING: LOW
+Transaction cost economics has a conceptual connection to trading:
+
+  - TRANSACTION COSTS: Our bot faces transaction costs (spreads,
+    slippage, Alpaca commissions) that erode returns. Williamson's
+    framework suggests we should only trade when expected profit
+    exceeds transaction costs by a meaningful margin.
+
+  - We already partially implement this through the spread check in
+    order_utils.py and the prediction threshold in the trading loops.
+
+POTENTIAL IMPLEMENTATION:
+  - Explicitly model total transaction costs (spread + slippage +
+    opportunity cost) and require predicted returns to exceed them
+    by a configurable multiplier
+  Data needed: Historical fill data (spread vs. predicted return)
+  Complexity: Low
+  Impact: Reduced over-trading, fewer low-conviction entries
+  Feasibility on Jetson: Trivial
+
+------------------------------------------------------------------------
+2010: PETER DIAMOND, DALE MORTENSEN & CHRISTOPHER PISSARIDES
+"For their analysis of markets with search frictions"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+The Diamond-Mortensen-Pissarides (DMP) model analyzes markets where
+finding a match is costly and time-consuming. Originally applied to
+labor markets (job seekers and employers), the framework applies to
+any market with search frictions.
+
+RELEVANCE TO TRADING: LOW-MODERATE
+The concept of "search frictions" maps to liquidity and price
+discovery in financial markets:
+
+  - SEARCH = FINDING LIQUIDITY: In thin markets, finding the other
+    side of a trade at a fair price takes time and effort. Our bot's
+    limit-order-with-timeout approach (ORDER_TIMEOUT = 30s) is a
+    search process with a deadline.
+
+  - MATCHING THEORY: The DMP model suggests that match quality
+    improves with patience. For our bot, being patient with limit
+    orders (waiting for better fills) vs. impatient (market orders)
+    involves the same tradeoff.
+
+  - MACRO INDICATOR: Labor market search frictions (job openings vs.
+    unemployment, the Beveridge curve) are leading indicators. Rising
+    job openings signal economic strength; rising unemployment signals
+    weakness.
+
+POTENTIAL IMPLEMENTATION:
+  - Feed JOLTS data (Job Openings and Labor Turnover Survey) into
+    the LLM analyst as a macro indicator
+  - Dynamically adjust ORDER_TIMEOUT based on observed fill rates
+  Data needed: JOLTS data from FRED API (free)
+  Complexity: Low
+  Impact: Better macro context; marginal execution improvement
+  Feasibility on Jetson: Trivial
+
+------------------------------------------------------------------------
+2011: THOMAS SARGENT & CHRISTOPHER SIMS
+"For their empirical research on cause and effect in the macroeconomy"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Sargent developed rational expectations econometrics, showing how
+economic agents' expectations shape outcomes. Sims invented Vector
+Autoregression (VAR) models, which capture the dynamic interactions
+among multiple macroeconomic variables without imposing strong
+theoretical assumptions.
+
+RELEVANCE TO TRADING: MODERATE-HIGH
+VAR models are directly relevant to multi-asset trading:
+
+  - CROSS-ASSET DYNAMICS: A VAR model of our 10 crypto assets or 31
+    stocks could capture lead-lag relationships. If BTC movements
+    predict ETH movements 1-2 bars later, we could trade ETH before
+    the move.
+
+  - IMPULSE RESPONSES: VAR models produce impulse response functions
+    showing how a shock to one variable propagates through the system.
+    A shock to BTC volatility affects all crypto prices -- knowing the
+    magnitude and timing helps position management.
+
+  - MACRO VARIABLE INCLUSION: VARs can include macro variables
+    (interest rates, VIX, Fear & Greed) alongside asset returns to
+    model how macro shocks affect individual assets.
+
+POTENTIAL IMPLEMENTATION:
+  - Fit a small VAR model on daily returns of our crypto universe
+    to detect lead-lag relationships
+  - Use VAR residuals as a "surprise" indicator (actual return minus
+    VAR-predicted return = genuine new information)
+  - The statsmodels library supports VAR estimation
+  Data needed: Historical daily returns (already available via
+    market_data.py bar fetching)
+  Complexity: Moderate (model fitting, feature engineering)
+  Impact: Could identify cross-asset alpha; useful for timing entries
+  Feasibility on Jetson: Moderate -- VAR on 10 assets is lightweight.
+    statsmodels runs fine on ARM64.
+
+------------------------------------------------------------------------
+2012: ALVIN ROTH & LLOYD SHAPLEY
+"For the theory of stable allocations and the practice of market design"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Shapley developed the theory of stable matching (the Gale-Shapley
+algorithm). Roth applied market design to real-world matching problems
+(kidney exchanges, medical residency matching, school choice).
+
+RELEVANCE TO TRADING: LOW
+Market design principles are more relevant to exchange/venue design
+than to trading strategies. However:
+
+  - MATCHING QUALITY: The concept of "stable matches" could inform
+    portfolio construction -- finding asset combinations that are
+    stable (low correlation) under different regimes.
+
+  - VENUE SELECTION: If trading across multiple exchanges/venues,
+    Roth's matching theory could inform optimal routing.
+
+No specific implementation recommended given our single-venue
+(Alpaca) setup.
+
+------------------------------------------------------------------------
+2013: EUGENE FAMA, LARS PETER HANSEN & ROBERT SHILLER
+"For their empirical analysis of asset prices"
+------------------------------------------------------------------------
+
+*** THIS IS THE MOST DIRECTLY RELEVANT PRIZE FOR OUR SYSTEM ***
+
+CONTRIBUTION SUMMARY:
+This prize remarkably honored both sides of the market efficiency
+debate simultaneously:
+
+  FAMA - Efficient Market Hypothesis (EMH):
+    - Weak form: Past prices cannot predict future prices (challenges
+      technical analysis)
+    - Semi-strong: Public information is instantly reflected in prices
+    - Strong: Even private information is reflected
+    - Developed the Fama-French Three-Factor Model (market, size,
+      value) and Five-Factor Model (adds profitability, investment)
+
+  SHILLER - Behavioral Finance / Excess Volatility:
+    - Showed stock prices are FAR more volatile than justified by
+      subsequent changes in dividends
+    - CAPE ratio (Cyclically Adjusted Price-Earnings): 10-year
+      inflation-adjusted P/E predicts long-term returns
+    - "Irrational Exuberance" -- markets overshoot due to behavioral
+      factors, narrative economics
+
+  HANSEN - Generalized Method of Moments (GMM):
+    - Statistical framework for testing asset pricing models without
+      fully specifying the data-generating process
+    - Founded "macro-finance" field connecting macro risk to asset
+      prices
+
+RELEVANCE TO TRADING: CRITICAL
+
+1. FAMA'S CHALLENGE TO OUR MODEL:
+   The EMH directly challenges whether our LSTM model CAN work. If
+   markets are efficient, technical patterns should offer no edge.
+   However:
+   - Fama himself acknowledges markets are "efficient enough" that
+     MOST investors can't beat them, not that it's impossible.
+   - Our model operates in crypto markets, which are less studied,
+     less liquid, and have more retail participants -- making
+     efficiency weaker.
+   - The Fama-French factors (size, value, momentum, profitability,
+     investment) are PERSISTENT anomalies that Fama himself
+     documents, suggesting markets are not perfectly efficient.
+   - Our edge likely comes from SPEED (30-second cycles), breadth
+     (many simultaneous positions), and discipline (no behavioral
+     biases in execution).
+
+2. THE FAMA-FRENCH FACTOR MODEL:
+   Our system currently treats each symbol independently. The
+   Fama-French framework suggests we should consider FACTOR EXPOSURES:
+   - Market beta: How much does each stock move with SPY?
+   - Size (SMB): Small caps outperform -- are we biased toward them?
+   - Value (HML): High book-to-market outperforms -- are we selecting
+     for this?
+   - Momentum (UMD): Recent winners continue winning -- our model
+     implicitly captures this through technical features, but we
+     could be explicit.
+   - Profitability (RMW): Profitable firms outperform.
+   - Investment (CMA): Conservative investors outperform aggressive
+     ones.
+
+3. SHILLER'S CAPE RATIO:
+   The CAPE ratio is one of the best-validated long-term return
+   predictors. While our bot trades short-term, CAPE provides crucial
+   REGIME CONTEXT:
+   - Current CAPE > 35: Historically associated with below-average
+     forward returns. Our bot should be more conservative (smaller
+     positions, tighter stops).
+   - CAPE < 15: Historically associated with excellent forward
+     returns. Be more aggressive.
+   - CAPE rate of change matters too: rapidly rising CAPE signals
+     momentum; rapidly falling signals panic.
+
+4. HANSEN'S GMM FOR MODEL VALIDATION:
+   GMM provides a rigorous framework for evaluating whether our
+   model's predictions are genuinely capturing a risk premium vs.
+   just fitting noise. We could use GMM to test whether our LSTM's
+   alpha is statistically significant.
+
+SPECIFIC IMPLEMENTATIONS:
+
+A) SHILLER CAPE REGIME FILTER
+   Data: Free API at shillerdata.com or FRED (no auth needed)
+   Algorithm: Fetch monthly CAPE, compute z-score relative to 20-year
+   mean. Use as a scaling factor for position sizes:
+     - CAPE z-score > 1.5: Reduce position sizes by 30%
+     - CAPE z-score < -1.0: Increase position sizes by 20%
+   Complexity: Very low (monthly HTTP fetch + simple math)
+   Impact: Moderate -- protects against buying into overvalued regimes
+   Feasibility on Jetson: Trivial
+
+B) FAMA-FRENCH FACTOR EXPOSURE ANALYSIS
+   Data: Factor returns from Kenneth French's Data Library (free)
+   Algorithm: Regress our portfolio returns against the five factors
+   to understand where our alpha comes from. If it's all explained
+   by factor exposures, we have no genuine edge.
+   Complexity: Moderate (monthly regression analysis)
+   Impact: Critical for understanding our edge (or lack thereof)
+   Feasibility on Jetson: Easy (numpy/scipy regression)
+
+C) MOMENTUM FACTOR AS EXPLICIT FEATURE
+   Data: Already available (historical returns in training data)
+   Algorithm: Add 1-month and 3-month momentum rank as features to
+   our LSTM model. This explicitly captures the momentum anomaly
+   that Fama-French document but don't fully explain.
+   Complexity: Low (feature engineering in harvest scripts)
+   Impact: Potentially significant -- momentum is one of the most
+   robust anomalies in financial literature
+   Feasibility on Jetson: Trivial
+
+------------------------------------------------------------------------
+2014: JEAN TIROLE
+"For his analysis of market power and regulation"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Tirole analyzed how firms with market power (oligopolies, monopolies)
+behave and how regulators should respond. Key insights include tacit
+collusion in oligopoly, the limits of simple regulation rules, and
+the importance of industry-specific regulatory approaches.
+
+RELEVANCE TO TRADING: LOW-MODERATE
+  - MARKET CONCENTRATION: Highly concentrated industries (tech,
+    pharma) may behave differently than competitive ones. Firms
+    with pricing power (Apple, Google) have more stable earnings
+    and may warrant different risk parameters.
+
+  - REGULATORY RISK: Tirole's work highlights that regulation is
+    industry-specific. For our stock universe, understanding which
+    firms face regulatory headwinds (antitrust, crypto regulation)
+    is valuable qualitative context for the LLM analyst.
+
+  - CRYPTO MARKET STRUCTURE: Crypto exchanges exhibit oligopolistic
+    behavior (Binance, Coinbase dominate volume). Their market power
+    affects spreads, fees, and liquidity.
+
+POTENTIAL IMPLEMENTATION:
+  - Tag stocks in stock_config.py with concentration/market-power
+    indicators to adjust the LLM analyst's regulatory risk assessment
+  Data needed: HHI (Herfindahl-Hirschman Index) by sector
+  Complexity: Low
+  Impact: Marginal
+  Feasibility on Jetson: Trivial
+
+------------------------------------------------------------------------
+2015: ANGUS DEATON
+"For his analysis of consumption, poverty, and welfare"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Deaton developed the "Almost Ideal Demand System" for modeling consumer
+behavior, studied the link between consumption and income (the
+consumption function), and pioneered methods for measuring welfare
+in developing countries.
+
+RELEVANCE TO TRADING: LOW
+Deaton's consumption analysis has indirect relevance:
+  - CONSUMPTION DATA AS INDICATOR: Consumer spending patterns are
+    leading economic indicators. The personal consumption expenditures
+    (PCE) price index, which Deaton's work informed, is the Fed's
+    preferred inflation gauge.
+  - Our LLM analyst could incorporate PCE data in macro context.
+
+No specific implementation recommended beyond what the LLM already
+considers through general macro awareness.
+
+------------------------------------------------------------------------
+2016: OLIVER HART & BENGT HOLMSTROM
+"For their contributions to contract theory"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Holmstrom formalized the principal-agent problem, showing how to
+design optimal incentive contracts when the agent's actions are not
+fully observable. His "informativeness principle" states that contracts
+should condition pay on any variable that provides information about
+the agent's effort. Hart developed incomplete contract theory, showing
+how ownership/control rights should be allocated when contracts cannot
+specify all contingencies.
+
+RELEVANCE TO TRADING: LOW-MODERATE
+Contract theory has subtle but important implications:
+
+  - EXECUTIVE COMPENSATION: Holmstrom's work explains CEO pay
+    structures. Stocks with heavily option-laden executive comp
+    may see different behavior around earnings (risk-taking to
+    hit option strike prices). This is useful qualitative context.
+
+  - INCOMPLETE CONTRACTS = INCOMPLETE MARKETS: Hart's framework
+    suggests that we can never fully contract against all risks.
+    For our bot, this means we should maintain conservative position
+    sizing because unknown risks (black swans) exist that our model
+    cannot anticipate.
+
+  - MORAL HAZARD IN CRYPTO: DeFi protocols involve smart contracts
+    (actual contracts). Contract design quality affects token value.
+    Poor contract design leads to exploits (hacks), which is
+    catastrophic for token prices.
+
+POTENTIAL IMPLEMENTATION:
+  - Add executive compensation structure as a factor in the
+    fundamentals.py module for stock analysis
+  - Flag crypto tokens with known smart contract audit issues
+  Data needed: SEC filings (executive comp), audit reports (crypto)
+  Complexity: Moderate (data sourcing is the challenge)
+  Impact: Marginal for stocks; potentially high for crypto safety
+  Feasibility on Jetson: Moderate (API calls, LLM interpretation)
+
+------------------------------------------------------------------------
+2017: RICHARD THALER
+"For his contributions to behavioral economics"
+------------------------------------------------------------------------
+
+*** HIGHLY RELEVANT TO TRADING SYSTEM DESIGN ***
+
+CONTRIBUTION SUMMARY:
+Thaler's work spans several key areas:
+
+  MENTAL ACCOUNTING: People treat money differently depending on
+  its source or intended use, creating artificial categories that
+  lead to suboptimal decisions. A $100 loss in a "trading account"
+  feels different from a $100 loss in a "savings account" even
+  though money is fungible.
+
+  ENDOWMENT EFFECT / LOSS AVERSION: People overvalue what they
+  already own, leading to holding losers too long and selling
+  winners too soon (the "disposition effect").
+
+  MARKET ANOMALIES: Thaler documented numerous persistent anomalies
+  including the Winner-Loser reversal effect (De Bondt & Thaler 1985),
+  calendar effects (January effect), and the equity premium puzzle.
+
+  NUDGE THEORY / LIBERTARIAN PATERNALISM: Designing choice
+  architectures that guide people toward better decisions without
+  restricting freedom.
+
+RELEVANCE TO TRADING: HIGH
+
+1. THE DISPOSITION EFFECT AND OUR STOP-LOSS DESIGN:
+   Our bot's ATR-based stop-loss system (crypto_loop.py, stock_loop.py)
+   is ALREADY a behavioral correction mechanism. By enforcing
+   mechanical stops, we avoid the human tendency to hold losers.
+   However, we can do better:
+
+   - ASYMMETRIC STOPS: Prospect theory (Kahneman, below) shows losses
+     hurt 2x as much as equivalent gains feel good. Our current
+     stop-loss and take-profit are symmetric in concept (ATR * 2.0
+     stop, 3:1 R:R take-profit). We should consider whether our
+     take-profit levels are too tight (cutting winners too early)
+     relative to our stops (which may be too loose for losers).
+
+   - Research by Odean (1998) and others shows the disposition effect
+     is "virtually zero among algorithms." Our bot inherently avoids
+     this bias -- but ONLY if we don't intervene manually.
+
+2. CALENDAR ANOMALIES:
+   Thaler documented several calendar-based patterns:
+   - JANUARY EFFECT: Small-cap stocks outperform in January (tax-loss
+     selling reversal). Our stock universe includes some smaller names.
+   - DAY-OF-WEEK EFFECT: Mondays historically show lower returns.
+   - PRE-HOLIDAY EFFECT: Markets rise before holidays.
+   - TURN-OF-MONTH EFFECT: Returns are higher on the last and first
+     few trading days of each month.
+
+   Many of these anomalies have weakened since publication but some
+   persist, especially in less-efficient markets (crypto).
+
+3. THE WINNER-LOSER EFFECT:
+   De Bondt & Thaler (1985) showed that past 3-5 year losers
+   outperform past winners (reversal). This conflicts with short-term
+   momentum (Jegadeesh & Titman 1993, 3-12 months). The implication:
+   - Short-term (our model's timeframe): MOMENTUM works
+   - Long-term (years): REVERSAL works
+   Our model should be calibrated to the momentum horizon.
+
+SPECIFIC IMPLEMENTATIONS:
+
+A) CALENDAR EFFECT FILTER
+   Algorithm: Add time-based features to the model or as a trading
+   filter:
+     - Day of week (one-hot encoded) -- already possible
+     - Day of month (is it turn-of-month? first 3 or last 2 days?)
+     - Month (is it January? is it September, historically worst?)
+   Complexity: Very low
+   Impact: Marginal but free improvement
+   Feasibility on Jetson: Trivial
+
+B) ANTI-DISPOSITION AUDIT
+   Algorithm: Review our stop-loss and take-profit parameters to
+   ensure we're not cutting winners too early. Analyze historical
+   trades to measure:
+     - Average holding time for winners vs. losers
+     - Average return of trades that hit take-profit vs. those that
+       were sold at model signal
+     - Whether widening take-profit levels improves returns
+   Complexity: Low (backtesting analysis)
+   Impact: Potentially significant
+   Feasibility on Jetson: Easy
+
+C) MENTAL ACCOUNTING PROTECTION
+   Design principle: Our bot treats all positions as part of ONE
+   portfolio, not separate mental accounts. This is correct. Ensure
+   we never implement logic that treats crypto and stock positions
+   differently for risk purposes when they should be viewed as a
+   unified portfolio.
+
+------------------------------------------------------------------------
+2018: WILLIAM NORDHAUS & PAUL ROMER
+"For integrating climate change (Nordhaus) and technological innovation
+(Romer) into long-run macroeconomic analysis"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Nordhaus developed integrated assessment models linking economic
+activity to climate change, pioneered the concept of carbon pricing,
+and quantified the "social cost of carbon." Romer developed endogenous
+growth theory showing how market forces drive innovation and
+technological change.
+
+RELEVANCE TO TRADING: LOW-MODERATE
+
+  - ESG / CLIMATE RISK: Nordhaus's work underpins the growing
+    importance of climate risk in asset pricing. Companies with high
+    carbon exposure face regulatory risk (carbon taxes, emissions
+    caps). This is increasingly priced into markets.
+
+  - CARBON PRICE AS MACRO INDICATOR: Rising carbon prices (EU ETS,
+    California Cap-and-Trade) signal tightening environmental
+    regulation, which affects energy, industrial, and transportation
+    sectors.
+
+  - ROMER AND INNOVATION: Romer's endogenous growth theory explains
+    why tech companies have persistent competitive advantages --
+    innovation begets more innovation (increasing returns to ideas).
+    This supports overweighting innovative firms.
+
+POTENTIAL IMPLEMENTATION:
+  - Add carbon/ESG risk scores to stock fundamentals
+  - Track carbon price trends as a macro input for the LLM analyst
+  Data needed: EU carbon futures price (free from Yahoo Finance)
+  Complexity: Low
+  Impact: Marginal for short-term trading; important for risk
+  Feasibility on Jetson: Trivial
+
+------------------------------------------------------------------------
+2019: ABHIJIT BANERJEE, ESTHER DUFLO & MICHAEL KREMER
+"For their experimental approach to alleviating global poverty"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Pioneered the use of Randomized Controlled Trials (RCTs) in
+development economics. By randomly assigning "treatment" and "control"
+groups, they could establish causal effects of specific interventions
+on poverty reduction.
+
+RELEVANCE TO TRADING: MODERATE (METHODOLOGY)
+Their RCT methodology is directly applicable as a FRAMEWORK for
+evaluating our trading system:
+
+  - A/B TESTING OUR STRATEGIES: We should treat parameter changes
+    as experiments. Run the bot with parameter set A on some symbols
+    and parameter set B on others, measuring outcomes. This is
+    exactly the RCT approach.
+
+  - AVOIDING DATA SNOOPING: The RCT framework emphasizes
+    pre-registration of hypotheses to avoid p-hacking. When we
+    optimize our LSTM hyperparameters (hypersearch_v2.py), we should
+    use walk-forward validation (which we already do) and
+    out-of-sample testing to avoid overfitting.
+
+  - CAUSAL INFERENCE VS. CORRELATION: Our LSTM may find patterns
+    that are correlational, not causal. The RCT mindset encourages
+    asking "does this feature CAUSE better predictions, or is it
+    just correlated with something that does?"
+
+POTENTIAL IMPLEMENTATION:
+  - Formalize A/B testing framework: split symbols into test/control
+    groups when testing new parameters
+  - Add out-of-sample reporting to hypersearch output
+  Complexity: Moderate
+  Impact: Better parameter selection, less overfitting
+  Feasibility on Jetson: Easy
+
+------------------------------------------------------------------------
+2020: PAUL MILGROM & ROBERT WILSON
+"For improvements to auction theory and inventions of new auction formats"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Wilson developed theory for auctions with "common values" (where the
+item has the same value to all bidders, but each bidder has imperfect
+information about that value). He formalized the "winner's curse" --
+the winning bidder tends to have the most optimistic estimate, so
+winning is actually bad news about the item's true value.
+
+Milgrom generalized auction theory to handle both common values and
+private values, showing how auction format design affects outcomes.
+
+RELEVANCE TO TRADING: MODERATE-HIGH
+
+1. THE WINNER'S CURSE IN TRADING:
+   When our bot buys a stock, it's "winning an auction" -- the
+   current ask price represents the cheapest someone is willing to
+   sell. If everyone else is selling, maybe they know something we
+   don't. This is the adverse selection problem.
+
+   For our system specifically:
+   - When our LSTM model gives a strong BUY signal but the price has
+     ALREADY moved up significantly, we may be buying at the top
+     (winner's curse). The signal is strongest when prices have
+     risen, but that's also when we're most likely overpaying.
+   - SOLUTION: Incorporate a "contrarian discount" -- when the model
+     is bullish AND price has already moved substantially (e.g.,
+     above its 20-period SMA by > 2 ATRs), reduce position size
+     or increase conviction threshold.
+
+2. INFORMATION AGGREGATION:
+   Milgrom showed that auction prices aggregate dispersed information.
+   In financial markets, prices aggregate the information of all
+   participants. When our model disagrees with the market price,
+   we should have strong reasons -- the market is aggregating many
+   other models and human judgments.
+
+3. OPTIMAL ORDER STRATEGIES:
+   Auction theory informs optimal bidding (ordering) strategies:
+   - In illiquid markets (crypto), place limit orders BELOW the
+     current bid-ask midpoint to avoid the winner's curse
+   - The optimal bid should account for estimated adverse selection
+   - Our current 5bps offset in compute_limit_price() is a crude
+     version of this
+
+SPECIFIC IMPLEMENTATIONS:
+
+A) WINNER'S CURSE FILTER
+   Algorithm: When the model signals BUY, check if price is already
+   extended (price > SMA20 + 2*ATR). If so, require a higher
+   prediction threshold or reduce position size.
+   Data needed: Already available (SMA, ATR in indicators.py)
+   Complexity: Low
+   Impact: Reduces buying at tops; may improve average entry price
+   Feasibility on Jetson: Trivial
+
+B) ADAPTIVE LIMIT ORDER OFFSET
+   Algorithm: Instead of fixed 5bps offset, calculate optimal offset
+   based on:
+     - Current bid-ask spread (wider spread -> larger offset)
+     - Recent volatility (higher vol -> larger offset)
+     - Model conviction (lower conviction -> larger offset)
+   Complexity: Low-Moderate
+   Impact: Better average fill prices
+   Feasibility on Jetson: Trivial
+
+------------------------------------------------------------------------
+2021: DAVID CARD, JOSHUA ANGRIST & GUIDO IMBENS
+"For empirical contributions to labor economics (Card) and
+methodological contributions to the analysis of causal relationships
+(Angrist & Imbens)"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Card used natural experiments (like minimum wage changes that affected
+one state but not a neighboring one) to establish causal effects in
+labor economics. Angrist and Imbens developed the framework of Local
+Average Treatment Effects (LATE) and instrumental variables for
+settings with imperfect compliance.
+
+RELEVANCE TO TRADING: MODERATE (METHODOLOGY)
+Their causal inference framework is valuable for evaluating our
+trading system:
+
+  - NATURAL EXPERIMENTS IN MARKETS: When the Fed unexpectedly
+    changes rates, that's a natural experiment. By measuring how
+    different stocks respond, we can estimate causal effects of
+    monetary policy on individual securities.
+
+  - INSTRUMENTAL VARIABLES FOR FEATURE SELECTION: When selecting
+    features for our LSTM model, we want features that have a CAUSAL
+    effect on future returns, not just correlations. IV methods can
+    help identify which technical indicators genuinely predict
+    returns vs. which are spuriously correlated.
+
+  - LABOR DATA AS TRADING SIGNALS: Card's work highlights the power
+    of employment data. Monthly jobs reports (NFP) are among the
+    most market-moving releases. Our system could flag NFP days and
+    adjust risk parameters.
+
+POTENTIAL IMPLEMENTATION:
+  - Create an economic calendar module that identifies high-impact
+    data releases (NFP, CPI, FOMC) and reduces position sizes on
+    those days or hours
+  - Apply instrumental variable analysis to feature selection in
+    our training pipeline
+  Data needed: Economic calendar (free APIs available)
+  Complexity: Low (calendar), High (IV analysis)
+  Impact: Reduced event-day risk; potentially better features
+  Feasibility on Jetson: Easy (calendar), Moderate (IV analysis)
+
+------------------------------------------------------------------------
+2022: BEN BERNANKE, DOUGLAS DIAMOND & PHILIP DYBVIG
+"For research on banks and financial crises"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Diamond and Dybvig modeled bank runs: banks perform maturity
+transformation (short-term deposits -> long-term loans), making them
+inherently vulnerable to coordinated withdrawals. A bank run can
+become self-fulfilling -- even a solvent bank fails if enough
+depositors withdraw simultaneously.
+
+Bernanke showed that the 1930s Great Depression was deepened by
+bank failures destroying the information capital in lending
+relationships. When banks fail, the economy loses the ability to
+channel savings to productive investments.
+
+RELEVANCE TO TRADING: MODERATE-HIGH
+
+1. SYSTEMIC RISK INDICATORS:
+   The Diamond-Dybvig model tells us what to watch for signals of
+   financial stress:
+   - BANK CDS SPREADS: Rising credit default swap spreads on major
+     banks signal systemic risk (predicted the 2008 crisis, the 2023
+     SVB crisis)
+   - INTERBANK LENDING RATES: Spreads between interbank rates (SOFR)
+     and risk-free rates (Treasury) indicate stress in the banking
+     system
+   - TED SPREAD (historically LIBOR - T-bill, now SOFR-based): A
+     classic measure of financial system stress
+
+2. BANK RUN ANALOGY FOR CRYPTO:
+   Crypto "bank runs" happen regularly:
+   - Stablecoin depegs (UST/LUNA, USDC wobble in March 2023)
+   - Exchange collapses (FTX November 2022)
+   - DeFi protocol exploits
+   These events create cascading sell-offs across all crypto assets.
+   Our bot should have CONTAGION DETECTORS.
+
+3. FLIGHT TO QUALITY:
+   During bank runs / financial crises, there's a flight to quality
+   (Treasury bonds, gold, USD). Our bot should detect risk-off
+   environments and reduce exposure.
+
+SPECIFIC IMPLEMENTATIONS:
+
+A) FINANCIAL STRESS INDEX
+   Data: FRED provides several stress indices:
+     - St. Louis Fed Financial Stress Index (STLFSI2)
+     - Chicago Fed National Financial Conditions Index (NFCI)
+     - OFR Financial Stress Index
+   All free, updated weekly.
+   Algorithm: When stress index exceeds historical threshold (e.g.,
+   > 1.0 standard deviations above mean):
+     - Reduce position sizes by 50%
+     - Tighten stop-losses
+     - Potentially halt new entries
+   Complexity: Very low
+   Impact: HIGH -- protects against tail risk events
+   Feasibility on Jetson: Trivial (weekly HTTP fetch)
+
+B) CRYPTO CONTAGION DETECTOR
+   Data: Monitor stablecoin pegs (USDT, USDC relative to $1.00)
+   Algorithm: If any major stablecoin deviates > 0.5% from peg:
+     - Immediately tighten all crypto stop-losses
+     - Halt new crypto entries
+     - Consider emergency flatten if deviation > 2%
+   Complexity: Low
+   Impact: HIGH -- protects against exchange/stablecoin collapse
+   Feasibility on Jetson: Easy (price monitoring already in place)
+
+------------------------------------------------------------------------
+2023: CLAUDIA GOLDIN
+"For having advanced our understanding of women's labor market outcomes"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Goldin collected 200+ years of US data to show how gender differences
+in earnings and employment evolved over time. She demonstrated that
+the gender pay gap is driven primarily by the "motherhood penalty"
+and the structure of work (firms that reward long hours and on-call
+availability penalize those with caregiving responsibilities).
+
+RELEVANCE TO TRADING: LOW
+Goldin's work is primarily about labor economics and gender dynamics.
+The trading relevance is indirect:
+
+  - MACRO LABOR MARKET ANALYSIS: Her methodology of using long-run
+    historical data to identify structural changes could inform how
+    we think about structural breaks in market data. Markets undergo
+    structural changes too (pre/post-HFT, pre/post-crypto, pre/post-
+    pandemic), and our model should account for potential regime
+    changes in the data.
+
+  - CONSUMER SPENDING: Goldin's work shows that dual-income households
+    have different spending patterns than single-income ones. This
+    affects consumer-facing sectors but is too high-level for our
+    30-second trading cycles.
+
+No specific implementation recommended.
+
+------------------------------------------------------------------------
+2024: DARON ACEMOGLU, SIMON JOHNSON & JAMES ROBINSON
+"For studies of how institutions are formed and affect prosperity"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Acemoglu, Johnson, and Robinson showed that inclusive institutions
+(protecting property rights, promoting broad participation, rule of
+law) drive long-run economic prosperity, while extractive institutions
+(concentrating power and wealth) lead to stagnation. They used
+colonial-era variation in institutional quality as natural experiments.
+
+RELEVANCE TO TRADING: LOW-MODERATE
+Their institutional framework has relevance for international and
+crypto investing:
+
+  - COUNTRY RISK IN INTERNATIONAL STOCKS: Institutional quality
+    predicts long-run stock market returns across countries. Markets
+    in countries with stronger institutions have higher risk-adjusted
+    returns.
+
+  - CRYPTO INSTITUTIONAL FRAMEWORK: The crypto market is still
+    developing its institutional framework (regulation, custody,
+    insurance). As institutions become more inclusive (ETF approvals,
+    regulatory clarity), crypto prices tend to rise. As they become
+    more extractive (bans, crackdowns), prices fall.
+
+  - REGULATORY REGIME CHANGES: Acemoglu's framework suggests that
+    institutional changes happen at "critical junctures." For crypto,
+    these are regulatory decisions (SEC ETF approval, CFTC
+    jurisdiction, EU MiCA implementation).
+
+POTENTIAL IMPLEMENTATION:
+  - Include regulatory sentiment as a specific factor in the LLM
+    analyst's crypto evaluation
+  - Track institutional development indicators for crypto markets
+  Data needed: Regulatory news (already captured by Finnhub headlines)
+  Complexity: Low
+  Impact: Better qualitative assessment of crypto environment
+  Feasibility on Jetson: Already partially implemented
+
+------------------------------------------------------------------------
+2025: JOEL MOKYR, PHILIPPE AGHION & PETER HOWITT
+"For having explained innovation-driven economic growth"
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Aghion and Howitt formalized "creative destruction" (Schumpeter's
+concept) in growth theory, showing how new innovations displace
+incumbents in a never-ending cycle that drives sustained growth.
+Mokyr identified the prerequisites for sustained technological
+progress: societies need deep understanding of WHY things work (not
+just THAT they work) for innovation to be self-sustaining.
+
+RELEVANCE TO TRADING: LOW-MODERATE
+
+  - CREATIVE DESTRUCTION IN STOCK SELECTION: Aghion-Howitt's model
+    implies that innovative firms displace incumbents. Our stock
+    universe should be periodically reviewed to drop stagnant
+    incumbents and add innovative challengers.
+
+  - R&D INTENSITY AS A FACTOR: Firms with higher R&D spending tend
+    to be the "creative destroyers." R&D/revenue ratio could be a
+    useful feature in stock selection.
+
+  - TECHNOLOGY ADOPTION S-CURVES: Mokyr's insight about understanding
+    "why" suggests that technologies at the "understanding" phase
+    (vs. mere "tinkering") have more sustained value creation
+    potential.
+
+POTENTIAL IMPLEMENTATION:
+  - Add R&D intensity ratio to fundamentals.py for stock analysis
+  - Periodically review and update stock_config.py to replace
+    stagnant firms with innovative ones
+  Data needed: R&D spending from financial statements
+  Complexity: Low
+  Impact: Marginal improvement in stock universe quality
+  Feasibility on Jetson: Trivial
+
+
+================================================================================
+PART II: FOUNDATIONAL PRE-2005 LAUREATES
+================================================================================
+
+------------------------------------------------------------------------
+1990: HARRY MARKOWITZ, MERTON MILLER & WILLIAM SHARPE
+Modern Portfolio Theory, Capital Asset Pricing Model
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Markowitz (1952) showed that portfolio risk depends not just on
+individual asset risks but on their COVARIANCES. The "efficient
+frontier" identifies portfolios with maximum return for given risk
+(or minimum risk for given return). Sharpe extended this to the
+Capital Asset Pricing Model (CAPM), showing that expected return is
+linearly related to systematic risk (beta). Miller contributed the
+Modigliani-Miller theorem on capital structure.
+
+RELEVANCE TO TRADING: CRITICAL
+
+Our bot currently has NO portfolio optimization. Each position is
+sized independently (fixed NOTIONAL_PER_SYMBOL). This is suboptimal:
+
+  - CORRELATION RISK: If we hold 5 tech stocks and they're all
+    correlated at 0.8, our effective diversification is much less
+    than holding 5 uncorrelated assets. A single adverse event
+    (tech selloff) hits all positions simultaneously.
+
+  - POSITION SIZING: Markowitz shows optimal position sizes should
+    depend on expected returns AND the covariance matrix. High-return,
+    low-correlation assets should get larger allocations.
+
+  - THE SHARPE RATIO: Our hypersearch already optimizes for Sharpe
+    ratio. This is directly from Sharpe's CAPM framework -- we're
+    maximizing risk-adjusted returns.
+
+SPECIFIC IMPLEMENTATIONS:
+
+A) CORRELATION-AWARE POSITION SIZING
+   Data: Rolling 30-day correlation matrix of portfolio assets
+   Algorithm: Before entering a new position, compute how it changes
+   the portfolio's correlation structure. If the new position is
+   highly correlated (> 0.7) with existing positions, reduce its
+   size or skip it entirely.
+   Complexity: Moderate (need to track and compute rolling correlations)
+   Impact: SIGNIFICANT -- reduces blow-up risk from concentrated bets
+   Feasibility on Jetson: Easy (numpy covariance matrix on 10 assets
+   is trivial)
+
+B) MEAN-VARIANCE POSITION OPTIMIZATION
+   Data: Model predictions (expected returns) + rolling covariance
+   Algorithm: Use PyPortfolioOpt or scipy.optimize to solve for
+   optimal weights given our LSTM predictions as expected returns
+   and historical covariance as risk inputs. This replaces the
+   current fixed $1000-5000 per symbol approach.
+   Complexity: Moderate-High
+   Impact: Potentially significant -- proper portfolio optimization
+   Feasibility on Jetson: Moderate (PyPortfolioOpt is pure Python,
+   runs on ARM64; scipy quadratic programming is lightweight)
+
+C) MAXIMUM PORTFOLIO CORRELATION CHECK
+   Data: Current positions + candidate entries
+   Algorithm: Simple rule -- never allow portfolio average pairwise
+   correlation to exceed 0.6. If adding a new position would push
+   it above, skip the entry.
+   Complexity: Low
+   Impact: Moderate -- prevents over-concentration
+   Feasibility on Jetson: Trivial
+
+------------------------------------------------------------------------
+1997: ROBERT MERTON & MYRON SCHOLES
+Black-Scholes-Merton Option Pricing
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+The Black-Scholes-Merton model provides a closed-form formula for
+pricing European options, based on the insight that an option can be
+replicated by a continuously-adjusted portfolio of the underlying
+asset and a risk-free bond. Key insight: the only unobservable input
+is the underlying asset's VOLATILITY.
+
+RELEVANCE TO TRADING: MODERATE
+
+We don't trade options, but the BSM framework provides crucial
+volatility insights:
+
+  - IMPLIED VOLATILITY (IV): Options prices reveal the market's
+    EXPECTATION of future volatility. When IV is high relative to
+    realized volatility, options are "expensive" (fear is elevated).
+    When IV is low, the market is complacent.
+
+  - THE VIX: The VIX index (CBOE Volatility Index) is derived from
+    S&P 500 option prices using BSM-related methodology. It's the
+    market's "fear gauge" and is already partially captured by our
+    Fear & Greed Index.
+
+  - VOLATILITY SMILE: Options at different strike prices often have
+    different implied volatilities (the "smile" or "skew"). The skew
+    tells us about tail risk expectations -- a steep put skew means
+    the market is worried about a crash.
+
+  - DYNAMIC HEDGING INSIGHT: BSM shows that risk management requires
+    CONTINUOUS adjustment, not static stops. Our ATR-based stops
+    partially capture this (ATR adapts as volatility changes), but
+    we could be more sophisticated.
+
+SPECIFIC IMPLEMENTATIONS:
+
+A) VIX-BASED REGIME FILTER
+   Data: VIX (available from Yahoo Finance via yfinance)
+   Algorithm: Use VIX levels to adjust risk parameters:
+     - VIX < 15: Low fear, normal trading
+     - VIX 15-25: Moderate fear, slightly tighten stops
+     - VIX 25-35: High fear, reduce position sizes by 50%
+     - VIX > 35: Extreme fear, halt new stock entries, tighten
+       all stops
+   Complexity: Very low
+   Impact: Moderate -- VIX is a well-validated risk indicator
+   Feasibility on Jetson: Trivial (yfinance already installed)
+
+B) IV PERCENTILE AS FEATURE
+   Data: Historical options IV data (harder to get for free)
+   Algorithm: Add IV percentile rank as a feature for the LSTM
+   model. High IV percentile often precedes mean reversion in
+   volatility, which affects directional predictions.
+   Complexity: Moderate (data sourcing challenge)
+   Impact: Moderate
+   Feasibility on Jetson: Depends on data availability
+
+------------------------------------------------------------------------
+2001: GEORGE AKERLOF, MICHAEL SPENCE & JOSEPH STIGLITZ
+Markets with Asymmetric Information
+------------------------------------------------------------------------
+
+CONTRIBUTION SUMMARY:
+Akerlof's "Market for Lemons" (1970) showed how information asymmetry
+leads to adverse selection -- when buyers can't distinguish good from
+bad products, bad products drive out good ones. Spence showed how
+the informed party can SIGNAL quality (e.g., education as a signal).
+Stiglitz showed how the uninformed party can SCREEN to extract
+information (e.g., insurance deductibles).
+
+RELEVANCE TO TRADING: MODERATE-HIGH
+
+Information asymmetry is CENTRAL to trading:
+
+  - ADVERSE SELECTION IN ORDER FLOW: When our bot places a buy order,
+    the party selling to us may have superior information (insider
+    knowledge, better models, more data). We face adverse selection
+    -- the orders most likely to fill are those where the other side
+    is confident they're right.
+
+  - SIGNALING IN MARKETS: Corporate actions are signals:
+    - Share buybacks signal management confidence (positive)
+    - Insider selling signals pessimism (negative)
+    - Dividend increases signal earnings stability
+    - Secondary offerings signal overvaluation or capital needs
+    Our fundamentals.py and LLM analyst could explicitly evaluate
+    these signals.
+
+  - SCREENING: Our LSTM model acts as a screening device -- it
+    attempts to separate "good" trades (positive expected return)
+    from "bad" ones (negative expected return). Stiglitz's framework
+    suggests we should design our screening to extract maximum
+    information about whether we face adverse selection.
+
+  - INSIDER TRADING AS INFORMATION SIGNAL: Stocks with high insider
+    buying tend to outperform. This is Spence's signaling theory
+    applied -- insiders use their OWN MONEY to signal confidence.
+
+SPECIFIC IMPLEMENTATIONS:
+
+A) INSIDER TRADING SIGNAL
+   Data: SEC Form 4 filings (available via Finnhub or SEC EDGAR API)
+   Algorithm: Track insider buying/selling ratios for our stock
+   universe. Net insider buying adds conviction; net insider selling
+   reduces it. Already partially implemented in fundamentals.py
+   with get_insider_activity().
+   Complexity: Low (data sourcing already started)
+   Impact: Moderate -- insider buying is one of the better-validated
+   signals in the academic literature
+   Feasibility on Jetson: Easy
+
+B) ADVERSE SELECTION SPREAD ANALYSIS
+   Data: Bid-ask spreads (already collected in order_utils.py)
+   Algorithm: Unusually wide spreads indicate higher adverse
+   selection risk (market makers protecting themselves from informed
+   traders). When spreads are unusually wide relative to their
+   historical average:
+     - Reduce position size
+     - Use more aggressive limit offsets
+     - Consider skipping the trade entirely
+   Complexity: Low (need to track historical spreads per symbol)
+   Impact: Moderate -- avoids trading when information asymmetry is
+   highest
+   Feasibility on Jetson: Easy
+
+------------------------------------------------------------------------
+2002: DANIEL KAHNEMAN (with Vernon Smith)
+"For having integrated insights from psychological research into
+economic science, especially concerning human judgment and decision-
+making under uncertainty"
+------------------------------------------------------------------------
+
+*** FOUNDATIONAL TO OUR SYSTEM'S DESIGN PHILOSOPHY ***
+
+CONTRIBUTION SUMMARY:
+Kahneman and Amos Tversky (who died before the prize) developed
+Prospect Theory, which describes how people ACTUALLY make decisions
+under uncertainty (as opposed to how rational agents SHOULD):
+
+  LOSS AVERSION: Losses hurt approximately 2x as much as equivalent
+  gains feel good. A $100 loss feels as bad as a $200 gain feels
+  good.
+
+  REFERENCE DEPENDENCE: People evaluate outcomes relative to a
+  reference point (usually the status quo), not in absolute terms.
+
+  PROBABILITY WEIGHTING: People overweight small probabilities
+  (why they buy lottery tickets and insurance) and underweight large
+  probabilities.
+
+  FRAMING EFFECTS: How a choice is presented affects the decision.
+  "90% survival rate" vs. "10% mortality rate" elicit different
+  choices despite being mathematically identical.
+
+  ANCHORING: Initial information disproportionately influences
+  subsequent judgments.
+
+RELEVANCE TO TRADING: CRITICAL
+
+1. LOSS AVERSION AND STOP-LOSS DESIGN:
+   Our stop-loss system should be designed with Kahneman's insights:
+   - Humans hold losers too long (loss aversion -> reluctance to
+     realize losses). Our mechanical stops prevent this.
+   - Humans sell winners too soon (risk aversion for gains). Our
+     trailing stop system partially addresses this, but we should
+     verify our take-profit levels aren't too tight.
+
+2. THE DISPOSITION EFFECT:
+   Kahneman's prospect theory explains the disposition effect
+   (Thaler, above). Our bot is IMMUNE to this because it follows
+   mechanical rules. This is a genuine EDGE over human traders.
+   We should NEVER add manual override capability.
+
+3. MARKET PARTICIPANT BEHAVIOR:
+   OTHER market participants (especially retail crypto traders) DO
+   exhibit these biases. We can EXPLOIT them:
+   - ANCHORING at round numbers (BTC at $50K, $60K, $100K) creates
+     support/resistance levels that are behaviorally driven
+   - OVERREACTION to bad news (loss aversion amplifies selling
+     pressure) creates buying opportunities after negative events
+   - UNDERREACTION to gradual changes (probability weighting) means
+     slow trends are often underpriced
+
+4. PROBABILITY CALIBRATION:
+   Kahneman showed people are terrible at estimating probabilities.
+   Our LSTM model outputs predicted returns, not probabilities. If
+   we convert to probabilities (e.g., probability of positive return),
+   we should NOT apply human probability intuitions to them. Use
+   the raw model output with proper calibration.
+
+SPECIFIC IMPLEMENTATIONS:
+
+A) OVERREACTION DETECTOR
+   Algorithm: After large negative moves (> 3 ATR daily decline),
+   check if the move is justified by fundamentals or is a behavioral
+   overreaction. If overreaction, this is a buying opportunity.
+   Combine with LLM analyst assessment of whether news justifies
+   the move.
+   Data needed: Already available (price data, LLM analyst)
+   Complexity: Moderate (distinguishing overreaction from justified
+   decline is the hard part)
+   Impact: Could capture mean-reversion alpha after panic selling
+   Feasibility on Jetson: Easy
+
+B) ROUND NUMBER SUPPORT/RESISTANCE
+   Algorithm: Identify round-number levels near current price and
+   factor them into stop-loss and take-profit placement:
+     - Don't place stops just below obvious round numbers (other
+       traders' stops cluster there, causing cascade selling)
+     - Place take-profits just below round numbers (where selling
+       pressure accumulates)
+   Complexity: Very low
+   Impact: Marginal but essentially free
+   Feasibility on Jetson: Trivial
+
+------------------------------------------------------------------------
+2003: ROBERT ENGLE (with Clive Granger)
+"For methods of analyzing economic time series with time-varying
+volatility (ARCH)"
+------------------------------------------------------------------------
+
+*** MOST DIRECTLY IMPLEMENTABLE IMPROVEMENT FOR OUR SYSTEM ***
+
+CONTRIBUTION SUMMARY:
+Engle developed ARCH (Autoregressive Conditional Heteroskedasticity)
+models in 1982. His student Tim Bollerslev generalized this to GARCH
+(1986), the most widely used volatility model in finance.
+
+Key insight: VOLATILITY CLUSTERS. Periods of high volatility tend to
+be followed by more high volatility, and periods of low volatility
+tend to continue. GARCH models capture this pattern by making today's
+volatility forecast depend on both recent squared returns (ARCH
+component) AND the previous volatility forecast (GARCH component).
+
+The GARCH(1,1) model:
+  sigma_t^2 = omega + alpha * r_{t-1}^2 + beta * sigma_{t-1}^2
+
+Where:
+  sigma_t^2 = today's variance forecast
+  omega = long-run variance constant
+  alpha = weight on yesterday's squared return (ARCH term)
+  beta = weight on yesterday's variance forecast (GARCH term)
+
+RELEVANCE TO TRADING: CRITICAL
+
+Our current volatility measure is ATR (Average True Range), which is
+a simple rolling average of true ranges. GARCH offers several
+advantages:
+
+1. ATR vs. GARCH COMPARISON:
+   ATR:
+   + Simple, robust, no estimation required
+   + Well-understood by practitioners
+   - Equal weighting of all observations in window
+   - Doesn't capture volatility clustering directly
+   - Slow to react to regime changes (uses 14-period average)
+   - No forward-looking forecast capability
+
+   GARCH:
+   + Captures volatility clustering (the most important volatility
+     feature)
+   + Exponentially decays old information (recent data matters more)
+   + Provides genuine FORECASTS of future volatility
+   + Can model asymmetric response (bad news -> more volatility,
+     via GJR-GARCH)
+   + Allows computation of Value-at-Risk (VaR)
+   - Requires parameter estimation
+   - More computationally expensive
+   - Can be numerically unstable with short series
+
+2. GARCH FOR STOP-LOSS IMPROVEMENT:
+   Our current stop-loss: entry - (ATR * multiplier)
+   GARCH-based stop: entry - (GARCH_forecast * multiplier)
+
+   The key advantage: GARCH FORECASTS adapt faster to changing
+   volatility regimes. When volatility suddenly spikes (e.g., news
+   event), GARCH immediately widens the expected range, while ATR
+   takes several periods to catch up. This means:
+   - Fewer premature stop-outs during volatility spikes
+   - Tighter stops during calm periods (capturing smaller moves)
+
+3. GARCH FOR POSITION SIZING:
+   Kelly-optimal position sizing depends on expected return / variance.
+   If we have better variance forecasts (GARCH), we get better
+   position sizing:
+   - Low GARCH forecast -> larger positions (calm market)
+   - High GARCH forecast -> smaller positions (volatile market)
+
+4. HYBRID LSTM-GARCH:
+   Recent research (2024-2025) shows that LSTM-GARCH hybrid models
+   outperform either alone for volatility forecasting in crypto
+   portfolios. Our existing LSTM architecture could incorporate
+   GARCH residuals as features:
+   - GARCH standardized residual = return / GARCH_sigma
+   - If |standardized residual| > 3, it's an outlier event
+   - The standardized residual series has nicer statistical properties
+     than raw returns
+
+SPECIFIC IMPLEMENTATIONS:
+
+A) GARCH(1,1) VOLATILITY FORECASTING MODULE
+   Library: arch (pip install arch) -- confirmed ARM64/aarch64
+   compatible with pre-built wheels
+   Algorithm:
+     1. Fit GARCH(1,1) on 100-250 recent daily returns
+     2. Forecast 1-day-ahead volatility
+     3. Use as replacement or supplement to ATR in stop-loss calc
+   Code sketch:
+     from arch import arch_model
+     am = arch_model(returns, vol='Garch', p=1, q=1, dist='t')
+     res = am.fit(disp='off')
+     forecast = res.forecast(horizon=1)
+     sigma_1d = np.sqrt(forecast.variance.values[-1, 0])
+   Complexity: Moderate (fitting GARCH, handling edge cases)
+   Impact: SIGNIFICANT -- better volatility forecasts improve
+   stop-loss placement, position sizing, and risk management
+   Feasibility on Jetson: GOOD -- arch package supports aarch64.
+   GARCH fitting on 250 observations takes < 1 second. Could fit
+   once per hour, not every 30-second cycle.
+
+B) GJR-GARCH FOR ASYMMETRIC VOLATILITY
+   Enhancement: GJR-GARCH adds a term for negative returns (leverage
+   effect). In stocks, bad news increases volatility more than good
+   news by the same magnitude. In crypto, the asymmetry is even
+   stronger.
+   Algorithm: Same as above but vol='GARCH' -> vol='GJR-GARCH'
+   Complexity: Same as GARCH(1,1)
+   Impact: Slightly better than standard GARCH for stocks
+   Feasibility on Jetson: Same as above
+
+C) GARCH-BASED POSITION SIZING
+   Algorithm: Replace fixed NOTIONAL_PER_SYMBOL with:
+     adjusted_notional = BASE_NOTIONAL * (TARGET_VOL / garch_sigma)
+   Where TARGET_VOL is our desired per-position volatility (e.g., 2%).
+   This ensures each position contributes roughly equal risk.
+   Complexity: Low (once GARCH is implemented)
+   Impact: SIGNIFICANT -- risk parity across positions
+   Feasibility on Jetson: Trivial
+
+D) GARCH FEATURES FOR LSTM
+   Algorithm: Add to the feature set in indicators.py:
+     - GARCH conditional volatility (sigma_t)
+     - GARCH standardized residuals (r_t / sigma_t)
+     - GARCH volatility forecast ratio (sigma_{t+1} / sigma_t)
+   Complexity: Moderate (integrate GARCH into harvest pipeline)
+   Impact: Potentially significant -- gives the LSTM better
+   volatility information than raw ATR
+   Feasibility on Jetson: Good (GARCH fitting in batch during harvest)
+
+
+================================================================================
+PART III: PRIORITY-RANKED IMPLEMENTATION ROADMAP
+================================================================================
+
+Based on the analysis above, here are the implementations ranked by
+expected impact / complexity ratio, most actionable first:
+
+------------------------------------------------------------------------
+TIER 1: HIGH IMPACT, LOW COMPLEXITY (Implement First)
+------------------------------------------------------------------------
+
+1. FINANCIAL STRESS INDEX (from Bernanke/Diamond/Dybvig 2022)
+   - Fetch STLFSI2 or NFCI from FRED weekly
+   - When elevated, reduce position sizes and tighten stops
+   - Expected: Major tail-risk protection
+   - Effort: ~2-3 hours
+   - Files to modify: crypto_loop.py, stock_loop.py, sentiment.py
+
+2. VIX-BASED REGIME FILTER (from Merton/Scholes 1997)
+   - Fetch VIX from yfinance (already installed)
+   - Adjust risk parameters by VIX level
+   - Expected: Better regime-aware risk management
+   - Effort: ~2-3 hours
+   - Files to modify: stock_loop.py, market_data.py
+
+3. CAPE REGIME AWARENESS (from Shiller 2013)
+   - Fetch monthly CAPE from free API
+   - Use as position-sizing multiplier (reduce when overvalued)
+   - Expected: Long-term regime protection
+   - Effort: ~1-2 hours
+   - Files to modify: stock_loop.py (or a new regime.py module)
+
+4. CRYPTO CONTAGION DETECTOR (from Diamond/Dybvig 2022)
+   - Monitor stablecoin pegs in real-time
+   - Emergency response when deviation exceeds thresholds
+   - Expected: Critical protection against exchange/stablecoin
+     failures
+   - Effort: ~2-3 hours
+   - Files to modify: crypto_loop.py, market_data.py
+
+5. WINNER'S CURSE FILTER (from Milgrom/Wilson 2020)
+   - Don't buy when price already extended above SMA + 2 ATR
+   - Expected: Better average entry prices
+   - Effort: ~1 hour
+   - Files to modify: crypto_loop.py, stock_loop.py
+
+------------------------------------------------------------------------
+TIER 2: HIGH IMPACT, MODERATE COMPLEXITY (Implement Second)
+------------------------------------------------------------------------
+
+6. GARCH VOLATILITY MODULE (from Engle 2003)
+   - Install arch package, implement GARCH(1,1) fitting
+   - Use forecasts for stop-loss placement and position sizing
+   - Expected: Significantly better risk management
+   - Effort: ~6-8 hours
+   - Files to modify: New volatility.py module, crypto_loop.py,
+     stock_loop.py, indicators.py
+
+7. CORRELATION-AWARE PORTFOLIO MANAGEMENT (from Markowitz 1990)
+   - Compute rolling correlation matrix of portfolio positions
+   - Limit maximum portfolio correlation, adjust sizes
+   - Expected: Reduced concentration risk
+   - Effort: ~4-6 hours
+   - Files to modify: crypto_loop.py, stock_loop.py (or new
+     portfolio.py module)
+
+8. ADVERSE SELECTION SPREAD MONITOR (from Akerlof/Stiglitz 2001)
+   - Track historical spread percentiles per symbol
+   - Reduce position size or skip when spreads abnormally wide
+   - Expected: Fewer adverse-selection-driven losses
+   - Effort: ~3-4 hours
+   - Files to modify: order_utils.py, crypto_loop.py, stock_loop.py
+
+9. ECONOMIC CALENDAR MODULE (from Card/Angrist 2021)
+   - Build or integrate an economic calendar
+   - Reduce risk exposure before high-impact data releases
+   - Expected: Fewer event-driven surprise losses
+   - Effort: ~4-5 hours
+   - Files to modify: New econ_calendar.py, stock_loop.py
+
+------------------------------------------------------------------------
+TIER 3: MODERATE IMPACT, LOW-MODERATE COMPLEXITY (Nice to Have)
+------------------------------------------------------------------------
+
+10. CALENDAR EFFECT FEATURES (from Thaler 2017)
+    - Add day-of-week, month, turn-of-month features to LSTM
+    - Expected: Marginal improvement
+    - Effort: ~2 hours
+    - Files to modify: indicators.py, harvest scripts
+
+11. MOMENTUM FACTOR AS EXPLICIT FEATURE (from Fama 2013)
+    - Add 1-month and 3-month momentum rank to features
+    - Expected: Moderate improvement (captures robust anomaly)
+    - Effort: ~2 hours
+    - Files to modify: indicators.py, harvest scripts
+
+12. INFLATION EXPECTATIONS DATA (from Phelps 2006)
+    - Fetch TIPS breakeven rates from FRED
+    - Include in LLM macro context
+    - Expected: Better macro regime awareness
+    - Effort: ~1-2 hours
+    - Files to modify: sentiment.py or fundamentals.py, LLM prompt
+
+13. ROUND NUMBER SUPPORT/RESISTANCE (from Kahneman 2002)
+    - Factor round numbers into stop/target placement
+    - Expected: Marginal improvement in execution
+    - Effort: ~1 hour
+    - Files to modify: crypto_loop.py, stock_loop.py
+
+14. ORDER TIMING RANDOMIZATION (from Aumann/Schelling 2005)
+    - Add jitter to loop intervals and order offsets
+    - Expected: Marginal improvement (anti-gaming)
+    - Effort: ~30 minutes
+    - Files to modify: crypto_loop.py, stock_loop.py
+
+------------------------------------------------------------------------
+TIER 4: RESEARCH / ANALYSIS TASKS (Insight Generation)
+------------------------------------------------------------------------
+
+15. FAMA-FRENCH FACTOR REGRESSION (from Fama 2013)
+    - Analyze our returns against the five factors
+    - Expected: Understanding of whether we have genuine alpha
+    - Effort: ~4-6 hours (one-time analysis)
+    - Files: New analysis script
+
+16. ANTI-DISPOSITION AUDIT (from Thaler 2017, Kahneman 2002)
+    - Analyze historical trades for disposition effect patterns
+    - Expected: Validates our stop-loss/take-profit design
+    - Effort: ~3-4 hours (one-time analysis)
+    - Files: New analysis script using trade_journal.py data
+
+17. VAR MODEL FOR CROSS-ASSET ANALYSIS (from Sargent/Sims 2011)
+    - Fit VAR model to portfolio assets to find lead-lag relations
+    - Expected: Potential cross-asset alpha; complex to implement
+    - Effort: ~8-12 hours
+    - Files: New analysis module
+
+18. A/B TESTING FRAMEWORK (from Banerjee/Duflo 2019)
+    - Formalize parameter testing with control groups
+    - Expected: Better parameter optimization
+    - Effort: ~6-8 hours
+    - Files: New testing framework
+
+
+================================================================================
+PART IV: CROSS-CUTTING THEMES AND SYNTHESIS
+================================================================================
+
+------------------------------------------------------------------------
+THEME 1: THE EFFICIENCY-BEHAVIORAL FINANCE SPECTRUM
+------------------------------------------------------------------------
+
+The 2013 prize (Fama + Shiller) represents the central tension in
+our system. Our bot implicitly assumes:
+  - Markets are NOT perfectly efficient (otherwise our LSTM has no
+    edge)
+  - Markets are MOSTLY efficient (otherwise everyone would be rich)
+  - Our edge comes from exploiting the gap between efficiency and
+    behavioral irrationality
+
+The practical synthesis:
+  - In LIQUID, WELL-STUDIED MARKETS (S&P 500 stocks), our edge is
+    small. Focus on risk management over alpha generation.
+  - In LESS EFFICIENT MARKETS (crypto, small caps), behavioral
+    anomalies are larger and our model may have a genuine edge.
+  - Our BIGGEST EDGE is not prediction accuracy but DISCIPLINE:
+    mechanical execution without behavioral biases (disposition
+    effect, loss aversion, anchoring).
+
+------------------------------------------------------------------------
+THEME 2: VOLATILITY IS THE KEY STATE VARIABLE
+------------------------------------------------------------------------
+
+Multiple laureates' work converges on volatility as the single most
+important variable for risk management:
+  - Engle (2003): GARCH for volatility forecasting
+  - Merton/Scholes (1997): Implied volatility from options
+  - Markowitz (1990): Variance in portfolio optimization
+  - Hansen (2013): Volatility in stochastic discount factors
+
+Our current ATR-based approach is a reasonable approximation, but
+GARCH offers a theoretically superior and empirically validated
+improvement. Priority recommendation: Implement GARCH.
+
+------------------------------------------------------------------------
+THEME 3: INFORMATION IS EVERYTHING
+------------------------------------------------------------------------
+
+Several prizes emphasize information processing:
+  - Akerlof/Spence/Stiglitz (2001): Information asymmetry
+  - Milgrom/Wilson (2020): Information in auctions
+  - Kahneman (2002): Biased information processing
+
+Our system already has a two-layer information architecture:
+  - QUANTITATIVE: LSTM model processes technical features
+  - QUALITATIVE: LLM analyst processes news, fundamentals, macro
+
+This dual-layer approach is well-aligned with the academic literature.
+The key improvement would be making the QUANTITATIVE layer aware of
+VOLATILITY STATE (GARCH) and making the QUALITATIVE layer aware of
+MACRO STATE (financial stress indices, CAPE, VIX, inflation
+expectations).
+
+------------------------------------------------------------------------
+THEME 4: TAIL RISK AND SYSTEMIC EVENTS
+------------------------------------------------------------------------
+
+Bernanke/Diamond/Dybvig (2022) remind us that the most damaging
+events are systemic: bank runs, exchange collapses, liquidity crises.
+Our bot needs protection against these fat-tail events:
+
+Current protection:
+  + Circuit breaker (5% daily equity drawdown -> flatten)
+  + Individual stop-losses (ATR-based)
+  + Sentiment gating (Fear & Greed Index)
+
+Missing protection:
+  - Financial stress index monitoring
+  - Stablecoin peg monitoring (crypto-specific)
+  - VIX regime awareness
+  - Cross-asset correlation spike detection (all correlations -> 1
+    during crises)
+
+------------------------------------------------------------------------
+THEME 5: THE BEHAVIORAL EDGE
+------------------------------------------------------------------------
+
+Kahneman (2002) and Thaler (2017) provide our bot's most fundamental
+advantage: it doesn't have human psychology. While other market
+participants (especially retail traders in crypto) exhibit:
+  - Loss aversion -> hold losers too long
+  - Disposition effect -> sell winners too early
+  - Anchoring -> fixate on entry prices
+  - Overconfidence -> over-trade
+  - Herding -> buy at tops, sell at bottoms
+
+Our bot follows mechanical rules. This is an edge that persists
+because it's rooted in human psychology, not in market structure.
+As long as markets have human participants, behavioral biases create
+exploitable inefficiencies.
+
+------------------------------------------------------------------------
+THEME 6: MACRO-FINANCE INTEGRATION
+------------------------------------------------------------------------
+
+Several prizes emphasize the link between macroeconomics and asset
+prices: Phelps (2006), Sargent/Sims (2011), Bernanke (2022). Our
+current system has limited macro awareness (Fear & Greed Index,
+LLM macro commentary). The recommended enhancement path:
+
+Level 1 (current): Fear & Greed Index + LLM macro assessment
+Level 2 (recommended): Add VIX, financial stress indices, CAPE
+Level 3 (aspirational): Add TIPS breakeven rates, yield curve
+  slope, credit spreads, JOLTS data
+
+Each level adds macro regime awareness at minimal computational cost
+(HTTP requests to free APIs).
+
+------------------------------------------------------------------------
+HARDWARE FEASIBILITY SUMMARY (Jetson Orin Nano, 8GB)
+------------------------------------------------------------------------
+
+All recommended implementations are feasible on the Jetson:
+
+  - GARCH fitting (arch package): Confirmed ARM64 compatible. Fitting
+    on 250 data points takes < 1 second. Fit once per hour, not
+    every 30s cycle. Memory: < 50MB additional.
+
+  - Correlation matrix (numpy): 10x10 or 31x31 covariance matrix is
+    trivial. < 1ms computation. < 1MB memory.
+
+  - HMM regime detection (hmmlearn): Confirmed ARM64 compatible.
+    Fitting a 3-state HMM on 250 daily returns takes < 1 second.
+    < 20MB memory.
+
+  - PyPortfolioOpt / scipy optimization: Pure Python + scipy, works
+    on ARM64. Optimization for 10-31 assets takes < 100ms. < 20MB
+    memory.
+
+  - API calls (FRED, Shiller, VIX): HTTP requests, negligible compute.
+    < 1MB memory each.
+
+  Total additional memory overhead: < 100MB, well within our 8GB budget.
+  All operations can be batched (run once per hour or once per day)
+  rather than every 30-second trading cycle, so there is no impact
+  on cycle time.
+
+
+================================================================================
+COMPLETE LAUREATE REFERENCE TABLE (2005-2025)
+================================================================================
+
+Year  | Laureates                          | Topic                    | Trading Relevance
+------|------------------------------------|--------------------------|------------------
+2025  | Mokyr, Aghion, Howitt              | Innovation & Growth      | LOW-MODERATE
+2024  | Acemoglu, Johnson, Robinson        | Institutions             | LOW-MODERATE
+2023  | Goldin                             | Labor / Gender           | LOW
+2022  | Bernanke, Diamond, Dybvig          | Banks / Financial Crises | MODERATE-HIGH
+2021  | Card, Angrist, Imbens              | Causal Inference         | MODERATE (method)
+2020  | Milgrom, Wilson                    | Auction Theory           | MODERATE-HIGH
+2019  | Banerjee, Duflo, Kremer            | RCTs / Poverty           | MODERATE (method)
+2018  | Nordhaus, Romer                    | Climate / Innovation     | LOW-MODERATE
+2017  | Thaler                             | Behavioral Economics     | HIGH
+2016  | Hart, Holmstrom                    | Contract Theory          | LOW-MODERATE
+2015  | Deaton                             | Consumption / Welfare    | LOW
+2014  | Tirole                             | Market Power             | LOW-MODERATE
+2013  | Fama, Hansen, Shiller              | Asset Pricing            | CRITICAL
+2012  | Roth, Shapley                      | Market Design            | LOW
+2011  | Sargent, Sims                      | Macro Causality / VAR    | MODERATE-HIGH
+2010  | Diamond, Mortensen, Pissarides     | Search Frictions         | LOW-MODERATE
+2009  | Ostrom, Williamson                 | Economic Governance      | LOW
+2008  | Krugman                            | Trade / Geography        | LOW
+2007  | Hurwicz, Maskin, Myerson           | Mechanism Design         | LOW-MODERATE
+2006  | Phelps                             | Inflation / Phillips     | MODERATE
+2005  | Aumann, Schelling                  | Game Theory              | LOW-MODERATE
+
+Pre-2005 Foundational:
+2003  | Engle (with Granger)               | ARCH/GARCH Volatility    | CRITICAL
+2002  | Kahneman (with Smith)              | Prospect Theory          | CRITICAL
+2001  | Akerlof, Spence, Stiglitz          | Information Asymmetry    | MODERATE-HIGH
+1997  | Merton, Scholes                    | Option Pricing           | MODERATE
+1990  | Markowitz, Sharpe, Miller          | Portfolio Theory / CAPM  | CRITICAL
+
+
+================================================================================
+SUMMARY: TOP 5 MOST ACTIONABLE INSIGHTS
+================================================================================
+
+1. IMPLEMENT GARCH VOLATILITY FORECASTING (Engle 2003)
+   Replace or augment ATR with GARCH for stop-losses and position
+   sizing. The arch Python package runs on ARM64. This is the single
+   highest-impact improvement available from a risk management
+   perspective.
+
+2. ADD FINANCIAL STRESS / VIX REGIME FILTERS (Bernanke 2022 +
+   Merton/Scholes 1997)
+   Monitor systemic risk indicators (STLFSI2, VIX) and scale down
+   exposure during stress periods. Free data from FRED and yfinance.
+   This protects against the tail-risk events our LSTM model cannot
+   predict.
+
+3. CORRELATION-AWARE POSITION SIZING (Markowitz 1990)
+   Stop treating each position independently. Compute rolling
+   correlations and ensure the portfolio has genuine diversification.
+   This is the biggest gap in our current system's risk management.
+
+4. LEVERAGE OUR BEHAVIORAL EDGE (Kahneman 2002 + Thaler 2017)
+   Our mechanical execution is an edge over human traders. Verify
+   this edge is maintained (audit for disposition effect, validate
+   stop-loss asymmetry). Never add manual override capabilities.
+   Consider exploiting others' behavioral biases (overreaction
+   detector, round-number support/resistance).
+
+5. MACRO REGIME AWARENESS LAYER (Shiller 2013 + Phelps 2006)
+   Add CAPE ratio, inflation expectations, and economic calendar
+   awareness to the LLM analyst's macro context. This gives the
+   qualitative layer better regime information for adjusting
+   conviction scores.
+
+================================================================================
+END OF REPORT
+================================================================================

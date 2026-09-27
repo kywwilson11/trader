@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import os
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -37,7 +38,9 @@ from data_sources import fetch_with_fallback
 from data_utils import (load_training_data, save_training_data,
                          append_ticker_data, validate_training_data,
                          raw_sidecar_enabled, load_raw_ohlcv, save_raw_ohlcv,
-                         merge_raw_ohlcv, find_interior_gaps)
+                         merge_raw_ohlcv, find_interior_gaps,
+                         _ensure_utc_index, wick_print_filter_enabled,
+                         repair_wick_prints)
 from market_data import fetch_historical_bars
 
 load_dotenv()
@@ -139,6 +142,14 @@ def prepare_data(ticker, btc_close=None, api=None, existing_ohlcv=None,
     if ohlcv.empty:
         return None
 
+    # Fail loud on a mis-typed bar index (R5: a mixed-tz merge once
+    # degraded it to object Index and crashed deep inside indicators).
+    _ensure_utc_index(ohlcv, ticker)
+
+    # SIG-R2-X6 wick repair, default OFF (see data_utils.repair_wick_prints).
+    if wick_print_filter_enabled():
+        ohlcv = repair_wick_prints(ohlcv, ticker)
+
     # Recompute ALL features on full history (indicators need lookback windows)
     df = compute_features(ohlcv, btc_close=btc_close)
 
@@ -196,20 +207,100 @@ def prepare_data(ticker, btc_close=None, api=None, existing_ohlcv=None,
         future_close = df['Close'].shift(-fb)
         df[f'Target_Return_{fb}'] = (future_close - df['Close']) / df['Close'] * 100
 
-    # Triple-barrier targets matched to the LIVE exit stack (ATR stop /
-    # trailing / TP, vertical barrier at fb bars — same policy_exits
-    # kernel the backtester runs), so the model can learn the return the
-    # policy actually realizes instead of a hold-exactly-fb-bars fiction.
-    from policy_exits import compute_tb_labels
-    for col, vals in compute_tb_labels(df, FORWARD_BARS, 'crypto').items():
-        df[col] = vals
-
     # Backward compat: Target_Return = shortest horizon
     df['Target_Return'] = df[f'Target_Return_{FORWARD_BARS[0]}']
 
     df = _fill_archive_features(df)
+    # Every real bar (walk-continuation source for the TB stamp), taken
+    # BEFORE the row filter.
+    walk_bars = _tb_price_frame(df)
+    # (1) Row filter first. TB_* are not stamped yet, so this dropna keeps
+    # exactly the rows the old stamp-then-dropna kept (a TB NaN only ever
+    # sat on a Target_Return NaN tail row). It DOES remove interior rows:
+    # Volume_Ratio is NaN across zero-volume stretches (2026-09-26 store:
+    # DOGE 37 / LINK 166 / SOL 252 interior bars).
     df = df.dropna()
+    # (2) Triple-barrier targets matched to the LIVE exit stack (ATR stop /
+    # trailing / TP, vertical barrier at fb bars — same policy_exits
+    # kernel the backtester runs), so the model can learn the return the
+    # policy actually realizes instead of a hold-exactly-fb-bars fiction.
+    # Stamped on the FILTERED rows (R4 / L7 full fix — see
+    # _stamp_tb_labels): TB_Bars_* are valid row offsets and the label
+    # walk sees exactly the bars backtest/meta_label replay.
+    df = _stamp_tb_labels(df, walk_bars)
+    stamp_index = df.index
+    tb_cols = [c for c in df.columns if c.startswith('TB_')]
+    if tb_cols:
+        df = df.dropna(subset=tb_cols)   # suffix-only by construction
+    if not _removals_prefix_suffix_only(stamp_index, df.index):
+        raise TBSpanError(f"{ticker}: interior rows removed after the TB "
+                          f"stamp")
     return df
+
+
+# --- R4 (L7 full fix, 2026-09-26): stamp TB labels AFTER the row filter ---
+# Twin of harvest_stock_data._stamp_tb_labels (crypto has no as-of masks,
+# so no post-concat re-stamp is needed). TB_Bars_{fb} is a POSITIONAL
+# offset in the frame compute_tb_labels walks (policy_exits.py caveat) and
+# backtest/meta_label replay the kernel over the STORED rows, so labels are
+# stamped on exactly the stored rows, continued past the LAST stored row
+# into the real bars after it (the Target_Return NaN tail) — the old
+# series-end behaviour. Rows whose walk never crossed a removed bar keep
+# byte-identical labels.
+
+class TBSpanError(RuntimeError):
+    """Post-stamp interior row removal / stamp precondition failure.
+    Fatal: main() exits 3 before any training-store write."""
+
+
+TB_SPAN_EXIT_CODE = 3
+_TB_PRICE_COLS = ('Open', 'High', 'Low', 'Close', 'ATR')
+
+
+def _tb_price_frame(df):
+    """Slim copy of exactly the columns compute_tb_labels reads."""
+    return df[[c for c in _TB_PRICE_COLS if c in df.columns]].copy()
+
+
+def _stamp_tb_labels(stored, bars, asset_type='crypto'):
+    """Stamp TB_* onto `stored` (ONE ticker's final rows) by walking the
+    exit kernel over them followed by the bars in `bars` strictly AFTER
+    the last stored row. Returns a new frame."""
+    if len(stored) == 0:
+        return stored
+    for name, ix in (('stored', stored.index), ('bars', bars.index)):
+        if not (ix.is_unique and ix.is_monotonic_increasing):
+            raise TBSpanError(f"TB stamp precondition: {name} index is not "
+                              f"sorted+unique (policy_exits caveat)")
+    cols = [c for c in _TB_PRICE_COLS
+            if c in stored.columns and c in bars.columns]
+    tail = bars.loc[bars.index > stored.index[-1], cols]
+    df = pd.concat([stored[cols], tail]) if len(tail) else stored[cols]
+    from policy_exits import compute_tb_labels
+    labels = compute_tb_labels(df, FORWARD_BARS, asset_type)
+    n = len(stored)
+    out = stored.assign(**{col: np.asarray(vals)[:n]
+                           for col, vals in labels.items()})
+    # Legacy column order: TB_* right after the last Target_Return_{fb}
+    # (where the pre-R4 stamp put them) — the store schema is unchanged.
+    rest = [c for c in out.columns if not c.startswith('TB_')]
+    tb = [c for c in out.columns if c.startswith('TB_')]
+    tr = [i for i, c in enumerate(rest) if c.startswith('Target_Return_')]
+    if tb and tr:
+        k = tr[-1] + 1
+        out = out[rest[:k] + tb + rest[k:]]
+    return out
+
+
+def _removals_prefix_suffix_only(pre_index, post_index):
+    """True iff post_index is ONE contiguous run of pre_index (rows
+    removed only from the front/back). Empty post is vacuously ok."""
+    if len(post_index) == 0:
+        return True
+    pos = pre_index.get_indexer(post_index)
+    if (pos < 0).any():
+        return False
+    return bool(((pos[1:] - pos[:-1]) == 1).all())
 
 
 # Archive-derived feature columns (Binance funding/metrics merges)
@@ -329,11 +420,17 @@ def main():
                 start = _get_incremental_start(existing, t)
                 print(f"  [INCREMENTAL] {t}: fetching from {start}")
 
-        crypto_df = prepare_data(t, btc_close=btc_close, api=api,
-                                  existing_ohlcv=existing_ohlcv,
-                                  start_date=start,
-                                  src_totals=src_totals,
-                                  raw_out=(raw_out if use_sidecar else None))
+        try:
+            crypto_df = prepare_data(t, btc_close=btc_close, api=api,
+                                      existing_ohlcv=existing_ohlcv,
+                                      start_date=start,
+                                      src_totals=src_totals,
+                                      raw_out=(raw_out if use_sidecar
+                                               else None))
+        except TBSpanError as e:
+            print(f"FATAL [TB-GUARD] {e} — aborting, NO training store "
+                  f"written")
+            sys.exit(TB_SPAN_EXIT_CODE)
         if crypto_df is not None:
             crypto_df['Ticker'] = t
             all_data.append(crypto_df)

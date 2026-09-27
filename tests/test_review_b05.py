@@ -255,7 +255,9 @@ def test_sh_source_compiles(sh_src):
 
 
 def test_sh_dead_code_removed(sh_src):
-    assert 'import math' not in sh_src
+    # 2026-07: the unused `import math` was removed; 2026-09-27: it is back and USED (math.isfinite
+    # guards non-finite LLM scores, G4-07) — the invariant is 'no unused math import'.
+    assert ('import math' not in sh_src) or ('math.isfinite(' in sh_src)
     assert 'cached_symbols' not in sh_src
     assert 'except sqlite3.IntegrityError' not in sh_src  # unreachable w/ OR IGNORE
     assert '.rowcount' in sh_src                          # real-insert counting

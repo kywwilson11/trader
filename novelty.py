@@ -84,7 +84,10 @@ def _save():
     global _dirty, _last_save_warn
     if not _dirty:
         return
-    tmp = str(_STORE_FILE) + '.tmp'
+    # Per-writer tmp name (G4-04, the trade_memory._save idiom): _LOCK is
+    # thread-only, and split-bot mode runs one process per book, so a shared
+    # '<store>.tmp' let two writers splice a torn store.
+    tmp = f"{_STORE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         _sweep(_store, time.time())
         with open(tmp, 'w') as f:

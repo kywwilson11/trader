@@ -296,3 +296,143 @@ class TestFieldHelper:
         obj = types.SimpleNamespace(a=1)
         assert _field(obj, "a") == 1
         assert _field(obj, "b", "default") == "default"
+
+
+# ---------------------------------------------------------------------------
+# 2026-09 G8 hunt (Jetson): fills on non-"filled" statuses, leap-year
+# long-term boundary, float dust. Real-account shapes: Alpaca string qtys,
+# a GTC limit that partially filled and was then canceled.
+# ---------------------------------------------------------------------------
+def _g8_order(sym, side, qty, px, when, status="filled", filled_qty=None):
+    return {"id": f"{sym}{side}{when}", "symbol": sym, "side": side,
+            "qty": str(qty), "type": "limit", "status": status,
+            "submitted_at": when, "filled_at": when,
+            "filled_avg_price": None if px is None else str(px),
+            "notional": None,
+            "filled_qty": str(qty if filled_qty is None else filled_qty)}
+
+
+class TestG8FillsOnNonFilledStatus:
+    def test_canceled_with_partial_fill_becomes_a_lot(self):
+        q = 14.723202954
+        r = estimate_taxes([
+            _g8_order("SOL/USD", "buy", 20, 86.5548, "2026-04-26T15:21:11Z",
+                      status="canceled", filled_qty=q),
+            _g8_order("SOL/USD", "sell", q, 90.0, "2026-04-27T15:00:00Z"),
+        ])
+        assert r["realized_gain"] == pytest.approx(q * (90.0 - 86.5548))
+        assert r["unmatched_sell_qty"] == pytest.approx(0.0)
+        assert r["basis_complete"] is True
+        assert r["num_trades"] == 1
+
+    def test_canceled_partial_sell_is_matched_for_its_filled_qty_only(self):
+        r = estimate_taxes([
+            _g8_order("AAA", "buy", 10, 100.0, _iso(BASE)),
+            _g8_order("AAA", "sell", 10, 120.0, _iso(BASE + dt.timedelta(days=2)),
+                      status="expired", filled_qty=4),
+        ])
+        assert r["realized_gain"] == pytest.approx(4 * 20.0)
+        assert r["unmatched_sell_qty"] == pytest.approx(0.0)
+
+    @pytest.mark.parametrize("status", ["canceled", "expired",
+                                        "partially_filled", "done_for_day"])
+    def test_fill_bearing_statuses_count(self, status):
+        r = estimate_taxes([
+            _g8_order("AAA", "buy", 5, 100.0, _iso(BASE), status=status,
+                      filled_qty=5),
+            _g8_order("AAA", "sell", 5, 110.0, _iso(BASE + dt.timedelta(days=1))),
+        ])
+        assert r["realized_gain"] == pytest.approx(50.0)
+        assert r["basis_complete"] is True
+
+    @pytest.mark.parametrize("status", ["canceled", "expired"])
+    def test_zero_or_missing_filled_qty_on_canceled_is_ignored(self, status):
+        for fq in (0, "0", None):
+            o = _g8_order("AAA", "buy", 5, 100.0, _iso(BASE), status=status)
+            o["filled_qty"] = fq
+            r = estimate_taxes([o, _g8_order(
+                "AAA", "sell", 5, 110.0, _iso(BASE + dt.timedelta(days=1)))])
+            assert r["unmatched_sell_qty"] == pytest.approx(5.0)
+            assert r["realized_gain"] == pytest.approx(0.0)
+
+    def test_new_and_replaced_still_ignored_even_with_filled_qty(self):
+        for status in ("new", "accepted", "replaced", "rejected"):
+            r = estimate_taxes([
+                _g8_order("AAA", "buy", 5, 100.0, _iso(BASE), status=status),
+                _g8_order("AAA", "sell", 5, 110.0,
+                          _iso(BASE + dt.timedelta(days=1))),
+            ])
+            assert r["unmatched_sell_qty"] == pytest.approx(5.0), status
+
+
+class TestG8LeapYearLongTerm:
+    @staticmethod
+    def _d(y, m, d):
+        return dt.datetime(y, m, d, 15, tzinfo=dt.timezone.utc)
+
+    def test_366_days_across_leap_day_is_short_term(self):
+        b, s = self._d(2024, 1, 15), self._d(2025, 1, 15)
+        assert (s - b).days == 366
+        assert _is_long_term(b, s) is False
+        r = estimate_taxes([
+            _g8_order("AAA", "buy", 1, 100, "2024-01-15T15:00:00Z"),
+            _g8_order("AAA", "sell", 1, 200, "2025-01-15T15:00:00Z"),
+        ])
+        assert r["short_term_gain"] == pytest.approx(100.0)
+        assert r["long_term_gain"] == pytest.approx(0.0)
+        assert r["estimated_tax"] == pytest.approx(100 * (0.37 + 0.05))
+
+    def test_anniversary_plus_one_day_is_long_term(self):
+        assert _is_long_term(self._d(2024, 1, 15), self._d(2025, 1, 16)) is True
+        # 366 days spanning 29 Feb 2024 is the exact anniversary -> short
+        assert _is_long_term(self._d(2023, 3, 1), self._d(2024, 3, 1)) is False
+        assert _is_long_term(self._d(2023, 3, 1), self._d(2024, 3, 2)) is True
+        r = estimate_taxes([
+            _g8_order("AAA", "buy", 1, 100, "2024-01-15T15:00:00Z"),
+            _g8_order("AAA", "sell", 1, 200, "2025-01-16T15:00:00Z"),
+        ])
+        assert r["long_term_gain"] == pytest.approx(100.0)
+        assert r["estimated_tax"] == pytest.approx(100 * (0.20 + 0.05))
+
+    def test_feb_29_purchase(self):
+        assert _is_long_term(self._d(2024, 2, 29), self._d(2025, 2, 28)) is False
+        assert _is_long_term(self._d(2024, 2, 29), self._d(2025, 3, 1)) is True
+
+    def test_dates_compared_in_utc_and_naive_tolerated(self):
+        b = dt.datetime(2023, 1, 1, 23, 30, tzinfo=dt.timezone.utc)
+        # 2024-01-02 00:10 +02:00 == 2024-01-01 22:10 UTC -> the anniversary
+        s = dt.datetime(2024, 1, 2, 0, 10,
+                        tzinfo=dt.timezone(dt.timedelta(hours=2)))
+        assert _is_long_term(b, s) is False
+        assert _is_long_term(dt.datetime(2023, 1, 1), self._d(2024, 1, 2)) is True
+
+
+class TestG8FloatDust:
+    def test_float_dust_does_not_flip_basis_complete(self):
+        r = estimate_taxes([
+            _g8_order("BTC/USD", "buy", 0.3, 100, "2026-01-01T00:00:00Z"),
+            _g8_order("BTC/USD", "sell", 0.1, 110, "2026-01-02T00:00:00Z"),
+            _g8_order("BTC/USD", "sell", 0.2, 110, "2026-01-03T00:00:00Z"),
+        ])
+        assert r["unmatched_sell_qty"] == 0.0
+        assert r["basis_complete"] is True
+        assert r["realized_gain"] == pytest.approx(3.0)
+        assert r["num_trades"] == 2
+
+    def test_dust_lot_is_popped_not_matched_again(self):
+        r = estimate_taxes([
+            _g8_order("X", "buy", 0.1, 100, "2026-01-01T00:00:00Z"),
+            _g8_order("X", "buy", 0.2, 100, "2026-01-01T00:00:01Z"),
+            _g8_order("X", "sell", 0.3, 110, "2026-01-02T00:00:00Z"),
+            _g8_order("X", "sell", 1.0, 110, "2026-01-03T00:00:00Z"),
+        ])
+        assert r["unmatched_sell_qty"] == pytest.approx(1.0)
+        assert r["num_trades"] == 2
+
+    def test_real_shortfall_above_tolerance_still_counts(self):
+        r = estimate_taxes([
+            _g8_order("X", "buy", 1.0, 100, "2026-01-01T00:00:00Z"),
+            _g8_order("X", "sell", 1.000001, 110, "2026-01-02T00:00:00Z"),
+        ])
+        assert r["unmatched_sell_qty"] == pytest.approx(1e-6)
+        assert r["basis_complete"] is False

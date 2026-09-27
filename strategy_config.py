@@ -194,7 +194,12 @@ GATE_TARGETS_CHALLENGER = False
 # policy). Flipping this changes trial scores — old Optuna scores become
 # incomparable, so flip ONLY on the Jetson together with CLAUDE.md gotcha #2
 # (delete v2_study.db + stock_v2_study.db, reset the adaptive best_score).
-OBJECTIVE_LONG_ONLY = False
+# 2026-09-27 (Jetson campaign, CEO decision at the clean-rebuild gotcha-#2 event; the runbook
+# Phase 3 lists this flip as owner-optional for exactly this event): flipped to True. The 6-trial
+# functional pass on the clean stores scored every trial negative with the short leg included;
+# the deployable policy is long-only. Study DBs + adaptive state were reset in the same event.
+# Reversible by the owner (another study reset).
+OBJECTIVE_LONG_ONLY = True
 
 # --- Hypersearch model-fit honesty v3 (2026-08 T1, D22/D23/D25 / 02_research B12) ---
 # OFF (default): search/gate/save flow BYTE-IDENTICAL to today (fold-max checkpoint
@@ -223,7 +228,11 @@ OBJECTIVE_LONG_ONLY = False
 # event (owner's call — this spec flips neither). NOTE: OBJECTIVE_V3 changes the
 # trade_threshold Optuna distribution — reusing an old study DB would make Optuna
 # reject the changed distribution; the study reset is mandatory, not optional.
-HYPERSEARCH_V3 = False
+# 2026-09-27 (Jetson campaign): flipped to True by the CEO on the founder's explicit instruction, at the
+# clean-rebuild gotcha-#2 event (runbook Phase 3 bundle). Evidence: DECOMP-1/2 (no selection skill; every
+# searched threshold below the admission floor) + SIGNAL's end-to-end verification of the ON paths.
+# Study DBs + adaptive state reset in the same event. Reversible by the owner (another study reset).
+HYPERSEARCH_V3 = True
 
 # --- Blend-coherence sub-flags (2026-08 R2-C packet R2C-02, defects M2 + H2) ---
 # Both act ONLY inside the HYPERSEARCH_V3 save path (inert while it is False) and
@@ -288,7 +297,11 @@ LGB_REFIT_FULL = False
 # threshold selection). Changes trial SCORES — same runbook as HYPERSEARCH_V3
 # above; the adaptive state's own trade_threshold range/edge-expansion is ignored
 # (overridden) while this flag is ON.
-OBJECTIVE_V3 = False
+# 2026-09-27 (Jetson campaign): flipped to True by the CEO on the founder's explicit instruction, at the
+# clean-rebuild gotcha-#2 event (runbook Phase 3 bundle). Evidence: DECOMP-1/2 (no selection skill; every
+# searched threshold below the admission floor) + SIGNAL's end-to-end verification of the ON paths.
+# Study DBs + adaptive state reset in the same event. Reversible by the owner (another study reset).
+OBJECTIVE_V3 = True
 
 # --- Trainer seed (2026-08 R2-C packet R2C-04, defect L3) ---
 # None (default): legacy fully-unseeded training — torch init/dropout, the
@@ -330,7 +343,181 @@ TRAINER_SEED = None
 #   incomparable: this flag rides Chain-2's single gotcha-#2 study-reset
 #   event (flip with HYPERSEARCH_V3/OBJECTIVE_V3, delete both study DBs,
 #   reset adaptive best_score + cum_trials) — NEVER a reset of its own.
-TRAINING_REPAIRS_V1 = False
+# 2026-09-27 (Jetson campaign): flipped to True by the CEO on the founder's explicit instruction, at the
+# clean-rebuild gotcha-#2 event (runbook Phase 3 bundle). Evidence: DECOMP-1/2 (no selection skill; every
+# searched threshold below the admission floor) + SIGNAL's end-to-end verification of the ON paths.
+# Study DBs + adaptive state reset in the same event. Reversible by the owner (another study reset).
+TRAINING_REPAIRS_V1 = True
+
+# --- SIG-R1-A3 (2026-09 Jetson campaign): holdout trade span by TARGET ---
+# The holdout n_eff (calendar concurrency) currently uses the triple-barrier
+# exit span (TB_Bars) for trades that are scored on the RAW fb-bar target and
+# therefore actually occupy fb bars (scripts/hypersearch_v2.py
+# evaluate_on_holdout). On the crypto store TB median = 13 bars for every
+# fb >= 18, so n_eff is overstated and the DSR gate is looser than designed.
+# ON: raw-target trades span their real fb-bar window. Gate-facing (changes
+# n_eff/DSR on the certificate) -> default OFF; the read site also honours
+# TRADER_HOLDOUT_SPAN_BY_TARGET=1/true/yes/on. Flip with a PROMOTION_GATE_V2
+# study (FR-01 step 2 of 06_signal_model_plan.md §4: n_eff/DSR delta on the
+# same saved winner). OFF path byte-pinned by tests/test_sig_r1_a3.py.
+HOLDOUT_SPAN_BY_TARGET = False
+
+# --- SIG-R1-BPY (2026-09 Jetson campaign): measured bars/year calendar ---
+# BARS_PER_YEAR['stock'] = 1638 (= 252 x 6.5) counts RTH HOURS, but the stock
+# store holds Alpaca EXTENDED-session hourly bars: scripts/bars_per_year_census.py
+# measured 15.19 bars/ticker-day trailing year = 3827 bars/yr (ratio 2.336,
+# sqrt 1.528). ON: bars_calendar.bars_per_year() returns the measured stock
+# value to hypersearch_v2.compute_sharpe and portfolio_backtest (crypto
+# unchanged; backtest.py's copy has no reader). Changes the trainer's Sharpe
+# scale -> regime-penalty crossings and the save ratchet vs a best_score on
+# the old scale: flip ONLY in a gotcha-#2 study-reset event and re-run the
+# census first. volatility.py (live sizing) moves in LOCKSTEP under this same
+# flag (ENGINE-R2): compute_vol_adjusted_size's per-bar target uses
+# bars_calendar.bars_per_year and the HAR daily->per-bar sigma uses
+# bars_calendar.bars_per_day (= bars_per_year / trading days, so the HAR
+# path's target/sigma ratio is scale-invariant and only GARCH-sourced
+# sigmas re-scale). OFF path byte-pinned by tests/test_sig_r1_bpy.py and
+# tests/test_engine_r2_flags.py.
+BARS_PER_YEAR_MEASURED = False
+
+# --- SIG-R2-1 (2026-09 Jetson campaign): failed trials PRUNED, not 0.0 ---
+# A trial that produced no honest score — OOM/RuntimeError, no walk-forward
+# folds, zero completed folds, or a fold that hit MAX_TRIAL_SECONDS before
+# its first checkpoint — is stored as a COMPLETE trial worth the 0.0
+# sentinel (scripts/hypersearch_v2.py create_objective). Under
+# OBJECTIVE_LONG_ONLY most real scores are negative, so the failure becomes
+# study.best_trial, seeds TPE's good set and inflates the COMPLETE-only
+# deflation pool / cum_trials. ON: the trial raises optuna.TrialPruned
+# (state PRUNED, user_attr failed_trial) — never best_trial, outside the
+# pool, TPE steered away. Search plumbing, but model-facing (changes which
+# trial wins and the TPE history) -> default OFF; env
+# TRADER_FAILED_TRIAL_PRUNE=1/true/yes/on wins. The flag is read PER TRIAL
+# at scoring time (scripts/hypersearch_v2.py:603 _failed_trial_prune), so
+# an already-recorded study keeps its stored trial states: flipping it later
+# cannot retroactively change a study's COMPLETE/best_trial history (old
+# 0.0 rows stay COMPLETE) — flip at a gotcha-#2 study reset. OFF path
+# byte-pinned by tests/test_sig_r2_1.py.
+FAILED_TRIAL_PRUNE = False
+
+# --- SIG-R2-MASK (2026-09 Jetson campaign): trainer session mask ---
+# The objective scores long entries on EVERY stock row, but the live book
+# enters only inside STOCK_ENTRY_WINDOWS_ET on weekdays (stock_loop
+# _in_entry_window; RTH when ENTRY_WINDOWS_ENABLED is False) — the point
+# rule keeps ~14 % of the extended-session stock rows. ON: every trainer
+# scorer (pruning, folds, regime Sharpes, holdout certificate, threshold
+# reselect) vetoes long entries outside that window
+# (scripts/hypersearch_v2.py:659 _objective_session_mask ->
+# :679 _session_entry_ok -> objective_utils.session_entry_mask; the mask
+# is built once per create_objective and at holdout scoring); crypto is
+# never masked. Model-facing (different trial scores / n_trades / DSR pool)
+# -> default OFF, gotcha #2 study reset; env
+# TRADER_OBJECTIVE_SESSION_MASK=1/true/yes/on wins. Evidence gate:
+# scripts/session_mask_holdout_ab.py verdict on the saved stock winner
+# (research/campaign_2026-09_jetson/objective_session_mask_proposal.md).
+# OFF path byte-pinned by tests/test_sig_r2_mask.py.
+OBJECTIVE_SESSION_MASK = False
+
+# --- SIG-R2-X6 (2026-09 Jetson campaign): harvest wick-print guard ---
+# Alpaca crypto hourly bars carry wick-only bad prints (Open ~= Close, a
+# Low/High 15-87 % away that Coinbase never printed; 62 of 67 venue-checked
+# flags — scripts/bad_print_census.py). ON: the crypto harvest REPAIRS
+# (never drops) the wick to min/max(O,C) -/+ the point-in-time 24-bar
+# median true range before features and TB labels
+# (data_utils.py:53 wick_print_filter_enabled / repair_wick_prints,
+# called at scripts/harvest_crypto_data.py:155); the raw sidecar keeps the
+# unrepaired bars.
+# Harvest-side, model-facing (store High/Low, ATR*, STOCH, TB labels) ->
+# default OFF, re-harvest + gotcha-#2 study reset; env
+# TRADER_WICK_PRINT_FILTER=1/true/yes/on wins. PRECONDITION for a flip:
+# the ENGINE live-bar parity repair at market_data.py:244
+# (fetch_bars_alpaca -> _filter_bad_prints tests Close only) so serving sees
+# the same bars. OFF path byte-pinned by tests/test_sig_r2_x6_wick_filter.py.
+WICK_PRINT_FILTER = False
+
+# --- ENGINE-R2 O8 (2026-09 Jetson campaign): crypto quote-staleness limit ---
+# order_utils.get_quote rejects a CRYPTO quote older than 180 s (returns
+# None); in base_loop._manage_stops a None quote skips EVERY software exit
+# (trail/TP/vertical/signal) for that symbol that cycle, and entries see
+# `no_quote`. Alpaca's `us` venue appears to stamp a quote only when the
+# touch changes (inferred, unverified in docs), so quiet-but-live books read
+# as stale: 10-min census ETH 15 % None cycles at 180 s (max 227 s), Sunday
+# probe SOL 18/24 polls > 180 s (max 486 s).
+# None (default): legacy 180 s, byte-identical (the literal stays in
+#   order_utils). A number (seconds, finite, > 0): the crypto threshold;
+#   stocks keep 180 s. Invalid values fall back to 180 s. Exit/entry-facing
+#   -> flip ONLY via the owner's flip proposal (ENGINE W7 report): >= 24 h
+#   weekday + weekend `scripts/crypto_quote_staleness_census.py --replay`
+#   evidence, and update the census's LIVE_MAX_AGE_S in the same change.
+#   Read at CALL time (getattr) by order_utils._quote_max_age_sec. OFF path
+#   byte-pinned by tests/test_engine_r2_flags.py.
+CRYPTO_QUOTE_MAX_AGE_SEC = None
+
+# --- ENGINE-R2 W9 (2026-09 Jetson campaign): halt cancels working buys ---
+# trading_halt.flag (Telegram /halt, GUI, touch) blocks only NEW entries in
+# base_loop._entries_allowed; a BUY order already working at the broker
+# (maker rung left live by an unconfirmed cancel -> 'maker_unknown'; a
+# lifecycle fetch-error give-up; a stock 'day' bracket parent whose cancel
+# did not confirm) keeps working and can FILL during the halt.
+# False (default): legacy — halt blocks entries only, byte-identical.
+# True: the first halted _entries_allowed call cancels this book's open BUY
+#   orders (universe symbols, side 'buy', non-stop types) once per halt
+#   epoch (base_loop._halt_cancel_working_buys); un-halting re-arms. SELL
+#   and stop orders are never touched. Changes what a halt does -> flip ONLY
+#   via the owner flip proposal (ENGINE W9 report): evidence = buy fills
+#   observed while trading_halt.flag was active. Read at CALL time. OFF
+#   path byte-pinned by tests/test_engine_r2_strikes_halt.py.
+HALT_CANCELS_WORKING_BUYS = False
+
+# --- ENGINE-R3 O3 + R4-b: server-fill attribution at the breaker, remote /flatten + stablecoin flatten sites ---
+# base_loop._run_one_cycle runs _circuit_breaker_check BEFORE _manage_stops.
+# On a gap that already FILLED the resting server stops (crypto GTC
+# stop_limit / stock bracket stop leg), emergency_flatten finds nothing and
+# the breaker journals ESTIMATED 'circuit_breaker' exits at the quote mid
+# for positions the BROKER already closed: no sell row with the real fill,
+# no 24 h hard-stop lockout, no cooldown stamp (replay proof:
+# tests/test_engine_r2_replay_harness.py, -7 % gap, six mis-attributed rows).
+# False (default): legacy, byte-identical — no extra broker call.
+# True: AFTER the flatten (zero added liquidation latency), each released
+#   position with a stop_order_id gets one get_order; 'filled' -> journaled
+#   through _manage_stops' own server-fill calls (server_stop row with the
+#   real fill, detect_source='breaker', last_trade_time, lockout); anything
+#   else keeps the estimated row. Not silent: moves real fills INTO Kelly's
+#   sample (estimated rows are excluded, trading_utils.compute_kelly_
+#   fraction) and arms the 24 h lockout, which outlives the breaker halt
+#   (next ~16:05 ET) -> can change a later BUY. Flip ONLY via the owner
+#   flip proposal (ENGINE W10 report): evidence = >= 1 live 'circuit_breaker'
+#   row whose stop order Alpaca reports 'filled'. Read at CALL time;
+#   TRADER_BREAKER_SERVER_FILL_ATTRIB=1/true/yes/on wins when set. OFF path
+#   byte-pinned by tests/test_engine_r3_o3_quote.py and
+#   tests/test_engine_r2_replay_harness.py.
+BREAKER_SERVER_FILL_ATTRIB = False
+
+# --- ENGINE-R3 O2+J11 (2026-09 Jetson campaign): restart stop anchor ---
+# After a restart, crypto_loop/stock_loop._replace_protective_stops re-place
+# the server stop at max(entry, hwm) * (1 - HARD stop distance) — the hard
+# distance anchored at the HWM — while the software truth
+# base_loop._desired_stop_for is max(entry-anchored hard stop, HWM-anchored
+# trail when trailing is active). O2: a zero-basis crypto book gets 6 %
+# stops at startup that cycle 1 cancels and re-places at the 5 % trail (18
+# order writes instead of 6). J11: hwm > entry with the trail NOT armed
+# puts the server stop ABOVE the software hard stop (entry 100 / hwm 101 /
+# ATR 1: 98.475 vs 97.5), so a fill is classified 'trail'.
+# False (default): legacy max(entry, hwm) * (1 - stop_dist), byte-identical.
+# True: both books place exactly _desired_stop_for(pos)[0] (stocks rounded
+#   to cents), the level the software loop enforces; crypto's
+#   _resting_stop_px records it, so cycle 1 does not churn. Stocks keep a
+#   PLAIN stop even when trailing_activated=True is restored (a native
+#   trailing_stop re-anchors at the submit-time price and cannot equal the
+#   software level). Inherits _desired_stop_for's trail denominator (HWM
+#   today), so a later loop->entry decision flows through here unchanged.
+# Not silent: it moves a resting stop LEVEL for every position with
+#   hwm > entry (looser when the trail is not armed, tighter or equal once
+#   it is; table in the ENGINE W11 report). Flip ONLY via the owner flip
+#   proposal (ENGINE W11): accept "restart server stop == software stop" as
+#   a policy identity, before the first restart with open positions. Read
+#   at CALL time. OFF path byte-pinned by
+#   tests/test_engine_r3_restart_anchor.py.
+RESTART_STOP_ANCHOR_DESIRED = False
 
 # --- Fixed-calendar holdout span (2026-08 R2-C packet R2C-05, FR-01) ---
 # None (default): legacy PROPORTIONAL holdout — the final 12% of the pooled

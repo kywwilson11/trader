@@ -35,6 +35,10 @@ bars) for stocks.
 
 The keep/kill verdict gates on the SIGNIFICANCE of b2 (with a sample-size floor),
 not a bright-line rho — at typical journal volume a rho of 0.05 is noise.
+The power floor is ALL of: n >= MIN_POWER_N (60) realized rows, >= MIN_POWER_T0
+(120) distinct t0-hour clusters and effective_n >= MIN_EFFECTIVE_N (20) —
+i.e. roughly 20+ days of hourly LLM cycles at forward_bars=24. n >= 60 alone
+is NOT enough for a verdict.
 
 Usage:
     python llm_eval.py --days 14
@@ -168,6 +172,18 @@ def _realized_forward_return(ts_arr, closes, t0: float, horizon_bars: int):
     return ret, round(elapsed, 2), round(entry_lag, 2), int(i1 - i0)
 
 
+def _clamp_stock_end(end_dt):
+    """Stock request end clamped by market_data._clamp_sip_end (SIP delay +
+    in-session forming-bar floor). Falls back to the plain 16-min delay clamp
+    if market_data cannot be imported (measurement path: fail soft)."""
+    try:
+        import market_data
+    except Exception:
+        limit = datetime.now(timezone.utc) - timedelta(minutes=16)
+        return end_dt if end_dt <= limit else limit
+    return market_data._clamp_sip_end(end_dt, 'stock')
+
+
 def realize_scored_rows(rows: list[dict], api=None,
                         diag_out: list | None = None) -> list[tuple]:
     """Realize forward returns for a list of scored rows.
@@ -211,7 +227,19 @@ def realize_scored_rows(rows: list[dict], api=None,
         t0s = [r['t0'] for _, r in items]
         max_h = max(int(r.get('horizon', 24) or 24) for _, r in items)
         start = datetime.fromtimestamp(min(t0s), tz=timezone.utc) - timedelta(hours=2)
-        end = datetime.fromtimestamp(max(t0s), tz=timezone.utc) + timedelta(hours=max_h + 6)
+        if asset == 'crypto':
+            end = datetime.fromtimestamp(max(t0s), tz=timezone.utc) + timedelta(hours=max_h + 6)
+        else:
+            # The horizon is stepped in BARS (_realized_forward_return), and
+            # stock hourly bars are <=16 per weekday (04:00-20:00 ET extended
+            # session) with none on weekends/holidays, so a wall-clock
+            # `max_h + 6` HOURS window cannot hold the exit bar of the newest
+            # rows. Fetch a calendar allowance instead (over-fetch is harmless:
+            # realization indexes bars and returns None past the frame end),
+            # then respect the SIP 15-min delay — an `end` inside it makes the
+            # feed reject the WHOLE request (market_data._clamp_sip_end; G6-1).
+            end = _clamp_stock_end(datetime.fromtimestamp(max(t0s), tz=timezone.utc)
+                                   + timedelta(days=max_h // 7 + 5))
         ts_arr, closes = _bars_lookup(api, sym, asset, start, end)
         for i, r in items:
             horizon = int(r.get('horizon', 24) or 24)
@@ -339,6 +367,126 @@ def _im_block_pvalue(X, y, cluster_ids, K=8):
     from scipy.stats import t as _t
     tstat = mean / (sd / np.sqrt(m))
     out['b2_im_p'] = round(float(2.0 * _t.sf(abs(tstat), m - 1)), 4)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# INTEL 2026-09 (Scout B E1) — REPORT-ONLY size-audit p-values for b2.
+# None of these drives the verdict (the carrier is still the DK/t_{G-1}
+# p_value above; changing it is an owner decision). They exist so the report
+# can show, beside the verdict p-value, estimators whose null size is closer
+# to nominal at the n_eff~20 power floor — measured by
+# scripts/har_size_audit.py. Every helper is None-safe and never raises.
+# ---------------------------------------------------------------------------
+
+# Kiefer & Vogelsang (2005), "A New Asymptotic Theory for Heteroskedasticity-
+# Autocorrelation Robust Tests", Econometric Theory 21(6):1130-1164 — the
+# cubic response-surface fit of the fixed-b critical-value function for the
+# BARTLETT kernel, cv(b) = a0 + a1*b + a2*b^2 + a3*b^3 (valid 0 < b <= 1),
+# at the one-sided 90 / 95 / 97.5 / 99 % quantiles (a0 = the normal quantile,
+# i.e. the b -> 0 limit). Re-checked on the Jetson 2026-09-27 by simulating
+# the fixed-b location-model t (T=500, 40k reps): every knot within ~2 % of
+# the simulated quantile for b in {0.1, 0.2, 0.4, 0.7, 1.0}.
+_KV2005_BARTLETT_CV = (
+    (0.90, (1.2816, 1.3040, 0.5135, -0.3386)),
+    (0.95, (1.6449, 2.1859, 0.3142, -0.3427)),
+    (0.975, (1.9600, 2.9694, 0.4160, -0.5324)),
+    (0.99, (2.3263, 4.1618, 0.5368, -0.9620)),
+)
+
+
+def _kv_fixedb_bartlett_pvalue(tstat, b):
+    """Two-sided fixed-b p-value for a Bartlett-kernel HAR t-statistic at
+    bandwidth ratio b = M/T, from the KV (2005) critical-value polynomials.
+
+    |t| is mapped to a normal-equivalent z by piecewise-linear interpolation
+    through the knots (0, 0), (cv_q(b), z_q) for q in 90/95/97.5/99 %, and
+    linearly (ratio z_99/cv_99) beyond the last knot; p = 2*(1 - Phi(z)).
+    Exact at the four tabulated levels (two-sided 20/10/5/2 %) — in
+    particular p < 0.05 iff |t| > cv_0.975(b) — interpolated between them.
+    Returns None when b is outside (0, 1] (the polynomial's fitted range) or
+    tstat is missing/non-finite."""
+    try:
+        if tstat is None or not np.isfinite(tstat) or not (0.0 < b <= 1.0):
+            return None
+        from scipy.stats import norm as _norm
+        xs, zs = [0.0], [0.0]
+        for q, (a0, a1, a2, a3) in _KV2005_BARTLETT_CV:
+            xs.append(a0 + a1 * b + a2 * b * b + a3 * b ** 3)
+            zs.append(float(_norm.ppf(q)))
+        a = abs(float(tstat))
+        z = (float(np.interp(a, xs, zs)) if a <= xs[-1]
+             else a * zs[-1] / xs[-1])
+        return round(float(2.0 * _norm.sf(z)), 4)
+    except Exception:
+        return None
+
+
+def _dk_fixedb_pvalue(X, resid, cluster_ids, b2, forward_bars, col=2):
+    """b2 p-value from Driscoll-Kraay at the Lazarus-Lewis-Stock-Watson
+    (2018, JBES 36(4)) Newey-West bandwidth rule M = 1.3*sqrt(T), floored at
+    2*forward_bars cluster steps (twice the MA(h-1) overlap), judged against
+    the KV (2005) Bartlett fixed-b critical values at b = M/T (T = G
+    clusters). Reuses _driscoll_kraay_se unchanged (lag = M-1, since its
+    Bartlett weights are 1 - l/(lag+1) = 1 - l/M; the G/(G-1) factor it
+    applies makes this marginally conservative). Report-only; never raises.
+    Returns {'b2_dk_fixedb_p', 'dk_fixedb_bandwidth', 'dk_fixedb_b'}."""
+    out = {'b2_dk_fixedb_p': None, 'dk_fixedb_bandwidth': None,
+           'dk_fixedb_b': None}
+    try:
+        G = int(len(np.unique(cluster_ids)))
+        if G < 2:
+            return out
+        M = max(int(round(1.3 * np.sqrt(G))), 2 * int(max(0, forward_bars)), 1)
+        b = M / G
+        out['dk_fixedb_bandwidth'] = int(M)
+        out['dk_fixedb_b'] = round(float(b), 4)
+        if b > 1.0:
+            return out                      # outside the KV fit -> p None
+        se, _ = _driscoll_kraay_se(X, resid, cluster_ids, lag=M - 1)
+        se_c = float(se[col])
+        if not np.isfinite(se_c) or se_c <= 1e-12:
+            return out
+        out['b2_dk_fixedb_p'] = _kv_fixedb_bartlett_pvalue(float(b2) / se_c, b)
+    except Exception:
+        pass
+    return out
+
+
+def _ewc_pvalue(X, resid, cluster_ids, b2, col=2):
+    """b2 p-value from the equal-weighted-cosine (EWC) long-run variance of
+    the per-cluster summed OLS scores, nu = floor(0.4 * T^(2/3)) cosines,
+    judged against t_nu (Lazarus, Lewis, Stock & Watson 2018, JBES 36(4),
+    "HAR Inference: Recommendations for Practice"; T = G clusters, rows
+    time-sorted as for _driscoll_kraay_se). Omega = (1/nu) sum_j L_j L_j',
+    L_j = sqrt(2/T) sum_t cos(pi*j*(t-1/2)/T) h_t; Var(beta) =
+    (X'X)^-1 (T*Omega) (X'X)^-1. Report-only; never raises.
+    Returns {'b2_ewc_p', 'ewc_nu'}."""
+    out = {'b2_ewc_p': None, 'ewc_nu': None}
+    try:
+        n, k = X.shape
+        uniq = np.unique(cluster_ids)
+        G = int(len(uniq))
+        nu = int(np.floor(0.4 * G ** (2.0 / 3.0))) if G > 0 else 0
+        if nu < 1 or nu >= G:
+            return out
+        out['ewc_nu'] = nu
+        u = X * resid[:, None]
+        h = np.zeros((G, k))
+        np.add.at(h, np.searchsorted(uniq, cluster_ids), u)
+        tt = (np.arange(1, G + 1) - 0.5) / G
+        C = np.sqrt(2.0 / G) * np.cos(np.pi * np.outer(np.arange(1, nu + 1), tt))
+        Lam = C @ h                                 # nu x k
+        omega = Lam.T @ Lam / nu
+        XtX_inv = np.linalg.pinv(X.T @ X)
+        var = np.diag(XtX_inv @ (G * omega) @ XtX_inv)
+        se_c = float(np.sqrt(max(float(var[col]), 0.0)))
+        if not np.isfinite(se_c) or se_c <= 1e-12:
+            return out
+        from scipy.stats import t as _t
+        out['b2_ewc_p'] = round(float(2.0 * _t.sf(abs(float(b2) / se_c), nu)), 4)
+    except Exception:
+        pass
     return out
 
 
@@ -525,6 +673,11 @@ def compute_incremental_report(samples, forward_bars: int = 24,
             enc['estimator'] = 'driscoll_kraay'
             enc['g_clusters'] = G
             enc.update(_im_block_pvalue(X, realized, cluster_ids))
+            # INTEL 2026-09 (Scout B E1): REPORT-ONLY size-audit p-values —
+            # the verdict below still reads enc['p_value'] (DK/t_{G-1}).
+            enc.update(_dk_fixedb_pvalue(X, resid, cluster_ids, b2,
+                                         forward_bars))
+            enc.update(_ewc_pvalue(X, resid, cluster_ids, b2))
             # Legacy rows-HAC on the SAME X/resid — printed alongside for one
             # release (c26 D09); b2 identical, only SE/p differ.
             se_l = _newey_west_se(X, resid, lag=hac_lag)
@@ -561,7 +714,10 @@ def compute_incremental_report(samples, forward_bars: int = 24,
     degenerate_or_insufficient = False
     if n < min_n:
         rep['verdict'] = (f'insufficient_power (n={n} < {min_n}); collect more '
-                          'journals before trusting the incremental estimate')
+                          'journals before trusting the incremental estimate '
+                          f'(a keep/kill verdict also needs >= {MIN_POWER_T0} '
+                          f'distinct t0-hour clusters and effective_n >= '
+                          f'{MIN_EFFECTIVE_N})')
         rep['insufficient_power'] = True
         degenerate_or_insufficient = True
     elif pred_degenerate:
@@ -798,13 +954,51 @@ def compute_calibration_report(p_up, realized, conviction=None, abstain=None,
     return rep
 
 
+def _size_audit_line(enc: dict) -> str:
+    """One printed line of the REPORT-ONLY b2 p-values (INTEL 2026-09):
+    the verdict carrier (DK/t_{G-1}) beside the fixed-b, EWC and IM reads."""
+    def _f(v):
+        return 'n/a' if v is None else f'{v:.3f}'
+    return (f"size-audit: DK p={_f(enc.get('p_value'))}, "
+            f"fixed-b p={_f(enc.get('b2_dk_fixedb_p'))}, "
+            f"EWC p={_f(enc.get('b2_ewc_p'))}, "
+            f"IM p={_f(enc.get('b2_im_p'))} "
+            f"(verdict still DK; see har_size_audit)")
+
+
+def _report_path(default: Path, out_dir=None) -> Path:
+    """Where a report JSON lands. out_dir=None (the default) returns
+    `default` untouched — the repo-root BASE_DIR / '<name>.json' literal at
+    each call site, which is what gui.py reads (REPORT_FRESHNESS_ITEMS + the
+    Models-tab LLM artifact) and what evidence_reads' source pin greps for;
+    otherwise out_dir / default.name, creating out_dir (--out)."""
+    if out_dir is None:
+        return default
+    d = Path(out_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / Path(default).name
+
+
 def _write_report(path: Path, report: dict) -> None:
     """Atomic write-then-rename (shared by run_eval and advisor_report) so a
     concurrent reader (e.g. the GUI) never sees a partially written file."""
-    tmp = path.with_suffix('.json.tmp')
-    with open(tmp, 'w') as f:
-        json.dump(report, f, indent=2, default=str)
-    os.replace(tmp, path)
+    # 2026-09: UNIQUE tmp in the same directory (tempfile.mkstemp) — the
+    # fixed '.json.tmp' name let a GUI-launched run and a CLI run (or two
+    # --asset runs) os.replace each other's half-written tmp into the live
+    # path, the race decision_report already fixed with pid-unique tmps.
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp',
+                               dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _meta_block(days: int, asset_filter: str | None, horizons=None) -> dict:
@@ -931,14 +1125,16 @@ def _asset_breakdown(samples, sample_assets, forward_bars) -> dict:
     return out
 
 
-def run_eval(days: int = 14, asset_filter: str | None = None, api=None) -> dict:
+def run_eval(days: int = 14, asset_filter: str | None = None, api=None,
+             out_dir=None) -> dict:
     entries = _load_entries(days)
     if asset_filter:
         entries = [e for e in entries if e.get('asset_type') == asset_filter]
     if not entries:
         print("No llm_analysis journal entries found — the bots journal one "
               "per LLM cycle; run again after some trading.")
-        _write_stub(BASE_DIR / 'llm_eval_report.json', days, asset_filter,
+        _write_stub(_report_path(BASE_DIR / 'llm_eval_report.json', out_dir),
+                    days, asset_filter,
                     'no_journal_entries')
         return {}
 
@@ -1033,7 +1229,8 @@ def run_eval(days: int = 14, asset_filter: str | None = None, api=None) -> dict:
         print(f"No realized samples. {len(symbols_all_unrealized)}/{len(needed)} "
               f"symbols returned no usable bars; the rest may have unelapsed "
               f"horizons.")
-        _write_stub(BASE_DIR / 'llm_eval_report.json', days, asset_filter,
+        _write_stub(_report_path(BASE_DIR / 'llm_eval_report.json', out_dir),
+                    days, asset_filter,
                     'no_realized_samples', horizons=horizons)
         return {}
 
@@ -1076,6 +1273,8 @@ def run_eval(days: int = 14, asset_filter: str | None = None, api=None) -> dict:
         print(f"legacy_b2 (rows-HAC, deprecated): b2={leg['b2_s']:+.4f} "
               f"p={leg['p_value']:.3f} — superseded by Driscoll-Kraay above "
               f"(c26 D09)")
+    if enc and enc.get('estimator') == 'driscoll_kraay':
+        print(_size_audit_line(enc))
     g = inc.get('grid', {})
     if g:
         print("LLM-vs-ML disagreement cells (where s can add orthogonal value):")
@@ -1116,6 +1315,11 @@ def run_eval(days: int = 14, asset_filter: str | None = None, api=None) -> dict:
 
     report['verdict'] = inc.get('verdict')
     print(f"\nVerdict: {inc.get('verdict')}")
+    print(f"(keep/kill power floor: n >= {MIN_POWER_N} AND >= {MIN_POWER_T0} "
+          f"distinct t0-hour clusters AND effective_n >= {MIN_EFFECTIVE_N} "
+          f"— ~20+ days of hourly LLM cycles; this run: n={inc.get('n')}, "
+          f"clusters={inc.get('n_clusters')}, "
+          f"effective_n~{inc.get('effective_n_hint')})")
 
     report['realization'] = _realization_block(sample_diag)
 
@@ -1128,7 +1332,7 @@ def run_eval(days: int = 14, asset_filter: str | None = None, api=None) -> dict:
 
     report['meta'] = _meta_block(days, asset_filter, horizons=horizons)
 
-    out = BASE_DIR / 'llm_eval_report.json'
+    out = _report_path(BASE_DIR / 'llm_eval_report.json', out_dir)
     _write_report(out, report)
     print(f"Report: {out}")
     return report
@@ -1151,7 +1355,8 @@ def _advisor_event_flag_stats(flag_lists, realized_arr):
     return out
 
 
-def advisor_report(days: int = 14, asset_filter: str | None = None, api=None) -> dict:
+def advisor_report(days: int = 14, asset_filter: str | None = None, api=None,
+                   out_dir=None) -> dict:
     """Advisor-v2 verdict: echo-gap of p_up vs the ML pred (incremental),
     calibration (reliability/Brier/slope + conviction/abstain checks),
     per-prompt-version drift (prompt-instability detector), and
@@ -1166,7 +1371,8 @@ def advisor_report(days: int = 14, asset_filter: str | None = None, api=None) ->
     if not entries:
         print("No llm_advisor_v2 journal entries found — enable "
               "advisor_v2_enabled and run again after some trading.")
-        _write_stub(BASE_DIR / 'llm_advisor_report.json', days, asset_filter,
+        _write_stub(_report_path(BASE_DIR / 'llm_advisor_report.json', out_dir),
+                    days, asset_filter,
                     'no_journal_entries')
         return {}
 
@@ -1221,7 +1427,8 @@ def advisor_report(days: int = 14, asset_filter: str | None = None, api=None) ->
 
     if not rows:
         print("No advisor rows had a scored symbol — nothing to realize.")
-        _write_stub(BASE_DIR / 'llm_advisor_report.json', days, asset_filter,
+        _write_stub(_report_path(BASE_DIR / 'llm_advisor_report.json', out_dir),
+                    days, asset_filter,
                     'no_scored_rows', horizons=horizons)
         return {}
 
@@ -1266,7 +1473,8 @@ def advisor_report(days: int = 14, asset_filter: str | None = None, api=None) ->
 
     if not samples:
         print("No realized advisor samples yet (horizons may not have elapsed).")
-        _write_stub(BASE_DIR / 'llm_advisor_report.json', days, asset_filter,
+        _write_stub(_report_path(BASE_DIR / 'llm_advisor_report.json', out_dir),
+                    days, asset_filter,
                     'no_realized_samples', horizons=horizons)
         return {}
 
@@ -1443,13 +1651,13 @@ def advisor_report(days: int = 14, asset_filter: str | None = None, api=None) ->
               f"cache hit with an earlier cycle — those are NOT independent "
               f"LLM calls.")
 
-    out = BASE_DIR / 'llm_advisor_report.json'
+    out = _report_path(BASE_DIR / 'llm_advisor_report.json', out_dir)
     _write_report(out, report)
     print(f"Report: {out}")
     return report
 
 
-if __name__ == '__main__':
+def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description='Evaluate LLM gate vs realized returns')
     ap.add_argument('--days', type=int, default=14)
     ap.add_argument('--asset', choices=['crypto', 'stock'], default=None)
@@ -1457,8 +1665,17 @@ if __name__ == '__main__':
                     help='Run the advisor-v2 calibration/incremental report '
                          '(llm_advisor_v2 shadow rows) instead of the base '
                          'llm_analysis eval')
-    args = ap.parse_args()
+    ap.add_argument('--out', default=None, metavar='DIR',
+                    help='Write llm_eval_report.json / llm_advisor_report.json '
+                         'under DIR (created if missing) instead of the repo '
+                         'root. Default: the repo root, which is what gui.py '
+                         'reads.')
+    args = ap.parse_args(argv)
     if args.advisor:
-        advisor_report(args.days, args.asset)
+        advisor_report(args.days, args.asset, out_dir=args.out)
     else:
-        run_eval(args.days, args.asset)
+        run_eval(args.days, args.asset, out_dir=args.out)
+
+
+if __name__ == '__main__':
+    main()

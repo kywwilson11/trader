@@ -46,6 +46,35 @@ from sample_weights import average_uniqueness, effective_n
 FORWARD_BARS = [12, 18, 24, 32, 48]
 
 
+def _projected_columns(book, keep):
+    """Store columns to request from data_utils.load_training_data: 'Ticker'
+    plus every column whose name satisfies keep(name), read from the parquet
+    SCHEMA (no data). None (= the full load, today's behaviour) whenever the
+    loader would not serve that parquet — absent, CSV fresher
+    (data_utils._csv_is_fresher), or no pyarrow — so the CSV path is never
+    narrowed by a stale parquet's schema. The DatetimeIndex is restored from
+    the parquet's pandas metadata either way, so the loaded frame differs
+    only in the columns this script never reads (output sha-identical)."""
+    try:
+        import contextlib
+        import io
+        import data_utils
+        import pyarrow.parquet as pq
+        stem = data_utils._stem(book)
+        pqp = data_utils._BASE_DIR / f'{stem}.parquet'
+        csvp = data_utils._BASE_DIR / f'{stem}.csv'
+        if not pqp.exists():
+            return None
+        with contextlib.redirect_stdout(io.StringIO()):   # loader re-prints
+            if data_utils._csv_is_fresher(pqp, csvp):
+                return None
+        cols = [c for c in pq.read_schema(pqp).names
+                if c == 'Ticker' or keep(c)]
+        return cols if 'Ticker' in cols and len(cols) > 1 else None
+    except Exception:
+        return None
+
+
 def _harvested_horizons(columns):
     """Sorted forward-bars horizons present as TB_Bars_* columns."""
     out = []
@@ -69,13 +98,17 @@ def _ticker_boundaries(tickers):
 def measure_book(prefix, horizons=None):
     """Measure one book. horizons=None discovers them from the data itself."""
     from data_utils import load_training_data
-    # Full-frame load on purpose: a pruned parquet read (columns=...) raises
-    # on missing columns (breaking the graceful diagnostics below), and the
-    # horizons are discovered from the columns anyway. The feature columns
-    # are dropped right after discovery so the sort copies ~7 columns, not
-    # the whole panel.
+    # Column-projected load (G6 C-1, 2026-09-26): request only Ticker +
+    # TB_Bars_* — names taken from the parquet's OWN schema, so a pruned read
+    # cannot raise on a missing column, and horizon discovery below still
+    # sees every harvested TB_Bars_* column. When the loader would serve the
+    # CSV (or no pyarrow) this falls back to the full load. Measured
+    # 2026-09-26 on the real stores: crypto (72 cols) output sha-identical,
+    # peak RSS 543 -> 301 MB; stock (110 cols) projected 532 MB, where the
+    # full load was not run (projected ~3.8 GB, beyond the 8 GB box's slack).
     try:
-        df = load_training_data(prefix, columns=None)
+        df = load_training_data(prefix, columns=_projected_columns(
+            prefix, lambda c: re.fullmatch(r'TB_Bars_\d+', str(c)) is not None))
     except Exception as e:
         print(f"[{prefix}] could not load training data: {e}")
         return None

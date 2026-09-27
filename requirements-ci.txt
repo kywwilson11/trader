@@ -25,3 +25,7 @@ lightgbm>=4.0
 pyarrow          # parquet engine: run_pipeline imports it directly, 7 modules read/write parquet
 
 pytest>=7.0
+# 2026-09-27: declared at last — imported by regime_detector.py (hmmlearn) and volatility.py (arch);
+# docs/MAP.md §9 item 19 recorded them as 'declared nowhere', which made CI/dev-Mac runs red on their tests.
+hmmlearn>=0.3
+arch>=6.0

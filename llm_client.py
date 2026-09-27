@@ -97,9 +97,55 @@ _OPENAI_FALLBACK_CHAIN = ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.4"]
 KNOWN_MODELS = GEMINI_MODELS + ANTHROPIC_MODELS + OPENAI_MODELS
 
 
+# Non-canonical spellings of a Claude id (review L2, 2026-09-26). The
+# family/version regex, the price table and the RPD tables are keyed on the
+# first-party alias (``claude-opus-4-6``); these all name the SAME model:
+#   us.anthropic.claude-opus-4-6 / anthropic.claude-opus-4-6   (Bedrock:
+#       region + vendor prefix; older ids also carry ``-v1:0``/``-v2:0``)
+#   anthropic/claude-opus-4-6, openrouter/anthropic/...        (router paths)
+#   claude-opus-4-5@20251101                                   (Vertex dated)
+#   claude-haiku-4-5-20251001, claude-3-7-sonnet-latest        (API snapshots)
+#   claude-opus-4.6                                            (dotted version)
+#   claude-opus-4-6[1m]                                        (context tag)
+# Pre-fix, ``us.anthropic.claude-opus-4-6`` classified as GEMINI and billed
+# at $1.25/$10 against a true $5/$25, so the $/day cap tripped late.
+# Classification/pricing ONLY — the raw id is still what goes on the wire.
+_CLAUDE_BRACKET_TAG_RE = re.compile(r"\[[^\]]*\]$")
+_CLAUDE_BEDROCK_VER_RE = re.compile(r"(?:-v\d+(?::\d+)?|:\d+)$")
+_CLAUDE_VERTEX_AT_RE = re.compile(r"@[\w.-]*$")
+_CLAUDE_LATEST_RE = re.compile(r"-latest$")
+_CLAUDE_DATE_RE = re.compile(r"-\d{8}$")
+_CLAUDE_DOTTED_VER_RE = re.compile(r"(?<=\d)\.(?=\d)")
+
+
+def _canonical_claude_id(model) -> str | None:
+    """Base first-party alias for any spelling of a Claude id, or None when
+    the id is not a Claude id at all. Strips everything before ``claude``
+    (region/vendor/router prefixes) and the ``[..]`` tag, Bedrock ``-vN:M``,
+    Vertex ``@date``, ``-latest`` and ``-YYYYMMDD`` suffixes; dotted
+    versions become dashed (``4.6`` -> ``4-6``). Lower-cased. Never raises."""
+    try:
+        m = str(model).strip().lower()
+    except Exception:
+        return None
+    i = m.find("claude")
+    if i < 0:
+        return None
+    m = m[i:]
+    m = _CLAUDE_BRACKET_TAG_RE.sub("", m)
+    m = _CLAUDE_BEDROCK_VER_RE.sub("", m)
+    m = _CLAUDE_VERTEX_AT_RE.sub("", m)
+    m = _CLAUDE_LATEST_RE.sub("", m)
+    m = _CLAUDE_DATE_RE.sub("", m)
+    m = _CLAUDE_DOTTED_VER_RE.sub("-", m)
+    return m
+
+
 def _provider_for(model: str) -> str:
     m = str(model)
-    if m.startswith("claude"):
+    # 'claude' ANYWHERE (review L2): us.anthropic.claude-*, anthropic/claude-*
+    # are Anthropic models, never the Gemini default.
+    if _canonical_claude_id(m) is not None:
         return "anthropic"
     if m.startswith("gpt") or m.startswith("o"):
         return "openai"
@@ -142,6 +188,25 @@ _FREE_TIER_BUDGETS = {
     "gpt-5.4-nano": 5000,
     "gpt-5.4-mini": 2000,
     "gpt-5.4": 1000,
+    # 2026-09 (FIX_G): rows for every id that has a _PRICING row, so a
+    # configured/override id no longer silently falls to the 50-RPD
+    # unknown default (audit D3). Anthropic/OpenAI rows mirror the paid
+    # table (no free tier on either). Gemini 3.x flash-lite: Google
+    # publishes per-model free-tier RPD ONLY inside AI Studio
+    # (ai.google.dev/gemini-api/docs/rate-limits, fetched 2026-09-26), so
+    # 1000 is an UNVERIFIED estimate copied from the 2.5-flash-lite row.
+    "gemini-3.5-flash-lite": 1000,
+    "gemini-3.1-flash-lite": 1000,
+    "claude-haiku-4-5-20251001": 5000,
+    "claude-sonnet-4-6": 2000,
+    "claude-opus-4-6": 1000,
+    "claude-opus-4-7": 1000,
+    "claude-opus-4-8": 1000,
+    "claude-opus-5": 1000,
+    "claude-opus-5-5": 1000,
+    "claude-fable-5": 500,
+    "claude-fable-5-1": 500,
+    "gpt-4.1": 1000,
 }
 _PAID_TIER_BUDGETS = {
     "gemini-2.5-pro": 1000,
@@ -154,7 +219,24 @@ _PAID_TIER_BUDGETS = {
     "gpt-5.4-nano": 5000,
     "gpt-5.4-mini": 2000,
     "gpt-5.4": 1000,
+    # 2026-09 (FIX_G): see the free-tier table's comment
+    "gemini-3.5-flash-lite": 5000,
+    "gemini-3.1-flash-lite": 5000,
+    "claude-haiku-4-5-20251001": 5000,
+    "claude-sonnet-4-6": 2000,
+    "claude-opus-4-6": 1000,
+    "claude-opus-4-7": 1000,
+    "claude-opus-4-8": 1000,
+    "claude-opus-5": 1000,
+    "claude-opus-5-5": 1000,
+    "claude-fable-5": 500,
+    "claude-fable-5-1": 500,
+    "gpt-4.1": 1000,
 }
+
+# Ids that fell through to the 50-RPD unknown-model default — one loud line
+# per id per process (not one per call), mirroring _unknown_price_warned.
+_unknown_budget_warned: set = set()
 
 # Actual responder of the most recent successful call (for journaling —
 # the analysis file used to claim 'pro' produced scores that flash wrote)
@@ -164,8 +246,110 @@ _last_model_used: str | None = None
 def get_last_model_used() -> str | None:
     return _last_model_used
 
+
+# --- Per-attempt transport metadata (INTEL W19, SCOUT_E A2) ---
+# Measurement-only: nothing in this module (routing, retry, fallback, cost,
+# budget, return values) reads it. `_last_model_used` above is a bare
+# unlocked module global written by the calling thread; this slot keeps the
+# same "the calling thread is the only writer, no lock" discipline but is
+# THREAD-LOCAL, so combined-bot mode's two loop threads (the G4-09 situation
+# at _rate_lock below) can never read each other's attempt.
+#   .pending  finish/block/status noted by the raw provider parsers
+#             (_call_gemini / _call_anthropic(_post) / _call_openai) during
+#             the attempt in flight; reset by _meta_begin before each attempt.
+#   .last     the completed-attempt dict get_last_call_meta() copies out.
+# call_gemini / call_claude / call_openai (hence call_model) reset .last on
+# entry, so a call that makes no HTTP attempt (cooldown, cost cap, disabled,
+# no key, RPD) leaves None. call_llm deliberately does NOT reset: it is the
+# fallback leg, and an attempt-less chain keeps the primary leg's record.
+_call_meta_tls = threading.local()
+
+
+def _meta_clear() -> None:
+    try:
+        _call_meta_tls.last = None
+        _call_meta_tls.pending = None
+    except Exception:
+        pass
+
+
+def _meta_begin() -> None:
+    try:
+        _call_meta_tls.pending = {}
+    except Exception:
+        pass
+
+
+def _note_transport(finish_reason=None, block_reason=None, resp=None) -> None:
+    """Called by the raw provider parsers; never raises, never alters their
+    control flow. Only str reasons / int statuses are kept (JSON-safe)."""
+    try:
+        pend = getattr(_call_meta_tls, 'pending', None)
+        if pend is None:
+            pend = {}
+            _call_meta_tls.pending = pend
+        if resp is not None:
+            st = getattr(resp, 'status', None)
+            if isinstance(st, int) and not isinstance(st, bool):
+                pend['http_status'] = st
+        if isinstance(finish_reason, str):
+            pend['finish_reason'] = finish_reason
+        if isinstance(block_reason, str) and block_reason:
+            pend['block_reason'] = block_reason
+    except Exception:
+        pass
+
+
+def _meta_end(provider, model, start, attempt_index, fallback_used=False,
+              http_status=None) -> None:
+    """Record one completed attempt (success or failure). Never raises."""
+    try:
+        pend = getattr(_call_meta_tls, 'pending', None) or {}
+        if not (isinstance(http_status, int)
+                and not isinstance(http_status, bool)):
+            http_status = pend.get('http_status')
+        now = time.time()
+        try:
+            latency_ms = max(0, int((now - start) * 1000))
+        except Exception:
+            latency_ms = None
+        _call_meta_tls.last = {
+            'provider': provider,
+            'model': model,
+            'finish_reason': pend.get('finish_reason'),
+            'block_reason': pend.get('block_reason'),
+            'http_status': http_status,
+            'latency_ms': latency_ms,
+            'attempt_index': int(attempt_index),
+            'fallback_used': bool(fallback_used),
+            'ts': now,
+        }
+    except Exception:
+        pass
+
+
+def get_last_call_meta() -> dict | None:
+    """READ-ONLY copy of this thread's most recent completed LLM HTTP
+    attempt: {provider, model, finish_reason (provider-native string or
+    None), block_reason (Gemini promptFeedback.blockReason or None),
+    http_status (response status, HTTPError code, or None for a network
+    error/timeout), latency_ms, attempt_index (0-based within the public
+    call; 429 re-sends count), fallback_used (call_llm only: the attempt was
+    on a chain entry after the first), ts (epoch s)}. None when this
+    thread's latest call_gemini/call_claude/call_openai/call_model made no
+    attempt. Measurement-only (INTEL W19): no gate reads it."""
+    try:
+        m = getattr(_call_meta_tls, 'last', None)
+        return dict(m) if isinstance(m, dict) else None
+    except Exception:
+        return None
+
 # --- Sliding-window rate limiter ---
 _call_timestamps: collections.deque = collections.deque()
+# Guards _call_timestamps (G4-09): combined-bot mode reaches _rate_limit_ok
+# from two loop threads; the unsynchronised check-then-popleft could raise
+# IndexError('pop from an empty deque') and the len/append pair over-admit.
+_rate_lock = threading.Lock()
 
 # --- Daily quota tracking (resets at midnight Pacific) ---
 _model_calls: dict[str, int] = {}
@@ -216,61 +400,135 @@ class _cost_file_lock:
 # The old table (flash 0.15/0.60, lite 0.075/0.30) understated real spend
 # 2-4x, so the $1/day cap tripped far later than intended.
 _PRICING = {
+    # Gemini paid-tier (Standard) list prices, <=200k-token prompts
+    # (ai.google.dev/gemini-api/docs/pricing, fetched 2026-09-26). The
+    # 3.x flash-lite ids are stable and "Free of charge" on the free tier;
+    # these are their PAID rates (a paid key is what the ledger meters).
     "gemini-2.5-pro":        (1.25, 10.0),
     "gemini-2.5-flash":      (0.30, 2.50),
     "gemini-2.5-flash-lite": (0.10, 0.40),
-    # Anthropic list prices per MTok. Prices move — llm_config.json may
-    # carry a "pricing": {model: [in, out]} override that wins over this
-    # table (see _pricing), so corrections never need a code change.
-    "claude-haiku-4-5":      (1.00, 5.00),
-    "claude-sonnet-5":       (3.00, 15.00),
-    "claude-opus-4-8":       (5.00, 25.00),
-    # ⚠️ LOUD WARNING: these OpenAI gpt-5.4 prices are CONSERVATIVE
-    # PLACEHOLDERS, not verified against OpenAI's published pricing page.
-    # Correct them via config['pricing'] overrides (same mechanism as the
-    # Claude/Gemini corrections above) the moment real prices are known —
-    # do NOT trust these numbers for real budget/cost-cap decisions.
-    "gpt-5.4":               (5.00, 15.00),
-    "gpt-5.4-mini":          (1.00, 4.00),
-    "gpt-5.4-nano":          (0.25, 1.00),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
+    "gemini-3.1-flash-lite": (0.25, 1.50),
+    # Anthropic first-party list prices per MTok (claude-api skill model
+    # table, cached 2026-06-24). Prices move — llm_config.json may carry a
+    # "pricing": {model: [in, out]} override that wins over this table
+    # (see _pricing), so corrections never need a code change.
+    "claude-haiku-4-5":          (1.00, 5.00),
+    "claude-haiku-4-5-20251001": (1.00, 5.00),   # dated snapshot of the above
+    "claude-sonnet-4-6":         (3.00, 15.00),
+    "claude-sonnet-5":           (2.00, 10.00),  # was 3/15 (audit D1)
+    "claude-opus-4-6":           (5.00, 25.00),
+    "claude-opus-4-7":           (5.00, 25.00),
+    "claude-opus-4-8":           (5.00, 25.00),
+    "claude-opus-5":             (5.00, 25.00),
+    "claude-opus-5-5":           (4.00, 20.00),
+    "claude-fable-5":            (10.00, 50.00),
+    "claude-fable-5-1":          (10.00, 50.00),
+    # OpenAI Standard-tier list prices (developers.openai.com/api/docs/
+    # pricing, fetched 2026-09-26) — replaces the unverified 5/15, 1/4,
+    # 0.25/1 placeholders (audit D2).
+    "gpt-5.4":               (2.50, 15.00),
+    "gpt-5.4-mini":          (0.75, 4.50),
+    "gpt-5.4-nano":          (0.20, 1.25),
+    "gpt-4.1":               (2.00, 8.00),
 }
 
 # Models already warned about this process (one loud line per unknown model,
-# not one per call) — billing an unknown model at the conservative pro-tier
-# fallback silently distorts the $1/day cap either direction.
+# not one per call) — billing an unknown model at the fallback price
+# silently distorts the $1/day cap, so the owner must see which id fell
+# through.
 _unknown_price_warned: set = set()
 
 
+def _fallback_price(model: str) -> tuple[float, float]:
+    """CONSERVATIVE price for an id with no table row: the element-wise max
+    (input, output) over every _PRICING row of the same provider family
+    (_provider_for), else over the whole table.
+
+    Pre-2026-09 every unknown id billed at a flat $1.25/$10 — cheaper than
+    most of the Anthropic line, so an untabled claude-opus-4-6 ($5/$25)
+    let the $1 cap admit ~$3 of real spend (audit D3). Billing at the
+    family's highest KNOWN tier means the cap can only trip EARLY, never
+    late, for any model priced at or below the most expensive tabled
+    sibling (today: anthropic $10/$50, openai $2.50/$15, gemini $1.25/$10).
+    A same-family model priced above every tabled sibling still needs a
+    table row or a config['pricing'] entry.
+    """
+    fam = _provider_for(model)
+    rows = [p for k, p in _PRICING.items() if _provider_for(k) == fam]
+    if not rows:
+        rows = list(_PRICING.values())
+    return (max(r[0] for r in rows), max(r[1] for r in rows))
+
+
 def _pricing(model: str) -> tuple[float, float]:
-    """Per-MTok (input, output) price: config override > table > pro-tier."""
+    """Per-MTok (input, output) price: config override > table >
+    conservative family ceiling (_fallback_price)."""
+    canon = _canonical_claude_id(model)
+    keys = [model] + ([canon] if canon and canon != model else [])
     try:
-        override = load_llm_config().get("pricing", {}).get(model)
-        if override and len(override) == 2:
-            return (float(override[0]), float(override[1]))
+        table = load_llm_config().get("pricing", {})
+        for k in keys:
+            override = table.get(k)
+            if override and len(override) == 2:
+                return (float(override[0]), float(override[1]))
     except Exception:
         pass
-    if model not in _PRICING and model not in _unknown_price_warned:
+    for k in keys:
+        # A region/vendor-prefixed or dated/-latest spelling prices as its
+        # base model (review L2); an unknown Claude id still falls through
+        # to the ANTHROPIC ceiling below, never the Gemini one.
+        if k in _PRICING:
+            return _PRICING[k]
+    fb = _fallback_price(model)
+    if model not in _unknown_price_warned:
         _unknown_price_warned.add(model)
         print(f"[LLM-COST] WARNING: no pricing entry for model '{model}' — "
-              f"billing at conservative fallback ($1.25/$10.00 per MTok). "
+              f"billing at conservative {_provider_for(model)} ceiling "
+              f"(${fb[0]:.2f}/${fb[1]:.2f} per MTok). "
               f"Add a config['pricing'] entry in llm_config.json.")
-    return _PRICING.get(model, (1.25, 10.0))
+    return fb
 
 
 _CACHE_MULT_DEFAULTS = {"anthropic": (1.25, 0.10), "gemini": (1.00, 0.25)}
+
+# Anthropic bills 1-hour-TTL cache WRITES at 2x base input (5-minute writes
+# at 1.25x) — claude-api skill, shared/prompt-caching.md "Economics"
+# (audit D14: the old code billed both TTLs at 1.25x). Kept separate from
+# the (write, read) pair so _cache_multipliers' public 2-tuple is unchanged;
+# a config override may carry it as an optional THIRD element:
+# pricing_cache_multipliers = {"anthropic": [w5m, read, w1h]}.
+_CACHE_WRITE_1H_MULT_DEFAULTS = {"anthropic": 2.0}
 
 
 def _cache_multipliers(provider: str) -> tuple[float, float]:
     """(write_mult, read_mult) vs input price for cache-billed tokens:
     config['pricing_cache_multipliers'] override > built-in defaults.
-    Unknown provider -> (1.0, 0.0) (cache tokens priced as no-ops)."""
+    Unknown provider -> (1.0, 0.0) (cache tokens priced as no-ops).
+    write_mult is the 5-minute-TTL write rate; see
+    _cache_write_1h_multiplier for 1-hour writes."""
     try:
         m = load_llm_config().get("pricing_cache_multipliers", {}).get(provider)
-        if m and len(m) == 2:
+        if m and len(m) >= 2:
             return (float(m[0]), float(m[1]))
     except Exception:
         pass
     return _CACHE_MULT_DEFAULTS.get(provider, (1.0, 0.0))
+
+
+def _cache_write_1h_multiplier(provider: str) -> float:
+    """1-hour-TTL cache-write multiplier vs input price: optional 3rd
+    element of the config override > built-in default > the provider's
+    5-minute write multiplier."""
+    try:
+        m = load_llm_config().get("pricing_cache_multipliers", {}).get(provider)
+        if m and len(m) >= 3:
+            return float(m[2])
+    except Exception:
+        pass
+    if provider in _CACHE_WRITE_1H_MULT_DEFAULTS:
+        return _CACHE_WRITE_1H_MULT_DEFAULTS[provider]
+    return _cache_multipliers(provider)[0]
 
 # --- Smart model routing ---
 # Cost brackets: {max_daily_cost: {role: model}}
@@ -656,15 +914,18 @@ def _parse_retry_after(http_error) -> float | None:
 
 def _rate_limit_ok() -> bool:
     """Check if we're within the per-minute rate limit (tier-aware)."""
-    now = time.time()
-    cutoff = now - 60.0
-    while _call_timestamps and _call_timestamps[0] < cutoff:
-        _call_timestamps.popleft()
+    # rpm read (may touch llm_config on disk) stays outside the lock; the
+    # prune / check / append on the shared deque is one atomic step.
     rpm = _get_rate_limit_rpm()
-    if len(_call_timestamps) >= rpm:
-        return False
-    _call_timestamps.append(now)
-    return True
+    with _rate_lock:
+        now = time.time()
+        cutoff = now - 60.0
+        while _call_timestamps and _call_timestamps[0] < cutoff:
+            _call_timestamps.popleft()
+        if len(_call_timestamps) >= rpm:
+            return False
+        _call_timestamps.append(now)
+        return True
 
 
 def _429_cooled_down(provider: str = "gemini") -> bool:
@@ -705,24 +966,115 @@ def _save_shared_cost():
         pass
 
 
+# Daily cost history (INTEL W9, 2026-09-27; measurement-only). The rollover
+# below overwrites llm_cost.json with the new day's $0, so before this the
+# previous day's spend survived only as a stdout print. One JSON line per
+# observed rollover is appended to llm_cost_history.jsonl NEXT TO _COST_FILE
+# (derived at call time, so a test that repoints _COST_FILE sandboxes it too).
+# Nothing reads it yet (future LLM-spend ledger reader); the ledger file,
+# every return value and the rollover itself are unchanged by it.
+_COST_HISTORY_MAX_LINE = 200  # bytes; one small O_APPEND write per line
+
+
+def _cost_history_path() -> str:
+    """<_COST_FILE minus .json>_history.jsonl, i.e. llm_cost_history.jsonl."""
+    root, _ext = os.path.splitext(_COST_FILE)
+    return root + "_history.jsonl"
+
+
+def _snapshot_prev_ledger(today: str):
+    """(date, cost) the shared file holds for a day other than `today` —
+    the ledger the rollover is about to overwrite — or None. Never raises."""
+    try:
+        with open(_COST_FILE) as f:
+            data = json.load(f)
+        d = data.get("date")
+        if isinstance(d, str) and d and d != today:
+            return d, float(data.get("cost", 0.0))
+    except Exception:
+        pass
+    return None
+
+
+def _append_cost_history(prev_file, mem_date: str, mem_cost: float):
+    """Append ONE line describing the ledger day that was just rolled over.
+    CALLER HOLDS _cost_file_lock (via _rollover_cost_locked), so two
+    processes rolling over at once cannot interleave; and since the first
+    process to roll over rewrites the file to today under that lock, a
+    later process's _load_shared_cost sees today and never reaches here —
+    one line per rollover. A duplicate is possible only when the ledger
+    write itself failed or the flock degraded; `pid` lets the reader dedupe
+    by date. `cost` is the shared file's value for its date (src "file",
+    the cross-process total) when readable, else the in-memory ledger
+    (src "mem"); `mem_date`/`mem_cost` always carry the in-memory ledger
+    (`_daily_cost` after _load_shared_cost — the value the reset print
+    shows). No prior ledger day at all (fresh process, no file) -> no line.
+    The single os-level write of <= _COST_HISTORY_MAX_LINE bytes goes to an
+    'ab' unbuffered handle: POSIX write() with O_APPEND sets the offset to
+    EOF with "no intervening file modification operation" between the seek
+    and the write (POSIX.1-2017 write(2), XSH). No fsync. FAIL-SOFT: any
+    exception is swallowed with one log line."""
+    try:
+        if prev_file is not None:
+            date, cost, src = prev_file[0], prev_file[1], "file"
+        elif mem_date:
+            date, cost, src = mem_date, mem_cost, "mem"
+        else:
+            return
+        rec = {"date": date, "cost": round(float(cost), 6), "src": src,
+               "mem_date": mem_date or None,
+               "mem_cost": round(float(mem_cost), 6),
+               "reset_at": datetime.now(timezone.utc).isoformat(
+                   timespec="seconds"),
+               "pid": os.getpid()}
+        line = (json.dumps(rec, allow_nan=False) + "\n").encode("utf-8")
+        if len(line) > _COST_HISTORY_MAX_LINE:
+            raise ValueError(f"history line {len(line)} B > "
+                             f"{_COST_HISTORY_MAX_LINE} B")
+        with open(_cost_history_path(), "ab", buffering=0) as f:
+            f.write(line)
+    except Exception as e:
+        print(f"[LLM-COST] cost history append failed: {e}")
+
+
+def _rollover_cost_locked(today: str):
+    """Re-sync the in-memory ledger for `today` from the shared file and,
+    if the file is still on an older date, start the new day at $0 and
+    persist it. CALLER MUST HOLD _quota_lock AND _cost_file_lock — the
+    rollover write is a read-modify-write of the shared file like any
+    other (audit D10: it used to run outside the flock, so a process
+    rolling over could overwrite another process's first spend of the new
+    day). After a successful ledger write, the rolled-over day is appended
+    to llm_cost_history.jsonl (_append_cost_history; fail-soft)."""
+    global _cost_reset_date, _daily_cost
+    # Load shared cost file first — another process may have spent today
+    _load_shared_cost()
+    if _cost_reset_date != today:
+        # Still not today's date — fresh day
+        prev_file = _snapshot_prev_ledger(today)
+        mem_date, mem_cost = _cost_reset_date, _daily_cost
+        if _daily_cost > 0:
+            print(f"[LLM] Daily cost reset (yesterday: ${_daily_cost:.4f})")
+        _daily_cost = 0.0
+        _cost_reset_date = today
+        _save_shared_cost()
+        _append_cost_history(prev_file, mem_date, mem_cost)
+
+
 def _maybe_reset_quota():
     """Reset daily quota and cost counters at midnight Pacific."""
-    global _quota_reset_date, _cost_reset_date, _daily_cost
+    global _quota_reset_date
     with _quota_lock:
         today = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
         if _quota_reset_date != today:
             _model_calls.clear()
             _quota_reset_date = today
         if _cost_reset_date != today:
-            # Load shared cost file first — another process may have spent today
-            _load_shared_cost()
-            if _cost_reset_date != today:
-                # Still not today's date — fresh day
-                if _daily_cost > 0:
-                    print(f"[LLM] Daily cost reset (yesterday: ${_daily_cost:.4f})")
-                _daily_cost = 0.0
-                _cost_reset_date = today
-                _save_shared_cost()
+            try:
+                with _cost_file_lock():
+                    _rollover_cost_locked(today)
+            except Exception as e:
+                print(f"[LLM-COST] daily rollover failed: {e}")
 
 
 def _estimate_cost(model: str, prompt_chars: int, response_chars: int) -> float:
@@ -752,28 +1104,7 @@ def _record_cost(model: str, prompt_chars: int, response_chars: int,
     """
     global _daily_cost
     try:
-        if usage and usage.get('promptTokenCount') is not None:
-            price_in, price_out = _pricing(model)
-            in_tok = usage.get('promptTokenCount', 0) or 0
-            # candidatesTokenCount excludes thinking tokens; thoughtsTokenCount
-            # is billed as output too
-            out_tok = ((usage.get('candidatesTokenCount', 0) or 0)
-                       + (usage.get('thoughtsTokenCount', 0) or 0))
-            cost = (in_tok * price_in + out_tok * price_out) / 1_000_000
-            provider = _provider_for(model)
-            if provider == "anthropic":
-                cw = usage.get('cacheWriteTokenCount', 0) or 0
-                cr = usage.get('cacheReadTokenCount', 0) or 0
-                if cw or cr:
-                    wm, rm = _cache_multipliers("anthropic")
-                    cost += (cw * wm + cr * rm) * price_in / 1_000_000
-            elif provider == "gemini":
-                cached = usage.get('cachedContentTokenCount', 0) or 0
-                if cached:
-                    _wm, rm = _cache_multipliers("gemini")
-                    cost -= cached * (1.0 - rm) * price_in / 1_000_000
-        else:
-            cost = _estimate_cost(model, prompt_chars, response_chars)
+        cost = _cost_of(model, prompt_chars, response_chars, usage)
     except Exception as e:
         print(f"[LLM-COST] cost computation failed for {model}: {e} — "
               f"falling back to char estimate")
@@ -785,13 +1116,130 @@ def _record_cost(model: str, prompt_chars: int, response_chars: int,
         with _quota_lock:
             with _cost_file_lock():
                 # Re-read under the FILE lock so a concurrent process's spend
-                # cannot be lost in this read-modify-write
-                _load_shared_cost()
+                # cannot be lost in this read-modify-write. A call that
+                # straddled midnight PT must not add today's cost onto
+                # yesterday's in-memory total (and then stamp that sum with
+                # today's date) — roll over first, under the same lock.
+                today = datetime.now(
+                    ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+                _rollover_cost_locked(today)
                 _daily_cost += cost
                 _save_shared_cost()
     except Exception as e:
         print(f"[LLM-COST] ledger write failed: {e} "
               f"(${cost:.6f} may be unrecorded)")
+
+
+def _cost_of(model: str, prompt_chars: int, response_chars: int,
+             usage: dict | None = None) -> float:
+    """$ cost of one (possibly summed) billed usage dict — the pure half of
+    _record_cost (split out 2026-09-26 so the Anthropic validation-retry
+    pre-flight can price the still-unrecorded first request, review L1).
+    MAY raise; _record_cost owns the never-raise fallbacks."""
+    if usage and usage.get('promptTokenCount') is not None:
+        price_in, price_out = _pricing(model)
+        in_tok = usage.get('promptTokenCount', 0) or 0
+        # candidatesTokenCount excludes thinking tokens; thoughtsTokenCount
+        # is billed as output too
+        out_tok = ((usage.get('candidatesTokenCount', 0) or 0)
+                   + (usage.get('thoughtsTokenCount', 0) or 0))
+        cost = (in_tok * price_in + out_tok * price_out) / 1_000_000
+        provider = _provider_for(model)
+        if provider == "anthropic":
+            cw = usage.get('cacheWriteTokenCount', 0) or 0
+            cr = usage.get('cacheReadTokenCount', 0) or 0
+            # 1-hour-TTL share of the writes (D14): billed at 2x, not
+            # the 5-minute 1.25x. Absent -> all writes are 5-minute,
+            # i.e. exactly the pre-change arithmetic.
+            cw1h = min(usage.get('cacheWrite1hTokenCount', 0) or 0, cw)
+            if cw or cr:
+                wm, rm = _cache_multipliers("anthropic")
+                wm1h = (_cache_write_1h_multiplier("anthropic")
+                        if cw1h else wm)
+                cost += (((cw - cw1h) * wm + cw1h * wm1h + cr * rm)
+                         * price_in / 1_000_000)
+        elif provider == "gemini":
+            cached = usage.get('cachedContentTokenCount', 0) or 0
+            if cached:
+                _wm, rm = _cache_multipliers("gemini")
+                cost -= cached * (1.0 - rm) * price_in / 1_000_000
+    else:
+        cost = _estimate_cost(model, prompt_chars, response_chars)
+    return cost
+
+
+def _usage_billed(usage) -> bool:
+    """True when a provider usage dict reports any billed token."""
+    if not usage:
+        return False
+    for k in ('promptTokenCount', 'candidatesTokenCount',
+              'thoughtsTokenCount', 'cacheWriteTokenCount',
+              'cacheReadTokenCount'):
+        try:
+            if (usage.get(k) or 0) > 0:
+                return True
+        except (TypeError, AttributeError):
+            continue
+    return False
+
+
+def _charge_discarded(model: str, prompt_chars: int, result, usage) -> None:
+    """Audit D6: a response the transport DISCARDED (MAX_TOKENS/length
+    truncation, safety block, empty or schema-invalid output) was still
+    billed by the provider when it carries usage. Charge it to the shared
+    ledger so the $1/day cap measures real money. No-op when a result was
+    returned (the caller's success branch records that cost) or when no
+    billed tokens were reported. Accounting only: the caller's control
+    flow and return value are untouched. Never raises (_record_cost
+    doesn't)."""
+    if result or not _usage_billed(usage):
+        return
+    # Review L1 (2026-09-26): a billed request is a REQUEST against the
+    # model's RPD budget whether or not its answer was usable — count it
+    # (success paths count via their own record_call).
+    try:
+        record_call(model)
+    except Exception:
+        pass
+    _record_cost(model, prompt_chars, 0, usage)
+    print(f"[LLM-COST] {model}: billed response discarded — charged to "
+          f"ledger (${_daily_cost:.4f} today)")
+
+
+def _retry_preflight(model: str, pending_usage: dict | None) -> bool:
+    """Review L1 (2026-09-26): an in-transport RE-request (the Anthropic
+    auto-path validation retry) passes the SAME gates the first request
+    passed in call_claude/call_llm — provider 429 cooldown, the $/day cost
+    cap, the per-model RPD budget and the per-minute rate limiter — and it
+    accounts for the first request, which was billed but is not yet on the
+    ledger or the RPD counter (the caller records both after the transport
+    returns): the cap check adds that request's cost, the RPD check needs
+    room for BOTH requests. The rate limiter goes last because a passing
+    _rate_limit_ok() consumes a slot. False -> the caller skips the retry
+    and the transport returns None (fail-open, unchanged). Never raises."""
+    try:
+        if not _429_cooled_down(_provider_for(model)):
+            reason = "provider 429 cooldown"
+        elif not _cost_ok():
+            reason = "daily cost cap"
+        else:
+            try:
+                pending = _cost_of(model, 0, 0, pending_usage) \
+                    if pending_usage else 0.0
+            except Exception:
+                pending = 0.0
+            if _daily_cost + pending >= _DAILY_COST_LIMIT:
+                reason = "daily cost cap (incl. the first request)"
+            elif get_budget(model)[0] <= 1:
+                reason = "RPD budget"
+            elif not _rate_limit_ok():
+                reason = "rate limit"
+            else:
+                return True
+    except Exception as e:
+        reason = f"pre-flight error: {e}"
+    print(f"[LLM] {model}: validation retry refused ({reason})")
+    return False
 
 
 def _cost_ok() -> bool:
@@ -817,6 +1265,17 @@ def get_budget(model: str) -> tuple[int, int]:
     """Return (remaining, total) daily budget for a model (tier-aware)."""
     _maybe_reset_quota()
     budgets = _get_budgets()
+    canon = _canonical_claude_id(model)
+    if model not in budgets and canon in budgets:
+        # Prefixed/dated spelling of a tabled Claude id (review L2): its
+        # base model's RPD row, not the 50-RPD unknown default. The call
+        # COUNTER stays keyed on the raw id the caller uses.
+        return max(0, budgets[canon] - _model_calls.get(model, 0)), budgets[canon]
+    if model not in budgets and model not in _unknown_budget_warned:
+        _unknown_budget_warned.add(model)
+        print(f"[LLM] WARNING: no RPD budget row for model '{model}' — "
+              f"using the conservative 50-RPD unknown-model default "
+              f"(per process). Add it to llm_client's budget tables.")
     total = budgets.get(model, 50)
     used = _model_calls.get(model, 0)
     return max(0, total - used), total
@@ -842,6 +1301,7 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
     retry-after parsing. Does NOT fall back to other models (caller decides).
     """
     global _last_model_used
+    _meta_clear()   # INTEL W19: an attempt-less call leaves no stale meta
     if not _429_cooled_down('gemini'):
         return None
 
@@ -870,6 +1330,7 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
     if timeout is None:
         timeout = config.get("max_llm_latency_sec", 30)
     start = time.time()
+    _meta_begin()
 
     try:
         result, usage = _call_gemini(prompt, system, gemini_key, model, max_tokens,
@@ -877,6 +1338,8 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
                                      json_schema=json_schema,
                                      temperature=temperature)
         elapsed = (time.time() - start) * 1000
+        _meta_end('gemini', model, start, 0)
+        _charge_discarded(model, prompt_chars, result, usage)
         if result:
             record_call(model)
             _record_cost(model, prompt_chars, len(result), usage)
@@ -886,6 +1349,7 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
 
     except urllib.error.HTTPError as e:
         elapsed = (time.time() - start) * 1000
+        _meta_end('gemini', model, start, 0, http_status=e.code)
         if e.code == 429:
             wait = _parse_retry_after(e)
             if wait and wait <= _429_MAX_WAIT_PRIMARY:
@@ -893,20 +1357,24 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
                 time.sleep(wait)
                 try:
                     start2 = time.time()
+                    _meta_begin()
                     result, usage = _call_gemini(prompt, system, gemini_key, model,
                                                  max_tokens, timeout,
                                                  json_mode=json_mode,
                                                  json_schema=json_schema,
                                                  temperature=temperature)
                     elapsed2 = (time.time() - start2) * 1000
+                    _meta_end('gemini', model, start2, 1)
+                    _charge_discarded(model, prompt_chars, result, usage)
                     if result:
                         record_call(model)
                         _record_cost(model, prompt_chars, len(result), usage)
                         _last_model_used = model
                         print(f"[LLM] {model}: {elapsed2:.0f}ms, {len(result)} chars (after wait)")
                     return result
-                except Exception:
-                    pass
+                except Exception as _e2:
+                    _meta_end('gemini', model, start2, 1,
+                              http_status=getattr(_e2, 'code', None))
             print(f"[LLM] {model}: 429 exhausted ({elapsed:.0f}ms)")
         else:
             print(f"[LLM] {model}: HTTP {e.code} ({elapsed:.0f}ms)")
@@ -914,6 +1382,7 @@ def call_gemini(prompt: str, system: str = "", model: str = "gemini-2.5-flash",
 
     except Exception as e:
         elapsed = (time.time() - start) * 1000
+        _meta_end('gemini', model, start, 0)
         print(f"[LLM] {model}: {e} ({elapsed:.0f}ms)")
         return None
 
@@ -981,6 +1450,7 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048,
                             timeout, json_schema=json_schema,
                             temperature=temperature, base_url=base_url)
 
+    _n_attempts = 0   # INTEL W19 attempt_index (0-based, 429 re-sends count)
     for i, (provider, model, base_url, api_key) in enumerate(chain):
         if provider in ("anthropic", "openai", "gemini") and not api_key:
             continue  # endpoints may legitimately be keyless (e.g. Ollama)
@@ -992,9 +1462,14 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048,
 
         max_wait = _429_MAX_WAIT_PRIMARY if i == 0 else _429_MAX_WAIT_FALLBACK
         start = time.time()
+        _meta_begin()
+        _att = _n_attempts
+        _n_attempts += 1
         try:
             result, usage = _dispatch(provider, model, base_url, api_key)
             elapsed = (time.time() - start) * 1000
+            _meta_end(provider, model, start, _att, i > 0)
+            _charge_discarded(model, prompt_chars, result, usage)
             if result:
                 record_call(model)
                 _record_cost(model, prompt_chars, len(result), usage)
@@ -1005,28 +1480,37 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = 2048,
             print(f"[LLM] {provider}/{model}: empty/truncated, trying next")
             continue
         except urllib.error.HTTPError as e:
+            _meta_end(provider, model, start, _att, i > 0, http_status=e.code)
             if e.code == 429:
                 wait = (_parse_retry_after(e) if provider == "gemini"
                         else _parse_retry_after_anthropic(e))
                 if wait and wait <= max_wait:
                     print(f"[LLM] {provider}/{model}: 429, waiting {wait:.0f}s")
                     time.sleep(wait)
+                    start_r = time.time()
+                    _meta_begin()
+                    _att_r = _n_attempts
+                    _n_attempts += 1
                     try:
                         result, usage = _dispatch(provider, model, base_url, api_key)
+                        _meta_end(provider, model, start_r, _att_r, i > 0)
+                        _charge_discarded(model, prompt_chars, result, usage)
                         if result:
                             record_call(model)
                             _record_cost(model, prompt_chars, len(result), usage)
                             _last_model_used = model
                             print(f"[LLM] {provider}/{model}: {len(result)} chars (after wait)")
                             return result
-                    except Exception:
-                        pass
+                    except Exception as _e2:
+                        _meta_end(provider, model, start_r, _att_r, i > 0,
+                                  http_status=getattr(_e2, 'code', None))
                 print(f"[LLM] {provider}/{model}: 429, trying next")
                 _trigger_429_cooldown(provider)
                 continue
             print(f"[LLM] {provider}/{model}: HTTP {e.code}, trying next")
             continue
         except Exception as e:
+            _meta_end(provider, model, start, _att, i > 0)
             print(f"[LLM] {provider}/{model}: {e}, trying next")
             continue
 
@@ -1130,19 +1614,209 @@ def _normalize_schema_for_openai(schema):
     return out
 
 
+# --- Anthropic per-model request-surface gates (claude-api skill, 2026-09) ---
+#
+# Sampling params: `temperature`/`top_p`/`top_k` return a 400 on Claude
+# Fable 5/5.1 (+ Mythos), Opus 5.5, Opus 5, Opus 4.8/4.7 and Sonnet 5; they
+# are still accepted on Opus 4.6, Sonnet 4.6, Haiku 4.5 and older (skill
+# "Thinking & Effort" table). Audit D4: the old transport always sent the
+# analyst's temperature, so every Anthropic model newer than Opus 4.6 —
+# including claude-sonnet-5 in _ANTHROPIC_FALLBACK_CHAIN — was a guaranteed
+# 400. Removal thresholds are per family, (major, minor); fable/mythos never
+# accepted it. Unparseable/unknown ids DROP temperature: omitting it can
+# never cause a 400, sending it can.
+_SAMPLING_REMOVED_FROM = {"opus": (4, 7), "sonnet": (5, 0), "haiku": (5, 0),
+                          "fable": (0, 0), "mythos": (0, 0)}
+# Forced tool use (`tool_choice` {"type":"tool"|"any"}) returns a 400 on
+# Claude Fable 5.1 / Mythos 5.1 / Opus 5.5 (skill "Forced tool use
+# removed"; Fable 5 / Opus 5 / Sonnet 5 / Haiku 4.5 still accept it). Audit
+# D5. The sonnet/haiku thresholds are forward guesses (next major) — an id
+# at or past a threshold, or an unparseable one, takes the `auto` path,
+# which every model accepts.
+_FORCED_TOOL_REMOVED_FROM = {"opus": (5, 5), "fable": (5, 1),
+                             "mythos": (5, 1), "sonnet": (6, 0),
+                             "haiku": (5, 0)}
+_CLAUDE_ID_RE = re.compile(
+    r"^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?"
+    r"(?:-\d{8})?$")
+# Appended as a trailing user-turn text block on the `auto` path only (the
+# skill's recommended replacement for forcing: auto + an explicit
+# instruction naming the tool + strict: true). The user turn, not the
+# system prompt, so a system cache prefix is untouched.
+_EMIT_JSON_INSTRUCTION = (
+    "Respond by calling the emit_json tool exactly once. Its input is your "
+    "complete answer; do not answer in plain text.")
+
+
+def _claude_family_version(model):
+    """('opus', (4, 6)) for 'claude-opus-4-6' — and for every non-canonical
+    spelling of it (us.anthropic.…, @date, -latest, -vN:M; review L2);
+    None if not a recognised Claude id (legacy 'claude-3-…' ids return
+    None)."""
+    m = _CLAUDE_ID_RE.match(_canonical_claude_id(model) or "")
+    if not m:
+        return None
+    return m.group(1), (int(m.group(2)), int(m.group(3) or 0))
+
+
+def _anthropic_accepts_sampling(model) -> bool:
+    fv = _claude_family_version(model)
+    if fv is None:
+        # Legacy Claude 2/3 ids accept sampling params; anything else
+        # unrecognised is treated as a newer model (drop — never a 400).
+        return (_canonical_claude_id(model) or "").startswith(
+            ("claude-3", "claude-2"))
+    fam, ver = fv
+    return ver < _SAMPLING_REMOVED_FROM[fam]
+
+
+def _anthropic_accepts_forced_tool(model) -> bool:
+    fv = _claude_family_version(model)
+    if fv is None:
+        return (_canonical_claude_id(model) or "").startswith(
+            ("claude-3", "claude-2"))
+    fam, ver = fv
+    return ver < _FORCED_TOOL_REMOVED_FROM[fam]
+
+
+def _json_type_ok(value, t: str) -> bool:
+    if t == "object":
+        return isinstance(value, dict)
+    if t == "array":
+        return isinstance(value, list)
+    if t == "string":
+        return isinstance(value, str)
+    if t == "boolean":
+        return isinstance(value, bool)
+    if t == "integer":
+        return (isinstance(value, int) and not isinstance(value, bool)) or (
+            isinstance(value, float) and value.is_integer())
+    if t == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if t == "null":
+        return value is None
+    return True  # unknown type keyword: don't reject
+
+
+def _json_matches_schema(value, schema) -> bool:
+    """Minimal structural validator for the schema subset the callers use
+    (type / properties / required / items / enum). Used ONLY on the
+    `auto` tool-choice path, where — unlike forced tool use — the API does
+    not guarantee a schema-shaped answer exists at all. Lenient on extra
+    keys; strict on required keys and types."""
+    if not isinstance(schema, dict):
+        return True
+    t = schema.get("type")
+    types = [t] if isinstance(t, str) else (t if isinstance(t, list) else [])
+    types = [x.lower() for x in types if isinstance(x, str)]
+    if types and not any(_json_type_ok(value, x) for x in types):
+        return False
+    if "enum" in schema and isinstance(schema["enum"], list) \
+            and value not in schema["enum"]:
+        return False
+    if isinstance(value, dict):
+        props = schema.get("properties") or {}
+        for k in schema.get("required") or []:
+            if k not in value:
+                return False
+        for k, v in value.items():
+            if k in props and not _json_matches_schema(v, props[k]):
+                return False
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        return all(_json_matches_schema(v, schema["items"]) for v in value)
+    return True
+
+
+def _sum_usage(a: dict | None, b: dict | None) -> dict | None:
+    """Add two normalized usage dicts (both requests were billed)."""
+    if not a:
+        return b
+    if not b:
+        return a
+    out = dict(a)
+    for k, v in b.items():
+        try:
+            out[k] = (out.get(k) or 0) + (v or 0)
+        except TypeError:
+            pass
+    return out
+
+
+def _anthropic_post(body: dict, api_key: str, timeout) -> dict:
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": _ANTHROPIC_VERSION,
+        },
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    _note_transport(resp=resp)          # INTEL W19 (measurement-only)
+    return json.loads(resp.read())
+
+
+def _anthropic_usage(data: dict, model: str, cache_ttl: str) -> dict:
+    u = data.get("usage") or {}
+    usage = {
+        "promptTokenCount": u.get("input_tokens", 0),
+        "candidatesTokenCount": u.get("output_tokens", 0),
+        "thoughtsTokenCount": 0,
+    }
+    # Cache accounting fields — added ONLY when present-and-nonzero so the
+    # normalized dict stays exactly {prompt,candidates,thoughts} on the
+    # default no-cache path (exact-equality pins in test_llm_claude.py).
+    cw = u.get("cache_creation_input_tokens") or 0
+    cr = u.get("cache_read_input_tokens") or 0
+    if cw:
+        usage["cacheWriteTokenCount"] = cw
+        # 1-hour-TTL share (billed 2x, D14): the API's per-TTL breakdown
+        # when present; else infer from the TTL this request asked for.
+        cc = u.get("cache_creation")
+        if isinstance(cc, dict):
+            cw1h = cc.get("ephemeral_1h_input_tokens") or 0
+        else:
+            cw1h = cw if cache_ttl == "1h" else 0
+        if cw1h:
+            usage["cacheWrite1hTokenCount"] = min(cw1h, cw)
+    if cr:
+        usage["cacheReadTokenCount"] = cr
+    if cache_ttl in ("5m", "1h") and not cw and not cr:
+        # Flag is ON but the API reported no cache tokens — the prefix is
+        # below the model's minimum cacheable length or was invalidated
+        # (per-symbol tool schema changed). Loud so the owner sees it.
+        print(f"[LLM] Claude {model}: cache_control active but no cache "
+              f"tokens reported (prefix below model minimum?)")
+    return usage
+
+
 def _call_anthropic(prompt, system, api_key, model, max_tokens, timeout,
                     json_mode=False, json_schema=None, temperature=None):
     """Call the Anthropic Messages API. Returns (text|None, usage|None);
     raises urllib errors for the caller's retry/fallback logic.
 
-    json_schema: enforced via FORCED TOOL USE — the schema becomes a tool's
-    input_schema and tool_choice pins the model to that tool, so the returned
-    tool_use input is schema-validated JSON. It is re-serialized to a JSON
-    string so callers parse both providers identically. Usage is normalized
-    to Gemini's usageMetadata key names so _record_cost stays provider-
-    agnostic. json_mode without a schema is best-effort (prompt discipline).
+    json_schema: on models that accept it, enforced via FORCED TOOL USE —
+    the schema becomes a tool's input_schema and tool_choice pins the model
+    to that tool, so the returned tool_use input is schema-validated JSON
+    (byte-identical request to the pre-2026-09 transport). On models that
+    reject forced tool use (Fable 5.1 / Mythos 5.1 / Opus 5.5 — audit D5)
+    the equivalent the claude-api skill recommends is used instead:
+    tool_choice auto + `strict: true` on the tool + an explicit
+    instruction, then the tool input (or, failing that, a JSON text
+    answer) is validated against the schema client-side, with ONE
+    validation retry — itself gated by _retry_preflight (cost cap incl.
+    the first request, RPD, rate limit, 429 cooldown) and counted against
+    RPD here (review L1); anything still not schema-shaped returns None
+    (-> the analyst's fail-open path). Either way the caller gets the
+    tool input re-serialized as a JSON string (so every provider parses
+    identically) or None. Usage is normalized to Gemini's usageMetadata
+    key names so _record_cost stays provider-agnostic, and on the retry
+    path is the SUM of both billed requests. `temperature` is sent only to
+    models that accept sampling params (audit D4). json_mode without a
+    schema is best-effort (prompt discipline).
     """
-    url = "https://api.anthropic.com/v1/messages"
     body = {
         "model": model,
         "max_tokens": max_tokens,
@@ -1167,49 +1841,71 @@ def _call_anthropic(prompt, system, api_key, model, max_tokens, timeout,
                                "cache_control": cc}]
         else:
             body["system"] = system
-    if temperature is not None:
+    if temperature is not None and _anthropic_accepts_sampling(model):
         body["temperature"] = temperature
+    forced = True
     if json_schema is not None:
-        body["tools"] = [{
-            "name": "emit_json",
-            "description": "Emit the structured answer in the required schema.",
-            "input_schema": _normalize_schema_for_anthropic(json_schema),
-        }]
-        body["tool_choice"] = {"type": "tool", "name": "emit_json"}
+        forced = _anthropic_accepts_forced_tool(model)
+        if forced:
+            body["tools"] = [{
+                "name": "emit_json",
+                "description": "Emit the structured answer in the required schema.",
+                "input_schema": _normalize_schema_for_anthropic(json_schema),
+            }]
+            body["tool_choice"] = {"type": "tool", "name": "emit_json"}
+        else:
+            # Strict tool use requires additionalProperties:false on every
+            # object — the same normalization OpenAI strict mode needs.
+            body["tools"] = [{
+                "name": "emit_json",
+                "description": "Emit the structured answer in the required schema.",
+                "input_schema": _normalize_schema_for_openai(json_schema),
+                "strict": True,
+            }]
+            body["tool_choice"] = {"type": "auto"}
+            body["messages"] = [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "text", "text": _EMIT_JSON_INSTRUCTION},
+            ]}]
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": _ANTHROPIC_VERSION,
-        },
-        method="POST",
-    )
-    resp = urllib.request.urlopen(req, timeout=timeout)
-    data = json.loads(resp.read())
-    u = data.get("usage") or {}
-    usage = {
-        "promptTokenCount": u.get("input_tokens", 0),
-        "candidatesTokenCount": u.get("output_tokens", 0),
-        "thoughtsTokenCount": 0,
-    }
-    # Cache accounting fields — added ONLY when present-and-nonzero so the
-    # normalized dict stays exactly {prompt,candidates,thoughts} on the
-    # default no-cache path (exact-equality pins in test_llm_claude.py).
-    cw = u.get("cache_creation_input_tokens") or 0
-    cr = u.get("cache_read_input_tokens") or 0
-    if cw:
-        usage["cacheWriteTokenCount"] = cw
-    if cr:
-        usage["cacheReadTokenCount"] = cr
-    if cache_ttl in ("5m", "1h") and not cw and not cr:
-        # Flag is ON but the API reported no cache tokens — the prefix is
-        # below the model's minimum cacheable length or was invalidated
-        # (per-symbol tool schema changed). Loud so the owner sees it.
-        print(f"[LLM] Claude {model}: cache_control active but no cache "
-              f"tokens reported (prefix below model minimum?)")
+    data = _anthropic_post(body, api_key, timeout)
+    _note_anthropic(data)               # INTEL W19 (measurement-only)
+    usage = _anthropic_usage(data, model, cache_ttl)
+
+    if json_schema is not None and not forced:
+        check_schema = _normalize_schema_for_anthropic(json_schema)
+        for attempt in (1, 2):
+            text, stop = _anthropic_extract_validated(data, check_schema)
+            if text is not None:
+                return text, usage
+            if attempt == 2 or stop in ("max_tokens", "refusal"):
+                # A truncation/refusal would just repeat — don't pay twice.
+                break
+            if not _retry_preflight(model, usage):
+                # Cap / RPD / rate limit / cooldown refuses a second billed
+                # request (review L1): fail open with the first request's
+                # usage so the caller still charges + counts it.
+                return None, usage
+            print(f"[LLM] Claude {model}: no schema-valid emit_json "
+                  f"(stop={stop}), one validation retry")
+            try:
+                data = _anthropic_post(body, api_key, timeout)
+            except Exception as e:
+                # The first request was billed — return its usage so the
+                # caller still charges it (D6), instead of losing it to a
+                # raise.
+                print(f"[LLM] Claude {model}: validation retry failed: {e}")
+                return None, usage
+            # The retry is its own billed request: count it against RPD
+            # here (the caller's record_call / _charge_discarded counts the
+            # first one) — review L1.
+            record_call(model)
+            _note_anthropic(data)       # INTEL W19: the retry's stop_reason
+            usage = _sum_usage(usage, _anthropic_usage(data, model, cache_ttl))
+        print(f"[LLM] Claude {model}: no schema-valid answer (stop={stop}), "
+              f"discarding")
+        return None, usage
+
     stop = data.get("stop_reason", "unknown")
     text_parts = []
     for block in data.get("content", []) or []:
@@ -1224,6 +1920,42 @@ def _call_anthropic(prompt, system, api_key, model, max_tokens, timeout,
         return "".join(text_parts), usage
     print(f"[LLM] Claude: no usable content (stop={stop})")
     return None, usage
+
+
+def _note_anthropic(data) -> None:
+    """INTEL W19: Claude's native stop_reason into the attempt meta."""
+    try:
+        _note_transport(finish_reason=data.get("stop_reason"))
+    except Exception:
+        pass
+
+
+def _anthropic_extract_validated(data: dict, schema: dict):
+    """`auto`-path extraction: the emit_json tool input if it validates,
+    else a JSON text answer if THAT validates, else None.
+    Returns (json_text|None, stop_reason)."""
+    stop = data.get("stop_reason", "unknown")
+    text_parts = []
+    for block in data.get("content", []) or []:
+        if block.get("type") == "tool_use" and block.get("name") == "emit_json":
+            inp = block.get("input")
+            if _json_matches_schema(inp, schema):
+                return json.dumps(inp), stop
+        elif block.get("type") == "text" and block.get("text", "").strip():
+            text_parts.append(block["text"])
+    if text_parts and stop != "max_tokens":
+        raw = "".join(text_parts).strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else ""
+            if raw.rstrip().endswith("```"):
+                raw = raw.rstrip()[:-3]
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            parsed = None
+        if parsed is not None and _json_matches_schema(parsed, schema):
+            return json.dumps(parsed), stop
+    return None, stop
 
 
 _DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -1289,6 +2021,7 @@ def _call_openai(prompt, system, api_key, model, max_tokens, timeout,
     )
     resp = urllib.request.urlopen(req, timeout=timeout)
     data = json.loads(resp.read())
+    _note_openai(resp, data)            # INTEL W19 (measurement-only)
     u = data.get("usage") or {}
     usage = {
         "promptTokenCount": u.get("prompt_tokens", 0),
@@ -1311,6 +2044,17 @@ def _call_openai(prompt, system, api_key, model, max_tokens, timeout,
     return None, usage
 
 
+def _note_openai(resp, data) -> None:
+    """INTEL W19: HTTP status + choices[0].finish_reason (None when the
+    response has no choices) into the attempt meta."""
+    try:
+        choices = data.get("choices") or []
+        fr = choices[0].get("finish_reason") if choices else None
+        _note_transport(finish_reason=fr, resp=resp)
+    except Exception:
+        _note_transport(resp=resp)
+
+
 def call_claude(prompt: str, system: str = "", model: str = "claude-haiku-4-5",
                 max_tokens: int = 2048, json_mode: bool = False,
                 json_schema: dict | None = None,
@@ -1322,6 +2066,7 @@ def call_claude(prompt: str, system: str = "", model: str = "claude-haiku-4-5",
     and cooldown discipline; single model, no fallback (caller decides).
     """
     global _last_model_used
+    _meta_clear()   # INTEL W19: an attempt-less call leaves no stale meta
     if not _429_cooled_down('anthropic'):
         return None
     if not _cost_ok():
@@ -1347,6 +2092,7 @@ def call_claude(prompt: str, system: str = "", model: str = "claude-haiku-4-5",
 
     for attempt in (1, 2):
         start = time.time()
+        _meta_begin()
         try:
             result, usage = _call_anthropic(prompt, system, api_key, model,
                                             max_tokens, timeout,
@@ -1354,6 +2100,8 @@ def call_claude(prompt: str, system: str = "", model: str = "claude-haiku-4-5",
                                             json_schema=json_schema,
                                             temperature=temperature)
             elapsed = (time.time() - start) * 1000
+            _meta_end('anthropic', model, start, attempt - 1)
+            _charge_discarded(model, prompt_chars, result, usage)
             if result:
                 record_call(model)
                 _record_cost(model, prompt_chars, len(result), usage)
@@ -1363,6 +2111,7 @@ def call_claude(prompt: str, system: str = "", model: str = "claude-haiku-4-5",
             return result
         except urllib.error.HTTPError as e:
             elapsed = (time.time() - start) * 1000
+            _meta_end('anthropic', model, start, attempt - 1, http_status=e.code)
             if e.code == 429 and attempt == 1:
                 wait = _parse_retry_after_anthropic(e)
                 if wait and wait <= _429_MAX_WAIT_PRIMARY:
@@ -1373,6 +2122,7 @@ def call_claude(prompt: str, system: str = "", model: str = "claude-haiku-4-5",
             return None
         except Exception as e:
             elapsed = (time.time() - start) * 1000
+            _meta_end('anthropic', model, start, attempt - 1)
             print(f"[LLM] {model}: {e} ({elapsed:.0f}ms)")
             return None
     return None
@@ -1396,6 +2146,7 @@ def call_openai(prompt: str, system: str = "", model: str = "gpt-5.4-nano",
     instead, which resolves base_url/api_key per-endpoint automatically).
     """
     global _last_model_used
+    _meta_clear()   # INTEL W19: an attempt-less call leaves no stale meta
     if not _429_cooled_down('openai'):
         return None
     if not _cost_ok():
@@ -1421,6 +2172,7 @@ def call_openai(prompt: str, system: str = "", model: str = "gpt-5.4-nano",
 
     for attempt in (1, 2):
         start = time.time()
+        _meta_begin()
         try:
             result, usage = _call_openai(prompt, system, api_key, model,
                                          max_tokens, timeout,
@@ -1428,6 +2180,8 @@ def call_openai(prompt: str, system: str = "", model: str = "gpt-5.4-nano",
                                          temperature=temperature,
                                          base_url=base_url)
             elapsed = (time.time() - start) * 1000
+            _meta_end('openai', model, start, attempt - 1)
+            _charge_discarded(model, prompt_chars, result, usage)
             if result:
                 record_call(model)
                 _record_cost(model, prompt_chars, len(result), usage)
@@ -1437,6 +2191,7 @@ def call_openai(prompt: str, system: str = "", model: str = "gpt-5.4-nano",
             return result
         except urllib.error.HTTPError as e:
             elapsed = (time.time() - start) * 1000
+            _meta_end('openai', model, start, attempt - 1, http_status=e.code)
             if e.code == 429 and attempt == 1:
                 wait = _parse_retry_after_anthropic(e)  # generic retry-after header parse
                 if wait and wait <= _429_MAX_WAIT_PRIMARY:
@@ -1447,6 +2202,7 @@ def call_openai(prompt: str, system: str = "", model: str = "gpt-5.4-nano",
             return None
         except Exception as e:
             elapsed = (time.time() - start) * 1000
+            _meta_end('openai', model, start, attempt - 1)
             print(f"[LLM] {model}: {e} ({elapsed:.0f}ms)")
             return None
     return None
@@ -1551,6 +2307,26 @@ def probe_available_models() -> dict:
 
 # --- Gemini API call ---
 
+def _note_gemini(resp, data) -> None:
+    """INTEL W19: HTTP status, candidates[0].finishReason (None when there
+    are no candidates) and promptFeedback.blockReason into the attempt
+    meta. Reads only; the parse below is untouched."""
+    fr = br = None
+    try:
+        cands = data.get("candidates")
+        if isinstance(cands, list) and cands and isinstance(cands[0], dict):
+            fr = cands[0].get("finishReason")
+    except Exception:
+        fr = None
+    try:
+        pf = data.get("promptFeedback")
+        if isinstance(pf, dict):
+            br = pf.get("blockReason")
+    except Exception:
+        br = None
+    _note_transport(finish_reason=fr, block_reason=br, resp=resp)
+
+
 def _call_gemini(prompt, system, api_key, model, max_tokens, timeout,
                  json_mode=False, json_schema=None, temperature=None):
     """Call Google Gemini API. Returns (text|None, usage_dict|None);
@@ -1600,6 +2376,7 @@ def _call_gemini(prompt, system, api_key, model, max_tokens, timeout,
     resp = urllib.request.urlopen(req, timeout=timeout)
     _capture_rate_limit_headers(resp, model)
     data = json.loads(resp.read())
+    _note_gemini(resp, data)            # INTEL W19 (measurement-only)
     usage = data.get("usageMetadata")
     try:
         finish = data["candidates"][0].get("finishReason", "unknown")

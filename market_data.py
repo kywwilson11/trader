@@ -5,6 +5,7 @@ plus a live ATR helper used by the trading loops for adaptive stop-losses.
 """
 
 import calendar
+import logging
 import os
 import threading
 import time
@@ -16,6 +17,8 @@ import pandas as pd
 import yfinance as yf
 
 from indicators import compute_atr
+
+log = logging.getLogger(__name__)
 
 
 def closed_bars_v2_enabled() -> bool:
@@ -533,6 +536,53 @@ def daily_bars_fetched_at(symbol):
 
 # --- HISTORICAL BAR FETCHING (for training data harvest) ---
 
+# Alpaca's Basic (free) market-data plan serves SIP stock bars only with a
+# 15-minute delay: any request whose `end` falls inside the last 15 minutes
+# is rejected outright ("subscription does not permit querying recent SIP
+# data") — the WHOLE chunk, not just the recent tail. The harvest used to
+# send end=now, so a full rebuild silently lost its final ~6-month chunk
+# (C_data blocker 1, 2026-09-26) and every weekly incremental (one chunk
+# ending at now) returned nothing and fell to the :30-aligned yfinance path.
+# 16 = the documented 15-min delay + 1 min margin. Stock feed only; crypto
+# bars have no such restriction and are never clamped.
+SIP_RECENT_DELAY_MIN = 16
+# Alpaca's stock hourly bars span the extended session, 04:00-20:00 ET on
+# weekdays. Inside it the bar that opened at floor_hour(limit) is still
+# forming (REVIEW M1, 2026-09-26): nothing on the harvest path drops it, and
+# its partial close then trips the 1% overlap-divergence merge guard
+# (data_utils.OVERLAP_DIVERGENCE_MAX) on the ticker's next incremental.
+_SIP_SESSION_TZ = 'America/New_York'
+_SIP_SESSION_OPEN_H, _SIP_SESSION_CLOSE_H = 4, 20
+
+
+def _clamp_sip_end(end_dt, asset_type, now=None):
+    """Clamp a stock request's `end` to `now - SIP_RECENT_DELAY_MIN`, and,
+    while that limit falls inside the extended session (04:00-20:00 ET,
+    Mon-Fri), further to the last COMPLETED hourly bar:
+    `floor_hour(limit) - 1s` — every returned bar then has open + 1h <= limit,
+    so a harvest run during trading hours never stores a forming bar.
+
+    Crypto passes through untouched. An `end` already older than the clamp
+    is returned unchanged (bounded gap-repair windows keep their bounds).
+    Outside the session (after 20:00 ET, weekends) the plain 16-min clamp
+    applies — no bar can be forming, so the hour floor would change nothing.
+    """
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+    if asset_type == 'crypto':
+        return end_dt
+    if now is None:
+        now = datetime.now(timezone.utc)
+    limit = now - timedelta(minutes=SIP_RECENT_DELAY_MIN)
+    et = limit.astimezone(ZoneInfo(_SIP_SESSION_TZ))
+    if (et.weekday() < 5
+            and _SIP_SESSION_OPEN_H <= et.hour < _SIP_SESSION_CLOSE_H):
+        # ET/UTC offsets are whole hours, so the hour floor is tz-agnostic.
+        limit = (limit.replace(minute=0, second=0, microsecond=0)
+                 - timedelta(seconds=1))
+    return end_dt if end_dt <= limit else limit
+
+
 def _fetch_chunk(api, symbol, start_iso, end_iso, asset_type, max_retries=4):
     """Fetch one date-range chunk with exponential backoff.
 
@@ -562,8 +612,14 @@ def _fetch_chunk(api, symbol, start_iso, end_iso, asset_type, max_retries=4):
 
         except Exception as e:
             err_str = str(e).lower()
-            # Subscription errors are permanent — no point retrying
+            # Subscription errors are permanent — no point retrying. Say so
+            # loudly: a swallowed chunk is a silent hole in the training
+            # store (the stock end-clamp above should make this unreachable
+            # for recent-SIP denials).
             if 'subscription' in err_str or 'not permit' in err_str:
+                log.warning("[HIST] %s: Alpaca subscription denied chunk "
+                            "%s..%s (%s) — chunk NOT fetched",
+                            symbol, start_iso, end_iso, e)
                 return None
             is_rate_limit = ('rate' in err_str or '429' in err_str
                              or 'too many' in err_str)
@@ -607,6 +663,11 @@ def fetch_historical_bars(api, symbol, start_date, asset_type='crypto',
     now = datetime.now(timezone.utc)
     end_dt = (datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
               if end_date else now)
+    # Stock (SIP) only: never ask for bars inside the plan's 15-min delay
+    # window, or the whole final chunk is rejected; in-session, also stop at
+    # the last completed hourly bar (no forming bar in the store). No-op for
+    # crypto and for a caller end_date already older than the clamp.
+    end_dt = _clamp_sip_end(end_dt, asset_type, now=now)
 
     # Build chunk boundaries
     chunks = []
@@ -634,8 +695,11 @@ def fetch_historical_bars(api, symbol, start_date, asset_type='crypto',
             asset_type,
         )
         if result is None:
-            # Skip retry for the last chunk — likely a subscription limit on
-            # recent data; yfinance will cover it
+            # Skip retry for the last chunk (historical policy: a final-chunk
+            # failure was usually the recent-SIP denial, now prevented by
+            # _clamp_sip_end). NOTE yfinance does NOT cover a lost stock
+            # tail: data_sources.fetch_with_fallback calls it for stocks
+            # only when Alpaca returned nothing at all.
             if i < len(chunks) - 1:
                 pace = min(pace * 3, 30)
                 print(f"  [HIST] Pacing increased to {pace:.0f}s, retrying chunk...")
@@ -645,6 +709,12 @@ def fetch_historical_bars(api, symbol, start_date, asset_type='crypto',
                     c_start.isoformat(), c_end.isoformat(),
                     asset_type,
                 )
+        if result is None:
+            # Earlier chunks' rows are kept; this window is a hole.
+            log.warning("[HIST] %s: chunk %d/%d %s..%s failed — %s MISSING "
+                        "from the result", symbol, i + 1, len(chunks),
+                        c_start.isoformat(), c_end.isoformat(),
+                        'TAIL' if i == len(chunks) - 1 else 'interior window')
         if result:
             all_rows.extend(result)
 

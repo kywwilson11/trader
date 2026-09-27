@@ -74,6 +74,477 @@ def artifact_freshness(items, now=None, default_stale_s=172800.0):
         return []
 
 
+# Content-aware freshness (INTEL W8, 2026-09-27). artifact_freshness ages by
+# mtime only, so a fresh no-data / stale / under-powered stub read "fresh".
+# artifact_validity reads the report's OWN flags; freshness_state folds the
+# two into one of 'missing' / 'aged' / 'void' / 'fresh'. Flags honoured, per
+# producer (read-only here — change them there first):
+#   decision_report.json  stale (decision_report.py:818-828, :1041-1049;
+#                         api_available None = no journal rows :833-836,
+#                         False = no API :837-847; stale_reason :1044/:1048),
+#                         quality.representative (:1013-1023)
+#   llm_eval_report.json  verdict == 'no_data' + reason (llm_eval.py:1019-1024),
+#                         verdict 'insufficient_power…' copied from
+#                         incremental (:1316; set at :570-571, :716-721,
+#                         :731-741), incremental.insufficient_power
+#   llm_advisor_report.json  same stub (:1374/:1430/:1476 -> :1019-1024);
+#                         power flag only at incremental.insufficient_power
+#                         (report block :1559-1561, no top-level verdict)
+#   execution_report.json no flag: an empty window writes only generated_at +
+#                         window_days (execution_report.py:102-110);
+#                         overall_mean_bps exists only when fills carry
+#                         slippage (:117-147)
+#   beta_report.json      joint.underpowered (beta_ledger.py:282-283, warned
+#                         :497-500); a failed run raises SystemExit and
+#                         writes no JSON (:860), so absent != void.
+VALID = 'valid'
+VOID = 'void'
+VALIDITY_KINDS = ('decision_report', 'llm_eval', 'llm_advisor', 'execution',
+                  'beta')
+_VALIDITY_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _void(reason):
+    return {'state': VOID, 'reason': str(reason)}
+
+
+def artifact_validity(path_or_doc, kind):
+    """{'state': 'valid'|'void'|'missing', 'reason': str|None} from a report
+    JSON's own flags (see the block comment above for every flag + its
+    producer line). path_or_doc: a path (read here) or an already-parsed
+    dict. kind: one of VALIDITY_KINDS; any other kind (shadow, drift,
+    ledgers…) has no content contract here and is 'valid'. Unparseable JSON
+    or a non-dict top level is 'void'. Never raises."""
+    try:
+        doc = path_or_doc
+        if not isinstance(doc, dict):
+            if kind not in VALIDITY_KINDS:
+                return {'state': VALID, 'reason': None}
+            p = str(path_or_doc)
+            try:
+                if os.path.getsize(p) > _VALIDITY_MAX_BYTES:
+                    return {'state': VALID, 'reason': 'too large to check'}
+                with open(p, encoding='utf-8') as f:
+                    doc = json.load(f)
+            except FileNotFoundError:
+                return {'state': 'missing', 'reason': None}
+            except (OSError, ValueError, TypeError):
+                return _void('unreadable JSON')
+        if not isinstance(doc, dict):
+            return _void('not a JSON object')
+        if kind == 'decision_report':
+            if doc.get('stale'):
+                if doc.get('stale_reason'):
+                    return _void(doc['stale_reason'])
+                api = doc.get('api_available', 'absent')
+                if api is None:
+                    return _void('no journal rows')
+                if api is False:
+                    return _void('no API to price counterfactuals')
+                return _void('stale report')
+            q = doc.get('quality')
+            if isinstance(q, dict) and q.get('representative') is False:
+                rate = q.get('unpriced_rate')
+                return _void('not representative (priced %s, unpriced %s)'
+                             % (q.get('priced'),
+                                '%.0f%%' % (100 * rate)
+                                if isinstance(rate, (int, float)) else 'n/a'))
+            return {'state': VALID, 'reason': None}
+        if kind in ('llm_eval', 'llm_advisor'):
+            verdict = doc.get('verdict')
+            if verdict == 'no_data':
+                return _void('no data: %s' % (doc.get('reason') or 'n/a'))
+            inc = doc.get('incremental')
+            inc = inc if isinstance(inc, dict) else {}
+            if (inc.get('insufficient_power')
+                    or (isinstance(verdict, str)
+                        and verdict.startswith('insufficient_power'))):
+                return _void('insufficient power (n=%s, clusters=%s, n_eff=%s)'
+                             % (inc.get('n', doc.get('n')),
+                                inc.get('n_clusters', 'n/a'),
+                                inc.get('effective_n_hint', 'n/a')))
+            return {'state': VALID, 'reason': None}
+        if kind == 'execution':
+            if 'overall_mean_bps' not in doc:
+                extra = set(doc) - {'generated_at', 'window_days'}
+                return _void('no journal rows' if not extra
+                             else 'no fills with slippage')
+            return {'state': VALID, 'reason': None}
+        if kind == 'beta':
+            joint = doc.get('joint')
+            if isinstance(joint, dict) and joint.get('underpowered'):
+                return _void('underpowered (%s obs/param)'
+                             % joint.get('obs_per_param'))
+            return {'state': VALID, 'reason': None}
+        return {'state': VALID, 'reason': None}
+    except Exception:
+        return {'state': VALID, 'reason': None}
+
+
+def freshness_state(row, validity=None):
+    """Fold an artifact_freshness row and an artifact_validity result into
+    'missing' | 'aged' | 'void' | 'fresh'. mtime ageing wins over content
+    (an aged report stays 'aged' whatever it says); a fresh-by-mtime file
+    whose content is void is 'void', never 'fresh'."""
+    if not row or not row.get('exists'):
+        return 'missing'
+    if row.get('stale'):
+        return 'aged'
+    if validity and validity.get('state') == VOID:
+        return VOID
+    return 'fresh'
+
+
+# Evidence-readiness panel (INTEL W8): reads the newest
+# scripts/evidence_reads.py summary.json (default out dir
+# logs/evidence_reads/<UTC ts>/summary.json, evidence_reads.py:546-547,
+# readiness rows :565-567, verdict strings :246-281).
+EVIDENCE_VERDICTS = ('READY', 'NOT YET', 'NO DATA', 'PARSE FAILED', 'FAILED',
+                     'SKIPPED', 'NOT RUN')
+_EVIDENCE_KEY_ALIAS = {'n_clusters': 'clusters', 'effective_n': 'n_eff',
+                       'n_obs_used': 'obs', 'priced': 'priced',
+                       'n_buys_with_slippage': 'buys w/ slip',
+                       'n_buy_rows': 'buy rows', 'dump_rows': 'rows'}
+
+
+def newest_evidence_summary(base_dir):
+    """Path (str) of the newest <base_dir>/*/summary.json by mtime (ties ->
+    lexically last run dir, whose name is the UTC stamp), or None when the
+    dir is absent/empty. One listdir + one stat per run dir. Never raises."""
+    try:
+        best = None
+        with os.scandir(str(base_dir)) as it:
+            for ent in it:
+                try:
+                    if not ent.is_dir():
+                        continue
+                    p = os.path.join(ent.path, 'summary.json')
+                    key = (os.stat(p).st_mtime, ent.name)
+                except (OSError, ValueError):
+                    continue
+                if best is None or key > best[0]:
+                    best = (key, p)
+        return best[1] if best else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def evidence_verdict_class(verdict):
+    """Leading class of an evidence_reads verdict string ('READY',
+    'NOT YET', …) or 'UNKNOWN'."""
+    v = str(verdict or '').strip().upper()
+    for cls in EVIDENCE_VERDICTS:
+        if v.startswith(cls):
+            return cls
+    return 'UNKNOWN'
+
+
+def _observed_vs_threshold(observed, rule):
+    """'n=0, n_clusters=n/a' + 'n >= 60 AND n_clusters >= 120' ->
+    'n 0/60 · clusters –/120'. The observed pairs are the rule's checks in
+    order (evidence_reads.py:264), so the k-th '>= N' in the rule text is
+    the k-th threshold. Falls back to the raw observed text on a mismatch."""
+    import re
+    obs = str(observed or '').strip()
+    if not obs or obs == '-':
+        return '—'
+    pairs = []
+    for part in obs.split(','):
+        k, sep, v = part.strip().partition('=')
+        if not sep:
+            return obs
+        pairs.append((k.strip(), v.strip()))
+    need = re.findall(r'>=\s*([0-9]+(?:\.[0-9]+)?)', str(rule or ''))
+    if len(need) < len(pairs):
+        return obs
+    out = []
+    for (k, v), n in zip(pairs, need):
+        k = _EVIDENCE_KEY_ALIAS.get(k, k)
+        out.append('%s %s/%s' % (k, '–' if v in ('n/a', '') else v, n))
+    return ' · '.join(out)
+
+
+def format_eta(eta_days, verdict_class=None):
+    """ETA cell text for a readiness row (INTEL W11): 'n/a (READY)' for a
+    READY read; '~12 d' / '<1 d' for a finite eta_days >= 0 (the W12
+    accrual projection, scripts/evidence_reads.py); '—' for anything else
+    (null = no history / no accrual, absent field, garbage). Never raises."""
+    if verdict_class == 'READY':
+        return 'n/a (READY)'
+    try:
+        if eta_days is None or isinstance(eta_days, bool):
+            return '—'
+        d = float(eta_days)
+    except (TypeError, ValueError):
+        return '—'
+    if not math.isfinite(d) or d < 0:
+        return '—'
+    return '<1 d' if d < 1 else '~%d d' % int(round(d))
+
+
+def evidence_readiness_rows(summary, with_eta=False):
+    """Row tuples for the Models-tab readiness panel, one per
+    summary['readiness'] entry:
+      (read, verdict_class, verdict_text, observed_vs_threshold,
+       source_kind, source)
+    source_kind is 'provisional' when the rule's source says so
+    (evidence_reads.py:78, _PROV) else 'documented'. Never raises.
+    with_eta=True (INTEL W11) appends (eta_text, eta_basis): eta_text is
+    format_eta(row['eta_days'], verdict_class); eta_basis is the row's
+    'eta_basis' string, '' when only eta_days is present, and None when the
+    summary predates the W12 fields (neither key present). The default
+    6-tuple shape is unchanged."""
+    rows = []
+    try:
+        for r in (summary or {}).get('readiness') or []:
+            if not isinstance(r, dict):
+                continue
+            src = str(r.get('source') or '')
+            cls = evidence_verdict_class(r.get('verdict'))
+            row = (str(r.get('read', '?')),
+                   cls,
+                   str(r.get('verdict') or ''),
+                   _observed_vs_threshold(r.get('observed'),
+                                          r.get('rule')),
+                   'provisional' if 'provisional' in src.lower()
+                   else 'documented',
+                   src)
+            if with_eta:
+                has = ('eta_days' in r) or ('eta_basis' in r)
+                b = r.get('eta_basis')
+                row = row + (format_eta(r.get('eta_days'), cls),
+                             (str(b) if b is not None else '') if has
+                             else None)
+            rows.append(row)
+    except Exception:
+        return rows
+    return rows
+
+
+def evidence_run_age_s(summary, mtime=None, now=None):
+    """Age (s) of an evidence_reads run from summary['generated_at'] (UTC
+    ISO, evidence_reads.py:576), falling back to the file mtime; None if
+    neither parses. Never raises."""
+    try:
+        if now is None:
+            now = time.time()
+        ts = None
+        g = (summary or {}).get('generated_at')
+        if g:
+            try:
+                d = datetime.datetime.fromisoformat(str(g))
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=datetime.timezone.utc)
+                ts = d.timestamp()
+            except (TypeError, ValueError):
+                ts = None
+        if ts is None and mtime is not None:
+            ts = float(mtime)
+        return None if ts is None else max(0.0, float(now) - ts)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Cockpit alarm hierarchy (INTEL W11; Scout B UX #4: ISA-18.2 priorities,
+# dedupe, flood, ack/shelve; WCAG 2.x SC 1.4.1 — colour is never the only
+# channel, so every row carries a text priority tag). Display-only: nothing
+# here feeds a decision, a gate or a file; all state is in-memory.
+# ---------------------------------------------------------------------------
+ALERT_PRIORITY = {
+    'halt': 'P1', 'flatten': 'P1', 'order-error': 'P1', 'rejected': 'P1',
+    'heartbeat': 'P2', 'stream': 'P2', 'stale': 'P2',
+    'resume': 'P3', 'flatten-complete': 'P3',
+}
+ALERT_PRIORITIES = ('P1', 'P2', 'P3')
+
+
+def alert_priority(kind, text=''):
+    """(priority, text_tag) for a cockpit alert, e.g. ('P1', '[P1]'). The
+    tag is the non-colour channel (WCAG SC 1.4.1). Never raises.
+
+    kind -> priority. Callers (gui.py `_push_alert(` sites, W11 line numbers):
+      P1 act now   halt              gui.py:4156   _refresh_cockpit_banner (halt edge)
+                   flatten           gui.py:4171   _refresh_cockpit_banner (flatten requested)
+                   order-error       gui.py:4881 (manual order), :4967 (close),
+                                     :9394 (cancel)
+                   rejected          gui.py:10990  pipeline command rejected
+      P2 degraded  heartbeat         gui.py:4047   _refresh_heartbeats (stale edge)
+                   stream            gui.py:9239   data stream failing (x3)
+                   stale             gui.py:10849  pipeline_status.json > 2 min
+      P3 info      resume            gui.py:4158   entries resumed
+                   flatten-complete  gui.py:8701   flatten done (the halt itself
+                                     is its own P1 'halt' row)
+      unknown kind: P2 if the text says 'error'/'fail', else P3.
+    """
+    p = ALERT_PRIORITY.get(str(kind or ''))
+    if p is None:
+        t = str(text or '').lower()
+        p = 'P2' if ('error' in t or 'fail' in t) else 'P3'
+    return p, '[%s]' % p
+
+
+class AlertLedger:
+    """In-memory alarm ledger behind the Cockpit alerts feed (INTEL W11).
+
+    - dedupe per kind+text over `window_s` (10 min, measured from the last
+      occurrence): a repeat bumps a xN counter on the existing row, refreshes
+      its timestamp, moves it to the top and clears its ack (ISA-18.2
+      re-alarm) instead of adding a row;
+    - flood collapse: more than `flood_n` (10) un-shelved pushes within
+      `window_s` spread over >= 2 rows render the in-window rows as ONE
+      '[Pk] <ts>  N alerts collapsed (P1 a, P2 b, P3 c)' row (k = highest
+      priority inside, '[+]'/'[−]' = expandable; detail = row count + the
+      in-window rows); `expanded` toggles it;
+    - ack(key): the row stays, only its highlight goes (' (ack)' suffix);
+    - shelve(kind): hides that kind for `shelve_s` (30 min) — its pushes are
+      still counted on the hidden row and excluded from the flood rate; a
+      muted '[shelved] kind — N min left' row keeps the shelf visible.
+    Nothing is persisted. `now` is injected (epoch seconds) for testability;
+    `ts_label` is the caller's display timestamp."""
+
+    COLLAPSED_KEY = ('__collapsed__', '')
+    SHELVED = '__shelved__'
+
+    def __init__(self, window_s=600.0, flood_n=10, shelve_s=1800.0, cap=100):
+        self.window_s = float(window_s)
+        self.flood_n = int(flood_n)
+        self.shelve_s = float(shelve_s)
+        self.cap = int(cap)
+        self.expanded = False
+        self._rows = []        # newest-first entries
+        self._stamps = []      # (t, prio, kind) per push, pruned to window
+        self._shelved = {}     # kind -> shelved-until epoch
+
+    # ---- mutation ---------------------------------------------------------
+    def push(self, kind, text, now, ts_label):
+        now = float(now)
+        prio, tag = alert_priority(kind, text)
+        key = (kind, text)
+        self._stamps.append((now, prio, kind))
+        lo = now - self.window_s
+        self._stamps = [s for s in self._stamps[-5000:] if s[0] >= lo]
+        for i, r in enumerate(self._rows):
+            if r['key'] != key:
+                continue
+            if now - r['last'] <= self.window_s:
+                r.update(count=r['count'] + 1, last=now, ts=ts_label,
+                         acked=False)
+                self._rows.insert(0, self._rows.pop(i))
+                return r
+            break          # newest same-key row is out of window: new row
+        r = dict(key=key, kind=kind, text=str(text), prio=prio, tag=tag,
+                 first=now, last=now, count=1, ts=ts_label, acked=False)
+        self._rows.insert(0, r)
+        del self._rows[self.cap:]
+        return r
+
+    def is_shelved(self, kind, now):
+        until = self._shelved.get(kind)
+        if until is None:
+            return False
+        if float(now) < until:
+            return True
+        self._shelved.pop(kind, None)
+        return False
+
+    def shelve(self, kind, now):
+        self._shelved[kind] = float(now) + self.shelve_s
+
+    def unshelve(self, kind):
+        self._shelved.pop(kind, None)
+
+    def _window_rows(self, now):
+        lo = float(now) - self.window_s
+        return [r for r in self._rows
+                if r['last'] >= lo and not self.is_shelved(r['kind'], now)]
+
+    def ack(self, key, now):
+        """Ack one row by key, or every in-window row for COLLAPSED_KEY.
+        Returns the number of rows acked."""
+        if tuple(key) == self.COLLAPSED_KEY:
+            rows = self._window_rows(now)
+        else:
+            rows = [r for r in self._rows if r['key'] == tuple(key)][:1]
+        for r in rows:
+            r['acked'] = True
+        return len(rows)
+
+    def ack_all(self):
+        for r in self._rows:
+            r['acked'] = True
+
+    # ---- view -------------------------------------------------------------
+    @staticmethod
+    def row_label(r):
+        """'[P1] 12:01:03  text' (+ ' ×N' when N > 1, + ' (ack)'). With
+        count 1 and no ack this is the pre-W11 '<ts>  <text>' row with only
+        the '[Pn] ' tag prefixed."""
+        s = '%s %s  %s' % (r['tag'], r['ts'], r['text'])
+        if r['count'] > 1:
+            s += ' ×%d' % r['count']
+        if r['acked']:
+            s += ' (ack)'
+        return s
+
+    def flood_counts(self, now):
+        """(n_pushes, {P1:a, P2:b, P3:c}) over the window, shelved kinds
+        excluded."""
+        lo = float(now) - self.window_s
+        c = {p: 0 for p in ALERT_PRIORITIES}
+        n = 0
+        for t, p, k in self._stamps:
+            if t >= lo and not self.is_shelved(k, now):
+                c[p] = c.get(p, 0) + 1
+                n += 1
+        return n, c
+
+    def rows(self, now):
+        """Display rows, top to bottom: dicts with label, key, kind, prio,
+        acked, detail ('' or the collapsed rows' labels). kind is None for
+        the shelf rows."""
+        now = float(now)
+        vis = [r for r in self._rows if not self.is_shelved(r['kind'], now)]
+        lo = now - self.window_s
+        in_win = [r for r in vis if r['last'] >= lo]
+        n, c = self.flood_counts(now)
+        out = []
+        tail = vis
+        if n > self.flood_n and len(in_win) >= 2:
+            top = min(in_win, key=lambda r: (r['prio'], -r['last']))
+            summary = '%d alerts collapsed (%s)' % (
+                n, ', '.join('%s %d' % (p, c.get(p, 0))
+                             for p in ALERT_PRIORITIES))
+            acked = all(r['acked'] for r in in_win)
+            # short label (the feed is ~1/3 of the Cockpit width); the row
+            # count, the click hint and the hidden rows go in the tooltip
+            detail = '%d rows — click to %s\n' % (
+                len(in_win), 'collapse' if self.expanded else 'expand') \
+                + '\n'.join(self.row_label(r) for r in in_win)
+            out.append(dict(
+                label='%s %s  %s %s' % (
+                    top['tag'], in_win[0]['ts'], summary,
+                    '[−]' if self.expanded else '[+]')
+                + (' (ack)' if acked else ''),
+                key=self.COLLAPSED_KEY, kind=top['kind'], prio=top['prio'],
+                acked=acked, detail=detail))
+            if not self.expanded:
+                tail = [r for r in vis if r['last'] < lo]
+        for r in tail:
+            out.append(dict(label=self.row_label(r), key=r['key'],
+                            kind=r['kind'], prio=r['prio'],
+                            acked=r['acked'], detail=''))
+        for k in sorted(self._shelved):
+            if self.is_shelved(k, now):
+                left = max(1, int(math.ceil((self._shelved[k] - now) / 60.0)))
+                out.append(dict(
+                    label='[shelved] %s — %d min left (click to unshelve)'
+                          % (k, left),
+                    key=(self.SHELVED, k), kind=None, prio=None, acked=True,
+                    detail=''))
+        return out
+
+
 def format_si(v):
     """SI-abbreviated tick label for a volume axis: '1.2K' / '3.4M' / '5.6B'.
     Magnitudes under 1000 print as a plain rounded integer; at/above 1000
@@ -1108,10 +1579,17 @@ def gate_panel_model(rep) -> dict:
             return out
         out['stale'] = bool(rep.get('stale'))
         if out['stale']:
-            out['stale_reason'] = (str(rep['stale_reason'])
-                                   if rep.get('stale_reason') is not None
-                                   else 'no API when generated — '
-                                        'counterfactuals not priced')
+            # decision_report._write_stale_report stamps api_available=None
+            # when the window had NO journal rows (nothing to price) and
+            # False when the API was unreachable — two different fixes.
+            if rep.get('stale_reason') is not None:
+                out['stale_reason'] = str(rep['stale_reason'])
+            elif 'api_available' in rep and rep['api_available'] is None:
+                out['stale_reason'] = ('no journal rows in the report window '
+                                       '— nothing to price')
+            else:
+                out['stale_reason'] = ('no API when generated — '
+                                       'counterfactuals not priced')
         gen = rep.get('generated')
         out['generated'] = str(gen) if gen is not None else None
         q = rep.get('quality')

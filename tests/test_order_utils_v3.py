@@ -170,7 +170,10 @@ class _Q:
         self.ap = ap
 
     def get_latest_crypto_quotes(self, symbols):
-        return {symbols[0]: SimpleNamespace(bp=self.bp, ap=self.ap, t=None)}
+        # fresh t (ENGINE r3 W10: a missing timestamp now fails closed)
+        import datetime as _dt
+        return {symbols[0]: SimpleNamespace(
+            bp=self.bp, ap=self.ap, t=_dt.datetime.now(_dt.timezone.utc))}
 
 
 class TestGetQuoteGuards:

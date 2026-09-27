@@ -507,7 +507,7 @@ class TestGetSigmaFeed:
                                     asset_type='crypto') == sigma
         # store persisted atomically with the merged complete days
         assert os.path.exists(volatility._HAR_RRV_FILE)
-        assert not os.path.exists(volatility._HAR_RRV_FILE + '.tmp')
+        assert not list(Path(volatility._HAR_RRV_FILE).parent.glob('*.tmp'))  # no writer tmp left
         stored = json.loads(Path(volatility._HAR_RRV_FILE).read_text())
         assert len(stored[sym]) == 80 + 9            # 9 new complete days
 

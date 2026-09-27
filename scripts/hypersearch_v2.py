@@ -149,6 +149,39 @@ def parse_args():
 # Data loading
 # ---------------------------------------------------------------------------
 
+# FIX-R1 (2026-09) non-finite parity guard — behaviour-identical twin of
+# predict_now._sanitize_nonfinite_features (kept local so the trainer does
+# not import the live-serving module and its torch thread side effect);
+# tests/test_oi_inf_2026_09.py pins both on the same inputs. Fill = 0.0, the
+# neutral value harvest_crypto_data._fill_archive_features writes for a NaN
+# archive feature and live serves when a value is unavailable.
+NONFINITE_FILL = 0.0
+
+
+def _sanitize_nonfinite_features(X, fill=NONFINITE_FILL, copy=True):
+    """Replace +-inf (-> NaN) and NaN in a feature matrix with `fill`.
+
+    Returns (X_out, n_nonfinite, n_inf, bad_col_idx) — bad_col_idx indexes
+    the last axis (feature columns). NOT model-facing for finite input:
+    an all-finite (or non-float) matrix is returned as the SAME object,
+    untouched (bit-identical scaler fits and fold matrices).
+    """
+    X = np.asarray(X)
+    if X.dtype.kind not in 'fc':
+        return X, 0, 0, []
+    bad = ~np.isfinite(X)
+    n_bad = int(np.count_nonzero(bad))
+    if n_bad == 0:
+        return X, 0, 0, []
+    n_inf = int(np.count_nonzero(np.isinf(X)))
+    bad_cols = np.flatnonzero(
+        bad.reshape(-1, X.shape[-1]).any(axis=0)).tolist()
+    if copy:
+        X = X.copy()
+    X[bad] = fill
+    return X, n_bad, n_inf, bad_cols
+
+
 def load_data(data_path='training_data.csv', preset_override=None,
               max_rows=500_000, window_days=None):
     print("Loading data...")
@@ -286,6 +319,18 @@ def load_data(data_path='training_data.csv', preset_override=None,
         offset += len(features)
 
     all_features = np.vstack(all_features_list)
+    # FIX-R1 parity guard, right before any scaler sees the matrix (the
+    # per-fold RobustScaler fits): (inf - median) / iqr = inf would poison
+    # every fold. In place (all_features is a fresh vstack we own), so no
+    # extra full-matrix copy on the Jetson. No-op on finite data. Runs
+    # after the float32 cast, so a float64 value that overflowed to inf
+    # is caught too.
+    all_features, _n_bad, _n_inf, _bad_idx = _sanitize_nonfinite_features(
+        all_features, copy=False)
+    if _n_bad:
+        print(f"[SANITIZE] {_n_bad} non-finite feature value(s) "
+              f"({_n_inf} inf) in {[feature_cols[j] for j in _bad_idx][:6]} "
+              f"-> neutral {NONFINITE_FILL}")
     all_times = np.concatenate(all_times_list)
     all_label_times = np.concatenate(all_label_times_list)
     all_returns_by_fb = {}
@@ -424,6 +469,7 @@ def get_walk_forward_folds(all_times, all_label_times, tickers,
 
     embargo_seconds = seq_len * EMBARGO_MULTIPLIER * 3600
     _repairs = _training_repairs()
+    _l6_gap_h = None  # SIG-R2-3: fold-0 embargo actually applied (print only)
     folds = []
     for fold_idx in range(n_folds):
         train_end_pct = 0.55 + fold_idx * (0.45 / n_folds)
@@ -443,6 +489,8 @@ def get_walk_forward_folds(all_times, all_label_times, tickers,
             # (identical to legacy on crypto's continuous hourly grid).
             _val_start = embargo_end_time(search_times, t_train_end,
                                           seq_len * EMBARGO_MULTIPLIER)
+            if _l6_gap_h is None:
+                _l6_gap_h = (_val_start - t_train_end) / 3600.0
             val_mask = (search_mask
                         & (t >= _val_start)
                         & (t < t_val_end))
@@ -463,6 +511,12 @@ def get_walk_forward_folds(all_times, all_label_times, tickers,
             continue
         folds.append((train_indices, val_indices))
 
+    if _repairs:
+        # SIG-R2-3: instrumentation only — prove L6 ran (values untouched)
+        print(f"[REPAIRS] L6 embargo in bars: {seq_len * EMBARGO_MULTIPLIER} "
+              f"distinct bars (fold-0 val starts +{_l6_gap_h}h after train "
+              f"end; legacy calendar rule +{embargo_seconds / 3600:.0f}h); "
+              f"folds={len(folds)}")
     return folds
 
 
@@ -527,6 +581,60 @@ def _training_repairs():
         return False
 
 
+def _holdout_span_by_target():
+    """SIG-R1-A3: HOLDOUT_SPAN_BY_TARGET (default False = legacy).
+
+    TRADER_HOLDOUT_SPAN_BY_TARGET env ('1'/'true'/'yes'/'on') wins over
+    strategy_config.HOLDOUT_SPAN_BY_TARGET (read with getattr — absent =
+    False). ON: a raw-target (target_kind != 'tb') holdout trade's
+    calendar window for the n_eff deflation is its fb-bar label window
+    instead of the triple-barrier TB_Bars span. Gate-facing (tightens).
+    """
+    v = os.environ.get('TRADER_HOLDOUT_SPAN_BY_TARGET')
+    if v not in (None, ''):
+        return v.strip().lower() in ('1', 'true', 'yes', 'on')
+    try:
+        import strategy_config as _sc
+        return bool(getattr(_sc, 'HOLDOUT_SPAN_BY_TARGET', False))
+    except Exception:
+        return False
+
+
+def _failed_trial_prune():
+    """SIG-R2-1: FAILED_TRIAL_PRUNE (default False = legacy 0.0 sentinel).
+
+    TRADER_FAILED_TRIAL_PRUNE env ('1'/'true'/'yes'/'on') wins over
+    strategy_config.FAILED_TRIAL_PRUNE (read with getattr — absent =
+    False). ON: a trial that produced no honest score (OOM/RuntimeError,
+    no walk-forward folds, zero completed folds, a fold that timed out
+    before its first checkpoint) raises optuna.TrialPruned instead of
+    returning the 0.0 sentinel — state PRUNED, so it can never be
+    study.best_trial, never counts as a COMPLETE (tested) configuration in
+    the deflation pool / cum_trials, and TPE files it in the 'above'
+    (bad) set. Legacy 0.0 outranked every negative trial (the
+    OBJECTIVE_LONG_ONLY regime). Model-facing (changes which trial wins).
+    """
+    v = os.environ.get('TRADER_FAILED_TRIAL_PRUNE')
+    if v not in (None, ''):
+        return v.strip().lower() in ('1', 'true', 'yes', 'on')
+    try:
+        import strategy_config as _sc
+        return bool(getattr(_sc, 'FAILED_TRIAL_PRUNE', False))
+    except Exception:
+        return False
+
+
+def _prune_failed_trial(trial, reason):
+    """SIG-R2-1 ON path: record why, then raise optuna.TrialPruned."""
+    print(f"  [FAILED-TRIAL] Trial {trial.number}: {reason} — pruned "
+          f"(FAILED_TRIAL_PRUNE: not scored, not in the deflation pool)")
+    try:
+        trial.set_user_attr('failed_trial', str(reason))
+    except Exception:
+        pass
+    raise optuna.TrialPruned(str(reason))
+
+
 def _trainer_seed():
     """R2C-04 (L3): base training seed, or None = legacy unseeded.
 
@@ -546,6 +654,47 @@ def _trainer_seed():
         return int(TRAINER_SEED) if TRAINER_SEED is not None else None
     except Exception:
         return None
+
+
+def _objective_session_mask():
+    """SIG-R2-MASK: OBJECTIVE_SESSION_MASK (default False = legacy).
+
+    TRADER_OBJECTIVE_SESSION_MASK env ('1'/'true'/'yes'/'on') wins over
+    strategy_config.OBJECTIVE_SESSION_MASK (read with getattr — absent =
+    False). ON: stock-book LONG entries are scored only on rows the live
+    book could enter (_session_entry_ok). Model-facing (fewer eligible
+    entries -> different trial scores / n_trades / DSR pool) — flip with
+    a gotcha-#2 study reset.
+    """
+    v = os.environ.get('TRADER_OBJECTIVE_SESSION_MASK')
+    if v not in (None, ''):
+        return v.strip().lower() in ('1', 'true', 'yes', 'on')
+    try:
+        import strategy_config as _sc
+        return bool(getattr(_sc, 'OBJECTIVE_SESSION_MASK', False))
+    except Exception:
+        return False
+
+
+def _session_entry_ok(times, asset_type):
+    """SIG-R2-MASK: per-row bool 'the live book may ENTER here', or None.
+
+    None (flag OFF, or any non-stock book — crypto_loop.check_market_hours
+    is always True and crypto has no entry window) = callers leave
+    long_veto exactly as today. Stock + ON: bar open-time inside
+    strategy_config.STOCK_ENTRY_WINDOWS_ET (stock_loop._in_entry_window's
+    rule) on a weekday; with ENTRY_WINDOWS_ENABLED False the live gate is
+    the market clock alone, mirrored as RTH 09:30-16:00 ET
+    (stock_loop.check_market_hours' wall-clock fallback). Scorers pass
+    long_veto = ~entry_ok (OR'd with any q10 veto).
+    """
+    if asset_type != 'stock' or not _objective_session_mask():
+        return None
+    from strategy_config import STOCK_ENTRY_WINDOWS_ET, ENTRY_WINDOWS_ENABLED
+    from objective_utils import session_entry_mask
+    windows = (STOCK_ENTRY_WINDOWS_ET if ENTRY_WINDOWS_ENABLED
+               else [('09:30', '16:00')])
+    return session_entry_mask(times, windows)
 
 
 def simulate_trades(predictions, actual_returns, threshold, forward_bars,
@@ -606,7 +755,13 @@ def compute_sharpe(predictions, actual_returns, threshold, forward_bars=24,
     std = trade_returns.std()
     if std < 1e-8:
         return 0.0
-    bars_per_year = BARS_PER_YEAR.get(asset_type, 8760)
+    # BARS_PER_YEAR_MEASURED (default OFF -> this module's dict, the
+    # pre-flag expression) — see bars_calendar for the measured stock value.
+    try:
+        from bars_calendar import bars_per_year as _bars_per_year
+        bars_per_year = _bars_per_year(asset_type, BARS_PER_YEAR, 8760)
+    except ImportError:
+        bars_per_year = BARS_PER_YEAR.get(asset_type, 8760)
     # Each trade occupies forward_bars bars; cap at full investment
     slots_per_year = bars_per_year / forward_bars
     occupancy = min(len(trade_returns) * forward_bars / max(len(predictions), 1), 1.0)
@@ -614,10 +769,90 @@ def compute_sharpe(predictions, actual_returns, threshold, forward_bars=24,
     return float((trade_returns.mean() / std) * np.sqrt(max(trades_per_year, 1.0)))
 
 
+# SIG-R3-DECOMP: per-fold trade decomposition recorded as trial user_attrs
+# (one list entry per fold, aligned with fold_sharpes). Instrumentation
+# only — the score and every pre-existing user_attr are untouched.
+DECOMP_KEYS = ('gross_ret_mean', 'gross_ret_std', 'net_ret_mean', 'cost_drag',
+               'n_trades', 'hit_rate', 'mean_hold_bars',
+               'threshold_pass_rate', 'n_rows')
+
+
+def fold_trade_decomposition(predictions, actual_returns, threshold,
+                             forward_bars=24, asset_type='crypto',
+                             block_ids=None, long_veto=None):
+    """Gross/net/cost split of the SAME walk compute_sharpe scores.
+
+    One extra simulate_trades call (same inputs + return_entries). The
+    net array is exactly the one compute_sharpe sees. Gross is read, not
+    re-simulated: the walk's entry test never reads txn_cost_pct
+    (objective_utils.simulate_trades_core), so trade i's gross return is
+    +r[e_i] for a long entry (p > threshold and not vetoed) and -r[e_i]
+    for a short; net_i = gross_i - cost up to float rounding.
+    mean_hold_bars: bars each entry blocks in the walk = min(fb, rows
+    left, next ticker block) — the walk holds fb bars for BOTH target
+    kinds (a TB label's own exit bar is not consulted).
+    Never raises: instrumentation must not change a trial's fate (the
+    objective maps RuntimeError to 0.0 and the regime block's except would
+    skip the penalty) — any error yields all-None fields + 'error'.
+    """
+    try:
+        return _fold_trade_decomposition(predictions, actual_returns,
+                                         threshold, forward_bars, asset_type,
+                                         block_ids, long_veto)
+    except Exception as e:  # pragma: no cover - defensive
+        out = {k: None for k in DECOMP_KEYS}
+        out['error'] = f'{type(e).__name__}: {e}'[:200]
+        return out
+
+
+def _fold_trade_decomposition(predictions, actual_returns, threshold,
+                              forward_bars, asset_type, block_ids, long_veto):
+    cost = TXN_COST_PCT.get(asset_type, 0.6)
+    p = np.asarray(predictions)
+    r = np.asarray(actual_returns)
+    net, entries = simulate_trades(p, r, threshold, forward_bars, cost,
+                                   return_entries=True, block_ids=block_ids,
+                                   long_veto=long_veto)
+    net = np.asarray(net, dtype=np.float64)
+    e = np.asarray(entries, dtype=np.int64)
+    n = int(len(e))
+    out = {'n_trades': n, 'n_rows': int(len(p)),
+           'threshold_pass_rate': (float((p > threshold).mean())
+                                   if len(p) else None)}
+    if n == 0:
+        out.update({k: None for k in ('gross_ret_mean', 'gross_ret_std',
+                                      'net_ret_mean', 'cost_drag',
+                                      'hit_rate', 'mean_hold_bars')})
+        return out
+    long_ok = p[e] > threshold
+    if long_veto is not None:
+        long_ok &= ~np.asarray(long_veto, dtype=bool)[e]
+    gross = np.where(long_ok, r[e], -r[e]).astype(np.float64)
+    end = np.minimum(e + int(forward_bars), len(p))
+    if block_ids is not None:
+        b = np.asarray(block_ids)
+        change = np.flatnonzero(np.diff(b) != 0) + 1
+        end = np.minimum(end, np.append(change, len(p))[
+            np.searchsorted(change, e, side='right')])
+    out.update({
+        'gross_ret_mean': float(gross.mean()),
+        'gross_ret_std': float(gross.std()),
+        'net_ret_mean': float(net.mean()),
+        'cost_drag': float(gross.mean() - net.mean()),
+        'hit_rate': float((gross > 0).mean()),
+        'mean_hold_bars': float((end - e).mean()),
+    })
+    return out
+
+
 def compute_regime_sharpes(predictions, actual_returns, threshold,
                            forward_bars=24, asset_type='crypto',
-                           block_ids=None):
+                           block_ids=None, long_veto=None,
+                           decomp_out=None):
     """Compute Sharpe in bull/bear/sideways regimes separately.
+
+    long_veto (None = legacy): per-row long-entry veto, subset with each
+    regime mask like block_ids (SIG-R2-MASK session mask).
 
     Regime labels approximate the trailing 50-bar cumulative return from
     the (overlapping) fb-bar forward returns by scaling the trailing mean:
@@ -644,6 +879,12 @@ def compute_regime_sharpes(predictions, actual_returns, threshold,
             'bear': known & (rolling_ret < -2.0),
         }
         regimes['sideways'] = known & ~regimes['bull'] & ~regimes['bear']
+        # SIG-R2-3: instrumentation only — prove L2 ran (values untouched)
+        print(f"[REPAIRS] L2 regime masks from lagged completed-by-t returns: "
+              f"bull={int(regimes['bull'].sum())} "
+              f"bear={int(regimes['bear'].sum())} "
+              f"sideways={int(regimes['sideways'].sum())} "
+              f"warmup_excluded={int((~known).sum())}")
     else:
         finite = np.where(np.isfinite(actual_returns), actual_returns, 0.0)
         window = 50
@@ -668,7 +909,18 @@ def compute_regime_sharpes(predictions, actual_returns, threshold,
                                       threshold, forward_bars, asset_type,
                                       block_ids=(block_ids[mask]
                                                  if block_ids is not None
+                                                 else None),
+                                      long_veto=(long_veto[mask]
+                                                 if long_veto is not None
                                                  else None))
+        if decomp_out is not None:  # SIG-R3-DECOMP (instrumentation)
+            decomp_out[name] = fold_trade_decomposition(
+                predictions[mask], actual_returns[mask], threshold,
+                forward_bars, asset_type,
+                block_ids=(block_ids[mask] if block_ids is not None
+                           else None),
+                long_veto=(long_veto[mask] if long_veto is not None
+                           else None))
 
     result['min'] = min(result.values())
     return result
@@ -760,6 +1012,15 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
     # Use adaptive search space if provided, otherwise use defaults
     _space = adaptive_space or {}
 
+    # SIG-R2-MASK (OBJECTIVE_SESSION_MASK, default OFF -> None, legacy):
+    # built once per data load; every trial's fold / pruning / regime
+    # scorer vetoes LONG entries on rows the live stock book cannot enter.
+    _entry_ok = _session_entry_ok(all_times, asset_type)
+    if _entry_ok is not None:
+        print(f"[SESSION] OBJECTIVE_SESSION_MASK ON: {int(_entry_ok.sum())}/"
+              f"{len(_entry_ok)} rows ({_entry_ok.mean():.1%}) entry-"
+              f"eligible (stock entry windows, bar open-time ET)")
+
     def objective(trial):
         trial_start = time.time()
         gc.collect()
@@ -847,6 +1108,9 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                 except Exception:
                     pass
             torch.cuda.empty_cache()
+            if _failed_trial_prune():
+                _prune_failed_trial(
+                    trial, f"{type(e).__name__}: {str(e)[:120]}")
             return 0.0
 
     def _train_walk_forward(trial, trial_start, cfg, trial_returns, input_dim,
@@ -867,14 +1131,21 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                                        ticker_boundaries, seq_len,
                                        purge_val_labels=_objective_v3())
         if not folds:
+            if _failed_trial_prune():
+                _prune_failed_trial(trial, 'no walk-forward folds')
             return 0.0
 
         _repairs = _training_repairs()  # R2C-04 TRAINING_REPAIRS_V1 (L1/L5)
+        _repairs_logged = set()  # SIG-R2-3: one [REPAIRS] line per trial
         base_seed = _trainer_seed()     # R2C-04 TRAINER_SEED (L3)
 
         offsets = np.arange(-seq_len, 0)
         fold_sharpes = []
-        fold_best_epochs = []  # per-fold best-val-loss epoch (instrumentation)
+        # per-fold epochs TRAINED at the best-val-loss checkpoint (a 1-based
+        # COUNT: loop index + 1 — SIG-R1-A4; final_refit trains exactly this
+        # many epochs, like fixed_boost_rounds' LightGBM best_iteration)
+        fold_best_epochs = []
+        fold_decomp = {k: [] for k in DECOMP_KEYS}  # SIG-R3-DECOMP
         oof_fold_rows, oof_fold_preds, oof_fold_ids = [], [], []
         best_fold_state = None
         best_fold_scaler = None
@@ -892,6 +1163,8 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
             # never spans a ticker boundary (None = legacy scoring).
             vb = (ticker_block_ids(val_indices, ticker_boundaries)
                   if _objective_v3() else None)
+            sv = (~_entry_ok[val_indices] if _entry_ok is not None
+                  else None)  # SIG-R2-MASK long veto (None = legacy)
 
             all_scaled, scaler = seq_cache.get(fold_idx, train_indices)
             n_train = len(train_indices)
@@ -996,6 +1269,11 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
             if oom_retries > 0:
                 print(f"  [OOM-RETRY] fold {fold_idx}: training with batch_size={eff_batch_size} "
                       f"(was {batch_size})")
+            if _repairs and 'L5' not in _repairs_logged:
+                _repairs_logged.add('L5')  # SIG-R2-3: print only
+                print(f"[REPAIRS] L5 trial {trial.number} fold {fold_idx}: "
+                      f"memory probe undone (init weights restored; fresh "
+                      f"optimizer/scheduler/grad-scaler)")
 
             best_val_loss = float('inf')
             best_epoch = -1
@@ -1064,6 +1342,12 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
 
                 val_loss = val_loss_sum / n_val
                 val_preds_np = np.concatenate(val_preds)
+                if _repairs and 'L1' not in _repairs_logged:
+                    _repairs_logged.add('L1')  # SIG-R2-3: print only
+                    print(f"[REPAIRS] L1 trial {trial.number} fold {fold_idx}: "
+                          f"val loss on the trial criterion (huber_delta="
+                          f"{huber_delta}, |y|+1 weights cap 50) "
+                          f"epoch0 val_loss={val_loss:.6g}")
 
                 if scheduler_type == 'plateau' and sched:
                     sched.step(val_loss)
@@ -1075,7 +1359,7 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                 epoch_sharpe = compute_sharpe(val_preds_np, y_val, trade_threshold,
                                               forward_bars=cfg['forward_bars'],
                                               asset_type=asset_type,
-                                              block_ids=vb)
+                                              block_ids=vb, long_veto=sv)
                 trial.report(epoch_sharpe, fold_idx * MAX_EPOCHS + epoch)
 
                 if epoch >= PRUNE_WARMUP_EPOCHS and trial.should_prune():
@@ -1136,17 +1420,37 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                 fold_sharpe = compute_sharpe(final_preds_np, y_val, trade_threshold,
                                              forward_bars=cfg['forward_bars'],
                                              asset_type=asset_type,
-                                             block_ids=vb)
+                                             block_ids=vb, long_veto=sv)
+                _fd = fold_trade_decomposition(
+                    final_preds_np, y_val, trade_threshold,
+                    forward_bars=cfg['forward_bars'], asset_type=asset_type,
+                    block_ids=vb, long_veto=sv)
+                for _k in DECOMP_KEYS:
+                    fold_decomp[_k].append(_fd[_k])
                 # D12/B04.1: keep this fold's honest val predictions (souped
                 # model, its own purged val slice) so the winner's OOF preds
                 # can be persisted at save time.
                 oof_fold_rows.append(val_indices.copy())
                 oof_fold_preds.append(final_preds_np.astype(np.float32))
                 oof_fold_ids.append(fold_idx)
-                fold_best_epochs.append(max(best_epoch, 0))
+                fold_best_epochs.append(best_epoch + 1)  # -1 (none) -> 0
             else:
+                if _failed_trial_prune():
+                    # Only reachable when the loop broke before epoch 0's
+                    # snapshot — the MAX_TRIAL_SECONDS timeout (a prune
+                    # raises; early stopping needs >= 1 epoch).
+                    del model
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    _prune_failed_trial(
+                        trial, f'fold {fold_idx} timed out before its '
+                               f'first checkpoint')
                 fold_sharpe = 0.0
-                fold_best_epochs.append(max(best_epoch, 0))
+                fold_best_epochs.append(best_epoch + 1)
+                for _k in DECOMP_KEYS:  # SIG-R3-DECOMP: keep lists aligned
+                    fold_decomp[_k].append(
+                        {'n_trades': 0, 'n_rows': int(n_val)}.get(_k))
 
             fold_sharpes.append(fold_sharpe)
 
@@ -1162,6 +1466,9 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        if not fold_sharpes and _failed_trial_prune():
+            _prune_failed_trial(trial, 'zero completed folds (every fold '
+                                       'below the row minimum)')
         avg_sharpe = np.mean(fold_sharpes) if fold_sharpes else 0.0
         std_sharpe = np.std(fold_sharpes) if len(fold_sharpes) > 1 else 0.0
         # Risk-adjusted score: penalize inconsistency across folds.
@@ -1193,16 +1500,31 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
                             vo = model_tmp(xvb)
                         all_preds.append(vo.cpu().numpy())
                 all_preds_np = np.concatenate(all_preds)
+                _rg_decomp = {}  # SIG-R3-DECOMP
                 regime_sharpes = compute_regime_sharpes(
                     all_preds_np, rg_y_val, trade_threshold,
                     forward_bars=cfg['forward_bars'], asset_type=asset_type,
                     block_ids=(ticker_block_ids(rg_val_indices,
                                                 ticker_boundaries)
-                               if _objective_v3() else None))
+                               if _objective_v3() else None),
+                    long_veto=(~_entry_ok[rg_val_indices]
+                               if _entry_ok is not None else None),
+                    decomp_out=_rg_decomp)
                 trial.set_user_attr('regime_sharpes', regime_sharpes)
+                try:
+                    trial.set_user_attr('regime_trade_decomp', _rg_decomp)
+                except Exception:
+                    pass
                 # Penalize if any regime has negative Sharpe
                 if regime_sharpes['min'] < -0.5:
-                    score *= 0.7  # 30% penalty
+                    if _repairs:
+                        # SIG-R1-A2 (TRAINING_REPAIRS_V1): sign-correct
+                        # 30% penalty — identical to *0.7 for score > 0,
+                        # but a negative score gets WORSE (legacy *0.7
+                        # moved it toward 0, i.e. rewarded the bad regime).
+                        score -= 0.3 * abs(score)
+                    else:
+                        score *= 0.7  # 30% penalty
                 del rg_scaled
             except Exception as e:
                 print(f"  [REGIME] Penalty eval failed: {e}")
@@ -1213,6 +1535,8 @@ def create_objective(all_features, all_returns_by_fb, all_times, all_label_times
         trial.set_user_attr('fold_sharpes', fold_sharpes)
         trial.set_user_attr('avg_sharpe', avg_sharpe)
         trial.set_user_attr('std_sharpe', std_sharpe)
+        for _k in DECOMP_KEYS:  # SIG-R3-DECOMP (lists aligned w/ fold_sharpes)
+            trial.set_user_attr(_k, fold_decomp[_k])
 
         if best_fold_state is not None and score > 0:
             # Only keep this trial's state; clear old entries to avoid memory leak
@@ -1635,6 +1959,9 @@ def final_refit(cfg, returns, all_features, all_times, all_label_times,
                 print(f"  [REFIT] OOM-RETRY: batch "
                       f"{eff_batch_size * 2}→{eff_batch_size} "
                       f"({str(e)[:60]})")
+        if _repairs:  # SIG-R2-3: print only
+            print("[REPAIRS] L5 final_refit: memory probe undone (init "
+                  "weights restored; fresh optimizer/scheduler/grad-scaler)")
 
         snaps: list[dict] = []
         for epoch in range(epochs):
@@ -1789,6 +2116,13 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                 n_vetoed = 0
                 blended = False
 
+        # SIG-R2-MASK (default OFF -> None): certify only the entries the
+        # live stock book could take; OR'd with the q10 veto (n_vetoed
+        # stays the q10-only count).
+        _sess_ok = _session_entry_ok(all_times[holdout_idx], asset_type)
+        if _sess_ok is not None:
+            long_veto = (~_sess_ok if long_veto is None
+                         else (long_veto | ~_sess_ok))
         hb = (ticker_block_ids(holdout_idx, ticker_boundaries)
               if _objective_v3() else None)
         sharpe = compute_sharpe(preds, y, threshold, forward_bars=fb,
@@ -1846,6 +2180,14 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
         n_eff_v2 = None
         if all_tb_bars_by_fb and fb in all_tb_bars_by_fb and len(entry_pos):
             tb = all_tb_bars_by_fb[fb]
+            if (cfg.get('target_kind') != 'tb'
+                    and _holdout_span_by_target()):
+                # SIG-R1-A3: a raw-target trade books the fb-bar forward
+                # return, so its label window is exactly fb bars; TB_Bars
+                # is the triple-barrier exit span of a DIFFERENT label
+                # (crypto store mean 0.35-0.78 x fb) and understates the
+                # overlap the deflation measures.
+                tb = np.full(len(tb), float(fb), dtype=np.float64)
             global_rows = holdout_idx[entry_pos]
             # Hoisted [entry, exit] calendar-time reconstruction — shared by
             # the legacy clustering, the v2 estimator, and the side-by-side
@@ -1885,7 +2227,12 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                     _rho = None
                     if _kish and asset_type in _rho_floor:
                         _rho = _rho_floor[asset_type]
-                    _cal = calendar_effective_n(entry_t, exit_t,
+                    # SIG-R1-A1: numeric times are HOURS by
+                    # calendar_effective_n's contract; entry_t/exit_t are
+                    # epoch SECONDS (per-second bins: wrong n_eff and a
+                    # ~0.9 GB transient on a 220-day crypto holdout).
+                    _cal = calendar_effective_n(entry_t / 3600.0,
+                                                exit_t / 3600.0,
                                                 rho_bar=_rho)
                     n_eff = float(_cal['n_eff'])
                     n_eff_v2 = float(_cal['n_eff'])
@@ -1958,7 +2305,9 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                 try:
                     from sample_weights import calendar_effective_n
                     if entry_t is not None:
-                        _cal = calendar_effective_n(entry_t, exit_t)
+                        # SIG-R1-A1: seconds -> hours (see the v2 branch)
+                        _cal = calendar_effective_n(entry_t / 3600.0,
+                                                    exit_t / 3600.0)
                         n_eff_v2 = float(_cal['n_eff'])
                         print(f"  [HOLDOUT] n_eff legacy={n_eff} "
                               f"(uniqueness->clustered) vs v2 calendar="
@@ -2017,6 +2366,9 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
                   # deciles of the holdout predictions (monitor_drift.py)
                   'pred_deciles': [round(float(x), 6) for x in
                                    np.percentile(preds, np.arange(0, 101, 10))]}
+        if _sess_ok is not None:  # SIG-R2-MASK: ON-only keys
+            report['session_mask'] = True
+            report['session_rows_ok'] = int(_sess_ok.sum())
         # ONLY when blended (flag-OFF report stays key-for-key identical)
         if blended:
             report['certified'] = 'blend'
@@ -2072,6 +2424,33 @@ def evaluate_on_holdout(state, scaler, cfg, all_features, all_returns_by_fb,
     except Exception as e:
         print(f"  [HOLDOUT] evaluation failed: {e} — gate fails closed")
         return None
+
+
+def _record_holdout_gate(adaptive_state, asset_type):
+    """SIG-R3-HGATES: +1 cum_holdout_gates per winner actually SCORED on
+    the holdout (the documented intent: research/campaign_2026-08/
+    02_research.md B03.2 "+1 per winner actually scored on the holdout" —
+    evaluations, pass OR fail; a None report scored nothing and is not
+    counted by the caller).
+
+    Written twice, deliberately: into the in-memory state (update_after_
+    search / the initial-params save re-save THIS object later) AND
+    straight to disk (the losing-run branch never saves this object —
+    record_trials reloads from disk). Both start from the same persisted
+    value, so every later save agrees on base+1. Measurement-only,
+    fail-soft: never blocks a save or changes the gate.
+    """
+    try:
+        adaptive_state['cum_holdout_gates'] = int(
+            adaptive_state.get('cum_holdout_gates', 0) or 0) + 1
+        from adaptive_config import save_adaptive_state
+        disk = load_adaptive_state(asset_type)
+        disk['cum_holdout_gates'] = int(
+            disk.get('cum_holdout_gates', 0) or 0) + 1
+        save_adaptive_state(disk)
+        print(f"[GATE] cum_holdout_gates={adaptive_state['cum_holdout_gates']}")
+    except Exception as e:
+        print(f"[GATE] cum_holdout_gates not recorded (non-fatal): {e}")
 
 
 def save_model_atomically(prefix, state, best_cfg, input_dim, config, scaler,
@@ -2164,6 +2543,56 @@ def save_model_atomically(prefix, state, best_cfg, input_dim, config, scaler,
 # Main
 # ---------------------------------------------------------------------------
 
+# SIG-R2-3: every training-path flag, printed on ONE grep-able line at
+# trainer start (`grep '^\[FLAGS\]' <log>`). Raw strategy_config values via
+# getattr (absent = None); env overrides listed separately; *.eff = the
+# resolved value the trainer actually uses where an env override exists.
+BANNER_FLAGS = ('OBJECTIVE_LONG_ONLY', 'HYPERSEARCH_V3', 'OBJECTIVE_V3',
+                'TRAINING_REPAIRS_V1', 'BLEND_FIT_ON_REFIT',
+                'BLEND_THRESHOLD_RESELECT', 'PROMOTION_GATE_V2',
+                'KISH_NEFF_ENABLED', 'LGB_REFIT_FULL',
+                'HOLDOUT_SPAN_BY_TARGET', 'BARS_PER_YEAR_MEASURED',
+                'FAILED_TRIAL_PRUNE', 'OBJECTIVE_SESSION_MASK',
+                'WICK_PRINT_FILTER')
+BANNER_ENV = ('TRADER_HOLDOUT_SPAN_BY_TARGET', 'TRADER_FAILED_TRIAL_PRUNE',
+              'TRADER_TRAINER_SEED', 'TRADER_FIXED_HOLDOUT_DAYS',
+              'TRADER_OBJECTIVE_SESSION_MASK',
+              'TRADER_WICK_PRINT_FILTER')
+
+
+def flags_banner(args, mode, num_trials, seed_base):
+    """The one-line [FLAGS] banner (instrumentation only; never raises)."""
+    def _safe(fn):
+        try:
+            return fn()
+        except Exception as e:
+            return f'?({type(e).__name__})'
+    try:
+        import strategy_config as _sc
+    except Exception:
+        _sc = None
+    parts = [f'{n}={getattr(_sc, n, None)}' for n in BANNER_FLAGS]
+    parts.append(f'HOLDOUT_SPAN_BY_TARGET.eff={_safe(_holdout_span_by_target)}')
+    _ftp = globals().get('_failed_trial_prune')  # SIG-R2-1 resolver, if landed
+    parts.append(f'FAILED_TRIAL_PRUNE.eff={_safe(_ftp) if _ftp else None}')
+    parts += [f'env.{n}={os.environ.get(n) or None}' for n in BANNER_ENV]
+
+    def _preset():
+        from indicator_config import load_indicator_config
+        return args.preset or load_indicator_config()["preset"]
+
+    def _data_path():
+        from data_utils import get_data_path
+        return get_data_path('stock' if 'stock' in args.data else 'crypto')
+    parts += [f'preset={_safe(_preset)}', f'preset_arg={args.preset}',
+              f'seed_base={seed_base}',
+              f'fixed_holdout_days={_safe(_fixed_holdout_days)}',
+              f'prefix={args.prefix or None}', f'mode={mode}',
+              f'trials={num_trials}', f'trials_arg={args.trials}',
+              f'data={_safe(_data_path)}', f'data_arg={args.data}']
+    return '[FLAGS] ' + ' '.join(str(x).replace(' ', '_') for x in parts)
+
+
 def main():
     args = parse_args()
     prefix = f'{args.prefix}_' if args.prefix else ''
@@ -2206,6 +2635,8 @@ def main():
         print(f"[SEED] TRAINER_SEED={_seed_base} — torch init/dropout, "
               f"batch shuffles, TPESampler and the final refit are "
               f"derived-seeded (objective_utils.derive_seed)")
+    # SIG-R2-3: provable flag state, before the study is created/deleted
+    print(flags_banner(args, mode, num_trials, _seed_base), flush=True)
 
     if args.fresh and os.path.exists(db_path):
         # Instrumentation (B03.2): persist the deletion event — the trials
@@ -2590,8 +3021,16 @@ def main():
                     else:
                         fit = fit_stale
                     # Sharpe-grid DIAGNOSTIC (logged only, never deployed)
+                    # SIG-R2-MASK: ON -> scored on entry-eligible rows only
+                    # (blend_fit._policy_sharpe is a per-row take-set, so
+                    # row-subsetting == a long veto); None = legacy.
+                    _sess_rows = _session_entry_ok(all_times[rows],
+                                                   asset_type)
+                    _gsel = (_sess_rows if _sess_rows is not None
+                             else slice(None))
                     w_grid = fit_blend_weight(
-                        lstm_oof, lgb_oof, y_fit, objective='sharpe',
+                        lstm_oof[_gsel], lgb_oof[_gsel], y_fit[_gsel],
+                        objective='sharpe',
                         threshold=best_cfg['trade_threshold'],
                         shrink_lambda=0.0)
                     # Champion slot's persisted weight = cross-retrain memory
@@ -2657,11 +3096,14 @@ def main():
                                                      ticker_boundaries)
                                     if _objective_v3() else None)
                         _old_thr = float(best_cfg['trade_threshold'])
+                        _tt_veto = (~_sess_rows if _sess_rows is not None
+                                    else None)  # SIG-R2-MASK
 
-                        def _tt_score(p, yy, th, _b=_tt_bids):
+                        def _tt_score(p, yy, th, _b=_tt_bids, _v=_tt_veto):
                             return compute_sharpe(
                                 p, yy, th, forward_bars=_fb,
-                                asset_type=asset_type, block_ids=_b)
+                                asset_type=asset_type, block_ids=_b,
+                                long_veto=_v)
 
                         _new_thr, _new_sc = reselect_trade_threshold(
                             _blend_val, y_fit,
@@ -2670,10 +3112,10 @@ def main():
                         _cost = TXN_COST_PCT.get(asset_type, 0.6)
                         _n_old = len(simulate_trades(
                             _blend_val, y_fit, _old_thr, _fb, _cost,
-                            block_ids=_tt_bids))
+                            block_ids=_tt_bids, long_veto=_tt_veto))
                         _n_new = len(simulate_trades(
                             _blend_val, y_fit, _new_thr, _fb, _cost,
-                            block_ids=_tt_bids))
+                            block_ids=_tt_bids, long_veto=_tt_veto))
                         try:
                             from strategy_config import (
                                 BLEND_THRESHOLD_RESELECT as _tt_deploy)
@@ -2785,6 +3227,8 @@ def main():
             q10_floor=(lgb_pack[2] if _v3 and lgb_pack else None),
             lstm_weight=lstm_weight,
         )
+        if holdout_report is not None:
+            _record_holdout_gate(adaptive_state, asset_type)
         gate_ok = (holdout_report is not None
                    and holdout_report['sharpe'] > 0
                    and holdout_report['dsr'] >= holdout_report['dsr_min'])
@@ -2960,7 +3404,7 @@ def main():
             pbo = pbo_from_fold_scores([r for r in rows if r])
             if pbo is not None:
                 print(f"\nPBO (coarse CSCV from fold Sharpes): {pbo:.2f}"
-                      f"{'  WARNING: >0.25 suggests overfitting' if pbo > 0.25 else ''}")
+                      f"{'  WARNING: >0.5 — the IS winner is a below-median OOS performer more often than not (Bailey et al.)' if pbo > 0.5 else ''}")
         except Exception as e:
             print(f"  PBO computation failed: {e}")
 

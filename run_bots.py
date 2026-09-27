@@ -51,6 +51,9 @@ from log_config import get_logger
 logger = get_logger(__name__)
 
 _shutdown = threading.Event()
+# Set when a trading loop died on an exception, so main() exits non-zero and
+# a supervisor keyed on exit status sees the crash (2026-09 G1 F4).
+_crashed = threading.Event()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Ops thread (c26 T7 / B19): standalone `python run_bots.py` previously had NO
@@ -166,6 +169,7 @@ def _run_loop(loop_cls, name):
         pass
     except Exception:
         logger.exception("[%s] Trading loop crashed", name)
+        _crashed.set()
     finally:
         logger.info("[%s] Loop thread exiting", name)
         _shutdown.set()  # one loop dying should surface, not hide
@@ -210,7 +214,8 @@ def main():
         threading.Thread(target=_ops_loop, args=(threads,),
                          name='ops', daemon=True).start()
 
-    logger.info("[BOTS] %d loop(s) running in one process", len(threads))
+    logger.info("[BOTS] %d loop(s) running in one process",
+                sum(t.is_alive() for t in threads))
     try:
         while not _shutdown.is_set():
             time.sleep(5)
@@ -220,7 +225,7 @@ def main():
         logger.info("[BOTS] Interrupted")
     # Daemon threads die with the process; positions are protected by
     # server-side stops (stocks) and reconstructed on next start.
-    return 0
+    return 1 if _crashed.is_set() else 0
 
 
 if __name__ == '__main__':

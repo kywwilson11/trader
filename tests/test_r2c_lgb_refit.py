@@ -168,7 +168,7 @@ def test_lgb_refit_full_default_off():
     import strategy_config
     assert strategy_config.LGB_REFIT_FULL is False
     # The V3 save path this flag lives inside stays OFF too.
-    assert strategy_config.HYPERSEARCH_V3 is False
+    assert strategy_config.HYPERSEARCH_V3 is True  # 2026-09-27: flipped at the gotcha-#2 event (founder)
 
 
 # ---------------------------------------------------------------------------

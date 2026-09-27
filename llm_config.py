@@ -101,8 +101,10 @@ Config keys (see _DEFAULTS below for the exact defaults):
                             analyst. The qualify report's config_patch
                             block carries the exact endpoint entries +
                             pricing [0,0] rows to paste here (an unknown
-                            model otherwise bills at llm_client's $1.25/$10
-                            fallback into the $1/day cap). See
+                            model otherwise bills at its provider family's
+                            most expensive tabled row, per
+                            llm_client._fallback_price, into the $1/day
+                            cap). See
                             FREE_CANDIDATE_PRESETS below.
   analyst_model_override    None = use smart routing; accepts any model
                             name in llm_client.KNOWN_MODELS (Gemini,
@@ -183,8 +185,10 @@ Config keys (see _DEFAULTS below for the exact defaults):
                             largest savings in static overnight hours.
 """
 
+import copy
 import json
 import os
+import threading
 from pathlib import Path
 
 LLM_CONFIG_FILE = Path(__file__).resolve().parent / "llm_config.json"
@@ -308,19 +312,22 @@ def load_llm_config() -> dict:
             del config[old_key]
             migrated = True
 
-    # Merge defaults for any missing top-level keys
+    # Merge defaults for any missing top-level keys. Deep copies (G4-10):
+    # callers mutate the returned dict (gui._on_settings_changed writes the
+    # typed api_key into config["models"][p]) — handing out the _DEFAULTS
+    # objects themselves leaked that into every later load in the process.
     for key, default in _DEFAULTS.items():
         if key not in config:
-            config[key] = default
+            config[key] = copy.deepcopy(default)
         elif key == "models" and isinstance(default, dict):
             # Merge per-provider defaults
             for provider, pdefault in default.items():
                 if provider not in config["models"]:
-                    config["models"][provider] = pdefault
+                    config["models"][provider] = copy.deepcopy(pdefault)
                 else:
                     for pk, pv in pdefault.items():
                         if pk not in config["models"][provider]:
-                            config["models"][provider][pk] = pv
+                            config["models"][provider][pk] = copy.deepcopy(pv)
 
     if migrated:
         save_llm_config(config)
@@ -331,10 +338,18 @@ def load_llm_config() -> dict:
 def save_llm_config(config: dict):
     """Persist LLM config to disk (atomic tmp+rename — a crash mid-write
     must not corrupt the file that holds every API key and provider switch)."""
+    # Per-writer tmp name (G4-04, the trade_memory._save idiom): the GUI
+    # autosave, any process's migration save and the bots' header capture can
+    # write concurrently; a shared '<file>.tmp' let two writers splice a torn
+    # file (every process then falls back to defaults).
+    tmp = f"{LLM_CONFIG_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
-        tmp = str(LLM_CONFIG_FILE) + ".tmp"
         with open(tmp, "w") as f:
             json.dump(config, f, indent=2)
         os.replace(tmp, LLM_CONFIG_FILE)
     except Exception as e:
         print(f"[LLM-CONFIG] Error saving: {e}")
+        try:
+            os.unlink(tmp)          # per-writer names would otherwise accumulate
+        except OSError:
+            pass

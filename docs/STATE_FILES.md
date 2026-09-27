@@ -148,6 +148,7 @@ root with no lock — last-writer-wins is accepted.
 | `retrain_requested.flag` — `stock_retrain_requested.flag` | `monitor_drift.py:68 (retrain_flag_file)` | `run_pipeline.py:216-217` | jetson | drift breach (PSI>0.25 x2 days) | `retrain_requested.flag` :93 · `stock_retrain_requested.flag` :94 |
 | `.clean_slate` | `hand-created by the operator / GUI reset` | `gui.py:1520`, `alpaca_compat.py:218 (comment)` | jetson | operator action (one-shot) | `.clean_slate` :40 |
 | `crypto_heartbeat` — `stock_heartbeat` | `notify.py:106 (ping_heartbeat, 1/min rate-limited)` | `gui.py:79-82 (HEARTBEAT_FILES)` | jetson | per cycle (<=1/min) | `*_heartbeat` :85 |
+| `~/.config/systemd/user/trader.service` (outside the repo) | `scripts/setup_jetson_system.sh --user` (temp file + `mv`; rolled back if `systemctl --user enable` fails) | the `kyle` user manager (`systemctl --user`) | jetson | operator action (one-shot install; `loginctl enable-linger` printed, never run) | n/a — not in the tree **added 2026-09-27** |
 
 `trading_halt.flag` blocks **entries only** — exits keep running. `flatten_request.flag` is the
 legacy shared name, fanned out per book to `flatten_{book}.flag` by `base_loop._flatten_flag_path`,
@@ -158,7 +159,8 @@ and goes stale after `FLATTEN_FLAG_STALE_SEC = 3600`.
 | Path (canonical — prefix variants) | Writer | Readers | Machine | When written | Gitignored? |
 |---|---|---|---|---|---|
 | `journals/YYYY-MM-DD.jsonl` — `journals/YYYY-MM-DD.jsonl.gz` | `trade_journal.py:116 (log_decision); rotation at trade_journa…` | `decision_report.py:111`, `fees.py:123`, `execution_report.py:36`, `llm_eval.py:89`, `c… | jetson | per trade / per skip decision | `journals/` :64 |
-| `journals/llm_replay/YYYY-MM-DD.jsonl` | `llm_analyst.py:35,1335 (replay_capture_enabled, default ON)` | `scripts/prompt_ab.py:51`, `scripts/llm_qualify.py:71,673` | jetson | per LLM cycle | `journals/` :64 |
+| `journals/llm_replay/YYYY-MM-DD.jsonl` | `llm_analyst.py:45,1681 (_journal_replay; replay_capture_enabled, default ON)` — successful scored cycles only; since INTEL W15 (2026-09-27) each record also carries `prompt_sha256`, `latency_ms`, `dedup_hit`, `fence_stripped`, `parse_flags{sym:{raw_s,s_defaulted,s_nonfinite,s_clamped[,raw_p_up,p_up_nonfinite,p_up_clamped,raw_conviction,conviction_nonfinite,conviction_clamped]}}` appended after the unchanged legacy keys | `scripts/prompt_ab.py:51`, `scripts/llm_qualify.py:71,673` | jetson | per LLM cycle | `journals/` :64 |
+| `journals/llm_calls/YYYY-MM-DD.jsonl` | `llm_analyst.py:1659 (_write_llm_call_row, via _journal_replay; same gates: persist + replay_capture_enabled)` — one `action:"llm_call"` row per non-dedup `analyze_trades` attempt, **failures included**: `outcome` ∈ ok/partial/parse_fail/not_object/empty/transport_discard/transport_error, `path`, `requested_model`, `model_used`, `n_symbols_sent`/`_returned`, `latency_ms`, `response_chars`, `max_tokens`, `temperature`, `prompt_sha256`, `advisor_v2`, `fence_stripped`, `n_s_defaulted`/`n_nonfinite`/`n_out_of_range`, `transport_errors` (exception class names only), `finish_reason`/`block_reason`/`usage_in`/`usage_out`/`http_status` (None until `llm_client` exposes `get_last_call_meta`), `cost_usd` | none yet (planned `scripts/llm_schema_reliability.py`, SCOUT_E spec) | jetson | per LLM attempt | `journals/` :64 |
 | `journals/llm_qualify/shadow_scores.jsonl` | `scripts/llm_qualify.py:68,70` | `—` | jetson | one-shot report run | `journals/` :64 |
 | `shadow_preds.jsonl` — `stock_shadow_preds.jsonl` | `shadow.py:124 (shadow_log_file)` | `shadow.evaluate_and_maybe_promote` | jetson | per shadow cycle (~hourly, SHADOW_LOG_INTERVA… | `*shadow_preds.jsonl` :124 |
 | `pred_history.jsonl` — `stock_pred_history.jsonl`, `pred_history.jsonl.lock` | `monitor_drift.py:64,94 (history_file + flock sidecar)` | `monitor_drift PSI window` | both | per prediction cycle; HISTORY_KEEP_DAYS=7 | `pred_history.jsonl` :90 · `stock_pred_history.jsonl` :91 · `*.jsonl.lock` :100 |
@@ -170,8 +172,8 @@ readers open the plain `.jsonl` path directly** — `fees.py`, `llm_eval.py`, `d
 `chart_core.py`, `gui.py`'s staleness glob, `llm_analyst.py`, `scripts/prompt_ab.py`,
 `scripts/sizing_cofire_report.py` — and only `trade_journal.open_journal` has a `.gz` fallback.
 Turning rotation on today would make those eight go blind past the horizon. Consequence:
-**journals grow unbounded on the Jetson**. The one exception is `journals/llm_replay/`, which
-`llm_analyst` prunes past `max_age_days` on its own.
+**journals grow unbounded on the Jetson**. The two exceptions are `journals/llm_replay/` and
+`journals/llm_calls/`, which `llm_analyst` prunes past `max_age_days` (45) on its own.
 
 ## 6. Reports and ledgers — one-shot CLI or GUI button (measurement-only)
 
@@ -210,9 +212,11 @@ producing script's own docstring (`scripts/train_lexicon.py:32-35`) says nothing
 | Path (canonical — prefix variants) | Writer | Readers | Machine | When written | Gitignored? |
 |---|---|---|---|---|---|
 | `llm_analysis.json` | `llm_analyst.py:34 (_ANALYSIS_FILE)` | `gui.py:2051,5707-5709` | jetson | per LLM analyst cycle | `llm_analysis.json` :141 **added 2026-09-08** |
-| `llm_cost.json` — `llm_cost.json.lock` | `llm_client.py:176 (_COST_FILE), 198 (.lock)` | `llm_client daily budget check` | both | per LLM call | `llm_cost.json` :71 · `*.json.lock` :152 **added 2026-09-08** |
+| `llm_cost.json` — `llm_cost.json.lock` | `llm_client.py:264 (_COST_FILE), 286 (.lock)` | `llm_client daily budget check` | both | per LLM call | `llm_cost.json` :71 · `*.json.lock` :152 **added 2026-09-08** |
+| `llm_cost_history.jsonl` (2026-09-27, INTEL W9) | `llm_client.py:881 (_cost_history_path), 901 (_append_cost_history), 963 (call in _rollover_cost_locked)` — path derived from `_COST_FILE`, so a sandboxed `_COST_FILE` sandboxes it; one append-only JSON line `{date, cost, src, mem_date, mem_cost, reset_at, pid}` per observed daily rollover, under `_cost_file_lock`, fail-soft | none yet (future LLM-spend ledger reader; dedupe by `date` is the reader's job) | both | once per daily cost rollover (first ledger touch after midnight PT) | **NO** — only the exact name `llm_cost.json` is ignored (:71); needs its own line |
+| `logs/llm_eprocess_report.json` (2026-09-27, INTEL W10) | `llm_eprocess.py:89 (DEFAULT_LIVE_OUT); written only by live mode, which exits 3 until `research/campaign_2026-09_jetson/llm_eprocess_params.json` carries signed_by/signed_at/registration_sha` | none (measurement-only; nothing in the repo reads its verdict) | Jetson | per operator run | yes — under `logs/` | Anytime-valid LLM-spend ledger (Scout C Design A); `--selftest` writes nothing |
 | `llm_config.json` | `llm_config.py:190 (LLM_CONFIG_FILE)` | `decision_report.py:961`, `trade_journal.py:49`, `llm_client`, `llm_analyst` | jetson | on settings change | `llm_config.json` :50 |
-| `sentiment_cache.db` — `sentiment_cache.db-wal`, `sentiment_cache.db-shm` | `sentiment_history.py:32 (_DB_PATH)` | `scripts/train_lexicon.py:36`, `learned_lexicon.py:147 (read-only URI)` | jetson | per sentiment fetch | `sentiment_cache.db` :56 · `sentiment_cache.db-wal` :58 · `sentiment_cache.db-shm` :57 |
+| `sentiment_cache.db` — `sentiment_cache.db-wal`, `sentiment_cache.db-shm` (2026-09-26: gains table `fng_daily_legacy_localtz` + `state.fng_date_basis` on the first crypto F&G fetch, via `_migrate_fng_date_basis`) | `sentiment_history.py:32 (_DB_PATH)` | `scripts/train_lexicon.py:36`, `learned_lexicon.py:147 (read-only URI)` | jetson | per sentiment fetch | `sentiment_cache.db` :56 · `sentiment_cache.db-wal` :58 · `sentiment_cache.db-shm` :57 |
 
 `llm_config.json` **contains API keys** and is gitignored at `.gitignore:50`; `llm_cost.json` is
 the daily spend ledger (not configuration) guarded by `llm_cost.json.lock`.
@@ -235,7 +239,7 @@ the daily spend ledger (not configuration) guarded by `llm_cost.json.lock`.
 Running `python3 -m pytest tests/` on this Mac used to leave five paths behind. All were
 gitignored, so none could pollute a commit; the problem was that they are the **live runtime
 paths**, written into the repo root instead of a `tmp_path`, and one accumulated across runs.
-**Four of the five were fixed on 2026-09-08** — a suite run now leaves only `logs/trader.log`.
+**Four of the five were fixed on 2026-09-08**; the fifth, `logs/trader.log`, on 2026-09-27 (INTEL W18) — a suite run no longer writes any of them.
 
 | Residue | Responsible test(s) | Why it landed in the repo root | Fix status |
 |---|---|---|---|
@@ -243,19 +247,21 @@ paths**, written into the repo root instead of a `tmp_path`, and one accumulated
 | `adaptive_state_testq1.json` (~2.4 KB) | `tests/test_c26_Q1.py` (`AC.record_trials('testq1', …)`) | `adaptive_config.save_adaptive_state` writes `adaptive_state_{asset_type}.json` into `adaptive_config.BASE_DIR` | **FIXED** — the `mock.patch('adaptive_config.BASE_DIR', tmp_path)` context was widened to cover the `record_trials` calls too. `.gitignore`'s comment still anticipates it ("test residue uses adaptive_state_test*") |
 | `llm_cost.json` (+`.lock`) | `tests/test_llm_providers.py`, `tests/test_llm_claude.py`, `tests/test_c26_S2.py`, `tests/test_c26_P1.py` | `llm_client._COST_FILE` / `_record_cost` write the real ledger | **FIXED** — every one of those modules now monkeypatches `llm_client._COST_FILE` into `tmp_path` |
 | `pred_history.jsonl` (+`.lock`) | `tests/test_review_b19.py`, `tests/test_c26_P1.py`, `tests/test_c26_P2.py`, `tests/test_monitor_drift.py` | `monitor_drift.history_file('')` without redirecting `BASE_DIR`; **accumulated across runs** (~3.6 KB of `{"preds":{"AAA":0.5}}` rows since 2026-08-19) | **FIXED** — `monkeypatch.setattr(monitor_drift, 'BASE_DIR', tmp_path)` at the writing tests (`BASE_DIR` is read at call time, so the redirect takes) |
-| `logs/trader.log` | *any* test that imports a module importing `log_config` | `log_config._setup` runs at first `get_logger` and `mkdir`s `logs/` — logging is configured as an **import-time side effect** | **NOT fixed.** Making logging lazy/opt-in is a production-behavior change, not a test fix — it belongs in the decision queue, not in a cleanup pass |
+| `logs/trader.log` | *any* test that imports a module importing `log_config` | `log_config._setup` runs at first `get_logger` (22 modules call it at import) and opened `<repo>/logs/trader.log` — the production log the live bots write | **FIXED 2026-09-27 (INTEL W18)** — `tests/conftest.py` sets `TRADER_LOG_DIR` to a per-session `mkdtemp(prefix='trader-test-logs-')` at module scope, before any repo import (a non-empty caller value wins); `log_config._log_paths()` (`log_config.py:102-135`) reads it at the first `_setup()`. Logging is still configured on first `get_logger` — production behaviour is unchanged (the variable is unset there → `<repo>/logs/trader.log`). The hygiene section prints `test logs: <dir>` and `production log untouched: yes / no / unattributable` (the last = changed while live bots held it open); pinned by `tests/test_intel_logdir_2026_09.py` |
 
 ## 10. Logs — what rotates and what does not
 
 | Path (canonical — prefix variants) | Writer | Readers | Machine | When written | Gitignored? |
 |---|---|---|---|---|---|
-| `logs/trader.log` — `logs/trader.log.1 .. .5` | `log_config.py:14-17 (RotatingFileHandler 10MB x5)` | `operator / gui log tail` | both | every logger call | `logs/` :31 |
+| `logs/trader.log` — `logs/trader.log.1 .. .5` | `log_config.py:22-25,162-168 (SharedRotatingFileHandler 10MB x5; dir from _log_paths() :102-135)` | `operator / gui log tail` | both | every logger call | `logs/` :31 |
 | `pipeline_output.log` — `crypto_bot_output.log`, `stock_bot_output.log`, `backfill_output.log`, `sentiment_fetch.log` +3 | `run_pipeline.py:41-43,1478,1516; gui.py:5549,5658; shadow.py:…` | `gui.py:111-114 (LOG_FILES)` | jetson | append while the process runs | `*.log` :29 · `sentiment_fetch.log` :61 · `meta_retrain.log` :125 |
 
 | | Path(s) | Handler | Rotation |
 |---|---|---|---|
-| **Rotated** | `logs/trader.log` (+ `.1`…`.5`) | `logging.handlers.RotatingFileHandler` (`log_config.py:14-17`) | `_MAX_BYTES = 10 MB` × `_BACKUP_COUNT = 5` → **~60 MB worst case** |
+| **Rotated** | `logs/trader.log` (+ `.1`…`.5`) | `log_config.SharedRotatingFileHandler` (a multi-process-safe `RotatingFileHandler` subclass, `log_config.py:46-99`; built at :162-168 from `_log_paths()` :102-135) | `_MAX_BYTES = 10 MB` × `_BACKUP_COUNT = 5` → **~60 MB worst case** |
 | **Unrotated** | `pipeline_output.log`, `crypto_bot_output.log`, `stock_bot_output.log`, `backfill_output.log`, `sentiment_fetch.log`, `meta_retrain.log`, `llm_refresh.log`, `llm_refresh_one.log` | raw `open(..., 'a')` in `run_pipeline.py`, `gui.py`, `shadow.py` | **none — unbounded** |
+
+**Override (2026-09-27):** `TRADER_LOG_DIR` (unset in production) moves `trader.log`, its `.1`-`.5` backups and `trader.log.lock` to another directory (absolute or repo-root-relative; unusable -> default + one stderr line) — `log_config._log_paths()` (`log_config.py:102-135`), read at the first `get_logger` call; `tests/conftest.py` sets it at module scope to a per-session `trader-test-logs-*` temp dir so pytest no longer writes into the production `logs/trader.log` (see `docs/FLAGS.md` §5.1 and §9 above).
 
 `log_config` pins `urllib3` / `httpx` / `httpcore` / `websockets` / `yfinance` / `numba` /
 `charset_normalizer` to WARNING so numba's per-deploy byteflow dumps cannot eat the rotation budget
@@ -266,7 +272,7 @@ paths**, written into the repo root instead of a `tmp_path`, and one accumulated
 the unrotated `journals/*.jsonl` (§5). On a long-running Jetson those two families, not the model
 artifacts, are what fills the disk. Neither has a monitor.
 
-## 11. Archive note — what moved on the dev Mac
+## 11. Archive note — what moved into `archive/` (dev Mac 2026-09-08, Jetson 2026-09-26)
 
 The 2026-09-08 cleanup moved stale local artifacts into a new root `archive/` tree rather than
 deleting them (owner rule: delete nothing). Nothing in `archive/` is read by any code path — every
@@ -287,3 +293,16 @@ directory — `trade_journal` recreates it anyway. On the Jetson none of this ap
 are live runtime state there and must stay where the code expects them.
 
 See `archive/README.md` for the moves as executed.
+
+**Jetson, 2026-09-26.** A second pass moved the untracked March-2026 Jetson residue out of the
+working tree (plain `mv`; none of it was ever in git, and nothing imports or names it): the PDF
+manual and its generator (`scripts/generate_manual.py`, `scripts/manual_expanded.py` — the latter
+was the one unreachable module failing `scripts/repo_graph.py --check`), `scripts/mem_diagnostic.py`,
+`global_context.py`/`.json`, the `research_*.txt` dumps and the `review_findings.md` /
+`research_gap_analysis.md` notes → `archive/jetson_residue_2026-03/` (untracked, deliberately not
+ignored — the owner decides whether to commit them); the `stock_*_v2.*.backup_score10` model
+backups and `*_study.db.bak*` Optuna backups → `archive/local_residue/`, ignored by two
+`archive/local_residue/`-anchored `.gitignore` patterns. The same day the untracked
+`indicators_c` C extension (`c_ext/indicators_c.c`, `c_ext/build.py` and the root `.so`) moved to
+`archive/c_ext/` (untracked, not ignored); `indicators.py` loads it only with `TRADER_INDICATORS_C=1`.
+Rows and restore notes: `archive/README.md`.

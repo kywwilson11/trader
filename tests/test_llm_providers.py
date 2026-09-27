@@ -167,8 +167,8 @@ def test_call_openai_records_cost_nano_pricing(lc, monkeypatch):
                         lambda req, timeout=None: FakeResp(OPENAI_PAYLOAD))
     out = lc.call_openai('p', system='s', model='gpt-5.4-nano')
     assert json.loads(out)['s'] == 0.42
-    # nano pricing: 1000 in @ $0.25/MTok + 100 out @ $1.00/MTok
-    expected = (1000 * 0.25 + 100 * 1.00) / 1_000_000
+    # nano pricing: 1000 in @ $0.20/MTok + 100 out @ $1.25/MTok (published, audit D2)
+    expected = (1000 * 0.20 + 100 * 1.25) / 1_000_000
     spent, _limit = lc.get_daily_cost()
     assert abs(spent - expected) < 1e-9
     assert lc.get_last_model_used() == 'gpt-5.4-nano'

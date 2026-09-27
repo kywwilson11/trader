@@ -291,7 +291,7 @@ def test_sub_flags_default_off():
     assert strategy_config.BLEND_FIT_ON_REFIT is False
     assert strategy_config.BLEND_THRESHOLD_RESELECT is False
     # The parent flag the whole save path hangs off stays OFF too.
-    assert strategy_config.HYPERSEARCH_V3 is False
+    assert strategy_config.HYPERSEARCH_V3 is True  # 2026-09-27: flipped at the gotcha-#2 event (founder)
 
 
 # ---------------------------------------------------------------------------

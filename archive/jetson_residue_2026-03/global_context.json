@@ -1,0 +1,61 @@
+{
+  "regime": "risk-on",
+  "themes": [
+    {
+      "theme": "AI and Tech Dominance Continues",
+      "impact": "The technology sector, particularly AI-related stocks, continues to show strong momentum.  This is driven by ongoing innovation and partnerships, with the NASDAQ up +13.9% in the last month and XLK up +19.4% in the last month.  Despite recent pullbacks for some specific names like ARM, the overarching trend remains positive.",
+      "sectors_positive": [
+        "Technology",
+        "Semiconductors",
+        "Software"
+      ],
+      "sectors_negative": []
+    },
+    {
+      "theme": "Geopolitical Tensions & Commodity Volatility",
+      "impact": "The Iran war is a significant driver of volatility in energy and precious metals. Crude Oil is down -8.6% this week but remains elevated year-to-date (+65.4%), and Gold is up +2.1% this week and +39.3% year-to-date. Sanctions on Iraqi oil officials and reports of tankers navigating the Hormuz Strait highlight supply chain risks.",
+      "sectors_positive": [
+        "Energy (selectively)",
+        "Precious Metals"
+      ],
+      "sectors_negative": [
+        "Shipping",
+        "Global Trade Dependent Industrials"
+      ]
+    },
+    {
+      "theme": "Consumer Resilience Amidst Cost Pressures",
+      "impact": "Consumer discretionary is showing signs of strength (+7.9% in the last month for XLY), suggesting consumer spending is holding up despite inflation concerns. However, companies like McDonald's are warning about rising costs impacting long-term demand, creating a bifurcated picture within the consumer space.",
+      "sectors_positive": [
+        "Consumer Discretionary (selectively)",
+        "E-commerce"
+      ],
+      "sectors_negative": [
+        "Consumer Staples (margin pressure)"
+      ]
+    },
+    {
+      "theme": "Shifting Dollar Dynamics",
+      "impact": "The US Dollar (DXY) is relatively stable (+0.0% this week) but is being eyed for potential weakness should geopolitical tensions ease, as suggested by the 'Trapdoor creaks for dollar if Iran war ends' headline. This could benefit international assets.",
+      "sectors_positive": [
+        "Emerging Markets",
+        "International Equities"
+      ],
+      "sectors_negative": [
+        "US Dollar"
+      ]
+    }
+  ],
+  "risk_factors": [
+    "Escalation of the Iran war and wider regional conflict",
+    "Resurgence of inflation leading to renewed hawkish central bank policy",
+    "Unexpected deterioration in consumer spending power impacting earnings"
+  ],
+  "opportunities": [
+    "Contrarian plays in energy and materials if geopolitical tensions stabilize or de-escalate, leading to a price correction",
+    "Rotation into undervalued sectors that have lagged the tech rally, provided economic data remains supportive"
+  ],
+  "summary": "The market remains in a strong risk-on regime, primarily driven by the continued enthusiasm for AI and technology, with the NASDAQ and XLK showing significant recent gains. However, ongoing geopolitical tensions in the Middle East are creating volatility in commodities like oil and gold, while also posing potential risks to global trade and the US dollar.",
+  "timestamp": "2026-05-07T19:02:37+00:00",
+  "model": "gemini-3.1-pro-preview"
+}

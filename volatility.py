@@ -89,7 +89,10 @@ def forecast_volatility(model_result) -> float | None:
     try:
         forecasts = model_result.forecast(horizon=1)
         variance = forecasts.variance.values[-1, 0]
-        if variance <= 0:
+        # A zero-variance (frozen/halted feed) series makes arch forecast
+        # NaN, and `NaN <= 0` is False: the NaN then became
+        # compute_vol_adjusted_size's max 1.5x boost. Contract: sigma or None.
+        if not np.isfinite(variance) or variance <= 0:
             return None
         # Model was fit on percentage returns, so sigma is in percentage points
         sigma_pct = np.sqrt(variance)
@@ -99,27 +102,9 @@ def forecast_volatility(model_result) -> float | None:
         return None
 
 
-# DEAD in live paths: stops are ATR-based (base_loop) and this floor/ceil
-# does not track strategy_config stop policy. It has NO non-test consumer —
-# base_loop no longer imports it (tests/test_grp_loops.py::test_dead_imports_pruned
-# asserts the name is absent from base_loop); the only exercise is
-# tests/test_new_modules.py.
-def get_garch_stop(entry_price: float, sigma: float, multiplier: float = 2.0,
-                   floor_pct: float = 0.03, ceil_pct: float = 0.10) -> float:
-    """Compute stop-loss price using GARCH volatility.
-
-    Args:
-        entry_price: Entry price
-        sigma: GARCH sigma (decimal, e.g. 0.02 = 2%)
-        multiplier: Number of sigmas for stop distance
-        floor_pct: Minimum stop distance as fraction of price
-        ceil_pct: Maximum stop distance as fraction of price
-
-    Returns:
-        Stop price (below entry for long positions).
-    """
-    stop_dist = max(floor_pct, min(ceil_pct, sigma * multiplier))
-    return entry_price * (1 - stop_dist)
+# get_garch_stop (zero production callers; stops are ATR-based) was REMOVED
+# 2026-09-27 (G5-8) — verbatim text + its two tests archived in
+# research/campaign_2026-08/08_removed_code.md.
 
 
 def get_cached_sigma(symbol: str, returns: np.ndarray) -> float | None:
@@ -155,6 +140,28 @@ def get_cached_sigma(symbol: str, returns: np.ndarray) -> float | None:
 
 BARS_PER_YEAR = {'crypto': 8760, 'stock': 1638}
 BARS_PER_DAY = {'crypto': 24.0, 'stock': 6.5}
+
+
+# Read sites route through bars_calendar at CALL time so ONE flip of
+# strategy_config.BARS_PER_YEAR_MEASURED moves trainer (hypersearch
+# compute_sharpe), portfolio_backtest and this module's live sizing together.
+# The dicts above stay the legacy tables (flag OFF -> `.get` on them,
+# byte-identical and monkeypatch-transparent); the measured numbers live only
+# in bars_calendar.
+def _bars_per_year(asset_type):
+    try:
+        from bars_calendar import bars_per_year
+    except ImportError:
+        return BARS_PER_YEAR.get(asset_type, 8760)
+    return bars_per_year(asset_type, BARS_PER_YEAR, 8760)
+
+
+def _bars_per_day(asset_type):
+    try:
+        from bars_calendar import bars_per_day
+    except ImportError:
+        return BARS_PER_DAY.get(asset_type, 6.5)
+    return bars_per_day(asset_type, BARS_PER_DAY, 6.5)
 
 
 # --- HAR-RV on realized range (Corsi 2009; HARQ insanity filter from
@@ -226,7 +233,7 @@ def _har_sigma_from_rrv(rrv, asset_type: str = 'stock', shrink: bool = False,
         rrv_hat = float(np.exp(x_now @ beta + 0.5 * sig2_resid))
         rrv_hat = min(max(rrv_hat, float(rrv.min())), float(rrv.max()))
         sigma_daily = np.sqrt(c_scale * rrv_hat)
-        return float(sigma_daily / np.sqrt(BARS_PER_DAY.get(asset_type, 6.5)))
+        return float(sigma_daily / np.sqrt(_bars_per_day(asset_type)))
     except Exception as e:
         logger.debug("HAR forecast failed: %s", e)
         return None
@@ -316,13 +323,20 @@ def _har_rrv_load() -> None:
 def _har_rrv_save() -> None:
     """Atomic persist (tmp -> os.replace, _rv_save pattern). Never raises."""
     import json
+    import threading
+    # Per-writer tmp (trade_memory idiom): a shared fixed '.tmp' let two
+    # concurrent savers truncate/splice each other's file into the live path.
+    tmp = f"{_HAR_RRV_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
-        tmp = _HAR_RRV_FILE + '.tmp'
         with open(tmp, 'w') as f:
             json.dump(_har_rrv_store['symbols'], f)
         os.replace(tmp, _HAR_RRV_FILE)
     except Exception as e:
         logger.warning("[HAR-RRV] history save failed: %s", e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _merge_complete_day_rrvs(history: dict, bars, window_days: int,
@@ -334,16 +348,26 @@ def _merge_complete_day_rrvs(history: dict, bars, window_days: int,
     fixes an earlier thin day). With min_bars=N, days with fewer than N
     bars are additionally skipped — protects the HAR store's HEAD day
     after downtime, where a partial first day would leave the 250-bar
-    frame and freeze undercounted. min_bars=None is byte-identical to the
-    Wave B-3 inline logic (update_crypto_rv_state). Returns True when
-    `history` changed."""
+    frame and freeze undercounted. The frame's FIRST calendar day is also
+    skipped when the frame starts after that day's 00:00 bar (G5-1): live
+    callers pass a ROLLING 250-bar frame, so every day passes through the
+    truncated head position, and the dict overwrite used to replace its
+    correct full-day RRV with ever-shorter partial sums (crypto_rv_history
+    stored ~1/24 of each settled day's true RRV). Every day is interior to
+    some 250-bar frame, so no day is lost. A frame starting exactly at
+    00:00 keeps its head day (unchanged). Returns True when `history`
+    changed."""
     changed = False
     rrv = daily_realized_range(bars)
     last_day = bars.index[-1].normalize()
+    first_day = bars.index[0].normalize()
+    head_truncated = bars.index[0] != first_day   # frame begins mid-day
     counts = (bars['High'].groupby(bars.index.normalize()).count()
               if min_bars is not None else None)
     for day, val in rrv.items():
-        if day != last_day and np.isfinite(val) and val > 0:
+        if (day != last_day
+                and not (head_truncated and day == first_day)
+                and np.isfinite(val) and val > 0):
             if counts is not None and int(counts.get(day, 0)) < min_bars:
                 continue
             key = day.date().isoformat()
@@ -566,17 +590,25 @@ def _rv_save() -> None:
     """Atomic persist (tmp -> os.replace, hard_stop_lockout pattern).
     Never raises."""
     import json
+    import threading
+    # Per-writer tmp (same idiom as _har_rrv_save): a shared fixed '.tmp'
+    # let two concurrent savers truncate/splice each other's file into the
+    # live path; the tmp is removed on any failure.
+    tmp = f"{_CRYPTO_RV_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         payload = {'rrv': _crypto_rv['history'] or {},
                    'state': _crypto_rv['state'],
                    'exit_count': _crypto_rv['exit_count'],
                    'last_bar_ts': _crypto_rv['last_bar_ts']}
-        tmp = _CRYPTO_RV_FILE + '.tmp'
         with open(tmp, 'w') as f:
             json.dump(payload, f)
         os.replace(tmp, _CRYPTO_RV_FILE)
     except Exception as e:
         logger.warning("[CRYPTO-RV] history save failed: %s", e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def update_crypto_rv_state(symbol: str, bars) -> None:
@@ -710,8 +742,8 @@ def compute_vol_adjusted_size(base_notional: float, sigma: float,
     Returns:
         Adjusted notional (clamped to 0.5x - 1.5x base).
     """
-    if sigma <= 0:
-        return base_notional
+    if not np.isfinite(sigma) or sigma <= 0:
+        return base_notional        # NaN/inf sigma -> neutral, never the 1.5x clamp
     # PORTFOLIO_VOL_TARGET scope (c26 S3 / B06 item g): under
     # strategy_config.DERISK_STACK_V2 the book-level scalar
     # (portfolio.get_book_vol_scalar_cached, inside the regime-family MIN)
@@ -721,7 +753,7 @@ def compute_vol_adjusted_size(base_notional: float, sigma: float,
     # BOTH (the documented double count, worst case 0.25x).
     from strategy_config import PORTFOLIO_VOL_TARGET
     annual_target = PORTFOLIO_VOL_TARGET.get(asset_type, 0.25)
-    target_per_bar = annual_target / np.sqrt(BARS_PER_YEAR.get(asset_type, 8760))
+    target_per_bar = annual_target / np.sqrt(_bars_per_year(asset_type))
     ratio = target_per_bar / sigma
     ratio = max(0.5, min(1.5, ratio))
     return base_notional * ratio

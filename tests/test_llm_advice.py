@@ -30,6 +30,25 @@ import llm_config
 import prompt_ab
 
 
+@pytest.fixture(autouse=True)
+def _sandboxed_cost_ledger(monkeypatch, tmp_path):
+    """Test hygiene (INTEL W9, 2026-09-27; idiom of test_g4b_fixes_2026_09.py
+    :181-197). TestAnalyzeTradesPlumbing reaches
+    llm_analyst.get_routing_info -> llm_client._maybe_reset_quota, whose
+    rollover opens <_COST_FILE>.lock for writing (repo-root MOD measured). Every
+    ledger path derives from the single constant llm_client._COST_FILE (the
+    '.lock' in _cost_file_lock, the '.tmp' + os.replace in _save_shared_cost,
+    and the rollover's llm_cost_history.jsonl), so pointing it into tmp_path
+    keeps the repo-root llm_cost.json{,.lock,.tmp} untouched; the in-memory
+    ledger globals go through monkeypatch so they are restored afterwards."""
+    import llm_client
+    monkeypatch.setattr(llm_client, '_COST_FILE',
+                        str(tmp_path / 'llm_cost.json'))
+    monkeypatch.setattr(llm_client, '_cost_reset_date', '')
+    monkeypatch.setattr(llm_client, '_daily_cost', 0.0)
+    return tmp_path
+
+
 # --------------------------------------------------------------------------- #
 # 1. build_compact_evidence
 # --------------------------------------------------------------------------- #

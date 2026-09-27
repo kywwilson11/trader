@@ -207,7 +207,7 @@ class TestFlagDefaults:
 
     def test_training_repairs_defaults_off(self):
         import strategy_config
-        assert strategy_config.TRAINING_REPAIRS_V1 is False
+        assert strategy_config.TRAINING_REPAIRS_V1 is True  # 2026-09-27: flipped at the gotcha-#2 event (founder)
 
 
 # ---------------------------------------------------------------------------

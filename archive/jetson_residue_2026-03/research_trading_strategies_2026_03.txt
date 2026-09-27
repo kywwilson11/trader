@@ -1,0 +1,683 @@
+================================================================================
+ALGORITHMIC TRADING RESEARCH SURVEY - MARCH 2026 UPDATE
+================================================================================
+Compiled: 2026-03-22
+Focus: LSTM-based stock/crypto trading bot on Jetson Orin Nano
+Prior research: research_trading_strategies.txt (Feb 2026)
+================================================================================
+
+TABLE OF CONTENTS
+1.  ML-Based Trading: Attention/Transformer vs LSTM
+2.  Position Sizing Beyond Kelly
+3.  Regime Detection Improvements
+4.  Transaction Cost Modeling
+5.  Stop Loss Research
+6.  Ensemble Methods for Trading Signals
+7.  Nobel Prize Theories for Algorithmic Trading
+8.  Risk of Ruin and Drawdown Management
+9.  Market Microstructure for Retail Traders
+10. Crypto vs Equity Market Structure
+
+================================================================================
+1. ML-BASED TRADING: ATTENTION/TRANSFORMER vs LSTM
+================================================================================
+
+KEY FINDING: Transformers outperform standalone LSTMs, but hybrid architectures
+outperform both. The Temporal Fusion Transformer (TFT) is the current
+state-of-the-art for financial time series.
+
+SOURCES:
+- "Hybrid CNN-LSTM Integrated with TFT for Stock Market Forecasting" (IIETA 2024)
+  https://www.iieta.org/journals/isi/paper/10.18280/isi.301122
+- "Temporal Fusion Transformers for Enhanced Multivariate Time Series" (IJCSIT 2024)
+  https://thesai.org/Downloads/Volume15No7/Paper_13-Temporal_Fusion_Transformers_for_Enhanced_Multivariate_Time_Series.pdf
+- "Adaptive Temporal Fusion Transformers for Cryptocurrency Prediction" (arXiv 2025)
+  https://arxiv.org/html/2509.10542v1
+- "Predictive Modeling of Stock Prices Using Transformer Model" (ACM ICMLT 2024)
+  https://dl.acm.org/doi/10.1145/3674029.3674037
+- "Lamformer: LSTM-enhanced Agent Attention and MoE Transformer" (Springer 2025)
+  https://link.springer.com/article/10.1007/s13042-025-02740-8
+- "CNN-Trans-SPP: Small Transformer with CNN" (ERA 2024)
+  https://aimspress.com/article/doi/10.3934/era.2024314?viewType=HTML
+- "Revisiting Ensemble Methods for Trading" (arXiv 2501.10709, FinRL 2023/2024)
+  https://arxiv.org/html/2501.10709v1
+- "TFT-Based Trading Strategy for Multi-Crypto Assets" (MDPI Systems 2025)
+  https://www.mdpi.com/2079-8954/13/6/474
+
+PERFORMANCE DATA:
+- Pure Transformer vs LSTM: Transformer achieved MAE 0.0826 vs LSTM's 0.2890 (3.5x better)
+- CNN-Transformer hybrid: reduced error by 45% vs LSTM, 32% vs attention-LSTM, 37% vs
+  pure Transformer
+- TFT vs LSTM: 40-50% reduction in MAE, MAPE below 2% across all stocks tested
+- TFT in bear markets: MAE 0.18 vs 0.22 (Vanilla Transformer) vs 0.25 (LSTM)
+- TFT trading strategy: +807% return (Jan 2024 - Sep 2025) vs +38% buy-and-hold
+- Performance gap widens for longer prediction horizons, suggesting TFT captures
+  long-term dependencies better
+
+WHY TFT IS SUPERIOR:
+- Variable Selection Network: automatically identifies which inputs matter
+- Multi-horizon attention: captures patterns at different time scales
+- Static covariate encoding: incorporates non-time-varying features (sector, asset class)
+- Interpretability: attention weights show WHICH features drove predictions and WHEN
+- Combines Transformer self-attention with LSTM seq2seq approach
+
+LIGHTWEIGHT ALTERNATIVES FOR EDGE DEVICES (Jetson Orin Nano):
+- LAMFormer: Uses Agent Attention (reduces computational burden of full self-attention)
+  with Mixture-of-Experts (MoE) for adaptive multi-scale temporal features
+- CNN-Trans-SPP: Small transformer with CNN feature extraction, designed for
+  resource-constrained environments
+- Attention-augmented LSTM: Add attention layer on top of existing LSTM rather than
+  full transformer replacement
+
+ACTION ITEMS FOR THE BOT:
+(a) The bot already has MultiheadAttention on LSTM (model_v2.py) -- this is good
+(b) Consider TFT migration for next major version (PyTorch Forecasting library)
+(c) For Jetson Orin Nano: LAMFormer or attention-augmented LSTM more practical than
+    full TFT due to 8GB memory constraint
+(d) Use TFT's Variable Selection Network concept to auto-select best features from
+    the current feature set
+(e) Explore Adaptive TFT for crypto specifically (arXiv 2509.10542)
+
+================================================================================
+2. POSITION SIZING BEYOND KELLY
+================================================================================
+
+KEY FINDING: Hybrid Kelly-VIX sizing outperforms pure Kelly or pure volatility
+targeting. Half-Kelly is the practical sweet spot for most traders.
+
+SOURCES:
+- "Sizing the Risk: Kelly, VIX, and Hybrid Approaches" (arXiv 2508.16598, Aug 2025)
+  https://arxiv.org/abs/2508.16598
+- "Kelly Criterion vs Fixed Fractional" (Medium, Jan 2026)
+  https://medium.com/@tmapendembe_28659/kelly-criterion-vs-fixed-fractional-which-risk-model-maximizes-long-term-growth-972ecb606e6c
+- "Risk Before Returns: Position Sizing Frameworks" (Medium 2025)
+  https://medium.com/@ildiveliu/risk-before-returns-position-sizing-frameworks-fixed-fractional-atr-based-kelly-lite-4513f770a82a
+- "Kelly Criterion Position Sizing" (Astute Investors Calculus)
+  https://astuteinvestorscalculus.com/kelly-criterion-position-sizing/
+
+KEY INSIGHTS:
+
+A. HYBRID KELLY-VIX SIZING (NEW - arXiv 2508.16598, 2025):
+   - Combines Kelly's optimal growth with VIX regime awareness
+   - Consistently balances return generation with drawdown control
+   - Particularly effective in low-volatility regimes (e.g., 2024)
+   - Outperforms pure Kelly during regime transitions
+   - Tested on S&P 500 options strategies with rigorous methodology
+
+B. FRACTIONAL KELLY RECOMMENDATIONS:
+   - Full Kelly: Maximum growth rate but extreme drawdowns (50%+ common)
+   - Half Kelly (f/2): 75% of full Kelly return, 50% of the variance
+   - Third Kelly (f/3): Still 55% of return, 33% of variance
+   - Quarter Kelly (f/4): Recommended for high estimation uncertainty
+   - Key insight: Kelly is extremely sensitive to edge estimation error.
+     If your estimated edge is off by even 20%, full Kelly will LOSE money
+
+C. VOLATILITY-TARGETING COMPARISON:
+   - ATR-based sizing: normalizes risk per trade by volatility
+   - GARCH-based (current bot approach): forward-looking vol estimate
+   - Realized vol targeting: scale positions to target constant portfolio vol
+   - All three reduce drawdowns vs fixed-size positions
+   - GARCH + fractional Kelly hybrid likely optimal for the bot
+
+D. FIXED FRACTIONAL (Vince 1990):
+   - More stable equity curve, lower volatility
+   - Mathematically prevents ruin (position size shrinks with losses)
+   - Lower ceiling on long-term growth vs Kelly
+
+ACTION ITEMS FOR THE BOT:
+(a) Implement hybrid Kelly-VIX: scale Kelly fraction by VIX regime
+    - Low VIX (<15): use 0.5 Kelly
+    - Medium VIX (15-25): use 0.35 Kelly
+    - High VIX (25-35): use 0.25 Kelly
+    - Crisis VIX (>35): use 0.15 Kelly
+(b) Add estimation error buffer: multiply Kelly fraction by (1 - uncertainty)
+    where uncertainty comes from prediction confidence interval
+(c) The bot already has GARCH vol targeting -- keep it, combine with Kelly-VIX
+(d) Consider "anti-martingale" scaling: increase size after wins, decrease
+    after losses (aligns with Kelly mathematics)
+
+================================================================================
+3. REGIME DETECTION IMPROVEMENTS
+================================================================================
+
+KEY FINDING: Online Bayesian change-point detection outperforms fixed-state HMM
+for real-time regime detection. Ensemble HMM + ML voting frameworks show
+strongest results.
+
+SOURCES:
+- "A Forest of Opinions: Multi-Model Ensemble-HMM Voting Framework" (AIMS 2025)
+  https://www.aimspress.com/article/id/69045d2fba35de34708adb5d
+- "Online Learning of Order Flow with Bayesian Change-Point Detection"
+  (Quantitative Finance, 2024)
+  https://www.tandfonline.com/doi/full/10.1080/14697688.2024.2337300
+- "Bayesian Autoregressive Online Change-Point Detection" (arXiv 2024)
+  https://arxiv.org/html/2407.16376v1
+- "Downside Risk Reduction Using Regime-Switching Signals: Statistical Jump Model"
+  (arXiv 2024)
+  https://arxiv.org/html/2402.05272v2
+
+KEY INSIGHTS:
+
+A. ONLINE BAYESIAN CHANGE-POINT DETECTION (BOCPD):
+   - Does NOT require pre-specifying number of regimes (unlike current HMM)
+   - Updates beliefs in real-time as each new data point arrives
+   - Score-driven approach accommodates temporal correlations within regimes
+   - Allows variance and correlation to vary within each regime
+   - Superior to traditional HMM for detecting novel market regimes
+
+B. ENSEMBLE HMM + ML VOTING (2025):
+   - Dual pipeline architecture:
+     Pipeline 1: Ensemble ML (bagging + boosting) on technical indicators
+     Pipeline 2: HMM on macroeconomic + long-horizon technical indicators
+   - Voting classifier combines both pipelines for robust regime classification
+   - Incorporates comprehensive macro + technical indicators for holistic view
+   - Better than either approach alone
+
+C. STATISTICAL JUMP MODEL (2024):
+   - Adds "jump penalty" at state transitions (encourages regime persistence)
+   - Reduces false regime switches that plague standard HMM
+   - Specifically designed for downside risk reduction
+   - Demonstrated reduction in maximum drawdown
+
+D. BIC-BASED MODEL SELECTION:
+   - Fit models with 3 to 9 states
+   - Select model with lowest Bayesian Information Criterion
+   - Current bot may be using suboptimal number of regimes
+
+ACTION ITEMS FOR THE BOT:
+(a) Add BOCPD as complementary signal to existing HMM
+    - Python package: bayesian_changepoint_detection (pip installable)
+    - Run in parallel with HMM, use agreement as confidence signal
+(b) Implement jump penalty in HMM transitions to reduce false switches
+(c) Add BIC-based regime count selection to hypersearch
+(d) Consider ensemble voting: combine HMM regime + GARCH regime + macro regime
+    for final regime classification (the bot already has all three signals)
+(e) Add online parameter updating: re-estimate HMM parameters on rolling window
+
+================================================================================
+4. TRANSACTION COST MODELING IN BACKTESTS
+================================================================================
+
+KEY FINDING: Most backtests dramatically overfit by assuming zero or minimal
+transaction costs. Realistic cost modeling typically reduces strategy returns
+by 50-80%. Proper walk-forward validation with costs produces Sharpe ~0.3-0.5,
+not the 2.0+ commonly reported.
+
+SOURCES:
+- "Interpretable Hypothesis-Driven Trading: Rigorous Walk-Forward Validation"
+  (arXiv 2512.12924, Dec 2025)
+  https://arxiv.org/html/2512.12924v1
+- "Impact of Transaction Costs and Slippage on Algorithmic Trading Performance"
+  (ResearchGate 2024)
+  https://www.researchgate.net/publication/384458498
+- "TCA: Benchmarks and Slippage" (Talos 2024)
+  https://www.talos.com/insights/execution-insights-through-transaction-cost-analysis-tca-benchmarks-and-slippage
+- "Backtest Overfitting in the ML Era" (ScienceDirect 2024)
+  https://www.sciencedirect.com/science/article/abs/pii/S0950705124011110
+- "Combinatorial Purged Cross-Validation" (various 2024-2025)
+  https://www.quantbeckman.com/p/with-code-combinatorial-purged-cross
+
+KEY INSIGHTS:
+
+A. REALISTIC COST MODEL (from arXiv 2512.12924):
+   - Fixed costs: $1 per trade (commission)
+   - Variable costs: 5 basis points (0.05%) x position size x execution price
+   - Orders execute at NEXT DAY'S OPEN (not signal-time close)
+   - Position constraints: max 5 concurrent, 20% per position, 50% per sector
+   - Result: 0.55% annualized return, Sharpe 0.33, max drawdown -2.76%
+   - This is HONEST. Most published strategies claiming Sharpe >1.5 are overfit
+
+B. COST COMPONENTS TO MODEL:
+   1. Commission/fees: Alpaca = $0 equity, varies for crypto
+   2. Spread cost: half the bid-ask spread per trade
+   3. Market impact: price movement caused by your order
+   4. Slippage: difference between signal price and execution price
+   5. Opportunity cost: orders that don't fill
+   - Quadratic models best capture market impact (nonlinear with size)
+
+C. COMBINATORIAL PURGED CROSS-VALIDATION (CPCV):
+   - Lopez de Prado's method for detecting backtest overfitting
+   - Systematically constructs multiple train-test splits
+   - Purges overlapping samples, enforces embargo period
+   - 2024 study found CPCV "markedly superior" in detecting overfitting
+   - Computes Probability of Backtest Overfitting (PBO)
+   - If PBO > 0.5, strategy is likely overfit
+
+D. WALK-FORWARD BEST PRACTICES (from 2025 framework):
+   - Use 34+ rolling windows over 10+ year period
+   - 252-day training, 63-day testing per window
+   - Strict information set discipline (no future data)
+   - Must succeed across MULTIPLE independent test periods
+   - Report p-values honestly (most strategies p > 0.1)
+
+ACTION ITEMS FOR THE BOT:
+(a) Add spread-cost tracking to backtest: measure actual bid-ask at signal time
+(b) Execute backtest trades at next bar's open, not signal bar's close
+(c) Add market impact model: for positions >1% of ADV, add sqrt(size/ADV) * spread
+(d) Implement PBO calculation in hypersearch_v2.py to detect overfit parameters
+(e) Add embargo period between train/test sets (at least 5 bars)
+(f) Track and report realistic Sharpe ratios (after all costs)
+
+================================================================================
+5. STOP LOSS RESEARCH
+================================================================================
+
+KEY FINDING: Trailing stops at 15-20% DO improve risk-adjusted returns vs
+buy-and-hold. Very tight stops (5%) HURT returns. ATR-based or volatility-
+adjusted stops outperform fixed-percentage stops. DRL-based dynamic stops
+are an emerging frontier.
+
+SOURCES:
+- "Effectiveness of Trailing Stop-Loss Strategies" (Portfolio Management Research)
+  https://www.pm-research.com/content/iijindinv/14/1/29
+- "Risk Reduction Using Trailing Stop-Loss Rules" (Dai et al., Int Review Finance 2021)
+  https://papers.ssrn.com/sol3/Delivery.cfm/SSRN_ID3338243_code3381625.pdf
+- "Trailing Stop-Loss and Re-Entry Strategies in Europe" (EJBMR)
+  https://www.ejbmr.org/index.php/ejbmr/article/view/1426
+- "Dynamic Stop Loss with Deep Reinforcement Learning on NASDAQ" (Springer 2024)
+  https://link.springer.com/chapter/10.1007/978-3-031-78465-1_15
+- "Optimal Trading with a Trailing Stop" (arXiv 1701.03960)
+  https://arxiv.org/abs/1701.03960
+
+KEY INSIGHTS:
+
+A. OPTIMAL STOP-LOSS LEVELS:
+   - Highest quarterly return: 20% trailing stop (1.71% average)
+   - Highest cumulative return: 15% trailing stop (73.91% over study period)
+   - 5% trailing stop: WORSE than buy-and-hold (excessive whipsawing)
+   - Sweet spot: 1.0-1.5 standard deviations from peak
+   - Trailing stops outperformed traditional stops by 27.47% over 11 years at
+     the 20% level
+
+B. ATR-BASED STOPS (PREFERRED):
+   - Set stop at price - N * ATR (where N typically 2-3)
+   - Automatically widens in volatile markets, tightens in calm markets
+   - Avoids whipsaw in volatile stocks, maintains protection in calm ones
+   - The bot already calculates ATR -- easy to implement
+
+C. VOLATILITY-ADJUSTED STOPS:
+   - Use GARCH-forecasted volatility to set stop distance
+   - Wider stops when volatility is expected to increase
+   - Tighter stops when volatility is expected to decrease
+   - Synergy with existing GARCH module
+
+D. DRL-BASED DYNAMIC STOPS (EMERGING):
+   - Deep Reinforcement Learning agent learns optimal stop levels
+   - Adapts to changing market conditions in real-time
+   - Tested on NASDAQ-100 stocks (2014-2024)
+   - Three-component architecture: trend detection + price prediction + stop
+   - Promising but computationally expensive for edge deployment
+
+E. RE-ENTRY AFTER STOP:
+   - Critical: re-entry strategy matters as much as stop placement
+   - Re-enter when price recovers above a moving average or breaks prior high
+   - Without re-entry rules, stops just lock in losses
+
+ACTION ITEMS FOR THE BOT:
+(a) Implement ATR-based trailing stops: stop = peak_price - 2.5 * ATR
+    - The bot already has ATR calculation in market_data.py
+    - 2.5 ATR provides ~15-20% trailing distance for typical stocks
+(b) Add GARCH-adjusted stop widening: multiply ATR factor by
+    garch_vol / historical_vol ratio
+(c) Implement re-entry logic: if stopped out, re-enter when price crosses
+    above 10-day SMA
+(d) Track stop-loss hit rate and adjust ATR multiplier via Optuna
+(e) Do NOT use tight stops (< 1 ATR) -- research is clear they hurt returns
+
+================================================================================
+6. ENSEMBLE METHODS FOR TRADING SIGNALS
+================================================================================
+
+KEY FINDING: Combining diverse models via weighted averaging or voting
+consistently reduces drawdown and improves risk-adjusted returns. The key is
+model DIVERSITY, not model count. Raw price features outperform technical
+indicators for ML prediction accuracy.
+
+SOURCES:
+- "Revisiting Ensemble Methods for Stock/Crypto Trading" (arXiv 2501.10709, 2025)
+  https://arxiv.org/html/2501.10709v1
+- "Assessing Impact of Technical Indicators on ML Stock Prediction" (arXiv 2412.15448)
+  https://arxiv.org/html/2412.15448v1
+- "Combined Momentum and Mean Reversion Strategy" (Multiple sources)
+- "Multi-Agent Stock Prediction Systems" (arXiv 2502.15853, 2025)
+  https://arxiv.org/html/2502.15853v1
+
+KEY INSIGHTS:
+
+A. ENSEMBLE PERFORMANCE (FinRL Contests 2023/2024):
+   - Stock ensemble (PPO+SAC+DDPG): 46.89-62.60% returns vs 18.95% market baseline
+   - Maximum drawdown reduction: up to 4.17% vs individual agents
+   - Sharpe ratio improvement: up to +0.21 over component models
+   - Crypto ensemble (DQN+DDQN+Dueling): max drawdown -0.73% vs -0.98% individual
+   - Win/loss ratio: 1.62 ensemble vs 1.31 individual
+
+B. CRITICAL INFRASTRUCTURE INSIGHT:
+   - Massively parallel simulation on GPU: 2,048 environments
+   - 1,746x speedup for crypto, 47.73x for stocks
+   - KL divergence regularization forces model diversity
+   - Varied datasets (with +/-1% price adjustments) prevent overfitting
+
+C. TECHNICAL INDICATOR FINDINGS (IMPORTANT WARNING):
+   - RAW PRICE FEATURES (close, open, high) consistently OUTPERFORMED technical
+     indicators for prediction accuracy
+   - RSI and Stochastic Oscillator showed "inconsistent or minimal impacts"
+   - Bollinger Bands + hybrid combos: better for RISK MANAGEMENT, not prediction
+   - All models showed NEGATIVE out-of-sample R-squared (overfitting warning)
+   - Implication: don't over-rely on technical indicators for ML prediction
+
+D. MOMENTUM + MEAN-REVERSION COMBINATION:
+   - Prioritize entries where momentum AND mean-reversion signals agree
+   - Use momentum indicators to avoid trading against strong trends
+   - Mean-reversion signals strongest in range-bound/low-vol regimes
+   - Regime detection (HMM) should gate which signal type gets priority
+   - Risk-adjusted position sizing manages exposure at signal level
+
+E. MULTI-SYSTEM CONFIRMATION:
+   - Require confirmation from 2+ systems to generate final trade signal
+   - Dramatically reduces false signals
+
+ACTION ITEMS FOR THE BOT:
+(a) The bot already has LSTM + LightGBM ensemble -- add signal agreement weighting
+(b) Consider testing raw OHLCV as primary ML features, with indicators as
+    secondary confirmation (this contradicts common wisdom but evidence supports it)
+(c) Add regime-gated signal selection:
+    - Trending regime (Hurst > 0.6): weight momentum signals higher
+    - Mean-reverting regime (Hurst < 0.4): weight mean-reversion signals higher
+    - Random walk (Hurst ~ 0.5): reduce position sizes
+(d) Require 2/3 signal agreement before trade: ML prediction + momentum/mean-rev
+    confirmation + sentiment gate
+(e) Track ensemble agreement rate as a meta-confidence signal
+
+================================================================================
+7. NOBEL PRIZE THEORIES FOR ALGORITHMIC TRADING
+================================================================================
+
+KEY FINDING: Several Nobel-winning theories have direct practical applications.
+The most actionable are: Markowitz (portfolio sizing, already implemented),
+Kahneman/Tversky (exploit others' biases), Fama-French (factor exposure),
+Thaler (behavioral anomalies as alpha), and Engle (GARCH, already implemented).
+
+SOURCES:
+- "Nobel Memorial Prize in Economic Sciences (Algo Trading)" (PaperswithBacktest)
+  https://paperswithbacktest.com/wiki/nobel-memorial-prize-economic-sciences
+- "Algorithmic Trading: A Prospect Theory Perspective" (Springer 2025)
+  https://link.springer.com/chapter/10.1007/978-981-96-7505-0_2
+- "When Prospect Theory Meets Mean-Reverting Asset Returns" (ScienceDirect 2024)
+  https://www.sciencedirect.com/science/article/abs/pii/S0378426624000797
+- "Behaviorally Informed DRL for Portfolio Optimization" (Nature Sci Reports 2026)
+  https://www.nature.com/articles/s41598-026-35902-x
+- "From Deep Learning to LLMs: Survey of AI in Quantitative Investment" (arXiv 2025)
+  https://arxiv.org/html/2503.21422v1
+- "Addressing Estimation Errors through Robust Portfolio Optimization" (Dec 2024)
+  https://optimization-online.org/2024/12/addressing-estimation-errors-through-robust-portfolio-optimization/
+
+APPLICABLE NOBEL THEORIES:
+
+A. MARKOWITZ - MODERN PORTFOLIO THEORY (1990 Nobel):
+   - Bot already implements correlation-aware sizing (portfolio.py)
+   - CRITICAL LIMITATION: Markowitz is extremely sensitive to estimation errors
+   - Even with shrinkage estimators, optimization fails with correlated assets
+   - "An algorithm that treats point estimates as if known with certainty will
+     react to tiny return differences well within measurement error" (error
+     maximization)
+   - 2024 solution: robust diagonal estimation-error matrices outperform classical
+   - Recommended: Ledoit-Wolf shrinkage or resampled efficient frontier
+
+B. FAMA - EFFICIENT MARKET HYPOTHESIS (2013 Nobel):
+   - Markets efficient in AGGREGATE but exploitable at EDGES
+   - Small-cap, after-hours, crypto markets less efficient
+   - Algo trading exploits information processing speed advantage
+   - Implication: focus on LESS efficient markets/timeframes for alpha
+
+C. KAHNEMAN & TVERSKY - PROSPECT THEORY (2002 Nobel):
+   - Loss aversion: people feel losses 2x more than equivalent gains
+   - Disposition effect: hold losers too long, sell winners too early
+   - Bot can EXPLOIT: buy when retail panic-sells (loss aversion overshoot)
+   - Bot can AVOID: systematic trading removes emotional bias
+   - 2025 research: algo trading "minimizes effects of certain emotional biases"
+     but does NOT eliminate reference dependence
+   - 2026 paper: DRL with loss aversion penalty improves portfolio optimization
+
+D. THALER - BEHAVIORAL ECONOMICS (2017 Nobel):
+   - Endowment effect, mental accounting, nudge theory
+   - Market anomalies from behavioral biases = trading opportunities
+   - Calendar effects persist because of behavioral patterns
+   - Bot already captures some via calendar features in indicators.py
+
+E. SHILLER - IRRATIONAL EXUBERANCE (2013 Nobel):
+   - CAPE ratio as long-term valuation signal
+   - Bot already uses CAPE via macro_indicators.py
+   - Excess volatility beyond fundamentals = mean-reversion opportunity
+
+F. ENGLE - ARCH/GARCH (2003 Nobel):
+   - Volatility clustering is a proven market phenomenon
+   - Bot already uses GARCH(1,1) via volatility.py
+   - Consider EGARCH for asymmetric volatility response (bad news = more vol)
+
+ACTION ITEMS FOR THE BOT:
+(a) Add robust covariance estimation to portfolio.py
+    - Ledoit-Wolf shrinkage: sklearn.covariance.LedoitWolf
+    - Or minimum covariance determinant estimator
+(b) Add sentiment extremes detector: when sentiment is extremely negative,
+    increase buy signal weight (exploit loss aversion overshoot)
+(c) Consider EGARCH instead of GARCH for asymmetric volatility
+(d) Add Fama-French factor exposure tracking (market, size, value, momentum)
+
+================================================================================
+8. RISK OF RUIN AND DRAWDOWN MANAGEMENT
+================================================================================
+
+KEY FINDING: For a $100k paper trading account, risk per trade should be 1-2%.
+Maximum drawdown target should be 15-20%. Risk of ruin should be below 5%.
+Fixed fractional sizing provides mathematical ruin prevention.
+
+SOURCES:
+- "Risk of Ruin: Definitions and Why Account Size Matters" (HeyGoTrade)
+  https://www.heygotrade.com/en/blog/risk-of-ruin-definitions
+- "Risk of Ruin Calculator for Trading" (BacktestBase)
+  https://www.backtestbase.com/education/risk-of-ruin-calculator-trading
+- "Drawdown Management" (QuantifiedStrategies)
+  https://www.quantifiedstrategies.com/drawdown/
+- "Strategies to Limit Drawdown Risk in Trading" (NumberAnalytics)
+  https://www.numberanalytics.com/blog/strategies-limit-drawdown-risk-trading
+
+KEY INSIGHTS:
+
+A. RISK OF RUIN MATHEMATICS:
+   - Risk of Ruin = ((1 - Edge) / (1 + Edge)) ^ (Capital / Risk_Per_Trade)
+   - For 55% win rate, 1:1.5 risk-reward, 2% risk per trade:
+     Risk of Ruin ~ 1.3% (acceptable)
+   - For 55% win rate, 1:1.5 risk-reward, 5% risk per trade:
+     Risk of Ruin ~ 12.6% (too high)
+   - Professional target: RoR < 5%, institutional: RoR < 1%
+
+B. DRAWDOWN RECOVERY MATHEMATICS:
+   -  10% drawdown: need  11.1% gain to recover
+   -  20% drawdown: need  25.0% gain to recover
+   -  30% drawdown: need  42.9% gain to recover
+   -  50% drawdown: need 100.0% gain to recover
+   - Relationship is exponential -- drawdowns beyond 25% are devastating
+
+C. RECOMMENDED RISK PARAMETERS ($100k account):
+   - Max risk per trade: 1-2% ($1,000-$2,000)
+   - Max correlated risk: 6% (e.g., 3 tech stocks at 2% each)
+   - Max total portfolio risk: 20% of capital
+   - Max drawdown target: 15-20%
+   - Daily loss limit: 3-5% ($3,000-$5,000)
+   - If drawdown hits 15%, reduce position sizes by 50%
+   - If drawdown hits 25%, halt trading, reassess
+
+D. FIXED FRACTIONAL AS SAFETY NET:
+   - Risk fixed % of CURRENT balance (not initial capital)
+   - As account shrinks, dollar risk shrinks (mathematical brake)
+   - Impossible to reach $0 (asymptotic approach)
+   - Small accounts: 0.5% risk per trade maximum for survival
+
+ACTION ITEMS FOR THE BOT:
+(a) Add risk-of-ruin calculation to monitoring dashboard
+(b) Implement drawdown-based position scaling:
+    - Drawdown 0-10%: normal sizing
+    - Drawdown 10-15%: reduce by 25%
+    - Drawdown 15-20%: reduce by 50%
+    - Drawdown >20%: reduce by 75%, alert operator
+(c) Add daily loss limit: if daily P&L < -3%, stop trading for the day
+(d) Track risk per trade and ensure Kelly sizing never exceeds 2% of equity
+(e) Add max correlated risk check in portfolio.py
+
+================================================================================
+9. MARKET MICROSTRUCTURE FOR RETAIL TRADERS
+================================================================================
+
+KEY FINDING: Spread costs and slippage are the biggest hidden costs for retail
+algo traders. Limit orders reduce costs but risk non-fill. The bot's existing
+spread-aware ordering is a competitive advantage.
+
+SOURCES:
+- "Six Market Microstructure Research Papers You Must Read" (Global Trading 2024)
+  https://www.globaltrading.net/research-on-the-web-in-2024/
+- "TCA: Benchmarks and Slippage" (Talos 2024)
+  https://www.talos.com/insights/execution-insights-through-transaction-cost-analysis-tca-benchmarks-and-slippage
+- "Market Microstructure Trading" (QuantVPS 2025)
+  https://www.quantvps.com/blog/market-micro-structure-trading
+- "Stop Trading Like It's 2010" (Bookmap 2025)
+  https://bookmap.com/blog/stop-trading-like-its-2010-whats-changed-in-the-market-microstructure
+- "Market Microstructure Guide" (AboveTheGreenLine)
+  https://abovethegreenline.com/market-microstructure/
+
+KEY INSIGHTS:
+
+A. SPREAD COSTS FOR RETAIL:
+   - Average equity spread: 1-3 cents for liquid stocks, 5-20 cents for illiquid
+   - Crypto spread: 5-50 bps on major exchanges, 50-200 bps on illiquid pairs
+   - Round-trip cost: spread is paid TWICE (buy and sell)
+   - For a $1,000 trade on a stock with 5 cent spread ($50 stock):
+     Cost = 2 * (0.05/50) = 0.2% round trip
+   - This alone can destroy a strategy with <1% expected return per trade
+
+B. SLIPPAGE SOURCES:
+   - Price movement between signal and execution
+   - Partial fills at worse prices (order book depth)
+   - Queue position for limit orders
+   - Latency (less relevant for daily/hourly strategies)
+
+C. ORDER TYPE OPTIMIZATION:
+   - Market orders: guaranteed fill, uncertain price
+   - Limit orders at mid: save half spread, risk non-fill
+   - TWAP/VWAP: split large orders over time, reduce market impact
+   - For daily strategy: limit at slightly better than current price, with
+     market order fallback after timeout
+
+D. 2025 MARKET EVOLUTION:
+   - Dark pools hide significant institutional liquidity
+   - Payment for order flow: retail orders routed to market makers
+   - Retail limit orders may get adversely selected
+   - Automation and speed define advantage even for retail
+
+ACTION ITEMS FOR THE BOT:
+(a) The bot already has spread-aware limit pricing (order_utils.py) -- keep it
+(b) Add spread tracking: log actual spread at trade time, compute total spread
+    cost over time. Use this to refine backtest cost assumptions
+(c) Implement adaptive order timeout: wider spread = longer limit order patience
+(d) Add order book depth check before large orders (if API supports)
+(e) For crypto: add exchange spread comparison before routing
+(f) Track fill rate and slippage metrics to monitor execution quality
+
+================================================================================
+10. CRYPTO vs EQUITY MARKET STRUCTURE
+================================================================================
+
+KEY FINDING: Crypto markets have fundamentally different microstructure from
+equities. Higher momentum persistence, greater toxicity (VPIN), fragmented
+liquidity, and structural changes from ETF introduction. The bot SHOULD use
+different parameters for crypto vs stock trading.
+
+SOURCES:
+- "Microstructure and Market Dynamics in Crypto Markets" (Easley, Cornell 2024)
+  https://stoye.economics.cornell.edu/docs/Easley_ssrn-4814346.pdf
+- "2025 Crypto Market Outlook" (Coinbase Institutional)
+  https://www.coinbase.com/institutional/research-insights/research/market-intelligence/2025-crypto-market-outlook
+- "Liquidity Fragmentation in Crypto: Still a Problem in 2025?" (FinchTrade)
+  https://finchtrade.com/blog/liquidity-fragmentation-in-crypto-is-it-still-a-problem-in-2025
+- "Market Efficiency and Determinants: Crypto" (ScienceDirect 2025)
+  https://www.sciencedirect.com/science/article/pii/S1059056025001017
+- "Temporal Patterns in Market Depth" (Amberdata 2025)
+  https://blog.amberdata.io/the-rhythm-of-liquidity-temporal-patterns-in-market-depth
+- "Are Weekends the Most Dangerous Time to Trade Crypto?" (DeFi Planet 2026)
+  https://defi-planet.com/2026/03/are-weekends-the-most-dangerous-time-to-trade-crypto/
+
+KEY DIFFERENCES:
+
+A. MICROSTRUCTURE METRICS:
+   - Roll Measure: "surprisingly high" in crypto vs equities
+   - VPIN: higher in crypto = greater toxicity / information asymmetry
+   - Greater serial correlation = more momentum-based trading works
+   - Implication: momentum strategies work BETTER in crypto than equities
+
+B. LIQUIDITY STRUCTURE:
+   - Crypto: fragmented across 100+ exchanges and DEXs
+   - No best-execution regulation (unlike equity Reg NMS)
+   - BTC depth: $2.71M at 21:00 UTC vs $3.86M at 11:00 UTC (42% drop overnight)
+   - Weekday peak: Tuesday-Thursday (institutional/ETF activity)
+   - Saturday: lowest spot volume
+   - Implication: trade during high-liquidity hours, reduce weekend sizing
+
+C. BITCOIN ETF IMPACT (2024-2025):
+   - Reduced BTC volatility by 55%
+   - Cumulative net inflows >$52.9 billion through Sep 2025
+   - Liquidity increasingly concentrated during US market hours
+   - Crypto becoming MORE like equity market structure
+   - Weekend/holiday liquidity gaps amplified (ETF bridge pauses)
+
+D. MARKET EFFICIENCY:
+   - Rising liquidity + declining volatility = increasing efficiency
+   - During uncertainty: inefficiencies EXACERBATED among illiquid crypto
+   - Less liquid alts: "often untradeable outside of majors"
+   - Stick to high-liquidity pairs (BTC, ETH) for algo trading
+
+E. STRUCTURAL RISKS UNIQUE TO CRYPTO:
+   - No circuit breakers
+   - Exchange counterparty risk (not centrally cleared)
+   - Smart contract risk for DEX trades
+   - Stablecoin peg risk (bot already monitors this)
+
+ACTION ITEMS FOR THE BOT:
+(a) Use different model parameters for crypto vs stocks:
+    - Longer momentum lookback for crypto (higher serial correlation)
+    - Wider stops for crypto (higher VPIN/toxicity)
+    - More aggressive mean-reversion for equities
+(b) Add time-of-day liquidity filter for crypto:
+    - Prefer trading during US market hours (highest liquidity post-ETF)
+    - Reduce position sizes during off-peak hours (especially weekends)
+(c) Add VPIN calculation as a feature/risk signal for crypto
+(d) Monitor BTC ETF flows as a sentiment/flow signal
+(e) Consider separate Optuna hypersearches for crypto vs stock parameters
+(f) Track weekend vs weekday trade performance
+
+================================================================================
+PRIORITY RANKING OF IMPROVEMENTS
+================================================================================
+
+HIGH IMPACT, LOW EFFORT (do first):
+1. Implement ATR-based trailing stops (Topic 5) -- ATR already computed
+2. Drawdown-based position scaling (Topic 8) -- simple if/else logic
+3. Hybrid Kelly-VIX sizing (Topic 2) -- VIX already tracked
+4. Separate crypto vs stock parameters in Optuna (Topic 10) -- already separate loops
+5. Regime-gated signal selection using Hurst (Topic 6) -- Hurst already computed
+
+HIGH IMPACT, MEDIUM EFFORT:
+6. Robust covariance estimation (Ledoit-Wolf) in portfolio.py (Topic 7)
+7. Combinatorial Purged Cross-Validation in hypersearch (Topic 4)
+8. Online Bayesian change-point detection (Topic 3)
+9. Spread/slippage tracking and cost analytics (Topic 9)
+10. Add sentiment extremes as contrarian signal (Topic 7)
+
+HIGH IMPACT, HIGH EFFORT (long-term):
+11. Full TFT migration (Topic 1) -- major architecture change
+12. DRL-based dynamic stop losses (Topic 5)
+13. Ensemble HMM + ML voting framework (Topic 3)
+14. PBO (Probability of Backtest Overfitting) calculation (Topic 4)
+15. VPIN calculation for crypto risk signal (Topic 10)
+
+================================================================================
+END OF RESEARCH SURVEY
+================================================================================

@@ -37,7 +37,13 @@ import numpy as np
 # Keep in sync with the identical dicts in backtest.py, volatility.py and
 # scripts/hypersearch_v2.py (pinned by tests/test_portfolio_backtest_v3.py).
 BARS_PER_YEAR = {'crypto': 8760.0, 'stock': 1638.0}
-DEFAULT_PERIODS_PER_YEAR = BARS_PER_YEAR['stock']   # stock RTH hourly bars/yr
+# Bound into the function defaults below at IMPORT time, so
+# BARS_PER_YEAR_MEASURED is read once here (default OFF -> 1638.0 exactly).
+try:
+    from bars_calendar import bars_per_year as _bars_per_year
+    DEFAULT_PERIODS_PER_YEAR = float(_bars_per_year('stock', BARS_PER_YEAR))
+except ImportError:
+    DEFAULT_PERIODS_PER_YEAR = BARS_PER_YEAR['stock']   # stock RTH hourly bars/yr
 
 
 # ---------------------------------------------------------------------------

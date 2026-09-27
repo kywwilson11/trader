@@ -1,0 +1,1624 @@
+================================================================================
+COMPREHENSIVE ALGORITHMIC TRADING RESEARCH ANALYSIS
+================================================================================
+Date: 2026-02-21
+System: Jetson Orin Nano (ARM64, 8GB unified memory, CUDA 12.6, sm_87)
+Current Model: RegressionLSTM with MultiheadAttention (model_v2.py)
+Current Features: ~35 technical indicators + cross-asset + cyclical time
+Current Training: Optuna hyperparameter search, walk-forward CV, Sharpe objective
+================================================================================
+
+
+TABLE OF CONTENTS
+-----------------
+1. Model Architectures Beyond LSTM
+2. Feature Engineering That Works
+3. Portfolio & Risk Management Strategies
+4. Proven Quantitative Strategies
+5. Execution Optimization
+6. Backtesting & Validation
+7. Open Source Trading Systems to Learn From
+8. Academic Papers & Research (2020-2026)
+9. Prioritized Implementation Roadmap
+
+
+================================================================================
+1. MODEL ARCHITECTURES BEYOND LSTM
+================================================================================
+
+Our current model (model_v2.py) is a 2-layer LSTM with MultiheadAttention,
+residual connection, LayerNorm, and a 2-layer FC head predicting continuous
+returns. Input: (batch, seq_len, input_dim) where seq_len is typically 12-32
+hourly bars and input_dim is ~25-35 features. The model is JIT-traced for
+~30% faster inference on Jetson. Training uses Huber loss with return-weighted
+emphasis and is optimized via Sharpe ratio across walk-forward folds.
+
+Below we evaluate seven alternative architectures.
+
+-------------------------------------------------------------------------------
+1.1  TEMPORAL FUSION TRANSFORMER (TFT)
+-------------------------------------------------------------------------------
+What it is:
+Google's TFT (Lim et al., 2019) combines LSTM for local temporal processing
+with interpretable multi-head self-attention for long-range dependencies. Key
+innovations include: Variable Selection Networks (VSN) that learn which inputs
+matter at each timestep, Gated Residual Networks (GRN) for nonlinear processing,
+and interpretable multi-horizon forecasting.
+
+Why it works:
+TFT excels because it explicitly handles three types of inputs: (1) static
+metadata (e.g., asset type), (2) known future inputs (e.g., day-of-week), and
+(3) observed past inputs (e.g., prices, indicators). The Variable Selection
+Network automatically learns feature importance, providing interpretability that
+pure LSTMs lack. Recent crypto studies (2024-2025) show TFT outperforming LSTM
+baselines on multi-asset forecasting when combined with on-chain indicators.
+
+How to integrate into our system:
+- Replace RegressionLSTM in model_v2.py with a TFT implementation
+- Categorize our features into static covariates (asset type), known future
+  (Hour_sin/cos, Day_sin/cos), and observed (all indicators)
+- Use pytorch-forecasting library or implement a custom lightweight version
+- Keep the same training pipeline (hypersearch_v2.py) with minimal changes
+
+Pros vs our LSTM:
++ Automatic feature selection (interpretable, which features drive predictions)
++ Multi-horizon forecasting natively (our multi-horizon targets fit perfectly)
++ Handles static metadata (could encode asset-specific information)
++ Better at capturing long-range dependencies than LSTM alone
++ Well-studied for financial applications
+
+Cons vs our LSTM:
+- Significantly more parameters (2-5x our current model size)
+- Longer training time (2-4x)
+- More complex to implement and debug
+- Overfitting risk with small datasets is higher
+- JIT tracing may be more fragile due to complex control flow
+
+Feasibility on Jetson Orin Nano:
+MODERATE. A lightweight TFT with hidden_dim=64 and 2 attention heads would fit
+in 8GB unified memory. Full TFT (hidden_dim=256, 8 heads) may OOM during
+training. Inference is feasible with FP16. Estimated inference time: 3-5ms per
+prediction (vs ~1-2ms for current LSTM).
+
+Implementation complexity: HARD
+Expected impact: MODERATE-HIGH (10-25% Sharpe improvement based on literature)
+
+-------------------------------------------------------------------------------
+1.2  N-BEATS / N-HiTS
+-------------------------------------------------------------------------------
+What it is:
+N-BEATS (Oreshkin et al., 2019) is a purely feed-forward architecture based on
+backward and forward residual links (doubly residual stacking). It uses FC
+blocks organized into stacks, where each block predicts basis expansion
+coefficients both forward (forecast) and backward (backcast). N-HiTS extends
+this with multi-rate input sampling for hierarchical temporal decomposition.
+
+Why it works:
+N-BEATS achieved 11% improvement over statistical baselines and 3% over the
+M4 competition winner. Its strength is decomposing time series into trend and
+seasonality components through interpretable basis functions. N-HiTS adds
+hierarchical pooling to capture patterns at multiple time scales.
+
+How to integrate:
+- These are univariate models by design. We would need to either:
+  (a) Use N-BEATS for each feature independently, then combine predictions
+  (b) Adapt the architecture for multivariate input (non-trivial)
+- Better suited as an ensemble member alongside our LSTM rather than a
+  replacement
+- Could use the nixtla/neuralforecast library implementation
+
+Pros vs our LSTM:
++ Interpretable decomposition (trend vs seasonality)
++ No recurrence = parallelizable = faster training
++ Strong benchmark results on standard time series tasks
++ Simpler architecture (just FC layers)
+
+Cons vs our LSTM:
+- Designed for univariate forecasting (not multivariate features)
+- No attention mechanism for cross-feature interaction
+- Less suitable for our multi-feature, multi-asset setup
+- Financial time series results are mixed compared to benchmarks
+
+Feasibility on Jetson:
+HIGH. Pure FC architecture is very lightweight. N-BEATS with 30 blocks would
+use <100MB memory. Training and inference both fast.
+
+Implementation complexity: MEDIUM (as ensemble member), HARD (as multivariate)
+Expected impact: LOW-MODERATE (5-15% if used in ensemble)
+
+-------------------------------------------------------------------------------
+1.3  PatchTST
+-------------------------------------------------------------------------------
+What it is:
+PatchTST (Nie et al., 2023, ICLR) segments time series into subseries-level
+patches served as input tokens to a Transformer. Two key design choices:
+(1) patching retains local semantic information while quadratically reducing
+attention computation, and (2) channel-independence where each univariate
+channel shares the same Transformer weights.
+
+Why it works:
+Patching creates meaningful tokens (like words in NLP) from contiguous time
+segments rather than individual timesteps. This allows the model to attend to
+longer history with less compute. Results: 21% MSE reduction and 16.7% MAE
+reduction over previous Transformer-based models on standard benchmarks.
+
+How to integrate:
+- Replace our LSTM encoder with a PatchTST encoder
+- Our seq_len=24 could be patched into 4 patches of 6 or 6 patches of 4
+- Keep our FC head for regression output
+- Channel-independence means each feature is processed separately (efficient
+  but loses cross-feature interaction)
+
+Pros vs our LSTM:
++ Much more efficient attention (quadratic reduction via patching)
++ Better long-range dependency modeling
++ Proven strong results on time series benchmarks
++ Parallelizable (no sequential processing like LSTM)
++ Recent FP32 quantization work (KDD 2025) makes it edge-friendly
+
+Cons vs our LSTM:
+- Channel-independence loses cross-feature correlations
+- Relatively new for financial applications
+- Patch size is another hyperparameter to tune
+- May not benefit much with our short sequences (12-32 bars)
+
+Feasibility on Jetson:
+HIGH. PatchTST is more efficient than standard Transformers. With patches,
+our seq_len=24 becomes only 4-6 tokens, making attention trivial. FP16
+inference would be very fast.
+
+Implementation complexity: MEDIUM
+Expected impact: MODERATE (10-20% on time series benchmarks, unclear for finance)
+
+-------------------------------------------------------------------------------
+1.4  TimesNet
+-------------------------------------------------------------------------------
+What it is:
+TimesNet (Wu et al., 2023, ICLR) extends temporal analysis to 2D by
+transforming 1D time series into 2D tensors based on detected periodicities.
+Intraperiod variations map to columns, interperiod variations to rows, then
+standard 2D convolutions (like image CNNs) capture both types of patterns.
+
+Why it works:
+Financial time series have multiple periodicities (hourly, daily, weekly) that
+interact. TimesNet captures these through 2D convolution, achieving SOTA on
+five mainstream tasks. For financial volatility forecasting, it showed
+competitive RMSE and QLIKE performance.
+
+How to integrate:
+- Replace our LSTM with a TimesNet encoder
+- Requires FFT-based period detection as a preprocessing step
+- Keep our FC regression head
+
+Pros vs our LSTM:
++ Captures multi-periodic patterns naturally
++ General-purpose (also handles anomaly detection, classification)
++ 2D CNN backbone is well-optimized on GPU
+
+Cons vs our LSTM:
+- Mixed results in financial MAE/MAPE metrics
+- FFT-based periodicity detection adds complexity
+- 2D reshaping of 1D data is somewhat artificial
+- May not improve on our attention-augmented LSTM
+
+Feasibility on Jetson:
+MODERATE. 2D convolutions are well-supported on Jetson GPUs. However, the
+Inception-style backbone is moderately parameter-heavy. Should fit in 8GB
+with careful sizing.
+
+Implementation complexity: HARD
+Expected impact: LOW-MODERATE (competitive but not clearly superior for finance)
+
+-------------------------------------------------------------------------------
+1.5  MAMBA / STATE SPACE MODELS (SSM)
+-------------------------------------------------------------------------------
+What it is:
+Mamba (Gu & Dao, 2023) is a selective state space model that achieves
+linear-time sequence processing (O(n) vs O(n^2) for attention). Key innovation:
+input-dependent selection mechanism that dynamically focuses on relevant parts
+of the input, similar to attention but without quadratic cost.
+
+Why it works:
+For financial time series, Mamba models (MambaStock, CryptoMamba, CMDMamba)
+have shown strong results in 2024-2025. MambaLLM accurately forecasts through
+the volatile late 2024 to early 2025 period where LSTM baselines lagged.
+CMDMamba achieves near-linear time complexity for efficient forecasting.
+
+How to integrate:
+- Replace LSTM with Mamba backbone: input -> Mamba layers -> pooling -> FC head
+- Use the mamba-ssm library or causal-conv1d implementation
+- Keep the same training pipeline and feature set
+
+Pros vs our LSTM:
++ Linear time complexity (much faster for long sequences)
++ Strong empirical results on financial time series
++ Better at capturing long-range dependencies
++ Lower memory usage than attention-based models
++ Active research community, rapidly improving
+
+Cons vs our LSTM:
+- Relatively new architecture (less battle-tested)
+- Custom CUDA kernels may need adaptation for sm_87
+- JIT tracing compatibility unknown
+- Fewer pretrained models available
+- Our sequences are short (12-32 bars), so linear vs quadratic doesn't matter
+
+Feasibility on Jetson:
+UNCERTAIN. Mamba's custom CUDA kernels (selective scan) may need recompilation
+for sm_87. The causal-conv1d library might not have ARM64 wheels. If the CUDA
+kernels compile successfully, it would be very efficient. If not, a pure PyTorch
+fallback implementation exists but is slower.
+
+Implementation complexity: MEDIUM-HARD (depends on CUDA kernel compatibility)
+Expected impact: MODERATE-HIGH (strong recent results in crypto/stock prediction)
+
+-------------------------------------------------------------------------------
+1.6  TEMPORAL CONVOLUTIONAL NETWORK (TCN)
+-------------------------------------------------------------------------------
+What it is:
+TCN uses dilated causal convolutions to capture temporal patterns. Each layer
+uses increasing dilation rates (1, 2, 4, 8...) to expand the receptive field
+exponentially. Causal convolutions ensure no future information leaks. Combined
+with residual connections, dropout, and weight normalization.
+
+Why it works:
+TCN outperforms LSTM in many financial benchmarks (stock prediction, volatility
+estimation, value-at-risk). The dilated convolutions efficiently capture both
+short-term and long-term dependencies. Parallelizable during training (no
+sequential bottleneck). Recent 2024 studies show TCN with attention achieving
+MAE of 1.23-1.45 on stock data, outperforming LSTM and ARIMA.
+
+How to integrate:
+- Replace LSTM with TCN backbone: input -> TCN blocks -> FC head
+- TCN blocks: dilated causal conv1d -> WeightNorm -> ReLU -> Dropout -> residual
+- Use pytorch-tcn library or implement from scratch (relatively simple)
+- Keep our attention mechanism on top of TCN output
+
+Pros vs our LSTM:
++ Fully parallelizable (faster training)
++ Better gradient flow (no vanishing gradients)
++ Explicit control over receptive field via dilation
++ Lower memory usage during training
++ Simple to implement and debug
++ Well-suited for our fixed-length sequences
+
+Cons vs our LSTM:
+- Fixed receptive field (not adaptive like attention)
+- Requires careful dilation schedule tuning
+- May need deeper networks for very long-range patterns
+- Less interpretable than attention weights
+
+Feasibility on Jetson:
+HIGH. Conv1d operations are heavily optimized on CUDA. TCN is lighter than
+LSTM for both training and inference. JIT tracing works perfectly for pure
+convolution architectures. FP16 inference is straightforward.
+
+Implementation complexity: EASY
+Expected impact: MODERATE (likely similar or slightly better than LSTM)
+RECOMMENDED as a quick experiment due to easy implementation.
+
+-------------------------------------------------------------------------------
+1.7  ENSEMBLE: XGBoost/LightGBM + NEURAL NETWORK STACKING
+-------------------------------------------------------------------------------
+What it is:
+Gradient boosted trees (XGBoost, LightGBM) with time series features as a
+first-stage predictor, stacked with neural network predictions in a
+meta-learner. The tree models capture non-linear feature interactions that
+the neural network may miss, while the neural network captures sequential
+patterns.
+
+Why it works:
+Research consistently shows 10-15% improvement from stacking tree-based and
+deep learning models vs either alone. Tree models excel at tabular data with
+diverse feature types. They naturally handle missing values, require minimal
+preprocessing, and are fast to train. The stacking approach combines
+complementary strengths.
+
+How to integrate:
+Step 1: Train LightGBM on our existing features (flatten sequence into features
+        like RSI_t, RSI_t-1, RSI_t-2, etc.)
+Step 2: Use LightGBM prediction as an additional feature for our LSTM
+Step 3: Meta-learner (linear or small neural net) combines both predictions
+- Can also use LightGBM for feature importance analysis to prune our feature set
+
+Pros vs our LSTM alone:
++ Captures non-linear feature interactions trees excel at
++ Fast training (minutes vs hours for neural nets)
++ No sequence length constraint (can use arbitrary lookback features)
++ Excellent interpretability (SHAP values, feature importance)
++ Robust to noisy features (built-in regularization)
++ Proven 10-15% accuracy improvement in stacking
+
+Cons:
+- More complex pipeline (two models to maintain)
+- Need to flatten sequential data for tree input
+- Risk of overfitting the meta-learner
+- Feature engineering for tree model is different than for LSTM
+
+Feasibility on Jetson:
+VERY HIGH. LightGBM is CPU-only and extremely fast on ARM64. Training on our
+dataset would take seconds to minutes. Inference is sub-millisecond. Memory
+usage is minimal.
+
+Implementation complexity: EASY-MEDIUM
+Expected impact: MODERATE-HIGH (10-15% improvement based on consistent literature)
+HIGHLY RECOMMENDED. Easy win with well-proven results.
+
+
+================================================================================
+2. FEATURE ENGINEERING THAT WORKS
+================================================================================
+
+Our current feature set (indicators.py) includes:
+- Price-based: RSI, MACD (line + histogram + signal), ATR, Bollinger Bands
+  (upper, lower, bandwidth, %B), SMA20, SMA100, ROC, Stochastic K/D
+- Volume-based: OBV, Volume Ratio (vs 20-period SMA)
+- Return-based: 4h return, 12h return, 12h volatility
+- Cross-asset: BTC return/SMA/RSI (crypto), SPY relative strength (stocks)
+- Cyclical: Hour sin/cos, Day sin/cos
+- Derived: ATR percentile, RSI divergence, volume-price confirmation,
+  price/SMA ratios
+- Stock-specific: VWAP, Gap%, normalized ATR, RS vs SPY
+
+This is a solid foundation. Below are additional features that research
+suggests would improve prediction accuracy.
+
+-------------------------------------------------------------------------------
+2.1  MICROSTRUCTURE FEATURES
+-------------------------------------------------------------------------------
+
+Order Flow Imbalance:
+- Measure the imbalance between buyer-initiated and seller-initiated volume
+- Can be approximated from Alpaca's quote data: compare volume at bid vs ask
+- Leading indicator of short-term price moves
+- Integration: compute per-bar from Alpaca trade data, add as feature
+
+VPIN (Volume-Synchronized Probability of Informed Trading):
+- Measures probability of informed trading using volume-bucketed data
+- Leading indicator of flash crashes and liquidity events (detected 2010 Flash
+  Crash hours before)
+- Implementation: Use volume clock (fixed-volume bars) instead of time bars,
+  classify trades using Bulk Classification Algorithm
+- Integration: Compute rolling VPIN using trade data, add as feature
+- Challenge: Requires tick-level or at least minute-level trade data
+
+Kyle's Lambda:
+- Measures price impact per unit of volume
+- Higher lambda = less liquidity = higher risk
+- Integration: Rolling regression of price change on signed volume
+
+Implementation complexity: MEDIUM (order flow), HARD (VPIN), MEDIUM (Lambda)
+Expected impact: MODERATE for crypto (significant informed trading dynamics)
+Feasibility on Jetson: HIGH (pure computation, no GPU needed)
+
+-------------------------------------------------------------------------------
+2.2  CROSS-ASSET SIGNALS
+-------------------------------------------------------------------------------
+
+Crypto Correlation Regimes:
+- Rolling correlation between BTC and altcoins changes dramatically
+- During sell-offs, correlations spike to ~0.95 (risk-off regime)
+- During calm markets, correlations drop to 0.3-0.6 (dispersion regime)
+- Integration: Add rolling 20/50-bar correlation with BTC for each altcoin
+
+Sector Rotation Signals (Stocks):
+- Track sector ETF momentum (XLK, XLF, XLE, XLV, etc.)
+- Money flows between sectors predict individual stock moves
+- Integration: Add relative performance of stock's sector vs SPY
+
+Yield Curve Signals:
+- 2y/10y spread, 3m/10y spread as macro regime indicators
+- Inverted curve historically predicts recessions
+- Integration: Daily yield data from FRED API, use as a static daily feature
+
+DXY (Dollar Index):
+- Strong inverse correlation with BTC and risk assets
+- Integration: Use yfinance to fetch DXY, compute DXY_RSI, DXY_Return features
+
+Integration path: Add to compute_features() and compute_stock_features() in
+indicators.py, include in harvest scripts for training data.
+
+Implementation complexity: EASY (correlation), MEDIUM (sector/yield/DXY)
+Expected impact: MODERATE (especially crypto correlation regimes)
+
+-------------------------------------------------------------------------------
+2.3  ALTERNATIVE DATA
+-------------------------------------------------------------------------------
+
+On-Chain Metrics (Crypto):
+- Exchange inflows/outflows: large inflows to exchanges precede selling
+- Active addresses: network health indicator
+- NVT ratio (Network Value to Transactions): crypto P/E ratio equivalent
+- Realized cap: aggregate cost basis of all coins
+- Data sources: CryptoQuant API, Glassnode, Coin Metrics
+- Challenge: Most require paid API access
+
+Social Sentiment Beyond FnG:
+- Reddit/Twitter mention volume and sentiment (already have Finnhub)
+- Google Trends data for search volume spikes
+- Crypto-specific: Fear & Greed breakdown (buying/selling pressure components)
+- Integration: Add as daily features
+
+Options Flow:
+- Put/call ratio, unusual options activity
+- Integration: Available through some Alpaca tiers or external APIs
+
+Implementation complexity: MEDIUM-HARD (requires external API integrations)
+Expected impact: MODERATE-HIGH for crypto (on-chain metrics are proven leading indicators)
+
+-------------------------------------------------------------------------------
+2.4  STATISTICAL / REGIME FEATURES
+-------------------------------------------------------------------------------
+
+Hurst Exponent:
+- Measures tendency to trend (H > 0.5) vs mean-revert (H < 0.5)
+- Rolling Hurst over 100-bar window tells you WHICH strategy to use
+- H > 0.5: trend-following signals are reliable
+- H < 0.5: mean-reversion signals are reliable
+- H = 0.5: random walk, no edge
+- Integration: Use nolds library or implement rescaled range analysis
+- Add as rolling feature: rolling_hurst_100
+
+Fractal Dimension:
+- D = 2 - H (directly from Hurst exponent)
+- D close to 1: smooth trend, D close to 2: rough/noisy
+- Integration: Derived from Hurst, no additional computation
+
+Entropy Measures:
+- Approximate Entropy (ApEn): measures predictability of time series
+- Sample Entropy (SampEn): improved version of ApEn
+- Low entropy = more predictable = stronger signals
+- Integration: Rolling 50-bar entropy as a feature
+
+Regime Detection via Hidden Markov Models:
+- HMM with 2-3 states: bull/bear/neutral or high-vol/low-vol
+- Train HMM on returns and volatility
+- Use current regime state as a feature for the LSTM
+- Integration: Fit HMM offline, use regime probability as feature
+- Library: hmmlearn
+
+Markov Switching Model:
+- Similar to HMM but parameters switch between regimes
+- Captures different return/volatility dynamics in each regime
+- Integration: Use statsmodels MarkovSwitching or regime-switching GARCH
+
+Implementation complexity: EASY (Hurst/entropy), MEDIUM (HMM/Markov switching)
+Expected impact: HIGH. Regime detection is consistently cited as one of the
+most impactful improvements for trading systems. Knowing whether the market is
+trending or mean-reverting changes which signals to trust.
+HIGHLY RECOMMENDED. Hurst exponent is easy to add and highly informative.
+
+-------------------------------------------------------------------------------
+2.5  CALENDAR / SEASONAL EFFECTS
+-------------------------------------------------------------------------------
+
+We already have:
+- Hour_sin/cos (24-hour cycle)
+- Day_sin/cos (7-day cycle)
+
+Additional features to add:
+- Month_sin/cos (12-month cycle): captures January effect, tax-loss selling
+- Quarter indicator: end-of-quarter rebalancing effects
+- FOMC meeting dates: binary flag for FOMC days and day-after
+- CPI/NFP release dates: macro event flags
+- Options expiration (OPEX): monthly/quarterly options expiry causes
+  systematic price patterns
+- Bitcoin halving distance: days since/until next halving (for crypto)
+
+Integration: Add cyclical encoding to compute_features(), add event flags as
+daily features (can be pre-computed calendar).
+
+Implementation complexity: EASY
+Expected impact: LOW-MODERATE (calendar effects exist but are small)
+
+
+================================================================================
+3. PORTFOLIO & RISK MANAGEMENT STRATEGIES
+================================================================================
+
+Our current risk management:
+- Fixed notional per symbol ($1000 crypto, $5000 stock)
+- ATR-based stop-loss (2x ATR), trailing stop (1.5x ATR), take-profit (3:1 RR)
+- Confidence-based sizing (pred/threshold, capped at 2x)
+- Sentiment gate (Fear & Greed + Finnhub headlines)
+- LLM gate (Anthropic API veto/multiplier)
+- Circuit breaker (5% daily drawdown -> flatten)
+- Max exposure caps ($3000/crypto, $50000 total stocks)
+- Cooldown timers per symbol
+
+This is comprehensive but can be improved significantly.
+
+-------------------------------------------------------------------------------
+3.1  KELLY CRITERION — Optimal Position Sizing
+-------------------------------------------------------------------------------
+
+What it is:
+The Kelly Criterion calculates the optimal fraction of capital to risk on each
+trade to maximize long-term growth rate. For a trade with probability p of
+winning and odds b (reward/risk ratio):
+    f* = p - (1-p)/b = (p*b - (1-p)) / b
+
+Practical application:
+- Use our model's historical accuracy to estimate p (win rate)
+- Use our mean win / mean loss to estimate b
+- Apply fractional Kelly (1/2 or 1/3 Kelly) to reduce volatility
+
+How to integrate:
+1. Track rolling win rate and win/loss ratio from trade_memory
+2. Compute Kelly fraction: kelly_f = (win_rate * avg_win/avg_loss - (1-win_rate)) / (avg_win/avg_loss)
+3. Use half-Kelly: position_size = 0.5 * kelly_f * equity
+4. Replace fixed NOTIONAL_PER_SYMBOL with Kelly-derived sizing
+5. Maintain minimum/maximum position bounds for safety
+
+Example: If win_rate=0.55, avg_win=2%, avg_loss=1.5% (b=1.33):
+  kelly_f = (0.55*1.33 - 0.45)/1.33 = 0.21 (21% of equity per trade)
+  half_kelly = 10.5% of equity per trade
+  On $100k account: ~$10,500 per trade (vs current $1000-$5000)
+
+Implementation complexity: EASY
+Expected impact: MODERATE-HIGH (optimal growth rate, reduced max drawdown)
+HIGHLY RECOMMENDED. Can be implemented in a few hours.
+
+NOTE: Kelly requires accurate estimates. With inaccurate win rate estimates,
+full Kelly can be disastrous. Always use fractional Kelly (1/3 to 1/2) and
+implement a minimum sample size (e.g., 50 trades) before switching from fixed
+sizing to Kelly.
+
+-------------------------------------------------------------------------------
+3.2  RISK PARITY
+-------------------------------------------------------------------------------
+
+What it is:
+Allocate by risk contribution rather than capital. Each asset contributes equal
+risk to the portfolio. An asset with half the volatility gets double the
+allocation.
+
+How to integrate:
+- Compute rolling volatility for each symbol (we already have Volatility_12h)
+- Weight inversely by volatility: w_i = (1/vol_i) / sum(1/vol_j)
+- Multiply by total target exposure to get per-symbol allocation
+
+Integration path:
+In crypto_loop.py and stock_loop.py, replace fixed NOTIONAL_PER_SYMBOL with
+volatility-weighted allocation:
+  vol_i = rolling_std(returns, 24)  # 24-bar rolling volatility
+  inv_vol = 1.0 / vol_i
+  weights = inv_vol / inv_vol.sum()
+  notional_i = TOTAL_NOTIONAL * weights[i]
+
+Implementation complexity: EASY
+Expected impact: MODERATE (better risk-adjusted returns, smoother equity curve)
+
+-------------------------------------------------------------------------------
+3.3  BLACK-LITTERMAN MODEL
+-------------------------------------------------------------------------------
+
+What it is:
+Combines market equilibrium returns (from CAPM or market cap weights) with
+subjective views (our ML predictions) to produce posterior expected returns
+for portfolio optimization. Solves the problem of overly concentrated
+Markowitz portfolios by anchoring to market equilibrium.
+
+How to integrate:
+Our ML predictions are perfect "views" for Black-Litterman:
+- Market-implied returns = market cap weighted equilibrium
+- Views = our predicted returns for each symbol
+- Confidence = based on model prediction strength
+- Use PyPortfolioOpt library (BlackLittermanModel class)
+- Output: optimal portfolio weights incorporating both market consensus and
+  our model's views
+
+Integration path:
+1. Install pypfopt
+2. Before the buy/sell loop, compute BL-optimal weights using predictions
+3. Use BL weights instead of equal-weight allocation
+4. This naturally handles the "top N selection" problem more elegantly
+
+Implementation complexity: MEDIUM
+Expected impact: HIGH (Black-Litterman is the industry standard for
+  incorporating views into portfolio construction)
+RECOMMENDED, especially for stock portfolio.
+
+-------------------------------------------------------------------------------
+3.4  CVaR / EXPECTED SHORTFALL
+-------------------------------------------------------------------------------
+
+What it is:
+Conditional Value at Risk (CVaR) measures the expected loss in the worst X%
+of scenarios. Unlike VaR (which just gives a threshold), CVaR tells you the
+average loss when things go bad. It is a coherent risk measure (sub-additive)
+unlike VaR.
+
+How to integrate:
+- Compute rolling CVaR for each position using historical returns
+- Use as a risk constraint: reduce position if CVaR exceeds threshold
+- Replace our fixed stop-loss percentages with CVaR-based limits
+
+Computing CVaR:
+  returns = sorted(historical_returns)
+  var_5pct = np.percentile(returns, 5)
+  cvar_5pct = returns[returns <= var_5pct].mean()
+  If abs(cvar_5pct) > MAX_ACCEPTABLE_LOSS: reduce_position()
+
+Implementation complexity: EASY
+Expected impact: MODERATE (better tail risk management than fixed stops)
+
+-------------------------------------------------------------------------------
+3.5  REGIME-BASED ALLOCATION
+-------------------------------------------------------------------------------
+
+What it is:
+Adjust strategy parameters based on detected market regime:
+- Bull/trending regime: larger positions, wider stops, trend-following signals
+- Bear/crisis regime: smaller positions, tighter stops, defensive
+- High-volatility regime: reduce all positions, widen stops proportionally
+- Low-volatility regime: normal positions, tighter stops
+
+How to integrate:
+1. Detect regime using HMM (section 2.4) or simple rules:
+   - Bull: SPY > SMA200 and VIX < 20
+   - Bear: SPY < SMA200 or VIX > 30
+   - High-vol: ATR percentile > 80th
+2. Adjust NOTIONAL_PER_SYMBOL, stop distances, and trade_threshold based on
+   current regime
+3. In crisis regime, increase CIRCUIT_BREAKER_PCT sensitivity
+
+Example regime adjustments:
+  if regime == 'bull':
+      notional_multiplier = 1.2
+      trade_threshold_adj = 0.9   # lower threshold = more trades
+  elif regime == 'high_vol':
+      notional_multiplier = 0.5
+      trade_threshold_adj = 1.5   # higher threshold = fewer trades
+  elif regime == 'bear':
+      notional_multiplier = 0.3
+      trade_threshold_adj = 2.0   # much higher threshold
+
+Implementation complexity: MEDIUM
+Expected impact: HIGH (regime-awareness is one of the highest-impact improvements)
+HIGHLY RECOMMENDED in combination with Hurst exponent from section 2.4.
+
+
+================================================================================
+4. PROVEN QUANTITATIVE STRATEGIES
+================================================================================
+
+Our current strategy is fundamentally a directional prediction strategy:
+predict whether an asset will go up or down, then buy or sell. Below are
+additional quantitative strategies that could complement or replace this.
+
+-------------------------------------------------------------------------------
+4.1  STATISTICAL ARBITRAGE / PAIRS TRADING
+-------------------------------------------------------------------------------
+
+What it is:
+Identify pairs of assets that are cointegrated (long-term equilibrium
+relationship). When the spread between them deviates from the mean, bet on
+convergence: go long the underperformer and short the outperformer.
+
+Core methodology:
+1. Test all pairs for cointegration (Engle-Granger or Johansen test)
+2. For cointegrated pairs, compute the spread and its z-score
+3. Enter trade when z-score > 2 (or < -2): long the cheap one, short the expensive
+4. Exit when z-score reverts to 0
+
+Crypto application:
+- BTC/ETH is a natural pair with strong cointegration historically
+- Altcoin pairs within similar categories (e.g., SOL/AVAX, LINK/UNI)
+- Recent 2024-2025 research shows deep learning for co-integrated crypto pair
+  prediction outperforms traditional methods
+
+How to integrate:
+- Use statsmodels coint() to test pairs from our symbol universe
+- Add a pairs trading mode alongside our directional strategy
+- Compute z-scores and trade the spread
+- Requires ability to short (check Alpaca crypto shorting support)
+
+Challenge: Alpaca's crypto paper trading may not support shorting. For stocks,
+short selling is supported. Consider pairs trading for stock portfolio only.
+
+Implementation complexity: MEDIUM
+Expected impact: MODERATE (provides uncorrelated returns to our directional strategy)
+
+-------------------------------------------------------------------------------
+4.2  MOMENTUM STRATEGIES
+-------------------------------------------------------------------------------
+
+Time-Series Momentum (Moskowitz et al., 2012):
+- Assets that have gone up over the past 1-12 months tend to continue going up
+- Our model already captures this implicitly through ROC and return features
+- Explicit implementation: compute 12-month return, go long if positive
+
+Cross-Sectional Momentum:
+- Rank assets by recent performance, go long winners and short losers
+- Our "top N selection" in stock_loop.py is already a form of this
+- Enhancement: explicitly track 1/3/6-month momentum rankings
+
+Integration path:
+- Add explicit momentum scores as features (1m, 3m, 6m returns)
+- Use momentum as a pre-filter before ML prediction
+- Combine: only buy assets with positive momentum AND positive ML prediction
+
+Implementation complexity: EASY
+Expected impact: LOW-MODERATE (partially captured by existing features)
+
+-------------------------------------------------------------------------------
+4.3  MEAN REVERSION — Ornstein-Uhlenbeck Process
+-------------------------------------------------------------------------------
+
+What it is:
+Model asset prices (or spreads) as an Ornstein-Uhlenbeck (OU) process:
+  dX = theta * (mu - X) * dt + sigma * dW
+where theta is speed of reversion, mu is long-term mean, sigma is volatility.
+
+Key metric: Half-life of mean reversion
+  half_life = -ln(2) / ln(1 + theta)
+  or estimated via regression: dX_t = a + b * X_{t-1} + epsilon_t
+  half_life = -ln(2) / b
+
+How to integrate:
+1. Test if each symbol's price-SMA spread is mean-reverting (ADF test)
+2. Estimate half-life from regression
+3. If half-life is reasonable (5-50 bars), trade mean reversion
+4. Entry: spread deviates > 2 std from mean; exit: spread reverts to mean
+
+Practical application:
+- Use Bollinger Band %B (already in our features) as mean reversion signal
+- When %B < 0 (below lower band) and Hurst < 0.5: mean reversion buy signal
+- When %B > 1 (above upper band) and Hurst < 0.5: mean reversion sell signal
+
+Implementation complexity: MEDIUM
+Expected impact: MODERATE (works well in range-bound markets, complements
+trend-following in trending markets)
+
+-------------------------------------------------------------------------------
+4.4  TREND FOLLOWING — CTA-Style
+-------------------------------------------------------------------------------
+
+What it is:
+Systematic rules-based strategy that enters positions in the direction of
+the trend and exits when the trend reverses. Used by Commodity Trading
+Advisors (CTAs) across futures, currencies, and commodities.
+
+Key components:
+- Trend detection: dual SMA crossover (fast vs slow), breakout systems,
+  channel breakout (Donchian channels)
+- Position sizing: ATR-based (we already do this)
+- Risk management: trailing stops (we already do this)
+- Multi-timeframe confirmation
+
+Recent research (2024-2025):
+Multi-horizon trend sleeves (20-day, 60-day, 125-day, 500-day) show that
+combining multiple timeframes significantly improves risk-adjusted returns.
+The 20-day and 500-day sleeves outperformed by reaching ~160 cumulative index
+values vs ~120 for middle timeframes.
+
+How to integrate:
+- Already partially implemented through SMA20, SMA100, price-SMA ratios
+- Enhancement: Add SMA200 and SMA50, compute multi-timeframe trend scores
+- Add Donchian channel breakout signals
+- Combine trend signals with ML predictions: only follow ML when trend agrees
+
+Implementation complexity: EASY
+Expected impact: LOW-MODERATE (we already capture trend signals)
+
+-------------------------------------------------------------------------------
+4.5  FACTOR INVESTING
+-------------------------------------------------------------------------------
+
+What it is:
+Systematic exposure to proven return factors:
+- Market: beta exposure (long the market)
+- Size: small caps outperform large caps long-term
+- Value: cheap assets (low P/E) outperform expensive ones
+- Momentum: recent winners continue winning (see 4.2)
+- Quality: profitable, stable-growth companies outperform
+
+Crypto-specific factors (CF Benchmarks 2024):
+- Market, Size, Value, Momentum, Growth, Downside Beta, Liquidity
+
+How to integrate:
+- Stock portfolio: use Fama-French factor loadings as features
+  - Download daily factor returns from Kenneth French data library
+  - Compute rolling factor exposures for each stock
+  - Add as features to model
+- Crypto: implement crypto-specific factors
+  - Size: market cap rank
+  - Momentum: 30d/90d return rank
+  - Liquidity: volume/market cap ratio
+
+Implementation complexity: MEDIUM
+Expected impact: MODERATE (factor investing is well-proven but effects are
+smaller at hourly timeframes)
+
+-------------------------------------------------------------------------------
+4.6  MARKET MAKING — Avellaneda-Stoikov Framework
+-------------------------------------------------------------------------------
+
+What it is:
+Provide liquidity by quoting both bid and ask prices. Profit from the spread
+while managing inventory risk. The Avellaneda-Stoikov model computes optimal
+quotes based on inventory position, volatility, and risk aversion.
+
+Crypto application:
+- 24/7 markets with significant spreads (especially altcoins)
+- Hummingbot provides an open-source framework with A-S implementation
+- Recent 2024 implementations on SOL-USDT, DOGE-USDT, GALA-USDT pairs
+
+Why NOT suitable for our system:
+- Requires very low latency (sub-second order management)
+- High capital requirements for meaningful inventory
+- Our 30-second loop interval is too slow for market making
+- Regulatory and exchange-specific requirements
+- Significant adverse selection risk
+
+Implementation complexity: VERY HARD
+Expected impact: N/A (not suitable for our architecture)
+NOT RECOMMENDED for our system.
+
+-------------------------------------------------------------------------------
+4.7  VOLATILITY STRATEGIES
+-------------------------------------------------------------------------------
+
+Volatility Risk Premium:
+- Implied volatility systematically exceeds realized volatility
+- Selling options/variance swaps harvests this premium
+- Recent research: BVIV-VIX spread widening signals crypto vol opportunity
+
+How to integrate (without options):
+- Use VIX level as a regime indicator (already discussed in section 3.5)
+- Track realized vs implied volatility divergence
+- When realized vol is low but model predicts high vol: reduce position size
+- Use ATR percentile (already computed) as vol regime indicator
+
+Volatility Targeting:
+- Scale positions so portfolio volatility stays constant
+- target_vol = 10% annualized
+- current_vol = realized_vol * sqrt(252 * bars_per_day)
+- scale_factor = target_vol / current_vol
+- position_size *= scale_factor
+
+Implementation complexity: EASY (vol targeting), N/A (options not available)
+Expected impact: MODERATE (vol targeting smooths returns significantly)
+
+
+================================================================================
+5. EXECUTION OPTIMIZATION
+================================================================================
+
+Our current execution:
+- Limit orders with 5bps offset from midpoint
+- 30-second polling lifecycle with market fallback
+- Spread check: only trade if predicted return > 2x round-trip spread
+
+-------------------------------------------------------------------------------
+5.1  TWAP (Time-Weighted Average Price)
+-------------------------------------------------------------------------------
+
+What it is:
+Split large orders into equal-sized slices executed at regular intervals over
+a time period.
+
+How to integrate:
+For orders > $5,000 (stock) or > $2,000 (crypto):
+  total_qty = target_qty
+  num_slices = max(3, total_qty / min_slice_qty)
+  interval = total_time / num_slices
+  for each slice:
+      place_limit_order(slice_qty)
+      wait(interval)
+
+Relevance:
+Our order sizes ($1,000-$5,000) are small enough that TWAP is unnecessary
+for stocks. For crypto with thin order books, TWAP could help on larger
+orders to avoid moving the price.
+
+Implementation complexity: EASY
+Expected impact: LOW (our order sizes are small relative to market volume)
+
+-------------------------------------------------------------------------------
+5.2  VWAP (Volume-Weighted Average Price)
+-------------------------------------------------------------------------------
+
+What it is:
+Execute proportionally to market volume. During high-volume periods, trade more;
+during low-volume periods, trade less.
+
+Relevance:
+Similar to TWAP - our order sizes are too small to meaningfully impact the
+market. However, VWAP timing (trading during high-volume periods) could
+improve fill quality.
+
+How to integrate:
+- Track intraday volume profile for each asset
+- Prefer to trade during high-volume periods (e.g., crypto: US market open,
+  European open; stocks: first and last hour)
+- Add a volume_weight_factor to order timing
+
+Implementation complexity: EASY
+Expected impact: LOW-MODERATE (better fills during high-volume periods)
+
+-------------------------------------------------------------------------------
+5.3  SPREAD-AWARE ORDER PLACEMENT
+-------------------------------------------------------------------------------
+
+Our current approach (5bps offset from midpoint) is reasonable but can be
+improved:
+- For wider spreads: place orders deeper in the book (closer to best bid/ask)
+- For narrow spreads: aggressive crossing is fine
+- Time-of-day adjustment: spreads are wider during low-volume hours
+
+How to integrate:
+Replace fixed 5bps offset with dynamic:
+  if spread_pct < 0.05:
+      offset_bps = 2  # tight spread, be aggressive
+  elif spread_pct < 0.20:
+      offset_bps = 5  # normal spread
+  else:
+      offset_bps = int(spread_pct * 20)  # wide spread, be patient
+
+Implementation complexity: EASY
+Expected impact: LOW-MODERATE (could save 1-3bps per trade on average)
+RECOMMENDED as a quick improvement.
+
+
+================================================================================
+6. BACKTESTING & VALIDATION
+================================================================================
+
+Our current approach (hypersearch_v2.py):
+- Walk-forward cross-validation with expanding windows (3 folds)
+- Embargo gap (seq_len * 1) between train and validation
+- Sharpe ratio as optimization objective
+- Risk-adjusted score: mean_sharpe - 0.5 * std_sharpe
+- Optuna TPE sampler with median pruning
+- Per-fold scaler fitting (no data leakage)
+
+This is already quite good. Below are improvements.
+
+-------------------------------------------------------------------------------
+6.1  COMBINATORIAL PURGED CROSS-VALIDATION (CPCV)
+-------------------------------------------------------------------------------
+
+What it is:
+De Prado's CPCV (from "Advances in Financial Machine Learning") generates ALL
+possible combinations of train/test splits from N groups, producing multiple
+backtest paths. Combined with purging (removing overlapping labels) and
+embargoing (removing nearby observations), it provides the most robust
+estimate of out-of-sample performance.
+
+Why it matters:
+Our current 3-fold walk-forward gives only 3 test paths. CPCV with N=5, k=2
+produces C(5,2)=10 paths, giving a distribution of performance estimates. This
+lets us compute the Probability of Backtest Overfitting (PBO) -- the probability
+that the best in-sample model is mediocre out-of-sample.
+
+How to integrate:
+- Use skfolio library: CombinatorialPurgedCV class
+- Replace get_walk_forward_folds() with CPCV fold generator
+- Compute PBO and Deflated Sharpe Ratio (DSR) as additional metrics
+- Flag models with PBO > 0.5 as likely overfit
+
+Implementation details:
+  from skfolio.model_selection import CombinatorialPurgedCV
+  cv = CombinatorialPurgedCV(
+      n_folds=6, n_test_folds=2,
+      purge_timedelta=pd.Timedelta(hours=seq_len),
+      embargo_timedelta=pd.Timedelta(hours=seq_len),
+  )
+  for train_idx, test_idx in cv.split(X):
+      # train and evaluate
+
+Implementation complexity: MEDIUM
+Expected impact: HIGH (dramatically reduces probability of deploying overfit models)
+HIGHLY RECOMMENDED. This is the industry standard for quant backtesting validation.
+
+-------------------------------------------------------------------------------
+6.2  MONTE CARLO SIMULATION
+-------------------------------------------------------------------------------
+
+What it is:
+Test strategy robustness by reshuffling trade returns and examining the
+distribution of outcomes. If the strategy is robust, most reshuffled paths
+should still be profitable.
+
+How to integrate:
+After walk-forward evaluation:
+1. Collect all trade returns from validation folds
+2. Resample (with replacement) 10,000 times to create randomized paths
+3. Compute Sharpe ratio for each path
+4. If 95th percentile Sharpe > 0: strategy is robust
+5. Report: median Sharpe, 5th percentile Sharpe, probability of positive Sharpe
+
+Code sketch:
+  trade_returns = [...]  # from validation
+  n_sims = 10000
+  sharpes = []
+  for _ in range(n_sims):
+      shuffled = np.random.choice(trade_returns, size=len(trade_returns), replace=True)
+      sharpes.append(shuffled.mean() / shuffled.std() * np.sqrt(252))
+  pct_5 = np.percentile(sharpes, 5)
+  prob_positive = np.mean(np.array(sharpes) > 0)
+
+Implementation complexity: EASY
+Expected impact: MODERATE (confidence measure for strategy robustness)
+RECOMMENDED. Easy to add to the training pipeline.
+
+-------------------------------------------------------------------------------
+6.3  REGIME-AWARE BACKTESTING
+-------------------------------------------------------------------------------
+
+What it is:
+Split the test set into regime-specific segments and evaluate performance in
+each regime separately. A strategy that works in bull markets but fails in
+bear markets is fragile.
+
+How to integrate:
+After validation:
+1. Label each test bar as bull/bear/sideways using SMA200 or returns
+2. Compute Sharpe ratio in each regime
+3. Reject models that have negative Sharpe in any regime
+4. Weight the score: score = min(bull_sharpe, bear_sharpe, sideways_sharpe)
+   (optimistic version: weighted average with minimum constraint)
+
+Enhancement to hypersearch_v2.py:
+  # In compute_sharpe or after final evaluation:
+  bull_mask = actual_returns > 0.1  # etc.
+  bear_mask = actual_returns < -0.1
+  bull_sharpe = compute_sharpe(predictions[bull_mask], actual_returns[bull_mask], threshold)
+  bear_sharpe = compute_sharpe(predictions[bear_mask], actual_returns[bear_mask], threshold)
+  min_regime_sharpe = min(bull_sharpe, bear_sharpe)
+  # Penalize models that only work in one regime
+
+Implementation complexity: EASY
+Expected impact: MODERATE-HIGH (prevents deploying regime-fragile models)
+RECOMMENDED. Trivial to add as a post-evaluation metric.
+
+-------------------------------------------------------------------------------
+6.4  TRANSACTION COST MODELING
+-------------------------------------------------------------------------------
+
+Our current approach only checks if predicted return > 2x spread. More
+realistic cost modeling should include:
+
+- Round-trip spread cost: already modeled
+- Slippage: the difference between expected and actual fill price
+  Estimate: 1-2 bps for stocks, 2-5 bps for crypto
+- Market impact: for our order sizes, negligible
+  But include: 0-1 bps for stocks, 0-2 bps for crypto
+- Opportunity cost: trades we miss due to latency or liquidity
+
+Integration into training:
+In compute_sharpe(), subtract estimated transaction costs:
+  trade_returns = signals[traded] * actual_returns[traded]
+  # Subtract round-trip cost for each trade
+  cost_per_trade = 0.05  # 5 bps = 0.05%
+  trade_returns -= cost_per_trade
+  # This makes the Sharpe more realistic
+
+Implementation complexity: EASY
+Expected impact: MODERATE (prevents over-trading on marginal signals)
+RECOMMENDED. Should be standard practice.
+
+
+================================================================================
+7. OPEN SOURCE TRADING SYSTEMS TO LEARN FROM
+================================================================================
+
+-------------------------------------------------------------------------------
+7.1  QLIB (Microsoft) — AI-Oriented Quantitative Investment Platform
+-------------------------------------------------------------------------------
+
+GitHub: github.com/microsoft/qlib (14k+ stars)
+
+What it offers:
+- Complete ML pipeline: data processing, model training, backtesting
+- Covers full chain: alpha seeking, risk modeling, portfolio optimization, execution
+- Point-in-time database prevents lookahead bias
+- Built-in models: LightGBM, LSTM, Transformer, GATs, TabNet
+- RD-Agent: LLM-driven automated factor discovery (2024-2025 innovation)
+- Modular architecture with loose coupling
+
+What we can learn:
+1. DATA HANDLING: Qlib's point-in-time DB ensures features are computed with
+   data available at prediction time. Our system computes features from
+   df.dropna() which could introduce subtle lookahead bias through indicators
+   that use future data in their computation window.
+
+2. FACTOR LIBRARY: Qlib provides 150+ alpha factors organized by category.
+   We could adopt their factor computation framework.
+
+3. PIPELINE ARCHITECTURE: Qlib separates concerns: data -> features -> model ->
+   signal -> portfolio -> execution. Our system mixes some of these (e.g.,
+   feature computation is split between harvest scripts and predict_now.py).
+
+4. AUTOMATED R&D: The RD-Agent concept (using LLMs to discover new factors)
+   is something we partially do with llm_analyst.py.
+
+Actionable items:
+- Study Qlib's Alpha158 and Alpha360 factor sets for new feature ideas
+- Adopt their strict point-in-time data handling
+- Consider their portfolio optimization module (Black-Litterman, etc.)
+
+Integration complexity: HARD (full adoption), MEDIUM (selective borrowing)
+
+-------------------------------------------------------------------------------
+7.2  FREQTRADE — Crypto Trading Bot Framework
+-------------------------------------------------------------------------------
+
+GitHub: github.com/freqtrade/freqtrade (40k stars)
+
+What it offers:
+- Exchange-agnostic crypto trading (via CCXT)
+- Built-in backtesting and hyperoptimization
+- FreqAI: adaptive ML models with continuous retraining
+- Telegram bot and web UI for monitoring
+- Strategy template system
+
+What we can learn:
+1. FREQAI RETRAINING: FreqAI continuously retrains models on new data. Our
+   system requires manual pipeline runs. We should implement automatic
+   retraining when performance degrades.
+
+2. DRY RUN MODE: Freqtrade's paper trading simulation is more sophisticated
+   than ours (we rely on Alpaca's paper trading).
+
+3. STRATEGY TEMPLATES: Freqtrade's IStrategy interface provides a clean
+   abstraction for strategy development. Our crypto_loop.py and stock_loop.py
+   have significant code duplication.
+
+Actionable items:
+- Implement automatic retraining trigger (performance degradation detection)
+- Refactor trading loops to share a common strategy interface
+- Study FreqAI's feature engineering pipeline
+
+Integration complexity: N/A (different framework, but ideas are transferable)
+
+-------------------------------------------------------------------------------
+7.3  JESSE — Crypto Trading Framework
+-------------------------------------------------------------------------------
+
+GitHub: github.com/jesse-ai/jesse (6.5k stars)
+
+What it offers:
+- Clean modular architecture with separation of concerns
+- Multi-timeframe support
+- Built-in risk management and position sizing
+- Backtesting without look-ahead bias by design
+- GPT-assisted strategy development (JesseGPT)
+
+What we can learn:
+1. MULTI-TIMEFRAME: Jesse natively supports multiple timeframes per strategy.
+   Our system uses a single timeframe (hourly bars). Adding multi-timeframe
+   features (daily, 4h, 15m) could improve predictions.
+
+2. STRATEGY ABSTRACTION: Jesse's strategy class provides should_long(),
+   should_short(), go_long(), go_short() methods. Cleaner than our if/else
+   logic in trading loops.
+
+3. RISK MANAGEMENT: Jesse has built-in position sizing methods including
+   risk_to_qty() which converts risk percentage to quantity.
+
+Actionable items:
+- Add multi-timeframe feature computation
+- Adopt Jesse's risk-to-qty pattern for position sizing
+
+-------------------------------------------------------------------------------
+7.4  FinRL — Deep Reinforcement Learning for Finance
+-------------------------------------------------------------------------------
+
+GitHub: github.com/AI4Finance-Foundation/FinRL (15k+ stars)
+
+What it offers:
+- Three-layer architecture: environment, agent, application
+- Multiple RL algorithms: DQN, DDPG, PPO, SAC, A2C, TD3
+- Market environment simulation with realistic constraints
+- Recent contest results (2024-2025) show 25% cumulative returns
+
+What we can learn:
+1. RL AS COMPLEMENT: Instead of pure prediction -> threshold -> trade, use
+   RL to learn the trading policy directly. The RL agent learns when to buy,
+   how much, and when to sell, optimizing for cumulative returns directly.
+
+2. ENVIRONMENT DESIGN: FinRL's market environment design shows how to properly
+   model transaction costs, slippage, and holding periods in the reward function.
+
+3. ENSEMBLE METHODS: FinRL's 2024 contest showed ensemble RL (combining
+   multiple agents) outperforms single agents. PPO augmented with sentiment
+   improved Sharpe from 0.69 to 1.08.
+
+Actionable items:
+- Consider adding a RL agent as an overlay on our prediction model
+- The RL agent could learn optimal trade_threshold, position_size, and
+  stop_loss distances based on market conditions
+- Start with PPO (simplest, most stable RL algorithm)
+
+Integration complexity: HARD (full RL agent), MEDIUM (RL for parameter tuning)
+Expected impact: MODERATE-HIGH (RL contests show meaningful improvements)
+
+-------------------------------------------------------------------------------
+7.5  VECTORBT — High-Performance Backtesting
+-------------------------------------------------------------------------------
+
+Not in original request but worth noting:
+
+What it offers:
+- Vectorized backtesting (100-1000x faster than event-driven)
+- NumPy/pandas/Numba powered (perfect fit for our stack)
+- Portfolio-level analysis with realistic transaction costs
+- Indicator library compatible with pandas
+
+What we can learn:
+- Vectorized approach for rapid strategy prototyping
+- Statistical testing framework for strategy validation
+- Portfolio analytics (Sharpe, Calmar, max drawdown, etc.)
+
+Actionable items:
+- Use vectorbt for rapid strategy prototyping before implementing in live loop
+- Adopt their portfolio analytics for monitoring
+
+-------------------------------------------------------------------------------
+7.6  ARCHITECTURE PATTERNS WE ARE MISSING
+-------------------------------------------------------------------------------
+
+Based on analysis of all frameworks above, key patterns our system lacks:
+
+1. STRATEGY ABSTRACTION LAYER: We need a common Strategy interface that
+   crypto_loop.py and stock_loop.py both implement. This reduces code
+   duplication and makes it easier to add new strategies.
+
+2. AUTOMATIC RETRAINING: No framework for detecting model degradation and
+   triggering retraining. Suggested: track rolling Sharpe, if it drops below
+   threshold, auto-run pipeline.
+
+3. MULTI-TIMEFRAME FEATURES: We only use hourly bars. Adding daily and 4h
+   aggregates as additional features would capture longer trends.
+
+4. PROPER BACKTESTING: We train and evaluate via walk-forward CV but don't
+   have a full backtesting simulation that models execution, slippage, and
+   portfolio effects.
+
+5. CONTINUOUS MONITORING: No system for tracking live prediction accuracy,
+   signal decay, or feature drift. Should log predictions and actual outcomes,
+   then compute rolling accuracy metrics.
+
+
+================================================================================
+8. ACADEMIC PAPERS & RESEARCH (2020-2026)
+================================================================================
+
+Based on comprehensive web research, here are the most relevant academic
+findings organized by topic.
+
+-------------------------------------------------------------------------------
+8.1  DEEP LEARNING FOR FINANCIAL PREDICTION
+-------------------------------------------------------------------------------
+
+Key findings from 2024-2025 survey papers:
+
+1. HYBRID MODELS DOMINATE: Pure LSTM, pure Transformer, and pure CNN all
+   underperform hybrid approaches (LSTM+Attention, CNN+LSTM, Transformer+GNN).
+   Our LSTM+MultiheadAttention is already hybrid, which is good.
+
+2. ATTENTION IS CRITICAL: Models with attention mechanisms consistently
+   outperform those without, across all architectures. Our multi-head
+   attention on LSTM output is well-aligned with this finding.
+
+3. GRAPH NEURAL NETWORKS SHOW PROMISE: GNNs that model inter-asset
+   relationships (stock correlations, supply chain links) achieve SOTA in
+   several benchmarks. TFT-GNN hybrid (2024) achieves highest predictive
+   accuracy by incorporating relational information between assets.
+
+   Integration potential: Build a correlation graph from our asset universe
+   and use a GNN layer to propagate information across assets.
+   Complexity: HARD. Impact: MODERATE-HIGH.
+
+4. MULTI-TASK LEARNING WORKS: Training models to simultaneously predict
+   returns AND volatility (or returns AND direction) improves both tasks.
+   A 2024 study showed multi-task LSTM achieved 16-25% lower RMSE than
+   single-task baselines.
+
+   Integration potential: Add volatility prediction as a secondary task to
+   our RegressionLSTM. Modify the FC head to output both predicted_return
+   and predicted_volatility.
+   Complexity: MEDIUM. Impact: MODERATE.
+
+5. DEEP REINFORCEMENT LEARNING: DRL agents for trading show 25% cumulative
+   returns on AAPL (2024-2025) vs 12% buy-and-hold, with Sharpe ratio of 0.75.
+   PPO augmented with sentiment indicators achieved Sharpe 1.08. However,
+   results are inconsistent and highly dependent on hyperparameters, environment
+   design, and the specific market period tested.
+
+-------------------------------------------------------------------------------
+8.2  REINFORCEMENT LEARNING FOR TRADING
+-------------------------------------------------------------------------------
+
+Algorithm comparison (2024 literature):
+- PPO: Most stable, easiest to tune. Best for beginners.
+- SAC: Best risk-adjusted performance in crypto. Superior stability.
+- DDPG: Highest absolute returns in some studies but unstable.
+- A2C: Top cumulative rewards in some benchmarks.
+- TD3: Balanced approach, middle-of-road performance.
+
+Practical considerations:
+- RL requires MUCH more compute than supervised learning
+- Reward function design is critical and error-prone
+- Results are not reproducible across seeds
+- State space must include portfolio state (positions, P&L)
+- Action space: discrete (buy/sell/hold) is more stable than continuous
+
+Integration path for our system:
+1. Start with PPO for PARAMETER TUNING (not direct trading):
+   - State: current indicators, portfolio state, recent P&L
+   - Action: trade_threshold, position_size_multiplier, stop_distance
+   - Reward: risk-adjusted return over episode
+2. This is a meta-learning approach: RL learns WHEN to be aggressive vs
+   conservative, while our LSTM does the prediction
+
+Feasibility on Jetson: MODERATE (PPO training is compute-intensive but possible;
+  inference is lightweight)
+Implementation complexity: HARD
+Expected impact: MODERATE (promising but uncertain)
+
+-------------------------------------------------------------------------------
+8.3  TRANSFER LEARNING IN FINANCE
+-------------------------------------------------------------------------------
+
+A 2024 systematic review (arxiv 2409.17183) found:
+- Pre-training on large financial datasets, then fine-tuning on specific
+  assets, consistently improves performance by 5-15%
+- Cross-market transfer (e.g., US stocks -> crypto) has mixed results
+- Same-market transfer (e.g., SPY features -> individual stocks) works well
+- Feature-level transfer (using general features, fine-tuning on specific
+  asset patterns) is most effective
+
+How to integrate:
+1. Pre-train model on ALL tickers combined (our current approach)
+2. Fine-tune separate heads or adapters for each ticker (or asset class)
+3. Alternatively: train on large stock universe, transfer to crypto
+
+Our current training already does a form of transfer learning: training on
+all tickers simultaneously allows the model to learn general patterns.
+Enhancement: add per-ticker adapter layers or ticker embedding.
+
+Implementation complexity: MEDIUM
+Expected impact: MODERATE (5-15% improvement based on systematic review)
+
+-------------------------------------------------------------------------------
+8.4  GRAPH NEURAL NETWORKS FOR MARKET CORRELATION
+-------------------------------------------------------------------------------
+
+Key papers:
+- Temporal and Heterogeneous GNN for Financial Time Series (CIKM 2022)
+- Relational Temporal Graph Convolutional Network (ICDE 2023)
+- Stock Movement Prediction via Dual Attention Networks on Market Knowledge
+  Graphs (TKDE 2023)
+- TFT-GNN Hybrid for Stock Market Prediction (2025)
+
+How it works:
+1. Build a graph where nodes are assets and edges are correlations or
+   industry relationships
+2. GNN propagates information across the graph, allowing each asset's
+   prediction to be informed by related assets
+3. Temporal GNNs add time-varying edge weights (correlations change)
+
+How to integrate:
+1. Build correlation graph from our 10 crypto symbols or 31 stocks
+2. Compute rolling correlation matrix (30-bar window)
+3. Use PyTorch Geometric (PyG) for GNN layers
+4. Architecture: LSTM per-asset -> GNN cross-asset -> FC head per-asset
+
+Challenges:
+- Our asset universe is small (10 crypto, 31 stocks). GNNs benefit most
+  with larger graphs (100+ nodes)
+- PyTorch Geometric on ARM64/Jetson may require source compilation
+- Adds significant complexity for uncertain benefit with small graphs
+
+Feasibility on Jetson: UNCERTAIN (PyG compilation on ARM64)
+Implementation complexity: HARD
+Expected impact: MODERATE for stocks (31 nodes), LOW for crypto (10 nodes)
+
+-------------------------------------------------------------------------------
+8.5  NOTABLE SPECIFIC PAPERS
+-------------------------------------------------------------------------------
+
+"Advances in Financial Machine Learning" - de Prado (2018, still highly relevant)
+Key insights applicable to us:
+- Meta-labeling: train a secondary model on whether the primary model's
+  prediction will be correct. Use this to filter trades and size positions.
+  Integration: MEDIUM complexity, HIGH impact.
+
+- Structural breaks: use CUSUM filter to detect regime changes
+  Integration: EASY, add as feature
+
+- Entropy features: standardized entropy of returns as predictability measure
+  Integration: EASY, add as feature
+
+- Fractionally differentiated features: transform non-stationary price series
+  into stationary while preserving memory. Better than simple returns.
+  Integration: MEDIUM, add to indicators.py
+
+"Deep Learning for Financial Applications: A Survey" (2025 review)
+Key findings relevant to us:
+- Ensemble methods (stacking LSTM + GBM) consistently outperform
+- Feature selection via mutual information outperforms PCA
+- Batch normalization after LSTM layers improves stability
+- Learning rate warmup + cosine decay outperforms fixed LR
+  (we already use cosine annealing with warm restarts)
+
+
+================================================================================
+9. PRIORITIZED IMPLEMENTATION ROADMAP
+================================================================================
+
+Based on expected impact, implementation difficulty, and Jetson feasibility,
+here is a prioritized roadmap:
+
+TIER 1 — QUICK WINS (1-3 days each, high impact)
+================================================
+
+1. HURST EXPONENT FEATURE [SECTION 2.4]
+   Files: indicators.py
+   What: Add rolling Hurst exponent (100-bar window) as a feature
+   Why: Tells the model whether trend or mean-reversion signals are reliable
+   Effort: 2-4 hours
+   Expected impact: HIGH (regime-aware predictions)
+
+2. KELLY CRITERION POSITION SIZING [SECTION 3.1]
+   Files: crypto_loop.py, stock_loop.py, trading_utils.py
+   What: Replace fixed notional with half-Kelly sizing based on rolling
+         win rate and win/loss ratio from trade_memory
+   Effort: 4-8 hours
+   Expected impact: HIGH (optimal growth rate)
+
+3. MONTE CARLO ROBUSTNESS TEST [SECTION 6.2]
+   Files: hypersearch_v2.py (add post-evaluation step)
+   What: After finding best model, run 10,000 Monte Carlo simulations on
+         validation trade returns to assess robustness
+   Effort: 2-4 hours
+   Expected impact: MODERATE (prevents deploying fragile strategies)
+
+4. TRANSACTION COST MODELING IN TRAINING [SECTION 6.4]
+   Files: hypersearch_v2.py (modify compute_sharpe)
+   What: Subtract 5bps per trade in Sharpe computation
+   Effort: 30 minutes
+   Expected impact: MODERATE (more realistic model selection)
+
+5. REGIME-AWARE BACKTESTING [SECTION 6.3]
+   Files: hypersearch_v2.py (add post-evaluation metric)
+   What: Compute Sharpe separately for bull/bear/sideways periods
+   Effort: 2-4 hours
+   Expected impact: MODERATE-HIGH
+
+TIER 2 — MEDIUM EFFORT, HIGH IMPACT (1-2 weeks each)
+====================================================
+
+6. LIGHTGBM ENSEMBLE STACKING [SECTION 1.7]
+   Files: New model_lgb.py, modify predict_now.py
+   What: Train LightGBM on flattened features, stack with LSTM prediction
+   Effort: 2-3 days
+   Expected impact: HIGH (proven 10-15% improvement)
+
+7. REGIME-BASED ALLOCATION [SECTION 3.5]
+   Files: crypto_loop.py, stock_loop.py, new regime_detector.py
+   What: HMM or rule-based regime detection, adjust sizing/thresholds
+   Effort: 3-5 days
+   Expected impact: HIGH
+
+8. COMBINATORIAL PURGED CV [SECTION 6.1]
+   Files: hypersearch_v2.py (replace fold generation)
+   What: Use CPCV instead of simple walk-forward, compute PBO
+   Effort: 2-3 days
+   Expected impact: HIGH (robust model selection)
+
+9. BLACK-LITTERMAN PORTFOLIO OPTIMIZATION [SECTION 3.3]
+   Files: stock_loop.py, new portfolio_optimizer.py
+   What: Use pypfopt to compute optimal weights from ML predictions
+   Effort: 3-5 days
+   Expected impact: HIGH (institutional-grade portfolio construction)
+
+10. TCN ARCHITECTURE EXPERIMENT [SECTION 1.6]
+    Files: New model_tcn.py, modify hypersearch_v2.py
+    What: Implement TCN as alternative to LSTM, compare via hypersearch
+    Effort: 2-3 days
+    Expected impact: MODERATE (likely similar performance, faster training)
+
+TIER 3 — SIGNIFICANT EFFORT, MODERATE-HIGH IMPACT (2-4 weeks each)
+===================================================================
+
+11. TFT ARCHITECTURE [SECTION 1.1]
+    Files: New model_tft.py, modify hypersearch_v2.py
+    What: Implement lightweight TFT with variable selection
+    Effort: 1-2 weeks
+    Expected impact: MODERATE-HIGH
+
+12. MAMBA/SSM ARCHITECTURE [SECTION 1.5]
+    Files: New model_mamba.py, install mamba-ssm
+    What: Implement Mamba backbone with custom CUDA kernel compilation
+    Effort: 1-2 weeks (depends on sm_87 compatibility)
+    Expected impact: MODERATE-HIGH
+
+13. MULTI-TASK LEARNING [SECTION 8.1, point 4]
+    Files: model_v2.py, hypersearch_v2.py
+    What: Dual output: predicted_return + predicted_volatility
+    Effort: 3-5 days
+    Expected impact: MODERATE
+
+14. ON-CHAIN FEATURES [SECTION 2.3]
+    Files: indicators.py, harvest scripts
+    What: Add exchange flow, active addresses, NVT ratio for crypto
+    Effort: 1-2 weeks (API integration)
+    Expected impact: MODERATE-HIGH for crypto
+
+15. AUTOMATIC RETRAINING [SECTION 7.6]
+    Files: run_pipeline.py, new performance_monitor.py
+    What: Track rolling Sharpe, auto-trigger retraining on degradation
+    Effort: 1 week
+    Expected impact: MODERATE-HIGH
+
+TIER 4 — RESEARCH PROJECTS (1+ month, uncertain impact)
+========================================================
+
+16. RL META-LEARNER [SECTION 8.2]
+    What: PPO agent that tunes strategy parameters based on market state
+    Effort: 2-4 weeks
+    Expected impact: UNCERTAIN but potentially HIGH
+
+17. GRAPH NEURAL NETWORK [SECTION 8.4]
+    What: GNN layer for cross-asset information propagation
+    Effort: 2-4 weeks
+    Expected impact: LOW-MODERATE (small graph size)
+
+18. PAIRS TRADING [SECTION 4.1]
+    What: Cointegration-based pairs strategy alongside directional
+    Effort: 2-3 weeks
+    Expected impact: MODERATE (uncorrelated returns)
+
+19. PATCHTST ARCHITECTURE [SECTION 1.3]
+    What: Patch-based transformer for time series
+    Effort: 1-2 weeks
+    Expected impact: MODERATE
+
+20. FinRL-STYLE RL AGENT [SECTION 7.4]
+    What: Full RL trading agent as alternative to prediction+threshold
+    Effort: 4+ weeks
+    Expected impact: UNCERTAIN
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+Our current system is well-architected with good fundamentals:
+- LSTM + MultiheadAttention is a competitive architecture
+- Walk-forward CV with Sharpe optimization is solid methodology
+- ATR-based stops, sentiment gating, and LLM oversight are strong risk controls
+- The feature set covers major technical indicators and cross-asset signals
+
+The highest-impact improvements, in order of expected ROI:
+
+1. ADD REGIME DETECTION (Hurst exponent + HMM) — transforms the system from
+   always-on to context-aware. Easy to implement, proven high impact.
+
+2. LIGHTGBM ENSEMBLE — stacking tree models with neural net predictions
+   consistently adds 10-15%. Well-proven, moderate effort.
+
+3. KELLY CRITERION SIZING — optimal position sizing based on actual edge.
+   Easy to implement, mathematically optimal.
+
+4. CPCV VALIDATION — prevents deploying overfit models. Industry standard.
+
+5. BLACK-LITTERMAN PORTFOLIO — institutional-grade weight optimization using
+   our ML predictions as views. Moderate effort, high impact for stock portfolio.
+
+6. TCN EXPERIMENT — quick architectural experiment. If TCN matches or beats
+   LSTM, we gain faster training. If not, minimal wasted effort.
+
+The LEAST promising paths for our system:
+- Market making (requires sub-second latency we don't have)
+- Full GNN (our asset graph is too small)
+- TimesNet (mixed financial results)
+- TWAP/VWAP (our order sizes are too small to matter)
+
+END OF RESEARCH ANALYSIS
+================================================================================

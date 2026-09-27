@@ -19,6 +19,7 @@ import argparse
 import datetime as dt
 import io
 import os
+import threading
 import urllib.error
 import urllib.request
 import zipfile
@@ -98,20 +99,64 @@ def _parse_zip(data: bytes):
     return pd.concat(rows) if rows else None
 
 
+# G5-4: the live feature injectors call this once per symbol per 30 s cycle
+# (predict_now re-predicts every symbol every cycle), and a full parquet decode
+# per call cost ~23 ms x 6 crypto names. The parsed frame is memoized on
+# (path, st_mtime_ns, st_size) and the per-symbol derived series on top of it;
+# a sync() rewrite (os.replace) or an ARCHIVE_FILE repoint changes the stamp,
+# so the memo self-invalidates across processes. Outputs are the SAME objects a
+# fresh read would compute (bit-identical); every caller is read-only on them.
+# A failed read is never memoized (it retries and reports every call, as before).
+_memo_lock = threading.Lock()
+_memo: dict = {'key': None, 'df': None, 'by_sym': {}}
+
+
+def _archive_stamp():
+    try:
+        st = os.stat(ARCHIVE_FILE)
+    except OSError:
+        return None
+    return (str(ARCHIVE_FILE), st.st_mtime_ns, st.st_size)
+
+
 def load_archive():
     import pandas as pd
-    if ARCHIVE_FILE.exists():
-        try:
-            return pd.read_parquet(ARCHIVE_FILE)
-        except Exception as e:
-            print(f"[FUNDING-ARCHIVE] corrupt archive {ARCHIVE_FILE}: {e} "
-                  f"— treating as empty")
+    key = _archive_stamp()
+    if key is not None:
+        with _memo_lock:
+            if _memo['key'] == key:
+                return _memo['df']
+            try:
+                df = pd.read_parquet(ARCHIVE_FILE)
+            except Exception as e:
+                print(f"[FUNDING-ARCHIVE] corrupt archive {ARCHIVE_FILE}: {e} "
+                      f"— treating as empty")
+            else:
+                _memo.update(key=key, df=df, by_sym={})
+                return df
     return pd.DataFrame(columns=['symbol', 'ts', 'rate'])
 
 
 def get_funding_series(alpaca_symbol: str):
-    """Funding rate Series (UTC ts index) for one Alpaca symbol, or None."""
+    """Funding rate Series (UTC ts index) for one Alpaca symbol, or None.
+
+    Memoized per symbol against the archive stamp (G5-4) — treat the
+    result as read-only."""
     arc = load_archive()
+    with _memo_lock:
+        memo_ok = _memo['df'] is arc     # arc is the memoized frame of _memo['key']
+        if memo_ok and alpaca_symbol in _memo['by_sym']:
+            return _memo['by_sym'][alpaca_symbol]
+    out = _funding_series_from(arc, alpaca_symbol)
+    if memo_ok:
+        with _memo_lock:
+            if _memo['df'] is arc:
+                _memo['by_sym'][alpaca_symbol] = out
+    return out
+
+
+def _funding_series_from(arc, alpaca_symbol: str):
+    """get_funding_series body on an already-loaded archive frame (unchanged math)."""
     if arc.empty:
         return None
     sub = arc[arc['symbol'] == alpaca_symbol]

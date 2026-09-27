@@ -216,6 +216,10 @@ class _API:
 
     def cancel_order(self, oid):
         self.canceled.append(oid)
+        # Like the real broker: a cancel settles a not-yet-filled order.
+        o = self.orders.get(oid)
+        if o is not None and o.status not in ('filled',):
+            o.status = 'canceled'
 
     def submit_order(self, **kw):
         self.submitted.append(kw)

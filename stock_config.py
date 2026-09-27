@@ -45,7 +45,9 @@ def load_stock_universe() -> list[str]:
             symbols = json.load(f)
         if isinstance(symbols, list) and symbols:
             return _clean(symbols)
-    except (OSError, json.JSONDecodeError, TypeError, AttributeError) as exc:
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        # ValueError covers JSONDecodeError AND the UnicodeDecodeError a
+        # binary-garbage file raises (same guard as risk_budget.read_registry).
         # AttributeError: _clean on non-string entries. The file is committed,
         # so ANY fallback silently swaps the traded universe — warn loudly.
         logging.getLogger(__name__).warning(

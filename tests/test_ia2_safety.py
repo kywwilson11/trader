@@ -16,7 +16,8 @@ research/campaign_2026-08/07_decision_influences.md:
 3. Quote-staleness guard under the alpaca_compat shim: the census claim
    ("timestamp dropped") is ALREADY fixed in the tree (_shim_quote
    threads t); pinned here — stale quotes are rejected under the shim
-   shape, absent timestamps fail safe (accepted, as today).
+   shape; absent timestamps fail CLOSED (rejected; ENGINE r3 W10 — they
+   were accepted before).
 4. FOMC/CPI static-table staleness alarm (§3.2): one loud daily warning
    + one notify per process when the table is exhausted; fail-open (gate
    behavior unchanged).
@@ -393,14 +394,14 @@ class TestQuoteStalenessUnderShim:
         assert q is not None
         assert q['midpoint'] == pytest.approx(100.05)
 
-    def test_absent_timestamp_fails_safe_accepted(self):
-        # Fail-safe contract: no timestamp behaves exactly as today —
-        # the quote is accepted, the check simply cannot run.
+    def test_absent_timestamp_fails_closed(self):
+        # Fail-closed contract (ENGINE r3 W10): a quote that cannot be aged
+        # is not fresh — rejected like a stale one (was: accepted).
         shim = alpaca_compat._shim_quote(
             SimpleNamespace(bid_price=100.0, ask_price=100.1))
         q = order_utils.get_quote(_api_returning(shim), 'TSLA',
                                   asset_type='stock')
-        assert q is not None
+        assert q is None
 
 
 # ---------------------------------------------------------------------------

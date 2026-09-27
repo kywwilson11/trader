@@ -208,11 +208,20 @@ class CryptoLoop(BaseTradingLoop):
     def _replace_protective_stops(self):
         """Re-place resting stops for every reconstructed crypto position
         (startup cancels this bot's working orders first)."""
+        import strategy_config
+        anchor_desired = getattr(strategy_config,
+                                 'RESTART_STOP_ANCHOR_DESIRED', False)
         for symbol, pos in self.positions.items():
-            # Anchor to the persisted HWM so restarts don't widen a
-            # trail that had already tightened
-            anchor = max(pos.entry_price, pos.high_water_mark)
-            stop_price = anchor * (1 - self._stop_distance_for(pos))
+            if anchor_desired:
+                # ENGINE-R3 O2+J11: exactly the software stop; the
+                # _resting_stop_px entry _place_resting_stop records is then
+                # the level _maybe_update_resting_stop compares against.
+                stop_price = self._desired_stop_for(pos)[0]
+            else:
+                # Anchor to the persisted HWM so restarts don't widen a
+                # trail that had already tightened
+                anchor = max(pos.entry_price, pos.high_water_mark)
+                stop_price = anchor * (1 - self._stop_distance_for(pos))
             self._place_resting_stop(symbol, pos, stop_price)
 
     def _maybe_update_resting_stop(self, symbol, pos, desired_stop_price):

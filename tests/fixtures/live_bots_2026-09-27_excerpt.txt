@@ -1,0 +1,93 @@
+# ENGINE R5 W16 — live paper-bot evidence excerpt, 2026-09-27 (CDT). Read-only copies; secrets: none (scrubbed/grepped).
+# Sources: scratchpad phase5/bots_stdout.log (pid 166905, run_bots.py combined, halt flag set);
+#          broker GET /v2/orders?status=all&after=2026-09-27T08:00:00Z (read-only, 03:33 CDT);
+#          /home/kyle/trader/position_state.json (03:34 CDT). Parsed by tests/test_engine_r5_live_invariants.py.
+### SECTION stdout
+
+===== start_bots.sh 2026-09-27T03:09:16-05:00 : /home/kyle/miniforge3/envs/jetson/bin/python -u run_bots.py =====
+2026-09-27 03:09:21 [base_loop] INFO: Loading prediction models...
+2026-09-27 03:09:21 [base_loop] WARNING: Model files not found. Buys are DISABLED until a model exists (fail closed); exits and stops still run.
+2026-09-27 03:09:21 [order_utils] INFO: [CLEANUP] No open orders to cancel.
+2026-09-27 03:09:21 [base_loop] WARNING: [RECONSTRUCT] BTC/USD: cost basis unknown (avg_entry_price=0.0) — hard stop and TP disabled, protection is a pure 5% trail from the high-water mark, book stop-risk counts it as 0
+  [BARS] Dropped 1 outlier bar(s) (bad prints)
+2026-09-27 03:09:23 [base_loop] WARNING: [RECONSTRUCT] ETH/USD: cost basis unknown (avg_entry_price=0.0) — hard stop and TP disabled, protection is a pure 5% trail from the high-water mark, book stop-risk counts it as 0
+  [BARS] Dropped 1 outlier bar(s) (bad prints)
+2026-09-27 03:09:23 [base_loop] WARNING: [RECONSTRUCT] XRP/USD: cost basis unknown (avg_entry_price=0.0) — hard stop and TP disabled, protection is a pure 5% trail from the high-water mark, book stop-risk counts it as 0
+  [BARS] Dropped 1 outlier bar(s) (bad prints)
+2026-09-27 03:09:23 [base_loop] WARNING: [RECONSTRUCT] SOL/USD: cost basis unknown (avg_entry_price=0.0) — hard stop and TP disabled, protection is a pure 5% trail from the high-water mark, book stop-risk counts it as 0
+2026-09-27 03:09:24 [base_loop] WARNING: [RECONSTRUCT] DOGE/USD: cost basis unknown (avg_entry_price=0.0) — hard stop and TP disabled, protection is a pure 5% trail from the high-water mark, book stop-risk counts it as 0
+  [BARS] Dropped 3 outlier bar(s) (bad prints)
+2026-09-27 03:09:24 [base_loop] WARNING: [RECONSTRUCT] LINK/USD: cost basis unknown (avg_entry_price=0.0) — hard stop and TP disabled, protection is a pure 5% trail from the high-water mark, book stop-risk counts it as 0
+  [BARS] Dropped 1 outlier bar(s) (bad prints)
+2026-09-27 03:09:24 [crypto_loop] INFO: [RESTING-STOP] BTC/USD: GTC stop_limit @ $79742.1016 (limit $78147.2596)
+2026-09-27 03:09:24 [crypto_loop] INFO: [RESTING-STOP] ETH/USD: GTC stop_limit @ $2554.6809 (limit $2503.5872)
+2026-09-27 03:09:24 [crypto_loop] INFO: [RESTING-STOP] XRP/USD: GTC stop_limit @ $1.4444 (limit $1.4155)
+2026-09-27 03:09:24 [crypto_loop] INFO: [RESTING-STOP] SOL/USD: GTC stop_limit @ $116.654 (limit $114.3209)
+2026-09-27 03:09:25 [crypto_loop] INFO: [RESTING-STOP] DOGE/USD: GTC stop_limit @ $0.091913 (limit $0.090075)
+2026-09-27 03:09:25 [crypto_loop] INFO: [RESTING-STOP] LINK/USD: GTC stop_limit @ $13.5548 (limit $13.2837)
+2026-09-27 03:09:25 [base_loop] INFO: Existing positions: BTC/USD, ETH/USD, XRP/USD, SOL/USD, DOGE/USD, LINK/USD
+2026-09-27 03:09:25 [base_loop] INFO: --- CRYPTO BOT STARTED ---
+2026-09-27 03:09:25 [base_loop] INFO: Symbols: 6 | Notional: $1000 | Loop: 30s | Cooldown: 60 min
+2026-09-27 03:09:25 [base_loop] INFO: Risk management: GARCH + Macro regime + Correlation + Kelly
+2026-09-27 03:09:25 [base_loop] INFO: [LLM] disk cache present but stale (> 2h) — starting with no scores (fail-open)
+2026-09-27 03:09:25 [base_loop] INFO: --- CYCLE 1: 2026-09-27 03:09:25 ---
+/home/kyle/trader/order_utils.py:192: UserWarning: Discarding nonzero nanoseconds in conversion.
+  qt = qt.to_pydatetime()
+2026-09-27 03:09:26 [crypto_loop] INFO: [RESTING-STOP] BTC/USD: GTC stop_limit @ $80590.4218 (limit $78978.6134)
+2026-09-27 03:09:26 [base_loop] INFO: Loading prediction models...
+2026-09-27 03:09:26 [base_loop] WARNING: Model files not found. Buys are DISABLED until a model exists (fail closed); exits and stops still run.
+2026-09-27 03:09:26 [order_utils] INFO: [CLEANUP] Canceling 0/6 open order(s) in this bot's universe...
+2026-09-27 03:09:26 [base_loop] INFO: --- STOCK BOT STARTED ---
+2026-09-27 03:09:26 [base_loop] INFO: Symbols: 46 | Notional: $5000 | Loop: 30s | Cooldown: 20 min
+2026-09-27 03:09:26 [base_loop] INFO: Risk management: GARCH + Macro regime + Correlation + Kelly
+2026-09-27 03:09:26 [base_loop] INFO: [LLM] disk cache present but stale (> 2h) — starting with no scores (fail-open)
+2026-09-27 03:09:26 [base_loop] INFO: [WAIT] Market closed. Next check in 30s...
+2026-09-27 03:09:27 [crypto_loop] INFO: [RESTING-STOP] ETH/USD: GTC stop_limit @ $2583.0262 (limit $2531.3657)
+2026-09-27 03:09:28 [crypto_loop] INFO: [RESTING-STOP] XRP/USD: GTC stop_limit @ $1.4628 (limit $1.4335)
+2026-09-27 03:09:29 [crypto_loop] INFO: [RESTING-STOP] SOL/USD: GTC stop_limit @ $118.0688 (limit $115.7075)
+2026-09-27 03:09:30 [crypto_loop] INFO: [RESTING-STOP] DOGE/USD: GTC stop_limit @ $0.093014 (limit $0.091154)
+2026-09-27 03:09:31 [__main__] INFO: [OPS] ops thread running (poll=60s, defers to live pipeline)
+2026-09-27 03:09:31 [__main__] INFO: [BOTS] 2 loop(s) running in one process
+[DRIFT] crypto: not checkable (no manifest deciles or <50 live preds)
+[DRIFT] stock: not checkable (no manifest deciles or <50 live preds)
+2026-09-27 03:09:31 [crypto_loop] INFO: [RESTING-STOP] LINK/USD: GTC stop_limit @ $13.699 (limit $13.425)
+2026-09-27 03:09:31 [macro_indicators] INFO: [MACRO] VIX: 14.9
+2026-09-27 03:09:32 [macro_indicators] INFO: [MACRO] Financial Stress (STLFSI2): -0.85
+2026-09-27 03:09:32 [base_loop] INFO: [MACRO] Regime: normal (sizing=1.00x, stops=1.00x)
+2026-09-27 03:09:33 [portfolio] INFO: [PORTFOLIO] crypto corr rebuild: 6/6 symbols, 30 pair entries, 1.0s, estimator=ledoit-wolf
+2026-09-27 03:09:33 [crypto_loop] INFO: [SENTIMENT] Fear & Greed: 70 (Greed)
+[LLM] gemini-2.5-flash-lite: HTTP 503 (3378ms)
+[LLM] Gemini: truncated (703 chars), discarding
+[LLM-COST] gemini-2.5-flash: billed response discarded — charged to ledger ($0.0108 today)
+[LLM] gemini/gemini-2.5-flash: empty/truncated, trying next
+[LLM] gemini/gemini-2.5-flash-lite: 5520ms, 4917 chars ($0.011 today)
+2026-09-27 03:10:04 [base_loop] INFO: [LLM] Scores: BTC/USD=0.62, ETH/USD=0.58, XRP/USD=0.38, SOL/USD=0.72, DOGE/USD=0.42, LINK/USD=0.55
+2026-09-27 03:10:04 [base_loop] WARNING: [HALT] trading_halt.flag active — entries blocked (/resume to clear)
+2026-09-27 03:10:04 [base_loop] INFO: [SLEEP] Next check in 29s...
+2026-09-27 03:10:33 [base_loop] INFO: --- CYCLE 2: 2026-09-27 03:10:33 ---
+/home/kyle/trader/order_utils.py:192: UserWarning: Discarding nonzero nanoseconds in conversion.
+  qt = qt.to_pydatetime()
+  [BARS] Dropped 1 outlier bar(s) (bad prints)
+2026-09-27 03:10:34 [base_loop] INFO: [SLEEP] Next check in 29s...
+2026-09-27 03:30:56 [base_loop] INFO: --- CYCLE 40: 2026-09-27 03:30:56 ---
+/home/kyle/trader/order_utils.py:192: UserWarning: Discarding nonzero nanoseconds in conversion.
+  qt = qt.to_pydatetime()
+2026-09-27 03:30:56 [order_utils] WARNING: [QUOTE] ETH/USD: quote is 203s stale, ignoring
+2026-09-27 03:30:57 [base_loop] INFO: [HW] GPU temp: 69C
+  [BARS] Dropped 1 outlier bar(s) (bad prints)
+2026-09-27 03:30:57 [base_loop] INFO: [SLEEP] Next check in 28s...
+### SECTION broker_orders
+2026-09-27T08:09:24.689135Z BTC/USD sell stop_limit gtc stop 79742.1016 lim 78147.2596 qty 0.249291739 canceled canceled_at 2026-09-27T08:09:25.565578Z cstop-
+2026-09-27T08:09:24.779365Z ETH/USD sell stop_limit gtc stop 2554.6809 lim 2503.5872 qty 7.904614454 canceled canceled_at 2026-09-27T08:09:26.583713Z cstop-
+2026-09-27T08:09:24.867968Z XRP/USD sell stop_limit gtc stop 1.4444 lim 1.4155 qty 13641.540903233 canceled canceled_at 2026-09-27T08:09:27.612766Z cstop-
+2026-09-27T08:09:24.95592Z SOL/USD sell stop_limit gtc stop 116.654 lim 114.3209 qty 212.082911929 canceled canceled_at 2026-09-27T08:09:28.639902Z cstop-
+2026-09-27T08:09:25.044727Z DOGE/USD sell stop_limit gtc stop 0.091913 lim 0.090075 qty 114913.12732127 canceled canceled_at 2026-09-27T08:09:29.661172Z cstop-
+2026-09-27T08:09:25.132569Z LINK/USD sell stop_limit gtc stop 13.5548 lim 13.2837 qty 1576.529633666 canceled canceled_at 2026-09-27T08:09:30.685309Z cstop-
+2026-09-27T08:09:26.23716Z BTC/USD sell stop_limit gtc stop 80590.4218 lim 78978.6134 qty 0.249291739 new canceled_at None cstop-
+2026-09-27T08:09:27.260188Z ETH/USD sell stop_limit gtc stop 2583.0262 lim 2531.3657 qty 7.904614454 new canceled_at None cstop-
+2026-09-27T08:09:28.289703Z XRP/USD sell stop_limit gtc stop 1.4628 lim 1.4335 qty 13641.540903233 new canceled_at None cstop-
+2026-09-27T08:09:29.31248Z SOL/USD sell stop_limit gtc stop 118.0688 lim 115.7075 qty 212.082911929 new canceled_at None cstop-
+2026-09-27T08:09:30.33685Z DOGE/USD sell stop_limit gtc stop 0.093014 lim 0.091154 qty 114913.12732127 new canceled_at None cstop-
+2026-09-27T08:09:31.353863175Z LINK/USD sell stop_limit gtc stop 13.699 lim 13.425 qty 1576.529633666 new canceled_at None cstop-
+### SECTION position_state
+{"hwm": {"BTC/USD": 84871.14600000001, "ETH/USD": 2721.5739999999996, "XRP/USD": 1.542225, "SOL/USD": 124.86449999999999, "DOGE/USD": 0.098415, "LINK/USD": 14.42}, "trailing": {"BTC/USD": false, "ETH/USD": false, "XRP/USD": false, "SOL/USD": false, "DOGE/USD": false, "LINK/USD": false}, "last_trade": {}, "daily_trades": {"date": "2026-09-27", "counts": {}}, "peak_equity": 124192.0, "entry_ts": {}}

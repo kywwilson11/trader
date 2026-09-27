@@ -1,0 +1,27 @@
+ceo-cert_20260927_071918.log: = 2 failed, 5652 passed, 11 skipped, 64 xfailed, 50 warnings in 581.23s (0:09:41) =
+ceo-gate4_20260927_001854.log: = 1 failed, 4564 passed, 7 skipped, 3 xfailed, 44 warnings in 194.10s (0:03:14) =
+ceo-gate4b_20260927_002251.log: = 3 failed, 4574 passed, 7 skipped, 3 xfailed, 44 warnings in 202.55s (0:03:22) =
+engine-r1_20260927_010705.log: ===== 4771 passed, 7 skipped, 18 xfailed, 44 warnings in 224.15s (0:03:44) =====
+engine-r2_20260927_015339.log: ===== 4946 passed, 7 skipped, 19 xfailed, 50 warnings in 299.29s (0:04:59) =====
+engine-r3_20260927_024152.log: ===== 5351 passed, 7 skipped, 64 xfailed, 55 warnings in 360.30s (0:06:00) =====
+engine-r4_20260927_031651.log: = 1 failed, 5398 passed, 7 skipped, 64 xfailed, 52 warnings in 372.53s (0:06:12) =
+engine-r5_20260927_060453.log: = 8 failed, 5532 passed, 97 skipped, 64 xfailed, 50 warnings in 676.94s (0:11:16) =
+intel-1_20260927_004248.log: ===== 4759 passed, 7 skipped, 18 xfailed, 44 warnings in 237.23s (0:03:57) =====
+intel-2_20260927_015518.log: ===== 4946 passed, 7 skipped, 19 xfailed, 50 warnings in 302.25s (0:05:02) =====
+intel-3_20260927_023804.log: ===== 5351 passed, 7 skipped, 64 xfailed, 55 warnings in 336.17s (0:05:36) =====
+intel-4_20260927_025756.log: = 4 failed, 5365 passed, 7 skipped, 64 xfailed, 55 warnings in 354.26s (0:05:54) =
+intel-4b_20260927_030442.log: = 11 failed, 5381 passed, 7 skipped, 64 xfailed, 57 warnings in 347.92s (0:05:47) =
+intel-4c_20260927_031717.log: = 1 failed, 5398 passed, 7 skipped, 64 xfailed, 52 warnings in 378.71s (0:06:18) =
+intel-4cert_20260927_061453.log: = 4 failed, 5650 passed, 11 skipped, 64 xfailed, 50 warnings in 562.43s (0:09:22) =
+intel-5cert_20260927_070322.log: tests/test_c26_W1.py ...
+signal-land_20260927_011235.log: ===== 4792 passed, 7 skipped, 18 xfailed, 44 warnings in 264.74s (0:04:24) =====
+signal-land-r2_20260927_060607.log: = 10 failed, 5632 passed, 11 skipped, 64 xfailed, 50 warnings in 615.65s (0:10:15) =
+signal-r1_20260927_010028.log: = 1 failed, 4770 passed, 7 skipped, 18 xfailed, 44 warnings in 233.66s (0:03:53) =
+signal-r2_20260927_015825.log: ===== 4946 passed, 7 skipped, 19 xfailed, 50 warnings in 300.31s (0:05:00) =====
+signal-r3_20260927_030349.log: = 3 failed, 5366 passed, 7 skipped, 64 xfailed, 55 warnings in 350.80s (0:05:50) =
+signal-r3b_20260927_031444.log: = 1 failed, 5398 passed, 7 skipped, 64 xfailed, 52 warnings in 349.81s (0:05:49) =
+snapshot 07:19:18
+exit=1
+= 2 failed, 5652 passed, 11 skipped, 64 xfailed, 50 warnings in 581.23s (0:09:41) =
+FAILED tests/test_engine_r5_rows_llm.py::test_stock_buy_row_join_keys_never_break_the_row
+FAILED tests/test_engine_r5_rows_llm.py::test_stock_buy_row_preexisting_keys_byte_identical_ab

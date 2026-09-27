@@ -10,6 +10,7 @@ Bar-fetching and ATR logic live in market_data.py.
 # NOTE: yfinance must be imported BEFORE torch to avoid CUDA's bundled
 # SQLite library overriding the system one (breaks yfinance's cache).
 import joblib
+import numpy as np
 import os
 import time
 import torch
@@ -59,6 +60,41 @@ _MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Missing-feature sets already warned about (once per set, not per cycle)
 _warned_missing: set[tuple] = set()
+
+# FIX-R1 (2026-09) non-finite parity guard. Neutral value = 0.0: exactly what
+# the harvest writes for a NaN archive feature (harvest_crypto_data.
+# _fill_archive_features) and what every live injection branch above serves
+# when it has no value. The twin in scripts/hypersearch_v2.py
+# (_sanitize_nonfinite_features) must stay behaviour-identical —
+# tests/test_oi_inf_2026_09.py pins both on the same inputs.
+NONFINITE_FILL = 0.0
+
+
+def _sanitize_nonfinite_features(X, fill=NONFINITE_FILL, copy=True):
+    """Replace +-inf (-> NaN) and NaN in a feature matrix with `fill`.
+
+    Returns (X_out, n_nonfinite, n_inf, bad_col_idx) — bad_col_idx indexes
+    the last axis (feature columns). NOT model-facing for finite input:
+    an all-finite (or non-float) matrix is returned as the SAME object,
+    untouched, so scaled inputs stay bit-identical. Only a matrix that
+    would otherwise feed inf/NaN into RobustScaler ((inf - median) / iqr =
+    inf) and the LSTM/LightGBM legs changes.
+    """
+    X = np.asarray(X)
+    if X.dtype.kind not in 'fc':
+        return X, 0, 0, []
+    bad = ~np.isfinite(X)
+    n_bad = int(np.count_nonzero(bad))
+    if n_bad == 0:
+        return X, 0, 0, []
+    n_inf = int(np.count_nonzero(np.isinf(X)))
+    bad_cols = np.flatnonzero(
+        bad.reshape(-1, X.shape[-1]).any(axis=0)).tolist()
+    if copy:
+        X = X.copy()
+    X[bad] = fill
+    return X, n_bad, n_inf, bad_cols
+
 
 # Live cross-sectional panel features, registered each cycle by the stock
 # loop's panel pre-pass (panel_ranks.compute_live_panel_ranks)
@@ -430,6 +466,19 @@ def get_live_prediction(symbol, model, scaler_X, config, feature_cols,
     # avoiding scaling the discarded leading rows every ~30s cycle per symbol
     # (a Jetson hot-path waste). Batch paths (backtest/hypersearch) still need
     # the full transform and are left untouched.
+    # FIX-R1 parity guard: a non-finite live input (e.g. a pre-fix OI
+    # inf) would otherwise go through the scaler as inf and yield a
+    # garbage/NaN prediction. No-op (same array) on finite input. Runs on
+    # the frame's matrix (one isfinite pass over ~1e4-1e5 values —
+    # negligible next to the scaler/LSTM) so the sliced transform below
+    # stays the pinned literal (tests/test_scaler_slice_equiv.py).
+    current_features, _n_bad, _n_inf, _bad_idx = \
+        _sanitize_nonfinite_features(current_features)
+    if _n_bad:
+        _bad_cols = [feature_cols[j] for j in _bad_idx]
+        print(f"  [FEATURES] {symbol}: {_n_bad} non-finite input value(s) "
+              f"({_n_inf} inf) in {_bad_cols[:4]} -> neutral "
+              f"{NONFINITE_FILL}")
     sequence = scaler_X.transform(current_features[-seq_len:])
     sequence = sequence.reshape(1, seq_len, -1)
     tensor_input = torch.tensor(sequence, dtype=torch.float32).to(dev)

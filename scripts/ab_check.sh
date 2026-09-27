@@ -14,6 +14,13 @@
 # intentional change (see the command in its own header comment).
 #
 # Usage: bash scripts/ab_check.sh   (or ./scripts/ab_check.sh, or sh scripts/ab_check.sh)
+#
+# Repo-root hygiene: tests/conftest.py prints a `== repo-root hygiene ==` section
+# (files CREATED/MODIFIED directly in <repo>/ or <repo>/tests/ during the run);
+# this script echoes that block after the suite summary. Report-only by default —
+# it does NOT affect the verdict. Opt-in enforcement: run with
+# TRADER_TESTS_STRICT_CLEAN=1 (passed through to pytest) and any NEW/MOD line
+# also makes this script exit 1. A missing section is only a warning.
 
 set -eu
 
@@ -111,7 +118,30 @@ echo ""
 echo "ab_check: suite summary: $SUMMARY_LINE"
 echo ""
 
+# Repo-root hygiene block (tests/conftest.py): its header plus the contiguous
+# lines in the section's own vocabulary (clean / NEW / MOD / ALW / strict / could
+# not write / test logs: / production log untouched: — the last two added by
+# INTEL W18 with the TRADER_LOG_DIR test-session log dir). Informational unless TRADER_TESTS_STRICT_CLEAN=1.
+HYGIENE_BLOCK=$(awk '/^=+ repo-root hygiene =+$/ {f=1; print; next}
+                     f && /^(clean$|NEW |MOD |ALW |strict |could not write |test logs: |production log untouched: )/ {print; next}
+                     {f=0}' "$RAW_OUT")
+HYGIENE_DIRTY=0
+if [ -n "$HYGIENE_BLOCK" ]; then
+    printf '%s\n' "$HYGIENE_BLOCK"
+    if printf '%s\n' "$HYGIENE_BLOCK" | grep -Eq '^(NEW|MOD) '; then
+        HYGIENE_DIRTY=1
+    fi
+else
+    echo "ab_check: note — no repo-root hygiene section in the pytest output (conftest hook not loaded?)"
+fi
+echo ""
+
 STATUS=0
+if [ "${TRADER_TESTS_STRICT_CLEAN:-}" = "1" ] && [ "$HYGIENE_DIRTY" -eq 1 ]; then
+    STATUS=1
+    echo "ab_check: TRADER_TESTS_STRICT_CLEAN=1 and the repo root is not clean (NEW/MOD lines above) — FAIL"
+    echo ""
+fi
 if [ -n "$NEW_NAMES" ]; then
     STATUS=1
     echo "NEW failures (regressions — not in baseline):"
@@ -163,6 +193,8 @@ fi
 echo ""
 if [ "$STATUS" -eq 0 ]; then
     echo "ab_check: PASS — zero regressions vs tests/baseline_failures.txt"
+elif [ -z "$NEW_NAMES" ]; then
+    echo "ab_check: FAIL — repo root not clean under TRADER_TESTS_STRICT_CLEAN=1 (no new failing test names)"
 else
     echo "ab_check: FAIL — new failing test names vs tests/baseline_failures.txt"
 fi

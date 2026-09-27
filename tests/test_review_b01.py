@@ -437,8 +437,9 @@ def test_execute_sells_routes_external_close_through_helper():
     seg = _extract_method(STOCK_SRC, 'StockLoop', '_execute_sells')
     assert '_journal_external_close' in seg
     # the not-found detection is still string-matched before dropping
-    for needle in ("'not found'", "'404'", "'no position'"):
-        assert needle in seg
+    # 2026-09-26: the hand-written needles were replaced by the shared helper
+    # order_utils._is_not_found (which also recognises 'position does not exist').
+    assert '_is_not_found(e)' in seg
 
 
 # ---------------------------------------------------------------------------

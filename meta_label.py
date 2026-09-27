@@ -825,6 +825,224 @@ def _gen_meta_rows(tdf, preds, asset_type, threshold, policy, *,
     return rows, labels, nets, times, exit_times
 
 
+# ---------------------------------------------------------------------------
+# OOF meta-frame dump (SIG-R3-METADUMP, 2026-09) — INSTRUMENTATION ONLY
+# ---------------------------------------------------------------------------
+# Env-only switch, read ONCE per train_meta call: TRADER_META_FRAME_DUMP
+#   unset / '' / 0 / false / no / off -> no dump, no extra computation (default)
+#   1 / true / yes / on               -> <repo>/logs/meta_frame_dump/ (gitignored)
+#   anything else                     -> that DIRECTORY (created if missing)
+# Files: {p}meta_frame.npz (per-row frame) + {p}meta_frame.json (provenance
+# sidecar, written LAST as the commit marker). The {p} book prefix keeps the
+# crypto and stock meta phases of one pipeline run from clobbering each other,
+# and the names match none of the meta artifact globs (_paths / .gitignore).
+# The dump never changes what train_meta computes, returns or publishes: it
+# runs after the calibrator exists, reads only already-built arrays (plus, on
+# the purged_oof branch, one extra legacy-style calibrator fit whose object is
+# discarded), and every failure is logged and swallowed.
+META_FRAME_DUMP_ENV = 'TRADER_META_FRAME_DUMP'
+META_FRAME_DUMP_SCHEMA = 'meta_frame_dump/v1'
+_DUMP_OFF = ('', '0', 'false', 'no', 'off')
+_DUMP_DEFAULT_ON = ('1', 'true', 'yes', 'on')
+
+
+def _meta_frame_dump_target(prefix: str = ''):
+    """(npz_path, json_path) when the dump is requested, else None. Pure."""
+    raw = os.environ.get(META_FRAME_DUMP_ENV)
+    if raw is None or raw.strip().lower() in _DUMP_OFF:
+        return None
+    v = raw.strip()
+    d = (BASE_DIR / 'logs' / 'meta_frame_dump'
+         if v.lower() in _DUMP_DEFAULT_ON else Path(v).expanduser())
+    p = f'{prefix}_' if prefix else ''
+    return d / f'{p}meta_frame.npz', d / f'{p}meta_frame.json'
+
+
+def _json_safe(o):
+    if hasattr(o, 'item'):
+        try:
+            return o.item()
+        except Exception:
+            pass
+    return str(o)
+
+
+def _p_list(a) -> list:
+    """Float list with non-finite -> None (strict JSON; reliability_report
+    reads None back as NaN via np.asarray(..., float))."""
+    return [float(v) if np.isfinite(v) else None
+            for v in np.asarray(a, float).ravel()]
+
+
+def _fit_legacy_calib_for_dump(raw_val, y_slice):
+    """The legacy same-slice calibrator exactly as train_meta's legacy branch
+    builds it (slice guard; CALIBRATION_V2 -> fit_calibrator, else sklearn
+    isotonic) — refit ONLY for the dump's p_legacy arm when the purged branch
+    was the one used. Returns None when the legacy branch would have refused."""
+    raw_val = np.asarray(raw_val, float)
+    y_slice = np.asarray(y_slice, float)
+    if _calib_slice_guard(raw_val, y_slice) is not None:
+        return None
+    if _calibration_v2_on():
+        from calibration import fit_calibrator
+        return fit_calibrator(raw_val, y_slice)
+    from sklearn.isotonic import IsotonicRegression
+    return IsotonicRegression(out_of_bounds='clip').fit(raw_val, y_slice)
+
+
+def _dump_meta_frame(target, *, prefix, booster, X, y, order, ts, exit_ts,
+                     net_list, tickers, split, p_served, calib_prov, oof_raw,
+                     params):
+    """Write the sorted OOF meta frame + provenance. Never raises.
+
+    Columns (npz, one row per replayed trade, in train_meta's post-argsort
+    row order = the order every split/fold below refers to):
+      row, ticker, entry_time_ns, exit_time_ns, entry_e, exit_e (epoch s,
+      exactly the purged branch's convention), fold_id (purged k=5 test fold
+      over entry_e/exit_e with train_meta's embargo, -1 if unassigned), split
+      ('train' = rows[:split] the booster fit on, 'earlystop' = rows[split:]
+      it early-stopped on and the legacy calibrator fits on), y, net_pct,
+      raw_score (full-sample booster), raw_oof (purged OOF raw score; NaN
+      when the purged branch did not run/failed), p_served (the published
+      calibrator's p == train_meta's p_all), p_legacy (legacy same-slice
+      calibrator; refit here when the purged branch was the one used),
+      p_purged (purged calibrator; NaN when not fitted), X (n x |features|)
+      + feature_names.
+    The JSON sidecar carries calib_prov, counts, params/n_iter, and — for
+    scripts/reliability_report.py — top-level p_legacy / p_purged / y over
+    the 'earlystop' slice (p_purged only when the purged calibrator exists).
+    """
+    try:
+        import pandas as pd
+        npz_path, json_path = Path(target[0]), Path(target[1])
+        npz_path.parent.mkdir(parents=True, exist_ok=True)
+        order = np.asarray(order)
+        X = np.asarray(X, float)
+        y = np.asarray(y, float).ravel()
+        n = int(len(y))
+        split = int(split)
+        # ts / exit_ts / net_list / tickers arrive in accumulation order;
+        # X and y were already permuted by `order` inside train_meta.
+        tss = [pd.Timestamp(t) for t in np.asarray(ts, dtype=object)[order]]
+        ets = [pd.Timestamp(t) for t in np.asarray(exit_ts, dtype=object)[order]]
+        net_sorted = np.asarray(net_list, float)[order]
+        tickers_sorted = [str(t) for t in np.asarray(tickers, dtype=object)[order]]
+        if not (len(tss) == len(ets) == len(net_sorted) == len(tickers_sorted)
+                == len(X) == n):
+            raise ValueError(f'length mismatch n={n} X={len(X)} ts={len(tss)} '
+                             f'exit={len(ets)} net={len(net_sorted)} '
+                             f'tickers={len(tickers_sorted)}')
+        raw_score = np.asarray(booster.predict(X), float).ravel()
+        calib_used = (calib_prov or {}).get('used')
+        best_iteration = getattr(booster, 'best_iteration', None)
+        entry_ns = np.array([t.value for t in tss], dtype=np.int64)
+        exit_ns = np.array([t.value for t in ets], dtype=np.int64)
+        entry_e = np.array([t.timestamp() for t in tss], float)
+        exit_e = np.array([t.timestamp() for t in ets], float)
+        embargo = _calibration_embargo()
+        fold_id = np.full(n, -1, dtype=np.int16)
+        try:
+            from calibration import purged_kfold_indices
+            for fid, (_tr, te) in enumerate(
+                    purged_kfold_indices(entry_e, exit_e, k=5,
+                                         embargo=embargo)):
+                fold_id[te] = fid
+        except Exception as e:
+            print(f"[META] frame dump: fold ids unavailable ({e})")
+        p_served = np.asarray(p_served, float).ravel()
+        oof_raw = (np.full(n, np.nan) if oof_raw is None
+                   else np.asarray(oof_raw, float).ravel())
+        nanv = np.full(n, np.nan)
+        if calib_used == 'purged_oof':
+            p_purged = p_served
+            p_legacy = nanv
+            try:
+                legacy_calib = _fit_legacy_calib_for_dump(raw_score[split:],
+                                                          y[split:])
+                if legacy_calib is not None:
+                    p_legacy = np.clip(np.asarray(
+                        legacy_calib.predict(raw_score), float), 0.0, 1.0)
+            except Exception as e:
+                print(f"[META] frame dump: legacy arm unavailable ({e})")
+        else:
+            p_legacy, p_purged = p_served, nanv
+        split_lab = np.where(np.arange(n) < split, 'train', 'earlystop')
+        tmp = f'{npz_path}.tmp.{os.getpid()}'
+        try:
+            with open(tmp, 'wb') as f:
+                np.savez_compressed(
+                    f, row=np.arange(n, dtype=np.int64),
+                    ticker=np.asarray(tickers_sorted, dtype=np.str_),
+                    entry_time_ns=entry_ns, exit_time_ns=exit_ns,
+                    entry_e=entry_e, exit_e=exit_e, fold_id=fold_id,
+                    split=split_lab.astype(np.str_), y=y,
+                    net_pct=net_sorted,
+                    raw_score=raw_score, raw_oof=oof_raw, p_served=p_served,
+                    p_legacy=np.asarray(p_legacy, float).ravel(),
+                    p_purged=np.asarray(p_purged, float).ravel(), X=X,
+                    feature_names=np.asarray(list(META_FEATURES),
+                                             dtype=np.str_))
+            os.replace(tmp, npz_path)
+        finally:
+            try:
+                os.unlink(tmp)   # no-op after a successful replace
+            except OSError:
+                pass
+        es = slice(split, n)
+        have_purged = bool(np.isfinite(p_purged).any())
+        sidecar = {
+            'schema': META_FRAME_DUMP_SCHEMA,
+            'prefix': prefix, 'asset_type': prefix or 'crypto',
+            'npz': npz_path.name,
+            'artifacts': {k: str(v) for k, v in _paths(prefix).items()},
+            'calibration': calib_prov,
+            'counts': {
+                'n_rows': n, 'n_train': split, 'n_earlystop': n - split,
+                'n_oof_finite': int(np.isfinite(oof_raw).sum()),
+                'n_tickers': int(len(set(tickers_sorted))),
+                'base_rate': float(np.mean(y)) if n else None,
+                'fold_sizes': [int((fold_id == k).sum()) for k in range(5)],
+            },
+            'split_index': split,
+            'kfold': {'k': 5, 'embargo': embargo},
+            'best_iteration': (int(best_iteration)
+                               if best_iteration is not None else None),
+            'n_iter_purged': int(best_iteration or 200),
+            'params': dict(params),
+            'features': list(META_FEATURES),
+            'reliability_slice': 'earlystop',
+            'reliability_holdout_honest': False,
+            'reliability_caveat': (
+                "rows[split:] are the booster's early-stop slice and the "
+                "legacy calibrator's own fit slice (in-sample for the legacy "
+                "arm, biased in its favour); the purged calibrator was fit on "
+                "OOF scores over all rows. Not the post-cutoff holdout "
+                "reliability_report's docstring asks for."),
+            'y': _p_list(y[es]),
+            'p_legacy': _p_list(np.asarray(p_legacy, float)[es]),
+        }
+        if have_purged:
+            sidecar['p_purged'] = _p_list(np.asarray(p_purged, float)[es])
+        jtmp = f'{json_path}.tmp.{os.getpid()}'
+        try:
+            with open(jtmp, 'w') as f:
+                json.dump(sidecar, f, indent=1, default=_json_safe)
+            os.replace(jtmp, json_path)
+        finally:
+            try:
+                os.unlink(jtmp)
+            except OSError:
+                pass
+        print(f"[META] frame dump: {n} rows ({split} train / {n - split} "
+              f"earlystop, calib={calib_used}, purged_arm={have_purged}) -> "
+              f"{npz_path}")
+        return npz_path
+    except Exception as e:
+        print(f"[META] frame dump failed ({type(e).__name__}: {e}) — "
+              f"training continues")
+        return None
+
+
 def train_meta(prefix: str = '', publish: bool = True) -> bool:
     import joblib
     try:
@@ -839,6 +1057,9 @@ def train_meta(prefix: str = '', publish: bool = True) -> bool:
                           _load_q10, _entry_window_mask)
     import datetime as _dt
 
+    # SIG-R3-METADUMP: env read ONCE; None (the default) = no dump and no
+    # extra work anywhere below (every dump line is behind this check).
+    _dump_target = _meta_frame_dump_target(prefix)
     asset_type = prefix or 'crypto'
     try:
         model, scaler, config, feature_cols = _load_artifacts(prefix)
@@ -905,6 +1126,7 @@ def train_meta(prefix: str = '', publish: bool = True) -> bool:
     # In-sample fallback population, built in the same pass when the OOF
     # path is active (predictions dominate cost; rows are 13 floats each).
     X_is, y_is, net_is, ts_is, exit_ts_is = [], [], [], [], []
+    tk_rows, tk_rows_is = [], []   # per-row ticker, filled only for the dump
     diag_tot = {'rows_legacy': 0, 'rows_parity': 0, 'n_bars': 0,
                 'n_covered': 0, 'edge_floor_pct': None,
                 'drops': {'lockout': 0, 'edge_floor': 0,
@@ -941,6 +1163,8 @@ def train_meta(prefix: str = '', publish: bool = True) -> bool:
             q10_preds=q10_arr, q10_floor=q10_floor, diag=tk_diag)
         X.extend(r); y.extend(l); net_list.extend(nr)
         ts.extend(t); exit_ts.extend(et)
+        if _dump_target is not None:
+            tk_rows.extend([str(ticker)] * len(r))
         for k in ('rows_legacy', 'rows_parity', 'n_bars', 'n_covered'):
             diag_tot[k] += tk_diag.get(k, 0)
         for k in diag_tot['drops']:
@@ -953,6 +1177,8 @@ def train_meta(prefix: str = '', publish: bool = True) -> bool:
                 q10_preds=q10_arr, q10_floor=q10_floor, diag=None)
             X_is.extend(r2); y_is.extend(l2); net_is.extend(nr2)
             ts_is.extend(t2); exit_ts_is.extend(et2)
+            if _dump_target is not None:
+                tk_rows_is.extend([str(ticker)] * len(r2))
         n_used += 1
         print(f"  [META] {ticker}: {len(r)} replayed trades")
     # Free the harvest frame and the primary BEFORE LightGBM allocates —
@@ -983,6 +1209,7 @@ def train_meta(prefix: str = '', publish: bool = True) -> bool:
                       f"in-sample population")
                 oof_fallback_reason = f'oof_starved(n={len(X)})'
                 X, y, net_list, ts, exit_ts = X_is, y_is, net_is, ts_is, exit_ts_is
+                tk_rows = tk_rows_is
             else:
                 pred_source, tier = 'oof', tier_name
         else:
@@ -1032,6 +1259,7 @@ def train_meta(prefix: str = '', publish: bool = True) -> bool:
     # closing that (per-fold early stop) is an owner decision. Fail-open to legacy.
     from strategy_config import META_CALIBRATION_MODE
     calib = None
+    _oof_raw = None   # purged OOF raw scores, kept only as a dump input
     calib_prov = {'mode_requested': META_CALIBRATION_MODE, 'used': 'legacy',
                   'fallback_reason': None, 'oof_rows': None,
                   'embargo': _calibration_embargo(),
@@ -1050,6 +1278,7 @@ def train_meta(prefix: str = '', publish: bool = True) -> bool:
 
             oof = crossfit_oof_predict(_fold_fit_predict, X, y, entry_e, exit_e,
                                        k=5, embargo=_calibration_embargo())
+            _oof_raw = oof
             calib = fit_calibrator(oof, y)
             if calib is not None:
                 calib_prov['used'] = 'purged_oof'
@@ -1132,6 +1361,14 @@ def train_meta(prefix: str = '', publish: bool = True) -> bool:
     calib_prov['guard_reasons'] = _publish_guard_reasons(p_all, val_auc,
                                                          frac_veto)
     calib_prov['publish_guards_ok'] = not calib_prov['guard_reasons']
+    if _dump_target is not None:
+        # SIG-R3-METADUMP (instrumentation): after the calibrator + guard
+        # verdict exist, before refusal/staging. Never raises; mutates nothing.
+        _dump_meta_frame(_dump_target, prefix=prefix, booster=booster, X=X,
+                         y=y, order=order, ts=ts, exit_ts=exit_ts,
+                         net_list=net_list, tickers=tk_rows, split=split,
+                         p_served=p_all, calib_prov=calib_prov,
+                         oof_raw=_oof_raw, params=params)
     if calib_prov['guard_reasons']:
         print(f"[META] REFUSING to publish: {calib_prov['guard_reasons']} — "
               f"previous meta triple stays live")

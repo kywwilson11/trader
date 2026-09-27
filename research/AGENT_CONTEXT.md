@@ -69,7 +69,7 @@ two-machine table and the numbered gotchas.
 - **Regression check: `bash scripts/ab_check.sh`** — diffs the full suite's
   failure NAMES against `tests/baseline_failures.txt` (the known dev-Mac
   missing-dependency set). Exit 0 = clean. Any NEW name is yours to fix or
-  revert. (On Jetson/CI with full deps the suite is green.)
+  revert. (The Jetson/CI suite state is recorded in `CLAUDE.md` § Running tests.)
 
 ## Style
 Match surrounding code; comments only for constraints code can't show; be

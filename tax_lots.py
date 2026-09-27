@@ -22,10 +22,31 @@ DEFAULT_FED_SHORT_TERM = 0.37
 DEFAULT_FED_LONG_TERM = 0.20
 DEFAULT_STATE_RATE = 0.05
 
-# IRS long-term boundary: a lot must be held for MORE than one year (366+
-# calendar days out) to qualify for long-term treatment; exactly 365 days is
-# still short-term. gui.py's original used `>= 365`, off by one.
+# IRS long-term boundary: a lot must be held for MORE than one year to
+# qualify for long-term treatment — i.e. sold AFTER the calendar anniversary of
+# the purchase date (see _is_long_term). In a year with no 29 Feb in the
+# holding window that is the same as 366+ days; across a 29 Feb the exact
+# anniversary is 366 days out and is still short-term. gui.py's original used
+# `>= 365` days (off by one); the interim `> 365` days misclassified a lot held
+# exactly one year across a leap day. Kept for reference / importers only —
+# no longer the boundary arithmetic.
 LONG_TERM_DAYS = 365
+
+# Order statuses whose filled_qty is a REAL execution even though the order is
+# not status == "filled": Alpaca reports a partially-filled order that was later
+# canceled / expired / done-for-day with that terminal status and filled_qty > 0
+# (filled_avg_price + filled_at set). Those shares really traded, so they are
+# lots / matched sells. Deliberately NOT included: "new"/"accepted"/
+# "pending_new" (cannot carry fills — a fill moves them to partially_filled)
+# and "replaced" (the fill history continues on the replacement order; counting
+# both could double-count).
+FILL_BEARING_STATUSES = frozenset(
+    {"partially_filled", "canceled", "expired", "done_for_day"})
+
+# Quantity tolerance for lot consumption: float subtraction of decimal
+# quantities leaves ~1e-17 dust that must not read as an unmatched sell /
+# open lot (e.g. buy 0.3, sell 0.1, sell 0.2 -> remaining 2.8e-17).
+QTY_EPS = 1e-9
 
 
 def _field(order, key, default=None):
@@ -61,14 +82,58 @@ def _parse_time(value):
         return None
 
 
+def _one_year_after(d):
+    """Calendar anniversary of date `d` (same month/day next year). A 29 Feb
+    purchase maps to 28 Feb of the (non-leap) next year, so a sale on 1 Mar is
+    the first long-term day — the IRS "more than one year" reading."""
+    try:
+        return d.replace(year=d.year + 1)
+    except ValueError:  # 29 Feb -> next year has no 29 Feb
+        return d.replace(year=d.year + 1, day=28)
+
+
 def _is_long_term(buy_time, sell_time):
-    """True iff held strictly MORE than LONG_TERM_DAYS days. Missing/
-    unparseable timestamps count as short-term — same net effect as gui.py's
-    original `except Exception: days_held = 0` fallback (0 >= 365 was always
-    False, so treating it as short-term here is behavior-preserving)."""
+    """True iff the lot was held MORE than one year: the sale date is strictly
+    after the calendar anniversary of the purchase date (so the exact
+    anniversary is still short-term, including the 366-day anniversary of a
+    holding period that spans 29 Feb). Dates are compared in UTC (Alpaca
+    timestamps; a naive value is taken as UTC). Missing/unparseable timestamps
+    count as short-term — same net effect as gui.py's original
+    `except Exception: days_held = 0` fallback."""
     if buy_time is None or sell_time is None:
         return False
-    return (sell_time - buy_time).days > LONG_TERM_DAYS
+    try:
+        def _utc_date(t):
+            if t.tzinfo is None:
+                return t.date()
+            return t.astimezone(dt.timezone.utc).date()
+        return _utc_date(sell_time) > _one_year_after(_utc_date(buy_time))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def _positive_float(value):
+    """float(value) if it parses and is > 0, else 0.0 (never raises)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if v > 0 else 0.0
+
+
+def order_has_fill(order):
+    """True iff `order` carries a real execution that belongs in the tax lots /
+    Recent Fills: it has a filled_avg_price AND either status == "filled" or a
+    fill-bearing terminal/partial status (FILL_BEARING_STATUSES) with
+    filled_qty > 0. Shared by estimate_taxes and gui.py's Recent Fills table so
+    the two can never disagree about what counts as a fill."""
+    if not _field(order, "filled_avg_price"):
+        return False
+    status = _field(order, "status")
+    if status == "filled":
+        return True
+    return (status in FILL_BEARING_STATUSES
+            and _positive_float(_field(order, "filled_qty")) > 0)
 
 
 def _mintax_sort_key(lot, sell_price, sell_time_str):
@@ -110,7 +175,9 @@ def estimate_taxes(
             DataFetcher.fetch_orders() output — dicts (or attribute-style
             objects; see _field) with symbol/side/status/filled_at/
             filled_qty (falls back to qty)/filled_avg_price. Only fills
-            (status == "filled" with a filled_avg_price) are considered.
+            are considered (order_has_fill): status == "filled", or a
+            canceled/expired/partially_filled/done_for_day order whose
+            filled_qty > 0 — both with a filled_avg_price.
         fed_short: federal short-term capital-gains rate (ordinary income).
         fed_long: federal long-term capital-gains rate.
         state_rate: flat state rate added on top of both tiers.
@@ -154,10 +221,7 @@ def estimate_taxes(
     realized = []
     unmatched_sell_qty = 0.0
 
-    filled = [
-        o for o in orders
-        if _field(o, "status") == "filled" and _field(o, "filled_avg_price")
-    ]
+    filled = [o for o in orders if order_has_fill(o)]
     filled.sort(key=lambda o: _field(o, "filled_at", "") or "")
 
     for o in filled:
@@ -178,7 +242,7 @@ def estimate_taxes(
         elif side == "sell":
             remaining = qty
             buys[sym].sort(key=lambda lot: _mintax_sort_key(lot, price, filled_at))
-            while remaining > 0 and buys[sym]:
+            while remaining > QTY_EPS and buys[sym]:
                 lot = buys[sym][0]
                 matched = min(remaining, lot["qty"])
                 gain = (price - lot["price"]) * matched
@@ -189,9 +253,9 @@ def estimate_taxes(
                 })
                 lot["qty"] -= matched
                 remaining -= matched
-                if lot["qty"] <= 0:
+                if lot["qty"] <= QTY_EPS:
                     buys[sym].pop(0)
-            if remaining > 0:
+            if remaining > QTY_EPS:
                 unmatched_sell_qty += remaining
 
     total_gain = sum(r["gain"] for r in realized)

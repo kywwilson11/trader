@@ -15,6 +15,7 @@ haircut were DELETED 2026-08-22 by owner ruling (KILL_LIST pending ask #3:
 research/campaign_2026-08/08_removed_code.md.
 """
 
+import math
 import time
 from log_config import get_logger
 
@@ -114,9 +115,16 @@ def fetch_vix() -> float | None:
         hist = vix.history(period='5d')
         if hist is not None and not hist.empty:
             val = float(hist['Close'].iloc[-1])
-            _set_cached('vix', val)
-            logger.info("[MACRO] VIX: %.1f", val)
-            return val
+            # A not-yet-populated last row reads Close=NaN. Accept only a
+            # finite, positive level: a NaN VIX silently passes every ladder
+            # at 1.0x AND evades the `vix is None` blind-warning/degraded
+            # clamp, and would be cached for the full TTL. Fall to FRED.
+            if math.isfinite(val) and val > 0:
+                _set_cached('vix', val)
+                logger.info("[MACRO] VIX: %.1f", val)
+                return val
+            logger.debug("[MACRO] VIX yfinance close non-finite/non-positive "
+                         "(%r) — trying FRED", val)
     except Exception as e:
         logger.debug("[MACRO] VIX fetch error: %s", e)
 
@@ -131,6 +139,8 @@ def fetch_vix() -> float | None:
             parts = line.split(',')
             if len(parts) == 2 and parts[1] not in ('.', 'VIXCLS', ''):
                 val = float(parts[1])
+                if not (math.isfinite(val) and val > 0):
+                    continue            # never cache/serve a NaN/inf/<=0 level
                 _set_cached('vix', val)
                 logger.info("[MACRO] VIX (FRED fallback, 1d lag): %.1f", val)
                 return val

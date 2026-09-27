@@ -11,12 +11,28 @@ Row schema (tagged union on `action`; `ts` on every row):
                   llm_multiplier, llm_score, llm_reasoning, final_notional,
                   decision_price, fill_price, slippage_bps, entry_tactic, maker,
                   skip_reason(=None); optional conviction fields + nested `sizing`.
+                  ENGINE r4 R4-a (base_loop._place_and_track_buy; since r5 also
+                  stock_loop._execute_buys; None when unknown): order_id
+                  (broker id of the acquiring order; maker ladder = the rung
+                  returned), decision_bid, decision_ask, decision_quote_ts
+                  (epoch s the decision quote was fetched), decision_quote_t
+                  (r5: exchange quote time, epoch s — get_quote's quote_t).
   "sell"          symbol, exit_reason, pnl_pct, decision_price, fill_price,
-                  slippage_bps, estimated.
+                  slippage_bps, estimated. ENGINE r4 R4-a: + order_id ONLY
+                  when the exit order carries one.
   "skip"          symbol, skip_reason (sentiment_block | llm_veto | meta_veto |
                   cost/qty_zero/…); optional pred_return, meta_prob, entry_rank,
                   + conviction fields (spread_pct, _fetch_failed, …).
-  "llm_analysis"  asset_type, forward_bars, scores={sym:{s,pred}}.
+  "llm_analysis"  asset_type, forward_bars, scores={sym:{s,pred,s_defaulted}};
+                  optional model, prompt_sha256, dedup_hit, latency_ms, cost_usd.
+                  s_defaulted (SCOUT_E A3): True when the parser substituted
+                  0.5 for a missing/non-numeric/non-finite s; None = unknown.
+  "llm_backoff"   asset_type, consecutive_failures, backoff_s (analyze_trades
+                  returned no scores); + outcome="no_scores", n_symbols_sent,
+                  latency_ms (SCOUT_E A1 ENGINE half).
+  "llm_error"     asset_type, outcome="exception", error_type (class name),
+                  n_symbols_sent, latency_ms — analyze_trades raised; the
+                  exception is re-raised after the row (SCOUT_E A1).
   "entry_window"  asset_type, n_candidates, admitted_k, admitted, veto_counts,
                   buys_allowed.
   "account_risk"  book, plus the record_book_risk_and_report payload.

@@ -178,6 +178,7 @@ def test_default_off_offline_flags():
     # procedures (see the comments above each constant in strategy_config.py).
     assert sc.IMPACT_COST_ENABLED is False
     assert sc.UNIQUENESS_WEIGHTS_ENABLED is False
-    assert sc.OBJECTIVE_LONG_ONLY is False
+    # 2026-09-27: flipped to True at the clean-rebuild gotcha-#2 event (see strategy_config.py comment)
+    assert sc.OBJECTIVE_LONG_ONLY is True
     assert sc.PREDICTION_CACHE_ENABLED is False
     assert sc.CROSS_BOOK_RHO == 1.0

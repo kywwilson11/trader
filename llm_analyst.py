@@ -15,12 +15,15 @@ On any failure, returns {} for pass-through (never blocks trades).
 import copy
 import hashlib
 import json
+import math
 import os
 import re
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from fundamentals import _safe_float  # FIX_E coercion: str/NaN/inf -> None
 from llm_config import load_llm_config
 from llm_client import (call_llm, call_model, get_recommended_model,
                         get_last_model_used)
@@ -34,6 +37,11 @@ except Exception:  # standalone use without the trading stack
     LLM_VETO_THRESHOLD = 0.15
 
 _ANALYSIS_FILE = Path(__file__).resolve().parent / "llm_analysis.json"
+# Serializes _save_analysis's load -> modify -> write within one process:
+# in combined-bots mode the crypto and stock loop THREADS both persist here,
+# and an unlocked interleave lets one thread's rebuild wipe the other's
+# freshly written section (2026-09 F3).
+_ANALYSIS_LOCK = threading.Lock()
 _REPLAY_DIR = Path(__file__).resolve().parent / "journals" / "llm_replay"
 
 _ANALYST_TEMPERATURE = 0.2  # a sizing gate should be near-deterministic
@@ -572,6 +580,11 @@ def analyze_trades(candidates: list[dict], asset_type: str,
         _cost0 = get_routing_info().get('daily_cost')
     except Exception:
         _cost0 = None
+    # INTEL W15 (SCOUT_E A1): attempt bookkeeping for the journals/llm_calls
+    # row — measurement-only, never read by any gate.
+    _call_path = 'call_model'
+    _transport_errors = []
+    _attempt_sha = _prompt_sha256(system, prompt)
     try:
         response = call_model(prompt, system=system,
                               model=analyst_model, max_tokens=max_tok,
@@ -580,20 +593,51 @@ def analyze_trades(candidates: list[dict], asset_type: str,
                               timeout=_ANALYST_TIMEOUT_SEC)
     except Exception as e:
         print(f"[LLM-ANALYST] call_model failed: {e}")
+        _transport_errors.append('call_model:' + type(e).__name__)
         response = None
     if not response:
+        _call_path = 'call_llm'
         try:
             response = call_llm(prompt, system=system,
                                 max_tokens=max_tok, json_schema=schema,
                                 temperature=_ANALYST_TEMPERATURE)
         except Exception as e:
             print(f"[LLM-ANALYST] call_llm fallback failed: {e}")
+            _transport_errors.append('call_llm:' + type(e).__name__)
             response = None
     if not response:
+        if persist:
+            # A1: a failed attempt used to leave NO journal trace. Same
+            # writer/gates as the success row (persist + replay_capture);
+            # fail-soft — the {} pass-through below is unchanged.
+            _fail_row = _build_call_row(
+                asset_type=asset_type, requested_model=analyst_model,
+                path=_call_path, response=response, result={},
+                diag=None, n_sent=n_syms,
+                latency_ms=int((time.monotonic() - _t0) * 1000),
+                max_tokens=max_tok, prompt_sha256=_attempt_sha,
+                advisor_v2=advisor_v2, transport_errors=_transport_errors,
+                cost0=_cost0)
+            if _fail_row is not None:
+                _journal_replay(candidates, asset_type, equity, positions,
+                                fng_value, model_config, position_details,
+                                {}, None, call_meta=_fail_row)
         return {}
 
     result = _parse_response(response, symbols, extended=advisor_v2)
     _latency_ms = int((time.monotonic() - _t0) * 1000)
+    _call_row = None
+    _parse_diag = None
+    if persist:
+        _parse_diag = _parse_diagnostics(response, symbols,
+                                         extended=advisor_v2)
+        _call_row = _build_call_row(
+            asset_type=asset_type, requested_model=analyst_model,
+            path=_call_path, response=response, result=result,
+            diag=_parse_diag, n_sent=n_syms, latency_ms=_latency_ms,
+            max_tokens=max_tok, prompt_sha256=_attempt_sha,
+            advisor_v2=advisor_v2, transport_errors=_transport_errors,
+            cost0=_cost0)
 
     # Persist analysis to disk for GUI display — recording the model that
     # ACTUALLY responded, not the one we asked for (fallbacks used to be
@@ -605,7 +649,7 @@ def analyze_trades(candidates: list[dict], asset_type: str,
         _save_analysis(result, asset_type, model_used)
         _journal_replay(candidates, asset_type, equity, positions,
                         fng_value, model_config, position_details, result,
-                        model_used)
+                        model_used, call_meta=_call_row)
 
         prompt_sha256_val = None
         try:
@@ -654,6 +698,28 @@ def analyze_trades(candidates: list[dict], asset_type: str,
         except Exception:
             pass
 
+        # SCOUT_E A3 hand-off to base_loop's llm_analysis row (ENGINE):
+        # get_last_analysis_meta()['parse_flags'][sym]['s_defaulted'].
+        # Additive key; only attached to THIS call's meta (guarded so a
+        # failed meta build above never carries these flags onto stale meta).
+        try:
+            if (_parse_diag is not None
+                    and _LAST_CALL_META.get('dedup_hit') is False
+                    and _LAST_CALL_META.get('latency_ms') == _latency_ms
+                    and _LAST_CALL_META.get('prompt_sha256')
+                    == prompt_sha256_val):
+                _LAST_CALL_META['parse_flags'] = copy.deepcopy(
+                    _parse_diag.get('parse_flags') or {})
+        except Exception:
+            pass
+    elif persist and _call_row is not None:
+        # Response arrived but parsed to nothing (parse_fail / not_object /
+        # no requested symbol): attempt row only — no replay record, so the
+        # prompt_ab / llm_qualify cycle readers never see a scoreless cycle.
+        _journal_replay(candidates, asset_type, equity, positions,
+                        fng_value, model_config, position_details,
+                        {}, _safe_last_model_used(), call_meta=_call_row)
+
     return result
 
 
@@ -700,63 +766,85 @@ def _save_analysis(result: dict, asset_type: str, model: str):
     """
     ts = datetime.now(timezone.utc).isoformat(timespec='seconds')
 
-    # Load existing
-    data = load_analysis()
+    with _ANALYSIS_LOCK:
+        # Load existing
+        data = load_analysis()
 
-    # Update the asset_type section
-    section = data.setdefault(asset_type, {})
-    for sym, entry in result.items():
-        m = entry.get("m")
-        if m is None and "s" in entry:
-            m = entry["s"] * 1.5
-        if m is None:
-            print(f"[LLM-ANALYST] Skipping {sym}: entry has neither 'm' nor 's'")
-            continue
-        record = {
-            "m": m,
-            "s": entry.get("s", m / 1.5),
-            "r": entry.get("r", ""),
-            "bull": entry.get("bull", ""),
-            "bear": entry.get("bear", ""),
-            "timestamp": ts,
-            "model": model,
-        }
-        # _parse_response's `if extended:` block sets all five v2 keys
-        # together (never a subset) only when analyze_trades ran the
-        # advisor-v2 schema — so presence of "p_up" on `entry` IS the "was
-        # this call v2" signal, with zero extra plumbing needed. On the
-        # default (v1) path `entry` has none of these keys, so `record`
-        # keeps exactly its original 7 keys — byte-identical to before,
-        # pinned by
-        # test_llm_advisor.py::test_analyze_trades_default_llm_analysis_json_keys.
-        # Never fabricated: a field present-but-unparseable on `entry`
-        # (e.g. p_up failed to coerce to float) is already None there and
-        # is persisted as None, not invented.
-        if "p_up" in entry:
-            record["p_up"] = entry.get("p_up")
-            record["conviction"] = entry.get("conviction")
-            record["abstain"] = entry.get("abstain")
-            record["key_risks"] = _bounded_str_list(entry.get("key_risks"))
-            record["event_flags"] = _bounded_str_list(entry.get("event_flags"))
-            record["prompt_version"] = PROMPT_VERSION_V2
-        section[sym] = record
+        # Update the asset_type section
+        section = data.setdefault(asset_type, {})
+        for sym, entry in result.items():
+            m = entry.get("m")
+            if m is None and "s" in entry:
+                m = entry["s"] * 1.5
+            if m is None:
+                print(f"[LLM-ANALYST] Skipping {sym}: entry has neither 'm' nor 's'")
+                continue
+            record = {
+                "m": m,
+                "s": entry.get("s", m / 1.5),
+                "r": entry.get("r", ""),
+                "bull": entry.get("bull", ""),
+                "bear": entry.get("bear", ""),
+                "timestamp": ts,
+                "model": model,
+            }
+            # _parse_response's `if extended:` block sets all five v2 keys
+            # together (never a subset) only when analyze_trades ran the
+            # advisor-v2 schema — so presence of "p_up" on `entry` IS the "was
+            # this call v2" signal, with zero extra plumbing needed. On the
+            # default (v1) path `entry` has none of these keys, so `record`
+            # keeps exactly its original 7 keys — byte-identical to before,
+            # pinned by
+            # test_llm_advisor.py::test_analyze_trades_default_llm_analysis_json_keys.
+            # Never fabricated: a field present-but-unparseable on `entry`
+            # (e.g. p_up failed to coerce to float) is already None there and
+            # is persisted as None, not invented.
+            if "p_up" in entry:
+                record["p_up"] = entry.get("p_up")
+                record["conviction"] = entry.get("conviction")
+                record["abstain"] = entry.get("abstain")
+                record["key_risks"] = _bounded_str_list(entry.get("key_risks"))
+                record["event_flags"] = _bounded_str_list(entry.get("event_flags"))
+                record["prompt_version"] = PROMPT_VERSION_V2
+            section[sym] = record
 
-    # Atomic write: crypto loop, stock loop, and the GUI refresh subprocess
-    # all write this file, and the GUI reads it concurrently. Write to a
-    # sibling .tmp file and os.replace() it in — this makes a crash or a
-    # concurrent reader see either the old complete file or the new
-    # complete file, never a half-written/corrupt one. The remaining
-    # read-modify-write race ACROSS processes (two writers both load-then-
-    # save around the same time, one's update is lost) is accepted —
-    # last-writer-wins per asset_type section; this fix is only for
-    # partial-read corruption, not cross-process update loss.
-    tmp_path = _ANALYSIS_FILE.with_name(_ANALYSIS_FILE.name + ".tmp")
-    try:
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp_path, _ANALYSIS_FILE)
-    except OSError as e:
-        print(f"[LLM-ANALYST] Error saving analysis: {e}")
+        # Atomic write: crypto loop, stock loop, and the GUI refresh subprocess
+        # all write this file, and the GUI reads it concurrently. Write to a
+        # sibling .tmp file and os.replace() it in — this makes a crash or a
+        # concurrent reader see either the old complete file or the new
+        # complete file, never a half-written/corrupt one. The remaining
+        # read-modify-write race ACROSS processes (two writers both load-then-
+        # save around the same time, one's update is lost) is accepted —
+        # last-writer-wins per asset_type section; this fix is only for
+        # partial-read corruption, not cross-process update loss.
+        #
+        # 2026-09 F3: the tmp name is PER WRITER ({pid}.{thread}) — a single
+        # shared ".tmp" let two concurrent writers O_TRUNC the same inode and
+        # os.replace interleaved bytes in (or fail with FileNotFoundError).
+        # Within this process _ANALYSIS_LOCK additionally serializes the whole
+        # load -> modify -> write, so the crypto and stock loop threads can no
+        # longer lose each other's section; only the cross-process lost update
+        # (GUI refresh subprocess) remains accepted, as above.
+        tmp_path = _ANALYSIS_FILE.with_name(
+            f"{_ANALYSIS_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, _ANALYSIS_FILE)
+        except OSError as e:
+            print(f"[LLM-ANALYST] Error saving analysis: {e}")
+            try:
+                os.unlink(tmp_path)   # never leave a per-writer tmp behind
+            except OSError:
+                pass
+            return
+        # The pre-F3 fixed tmp name ("llm_analysis.json.tmp") is no longer
+        # written by anyone, so a copy left by a crash under the old code is
+        # stale garbage — sweep it (best-effort) so it never lingers.
+        try:
+            os.unlink(_ANALYSIS_FILE.with_name(_ANALYSIS_FILE.name + ".tmp"))
+        except OSError:
+            pass
 
 
 def _build_symbol_profiles(symbols):
@@ -813,7 +901,7 @@ def _build_symbol_profiles(symbols):
             if len(close) >= 50:
                 sma50 = close.rolling(50).mean().iloc[-1]
                 techs.append(f"SMA50: ${sma50:.2f} ({(cur / sma50 - 1) * 100:+.1f}%)")
-            sma200 = info.get('twoHundredDayAverage')
+            sma200 = _safe_float(info.get('twoHundredDayAverage'))
             if sma200:
                 techs.append(f"SMA200: ${sma200:.2f} ({(cur / sma200 - 1) * 100:+.1f}%)")
 
@@ -867,7 +955,10 @@ def _build_symbol_profiles(symbols):
                 ('beta', 'Beta'),
                 ('shortRatio', 'ShortRatio'),
             ]:
-                v = info.get(key)
+                # G4-06: yfinance ships 'Infinity'/'N/A'/'' strings for
+                # numeric keys; coerce (non-numeric -> omitted) so one bad
+                # field can't drop the whole profile via the except below.
+                v = _safe_float(info.get(key))
                 if v is not None:
                     if key == 'marketCap':
                         if v >= 1e12:
@@ -881,7 +972,7 @@ def _build_symbol_profiles(symbols):
                     else:
                         fund.append(f"{label}: {v:.2f}")
             # Analyst targets
-            target = info.get('targetMeanPrice')
+            target = _safe_float(info.get('targetMeanPrice'))
             n_analysts = info.get('numberOfAnalystOpinions')
             rec = info.get('recommendationKey')
             if target and n_analysts:
@@ -1069,6 +1160,12 @@ def _parse_response(response: str, symbols: list[str],
     keys on each result entry. s/m/r/bull/bear handling is unchanged either
     way, so llm_analysis.json (which only ever reads that fixed key set)
     is unaffected regardless of `extended`.
+
+    Non-finite s -> neutral 0.5 (logged); non-finite p_up -> None;
+    non-finite conviction -> None (G4-07). INTEL W19 (class A, crash-path
+    only): an integer too large for float() (OverflowError) now takes those
+    same non-finite paths instead of escaping analyze_trades; finite inputs
+    are byte-identical.
     """
     text = response.strip()
     text = re.sub(r'^```(?:json)?\s*', '', text)
@@ -1091,9 +1188,23 @@ def _parse_response(response: str, symbols: list[str],
             continue
         s = entry.get("s", 0.5)
         try:
-            s = max(0.0, min(1.0, float(s)))
+            s = float(s)
         except (TypeError, ValueError):
             s = 0.5
+        except OverflowError:
+            # INTEL W19 (class A, crash-path only): float() of a huge JSON
+            # integer literal (e.g. 10**400) raises OverflowError, which used
+            # to escape analyze_trades' fail-open contract. Route it into the
+            # existing non-finite branch below (logged, neutral 0.5). Every
+            # input that did not raise before takes the exact same path.
+            s = float('nan')
+        if not math.isfinite(s):
+            # G4-07: min/max keep NaN's comparison partner, so NaN clamped
+            # to 1.0 (MOST bullish, 1.5x tilt). Non-finite == unparseable
+            # -> the same neutral 0.5 as a missing/malformed "s".
+            print(f"[LLM-ANALYST] non-finite score for {sym} -> neutral 0.5")
+            s = 0.5
+        s = max(0.0, min(1.0, s))
         result[sym] = {
             "m": round(s * 1.5, 2),  # legacy field for old consumers
             "s": s,
@@ -1105,13 +1216,25 @@ def _parse_response(response: str, symbols: list[str],
         if extended:
             p_up = entry.get("p_up")
             try:
-                p_up = max(0.0, min(1.0, float(p_up)))
+                p_up = float(p_up)
             except (TypeError, ValueError):
                 p_up = None
+            except OverflowError:
+                # INTEL W19 (class A): huge integer literal -> the existing
+                # non-finite path (-> None) instead of an escaping exception.
+                p_up = float('nan')
+            if p_up is not None:
+                p_up = (max(0.0, min(1.0, p_up)) if math.isfinite(p_up)
+                        else None)  # G4-07: NaN/inf -> missing
 
             conviction = entry.get("conviction")
             try:
                 conviction = max(1, min(5, int(conviction)))
+            except OverflowError:
+                # G4-07: int(float('inf')) — json.loads accepts a bare
+                # Infinity token; must not escape analyze_trades.
+                print(f"[LLM-ANALYST] non-finite conviction for {sym} -> None")
+                conviction = None
             except (TypeError, ValueError):
                 conviction = None
 
@@ -1242,13 +1365,16 @@ def build_compact_evidence(symbol: str, snapshot: dict | None,
     # --- Valuation one-liner (crypto fundamentals are all-None -> omitted) ---
     if fundamentals:
         val_parts = []
-        pe = fundamentals.get('pe_ratio')
+        # G4-06: the cached fundamentals dict carries raw provider values
+        # ('Infinity'/'N/A'/'' strings); a ValueError here used to make the
+        # caller drop the WHOLE evidence block. Non-numeric -> omitted.
+        pe = _safe_float(fundamentals.get('pe_ratio'))
         if pe is not None:
             val_parts.append(f"P/E {pe:.1f}")
-        pb = fundamentals.get('pb_ratio')
+        pb = _safe_float(fundamentals.get('pb_ratio'))
         if pb is not None:
             val_parts.append(f"P/B {pb:.1f}")
-        mc = fundamentals.get('market_cap')
+        mc = _safe_float(fundamentals.get('market_cap'))
         if mc:
             if mc >= 1e12:
                 val_parts.append(f"MktCap ${mc / 1e12:.1f}T")
@@ -1256,17 +1382,17 @@ def build_compact_evidence(symbol: str, snapshot: dict | None,
                 val_parts.append(f"MktCap ${mc / 1e9:.1f}B")
             else:
                 val_parts.append(f"MktCap ${mc / 1e6:.0f}M")
-        rg = fundamentals.get('revenue_growth')
+        rg = _safe_float(fundamentals.get('revenue_growth'))
         if rg is not None:
             val_parts.append(f"RevGrowth {rg * 100:+.1f}%")
-        beta = fundamentals.get('beta')
+        beta = _safe_float(fundamentals.get('beta'))
         if beta is not None:
             val_parts.append(f"Beta {beta:.2f}")
         sector = fundamentals.get('sector')
         if sector:
             val_parts.append(f"Sector {sector}")
-        w_hi = fundamentals.get('week52_high')
-        w_lo = fundamentals.get('week52_low')
+        w_hi = _safe_float(fundamentals.get('week52_high'))
+        w_lo = _safe_float(fundamentals.get('week52_low'))
         if w_hi and w_lo and close is not None and w_hi > w_lo:
             pos52 = (close - w_lo) / (w_hi - w_lo)
             val_parts.append(f"52w-pos {pos52:.2f}")
@@ -1305,8 +1431,276 @@ def build_compact_evidence(symbol: str, snapshot: dict | None,
     return block[:600]
 
 
+# ---------------------------------------------------------------------------
+# INTEL W15 (2026-09-27) — LLM attempt journal (SCOUT_E spec A1-A4).
+# Measurement-only: nothing below is read by any gate, and every helper is
+# fail-soft (returns None / {} / writes nothing rather than raising), so
+# analyze_trades' return value is byte-identical with or without it.
+# Rows land in journals/llm_calls/YYYY-MM-DD.jsonl (sibling of llm_replay/,
+# same 45-day prune) — NOT in llm_replay/, whose readers (prompt_ab,
+# llm_qualify) treat every line as a replayable scored cycle.
+# ---------------------------------------------------------------------------
+
+_LLM_CALLS_DIRNAME = "llm_calls"
+
+# Outcome vocabulary of the `llm_call` row (SCOUT_E §3/§6 A1):
+#   ok                every requested symbol came back with an entry
+#   partial           JSON object parsed, fewer symbols than sent (may be 0)
+#   parse_fail        response text is not JSON
+#   not_object        JSON parsed but is not an object
+#   empty             no text from either transport (no exception)
+#   transport_discard as `empty`, but the client reported a finish/block
+#                     reason (llm_client.get_last_call_meta, INTEL W19)
+#   transport_error   every transport attempted raised
+LLM_CALL_OUTCOMES = ('ok', 'partial', 'parse_fail', 'not_object', 'empty',
+                     'transport_discard', 'transport_error')
+
+
+def _prompt_sha256(system, prompt):
+    """sha256 of the exact system+prompt bytes, NUL-joined exactly like the
+    llm_analysis/advisor rows' prompt_sha256. None on any error."""
+    try:
+        return hashlib.sha256(
+            (system + '\x00' + prompt).encode('utf-8')).hexdigest()
+    except Exception:
+        return None
+
+
+def _journal_scalar(v):
+    """A raw provider value in strict-JSON-safe, bounded form: finite
+    numbers/bools/None as-is, non-finite floats as 'nan'/'inf'/'-inf',
+    strings truncated to 32 chars, anything else as '<typename>'."""
+    try:
+        if v is None or isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return v if abs(v) < 10 ** 15 else repr(v)[:32]
+        if isinstance(v, float):
+            return v if math.isfinite(v) else repr(v)
+        if isinstance(v, str):
+            return v[:32]
+        return '<' + type(v).__name__ + '>'
+    except Exception:
+        return None
+
+
+def _parse_diagnostics(response, symbols, extended=False) -> dict:
+    """Mirror of _parse_response's fallback decisions, reported instead of
+    applied (SCOUT_E A3). Re-parses `response` independently — never
+    touches the scores _parse_response produced. Returns
+    {'parse_outcome': 'ok'|'parse_fail'|'not_object'|'error',
+     'fence_stripped': bool|None, 'parse_flags': {sym: {...}}} where each
+    per-symbol dict holds raw_s, s_defaulted (missing / non-numeric /
+    non-finite -> 0.5), s_nonfinite, s_clamped (finite, outside [0,1]) and,
+    when extended, raw_p_up, p_up_nonfinite, p_up_clamped, raw_conviction,
+    conviction_nonfinite, conviction_clamped (int() outside 1..5)."""
+    out = {'parse_outcome': 'error', 'fence_stripped': None,
+           'parse_flags': {}}
+    try:
+        text = response.strip()
+        stripped = re.sub(r'^```(?:json)?\s*', '', text)
+        stripped = re.sub(r'\s*```$', '', stripped).strip()
+        out['fence_stripped'] = stripped != text
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            out['parse_outcome'] = 'parse_fail'
+            return out
+        if not isinstance(parsed, dict):
+            out['parse_outcome'] = 'not_object'
+            return out
+        out['parse_outcome'] = 'ok'
+        _missing = object()
+        for sym in symbols:
+            entry = parsed.get(sym) or parsed.get(sym.replace("/", ""))
+            if not entry or not isinstance(entry, dict):
+                continue
+            fl = {'raw_s': None, 's_defaulted': False,
+                  's_nonfinite': False, 's_clamped': False}
+            raw = entry.get('s', _missing)
+            if raw is _missing:
+                fl['s_defaulted'] = True
+            else:
+                fl['raw_s'] = _journal_scalar(raw)
+                try:
+                    f = float(raw)
+                    if not math.isfinite(f):
+                        fl['s_nonfinite'] = True
+                        fl['s_defaulted'] = True
+                    elif f < 0.0 or f > 1.0:
+                        fl['s_clamped'] = True
+                except OverflowError:   # int too large for float
+                    fl['s_nonfinite'] = True
+                    fl['s_defaulted'] = True    # W19: -> 0.5, like inf/NaN
+                except (TypeError, ValueError):
+                    fl['s_defaulted'] = True
+            if extended:
+                raw_p = entry.get('p_up')
+                fl['raw_p_up'] = _journal_scalar(raw_p)
+                fl['p_up_nonfinite'] = False
+                fl['p_up_clamped'] = False
+                try:
+                    fp = float(raw_p)
+                    if not math.isfinite(fp):
+                        fl['p_up_nonfinite'] = True
+                    elif fp < 0.0 or fp > 1.0:
+                        fl['p_up_clamped'] = True
+                except OverflowError:
+                    fl['p_up_nonfinite'] = True
+                except (TypeError, ValueError):
+                    pass
+                raw_c = entry.get('conviction')
+                fl['raw_conviction'] = _journal_scalar(raw_c)
+                fl['conviction_nonfinite'] = False
+                fl['conviction_clamped'] = False
+                try:
+                    iv = int(raw_c)
+                    if iv < 1 or iv > 5:
+                        fl['conviction_clamped'] = True
+                except OverflowError:
+                    fl['conviction_nonfinite'] = True
+                except (TypeError, ValueError):
+                    if isinstance(raw_c, float) and math.isnan(raw_c):
+                        fl['conviction_nonfinite'] = True
+            out['parse_flags'][sym] = fl
+    except Exception:
+        out['parse_outcome'] = 'error'
+    return out
+
+
+def _client_last_call_meta():
+    """READ-ONLY view of llm_client's last-call transport metadata
+    (SCOUT_E A2), via llm_client.get_last_call_meta() (INTEL W19): this
+    thread's most recent completed HTTP attempt — provider, model,
+    finish_reason, block_reason, http_status, latency_ms, attempt_index,
+    fallback_used, ts. usage_in/usage_out are not provided by it and stay
+    None. Resolved by attribute at call time (so a test stub of the module
+    attribute is honoured); None when unavailable or on any error."""
+    try:
+        import llm_client as _lc
+        fn = getattr(_lc, 'get_last_call_meta', None)
+        if not callable(fn):
+            return None
+        meta = fn()
+        return dict(meta) if isinstance(meta, dict) else None
+    except Exception:
+        return None
+
+
+def _safe_last_model_used():
+    try:
+        return get_last_model_used()
+    except Exception:
+        return None
+
+
+def _cost_delta(cost0):
+    """Ledger spend since `cost0` (same rule as _LAST_CALL_META's cost_usd);
+    None when unknown."""
+    try:
+        if cost0 is None:
+            return None
+        from llm_client import get_routing_info
+        c1 = get_routing_info().get('daily_cost')
+        if c1 is not None and c1 >= cost0:
+            return round(c1 - cost0, 4)
+    except Exception:
+        pass
+    return None
+
+
+def _build_call_row(*, asset_type, requested_model, path, response, result,
+                    diag, n_sent, latency_ms, max_tokens, prompt_sha256,
+                    advisor_v2, transport_errors, cost0):
+    """The `llm_call` attempt row (SCOUT_E A1+A2 fields; A3 counts). Built
+    for every non-dedup analyze_trades attempt, success or failure. Returns
+    None on any internal error (the attempt is then simply not journaled)."""
+    try:
+        cmeta = _client_last_call_meta() or {}
+        n_ret = len(result) if result else 0
+        if not response:
+            if transport_errors and len(transport_errors) >= 2:
+                outcome = 'transport_error'
+            elif cmeta.get('finish_reason') or cmeta.get('block_reason'):
+                outcome = 'transport_discard'
+            else:
+                outcome = 'empty'
+        elif n_ret and n_ret >= n_sent:
+            outcome = 'ok'
+        elif n_ret:
+            outcome = 'partial'
+        else:
+            po = (diag or {}).get('parse_outcome')
+            outcome = po if po in ('parse_fail', 'not_object') else 'partial'
+        flags = (diag or {}).get('parse_flags') or {}
+        n_def = n_nonfin = n_oor = 0
+        for fl in flags.values():
+            if fl.get('s_defaulted'):
+                n_def += 1
+            if (fl.get('s_nonfinite') or fl.get('p_up_nonfinite')
+                    or fl.get('conviction_nonfinite')):
+                n_nonfin += 1
+            if (fl.get('s_clamped') or fl.get('p_up_clamped')
+                    or fl.get('conviction_clamped')):
+                n_oor += 1
+        row = {
+            'asset_type': asset_type,
+            'requested_model': requested_model,
+            'model_used': None,
+            'path': path,
+            'outcome': outcome,
+            'n_symbols_sent': n_sent,
+            'n_symbols_returned': n_ret,
+            'latency_ms': latency_ms,
+            'response_chars': len(response) if response else 0,
+            'max_tokens': max_tokens,
+            'temperature': _ANALYST_TEMPERATURE,
+            'prompt_sha256': prompt_sha256,
+            'advisor_v2': bool(advisor_v2),
+            'dedup_hit': False,
+            'fence_stripped': (diag or {}).get('fence_stripped'),
+            'n_s_defaulted': n_def,
+            'n_nonfinite': n_nonfin,
+            'n_out_of_range': n_oor,
+            'transport_errors': list(transport_errors or []),
+            'finish_reason': cmeta.get('finish_reason'),
+            'block_reason': cmeta.get('block_reason'),
+            'usage_in': cmeta.get('usage_in'),
+            'usage_out': cmeta.get('usage_out'),
+            'http_status': cmeta.get('http_status'),
+            'cost_usd': _cost_delta(cost0),
+            'parse_flags': flags,
+        }
+        return row
+    except Exception:
+        return None
+
+
+def _write_llm_call_row(call_meta, model_used):
+    """Append one `llm_call` row to journals/llm_calls/YYYY-MM-DD.jsonl
+    (the llm_replay dir's sibling; 45-day prune). parse_flags stay on the
+    replay record only — the row carries their counts. Never raises."""
+    try:
+        now = datetime.now(timezone.utc).astimezone()
+        row = {'ts': now.isoformat(), 'action': 'llm_call'}
+        for k, v in call_meta.items():
+            if k != 'parse_flags':
+                row[k] = v
+        if model_used is not None:
+            row['model_used'] = model_used
+        call_dir = _REPLAY_DIR.parent / _LLM_CALLS_DIRNAME
+        call_dir.mkdir(parents=True, exist_ok=True)
+        path = call_dir / f"{now.date().isoformat()}.jsonl"
+        with open(path, "a") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+        _prune_replay_journal(call_dir)
+    except Exception as e:
+        print(f"[LLM-ANALYST] llm_call journal failed (non-fatal): {e}")
+
+
 def _journal_replay(candidates, asset_type, equity, positions, fng_value,
-                    model_config, position_details, result, model_used):
+                    model_config, position_details, result, model_used,
+                    call_meta=None):
     """Journal the full candidate-cycle inputs for offline prompt A/B replay.
 
     Without this, scripts/prompt_ab.py has nothing to replay: the existing
@@ -1314,10 +1708,23 @@ def _journal_replay(candidates, asset_type, equity, positions, fng_value,
     — headlines/fundamentals/fng/positions are NOT journaled there. This is
     measurement-only and must NEVER affect analyze_trades' return value —
     entire body fail-soft (mirrors every other journal write in this repo).
+
+    call_meta (INTEL W15, SCOUT_E A1/A3/A4; None = the exact pre-W15
+    behaviour): the analyze_trades attempt row. When given, the replay
+    record additionally carries prompt_sha256 / latency_ms / dedup_hit /
+    fence_stripped / parse_flags (old keys and values unchanged), and the
+    row is appended to journals/llm_calls/ via _write_llm_call_row. With an
+    EMPTY result (failed attempt) only the llm_calls row is written — no
+    replay record, so prompt_ab / llm_qualify never replay a scoreless
+    cycle. Same gates as the replay record: persist (at the call site) and
+    replay_capture_enabled (here).
     """
     try:
         config = load_llm_config()
         if not config.get("replay_capture_enabled", True):
+            return
+        if call_meta is not None and not result:
+            _write_llm_call_row(call_meta, model_used)
             return
         replay_dir = _REPLAY_DIR
         replay_dir.mkdir(parents=True, exist_ok=True)
@@ -1335,11 +1742,22 @@ def _journal_replay(candidates, asset_type, equity, positions, fng_value,
             "live_scores": {sym: v.get("s") for sym, v in result.items()},
             "live_model": model_used,
         }
+        if call_meta is not None:
+            try:   # A3/A4 — additive keys appended after the legacy ones
+                record["prompt_sha256"] = call_meta.get("prompt_sha256")
+                record["latency_ms"] = call_meta.get("latency_ms")
+                record["dedup_hit"] = False
+                record["fence_stripped"] = call_meta.get("fence_stripped")
+                record["parse_flags"] = call_meta.get("parse_flags") or {}
+            except Exception:
+                pass
         path = replay_dir / f"{now.date().isoformat()}.jsonl"
         with open(path, "a") as f:
             f.write(json.dumps(record, default=str) + "\n")
 
         _prune_replay_journal(replay_dir)
+        if call_meta is not None:
+            _write_llm_call_row(call_meta, model_used)
     except Exception as e:
         print(f"[LLM-ANALYST] replay capture failed (non-fatal): {e}")
 

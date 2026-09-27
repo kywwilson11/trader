@@ -1,0 +1,983 @@
+================================================================================
+COMPREHENSIVE CODE QUALITY AUDIT — TRADER BOT CODEBASE
+================================================================================
+Date: 2026-02-21
+Scope: 20+ Python source files, ~7000 lines of production code + ~3500 lines tests
+Auditor: Automated CS analysis (research only, no code changes)
+
+TABLE OF CONTENTS
+-----------------
+  1. Python Best Practices
+  2. Algorithm Efficiency
+  3. Concurrency & Parallelism
+  4. Code Organization & Architecture
+  5. Error Handling
+  6. Memory Management
+  7. Configuration Management
+  8. Testing
+  9. Logging
+  10. Type Safety
+
+
+================================================================================
+1. PYTHON BEST PRACTICES
+================================================================================
+
+1.1 STRENGTHS
+-------------
+
+- pathlib usage: Consistently used across most modules (trade_memory.py:12,
+  trade_journal.py:13, llm_config.py:9, stock_config.py:11, gpu_lock.py:29).
+  Good adoption of modern path handling.
+
+- Context managers: gpu_lock.py:70-112 is an exemplary contextmanager
+  implementation with proper cleanup in finally blocks. The fcntl-based file
+  locking is well designed for the Jetson's single-GPU constraint.
+
+- frozenset for immutable lookup tables: sentiment.py:54-121 uses frozenset
+  for _POSITIVE and _NEGATIVE keyword sets. This is correct — O(1) lookup and
+  immutable.
+
+- f-strings throughout: Consistent use of f-strings for formatting. No
+  old-style % formatting or .format() calls.
+
+- Modern Python syntax: Uses list[dict], dict[str, dict], tuple[int, int]
+  type hints (PEP 585) in several files (llm_analyst.py:60, market_data.py:35,
+  fundamentals.py:94, gpu_lock.py:61). Uses X | None union syntax (PEP 604).
+
+
+1.2 ISSUES
+----------
+
+(a) No dataclasses or NamedTuples for structured data
+
+  The codebase passes positions as raw dicts with string keys throughout:
+
+    positions[symbol] = {
+        'qty': total_qty,
+        'entry_price': fill_price,
+        'high_water_mark': hwm,
+        'stop_order_id': None,
+        'trailing_activated': False,
+        'entry_atr': entry_atr,
+        'take_profit_price': tp_price,
+    }
+
+  Seen in: crypto_loop.py:539-547, stock_loop.py:689-696, order_utils.py:294-300
+
+  WHY IT MATTERS: No compile-time key validation, easy to misspell keys (e.g.,
+  'trailing_activated' vs 'trailing'), no IDE autocomplete, no default values.
+  A @dataclass with __slots__ would catch bugs at definition time and use less
+  memory.
+
+  Similarly, quote dicts (order_utils.py:38-44), LLM score dicts
+  (llm_analyst.py:337-343), and sentiment result dicts (sentiment.py:834-839)
+  would all benefit from being typed structures.
+
+(b) super().__init__() vs super(ClassName, self).__init__()
+
+  model.py:20 uses the old-style: super(CryptoLSTM, self).__init__()
+  model_v2.py:17 correctly uses: super().__init__()
+
+  The old style is unnecessary in Python 3 and should be updated for
+  consistency.
+
+(c) Global mutable state via module-level variables
+
+  Multiple modules use module-level mutable dicts/deques as caches:
+
+    sentiment.py:24:   _cache = {}
+    sentiment.py:27:   _llm_retry_queue: collections.deque = collections.deque(maxlen=50)
+    sentiment.py:276:  _article_cache = {}
+    fundamentals.py:16: _cache = {}
+    llm_client.py:52:  _call_timestamps: collections.deque = collections.deque()
+    llm_client.py:60:  _model_calls: dict[str, int] = {}
+    predict_now.py:23-24: _get_live_sentiment = None, _sentiment_import_failed = False
+
+  WHY IT MATTERS: These are not thread-safe. When ThreadPoolExecutor runs
+  predict_symbol concurrently (crypto_loop.py:285, stock_loop.py:387), any
+  shared module state accessed from worker threads has potential race
+  conditions. In practice, the GIL prevents data corruption for simple dict
+  operations, but the design is fragile and would break under asyncio or
+  multiprocessing.
+
+(d) Inline imports
+
+  Several files import inside functions rather than at module level:
+
+    stock_loop.py:108:     import zoneinfo
+    market_data.py:84:     from datetime import datetime, timedelta, timezone
+    sentiment.py:498:      from llm_config import load_llm_config
+    fundamentals.py:235:   from llm_client import call_llm
+    llm_analyst.py:178:    from trade_memory import get_lesson_summary
+
+  While some are justified (avoiding circular imports, lazy loading heavy
+  deps), the pattern in market_data.py:84 (importing stdlib datetime inside a
+  function that's called frequently) is unnecessary. Move it to module level.
+
+(e) Missing __all__ exports
+
+  No module defines __all__, which means `from module import *` pulls in
+  everything. Not critical for this project size, but standard practice for
+  library-quality code.
+
+
+================================================================================
+2. ALGORITHM EFFICIENCY
+================================================================================
+
+2.1 STRENGTHS
+-------------
+
+- Numba JIT acceleration: indicators.py has excellent Numba implementations
+  for RSI, MACD, ATR, BBands, Stochastic, OBV, rolling percentile, and linear
+  slope. All decorated with @njit(cache=True) for compiled caching across runs.
+  Pure-numpy fallbacks exist for environments without Numba. This is textbook
+  high-performance numerical Python.
+
+- Vectorized numpy/pandas: indicator computations use vectorized operations
+  (df['Close'].pct_change(), rolling(), ewm()) rather than row-by-row loops.
+
+- SeqCache in hypersearch_v2.py:254-311: Caches one fold's sequence arrays at
+  a time with proper eviction. Smart memory management for 8GB Jetson.
+
+- FP16 mixed precision: hypersearch_v2.py uses torch.amp.autocast and
+  GradScaler for ~2x training speedup on Jetson tensor cores.
+
+
+2.2 ISSUES
+----------
+
+(a) O(n*w) rolling min/max — could be O(n) with monotonic deque
+
+  indicators.py:88-112, _rolling_min and _rolling_max:
+
+    @njit(cache=True)
+    def _rolling_min(arr, window):
+        ...
+        for i in range(window - 1, n):
+            m = arr[i]
+            for j in range(i - window + 1, i):  # inner loop: O(window)
+                if arr[j] < m:
+                    m = arr[j]
+            out[i] = m
+        return out
+
+  This is O(n * window). For window=14 and n=120, this is fine (~1680 ops).
+  For the training pipeline with n=500,000 and window=100, this becomes
+  50 million comparisons. A monotonic deque algorithm (Luo, 2006) computes
+  rolling min/max in O(n) regardless of window size.
+
+  However, since Numba JIT compiles this to native code and the arrays are
+  moderate size, the practical impact is small. Still worth noting for
+  correctness of algorithmic complexity analysis.
+
+(b) _rolling_std uses two-pass algorithm inside Numba
+
+  indicators.py:72-86:
+
+    for i in range(window - 1, n):
+        s = 0.0
+        s2 = 0.0
+        for j in range(i - window + 1, i + 1):
+            s += arr[j]
+            s2 += arr[j] * arr[j]
+
+  This is O(n * window). An online/incremental algorithm (Welford's) would
+  be O(n). Again, compiled Numba mitigates this significantly, but it's
+  O(n*w) unnecessarily.
+
+(c) Redundant API calls in crypto_loop.py
+
+  crypto_loop.py:216-218 and crypto_loop.py:376-377 both call
+  get_crypto_quote(api, symbol) for the same symbol within the same cycle —
+  once in the stop-loss check loop, and again in the sell logic. The quote
+  from 5 seconds ago is perfectly adequate for the sell decision.
+
+  Similarly, stock_loop.py:333 calls get_stock_quote in the trailing stop
+  upgrade loop, and stock_loop.py:534 calls it again for LLM veto sells.
+
+  FIX: Cache quotes per-symbol at the start of each cycle.
+
+(d) Repeated position verification
+
+  crypto_loop.py:357 calls verify_position(api, symbol) for each held symbol,
+  then crypto_loop.py:514 calls it again if a buy succeeds. The Alpaca API
+  is called twice for the same information.
+
+(e) get_recent_headlines duplicates work from get_news_sentiment
+
+  sentiment.py:1176-1214 (get_recent_headlines) makes a separate Finnhub API
+  call identical to the one already made by get_news_sentiment (lines
+  1003-1060). The headline data is already fetched and could be cached.
+
+  In llm_analyst.py:199, get_recent_headlines is called for each candidate
+  symbol. With 10 symbols, that's 10 additional Finnhub API calls per LLM
+  analysis cycle — all redundant if get_news_sentiment was already called.
+
+(f) Linear scan for most common exit reason in trade_memory.py
+
+  trade_memory.py:100:
+    most_common = max(set(exit_reasons), key=exit_reasons.count)
+
+  For each unique exit reason, .count() scans the full list: O(u * n).
+  collections.Counter(exit_reasons).most_common(1) is O(n).
+  The list is capped at 10 items so this is negligible, but it's a
+  code smell that would scale poorly.
+
+(g) fetch_crypto_volume makes sequential HTTP requests
+
+  market_data.py:45-67: Iterates over symbols one at a time, making a
+  blocking HTTP request for each. With 10 crypto symbols, this takes ~5
+  seconds (10 * 500ms). Using concurrent.futures.ThreadPoolExecutor or
+  asyncio would reduce this to ~500ms.
+
+
+================================================================================
+3. CONCURRENCY & PARALLELISM
+================================================================================
+
+3.1 STRENGTHS
+-------------
+
+- ThreadPoolExecutor for prediction: crypto_loop.py:285-308 and
+  stock_loop.py:387-408 correctly use ThreadPoolExecutor(max_workers=5) for
+  parallel predictions. The as_completed pattern is properly used.
+
+- QThread for GUI background work: gui.py uses QThread + QObject + Signal/Slot
+  pattern correctly for non-blocking API fetches (DataFetcher, LogTailer).
+  This prevents the GUI from freezing during API calls.
+
+- GPU lock via fcntl: gpu_lock.py provides a file-based mutex that prevents
+  CUDA OOM from concurrent GPU access. The OS-level lock auto-releases on
+  process crash, avoiding stale locks. This is a pragmatic, correct solution.
+
+- Interruptible startup: gui.py:696 checks isInterruptionRequested() between
+  initial fetch calls, allowing clean shutdown during startup burst.
+
+
+3.2 ISSUES
+----------
+
+(a) ThreadPoolExecutor for I/O-bound work — should consider asyncio
+
+  The trading loops make many I/O-bound API calls (quotes, position checks,
+  order submission). ThreadPoolExecutor works but has overhead:
+
+  - Each thread costs ~8MB of stack memory
+  - Thread switching overhead for 10+ concurrent requests
+  - No cooperative scheduling — threads can block indefinitely
+
+  asyncio with aiohttp would be more efficient for the I/O-heavy pattern:
+  - Lower memory overhead (coroutines are ~256 bytes)
+  - Cooperative scheduling — single thread handles all I/O
+  - Native support for timeouts and cancellation
+
+  However, the Alpaca SDK (alpaca-trade-api) is synchronous, so asyncio would
+  require either (a) wrapping sync calls with loop.run_in_executor or (b)
+  switching to alpaca-py (the async-native SDK). Given the 30-second loop
+  interval, the current approach is acceptable pragmatically.
+
+(b) Thread safety of module-level caches
+
+  sentiment.py, fundamentals.py, and llm_client.py all use module-level
+  dicts as caches. These are accessed from:
+
+  1. The main trading loop thread
+  2. ThreadPoolExecutor worker threads (via predict_symbol)
+  3. GUI DataFetcher thread (gui.py:812 calls sentiment functions)
+
+  While CPython's GIL prevents data corruption for simple dict read/write,
+  there are logic-level race conditions:
+
+    sentiment.py:1017-1019:
+        if cache_key in _cache:
+            ts, result = _cache[cache_key]
+            if now - ts < symbol_ttl:
+
+  Between the `in` check and the indexing, another thread could evict the key.
+  This won't crash (dict access is atomic in CPython), but could produce stale
+  data or redundant API calls.
+
+  FIX: Use threading.Lock() around cache reads/writes, or switch to
+  functools.lru_cache / cachetools.TTLCache (thread-safe wrappers).
+
+(c) No process supervision beyond simple polling
+
+  run_pipeline.py:193-210 (_check_restart_bots) restarts crashed bots by
+  polling proc.poll(). This is a simple but limited approach:
+
+  - No exponential backoff on repeated crashes
+  - No crash counting or circuit breaker (a bot that crashes in a loop will
+    be restarted indefinitely)
+  - No structured logging of crash events
+  - No signal handling (SIGTERM, SIGINT) for graceful shutdown
+
+(d) Blocking time.sleep in trading loops
+
+  crypto_loop.py:566 and stock_loop.py:717 use time.sleep(sleep_interval).
+  During the sleep, the bot cannot respond to signals, hot-reload events, or
+  circuit breaker conditions.
+
+  An Event-based sleep (threading.Event.wait(timeout=sleep_interval)) would
+  allow immediate wake-up when an external condition changes.
+
+
+================================================================================
+4. CODE ORGANIZATION & ARCHITECTURE
+================================================================================
+
+4.1 STRENGTHS
+-------------
+
+- Good module decomposition: The codebase is split into focused modules:
+  indicators.py (pure computation), market_data.py (I/O), order_utils.py
+  (order lifecycle), sentiment.py (NLP), etc. Each module has a clear
+  responsibility.
+
+- Shared utilities factored out: trading_utils.py centralizes get_api(),
+  cooldown_ok(), predict_symbol(), choose_inference_device(). This avoids
+  duplication between crypto_loop.py and stock_loop.py.
+
+- Pipeline orchestrator pattern: run_pipeline.py cleanly separates phases
+  (harvest, search, trading) and manages subprocess lifecycle.
+
+- Hot-reload design: Both trading loops check model file mtimes each cycle
+  and reload models without restarting. This enables continuous trading
+  during retraining.
+
+
+4.2 ISSUES
+----------
+
+(a) crypto_loop.py and stock_loop.py are ~90% identical
+
+  Both files follow the exact same structure:
+  1. Load models
+  2. Cancel stale orders
+  3. Reconstruct positions
+  4. Main loop: sentiment check, hot-reload, circuit breaker, stop-loss,
+     predictions, LLM analysis, sell, LLM veto sell, buy, thermal throttle
+
+  The differences are:
+  - Market hours check (stock only)
+  - Flatten before close (stock only)
+  - Order type (bracket for stocks, limit for crypto)
+  - Symbol universe source
+  - Stop parameters (slightly different percentages)
+
+  This is a textbook case for the Template Method pattern. A base class
+  BaseTradingLoop with abstract methods for the variant parts would eliminate
+  ~400 lines of duplicated code and make it impossible for the two loops to
+  drift apart (which they already have — e.g., crypto uses place_smart_order
+  while stock uses direct api.submit_order with bracket).
+
+(b) God functions: run_crypto_bot() and run_stock_bot()
+
+  crypto_loop.py:123-569 (446 lines) and stock_loop.py:194-721 (527 lines)
+  are massive single functions. They handle model loading, position
+  reconstruction, stop-loss management, prediction fetching, LLM analysis,
+  sell decisions, buy decisions, and thermal management — all in one
+  function with deeply nested loops and conditionals.
+
+  Each of these responsibilities should be a separate method or function.
+  The main loop body should read like a high-level script:
+
+    while True:
+        check_circuit_breaker()
+        manage_stops()
+        predictions = get_predictions()
+        execute_sells(predictions)
+        execute_buys(predictions)
+        sleep()
+
+(c) Duplicate JSON parsing/repair code
+
+  Both llm_analyst.py:225-260 (_repair_truncated_json) and
+  sentiment.py:411-490 (_parse_llm_json) implement brace-counting JSON
+  repair with nearly identical logic. This should be a shared utility
+  function, perhaps in llm_client.py.
+
+(d) No dependency injection — tight coupling to Alpaca SDK
+
+  All API interactions use the raw Alpaca SDK directly. There's no
+  abstraction layer (e.g., a BrokerClient interface). This makes:
+  - Testing difficult (must mock SDK internals)
+  - Switching brokers impossible without rewriting everything
+  - No paper/live toggle at the architecture level
+
+  A simple Protocol (PEP 544) or ABC defining get_position(), submit_order(),
+  get_quote() etc. would decouple the trading logic from the broker.
+
+(e) Circular-ish import risk
+
+  llm_analyst.py imports from trade_memory.py (line 178: from trade_memory
+  import get_lesson_summary). trade_memory.py is standalone, but the pattern
+  of inline imports suggests past circular dependency issues. The import is
+  wrapped in try/except, further suggesting fragility.
+
+(f) harvest scripts in scripts/ subdir import from parent
+
+  Both harvest scripts and hypersearch_v2.py use:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+  This is a hack. A proper package structure (setup.py or pyproject.toml
+  with editable install) would eliminate these path manipulations.
+
+
+================================================================================
+5. ERROR HANDLING
+================================================================================
+
+5.1 STRENGTHS
+-------------
+
+- Consistent API error handling: order_utils.py wraps every API call in
+  try/except with meaningful error messages. No bare excepts.
+
+- Graceful degradation: The system is designed to degrade gracefully:
+  - No models? Skip prediction gating (crypto_loop.py:139)
+  - Finnhub unavailable? Skip sentiment (sentiment.py:46)
+  - LLM down? Return empty dict (llm_analyst.py:98-99)
+  - JIT trace fails? Fall back to eager mode (predict_now.py:74-75)
+
+- Circuit breaker pattern: order_utils.py:309-319 implements a daily drawdown
+  circuit breaker with emergency flatten. This is a critical safety mechanism.
+
+- Retry with exponential backoff: market_data.py:168-209 (_fetch_chunk)
+  implements proper retry logic with exponential backoff for rate limits.
+
+
+5.2 ISSUES
+----------
+
+(a) Broad exception catching in critical paths
+
+  crypto_loop.py:263:
+    except Exception as e:
+        print(f"  [STOP] {symbol}: Sell error: {e}")
+
+  A stop-loss sell is the most critical order in the system. If it fails,
+  the position remains open with unbounded downside. This should:
+  1. Retry immediately with market order
+  2. Log the full traceback (not just str(e))
+  3. Trigger an alert mechanism
+  4. Add the symbol to a "needs manual attention" list
+
+  The same issue exists for LLM veto sells (crypto_loop.py:436,
+  stock_loop.py:542).
+
+(b) check_circuit_breaker has no error handling
+
+  order_utils.py:309-319:
+    def check_circuit_breaker(api, max_drawdown_pct=0.05):
+        account = api.get_account()  # can throw!
+
+  If this API call fails, the exception propagates up and crashes the main
+  loop. This safety-critical function should never crash — it should return
+  (False, 0.0) on API error and log the failure.
+
+(c) emergency_flatten doesn't verify success
+
+  order_utils.py:324-352: After submitting market sell orders, the function
+  doesn't verify that the orders actually filled. In a real emergency (e.g.,
+  exchange outage), the sells might not execute. There should be a
+  verification loop.
+
+(d) File I/O without atomic writes in some places
+
+  trade_memory.py:30-33 and trade_journal.py:29-31 write JSON directly
+  without atomic temp-file-then-rename. If the process crashes mid-write,
+  the file could be corrupted. Contrast with run_pipeline.py:75-78 which
+  correctly uses os.replace() for atomic writes.
+
+(e) No timeout on position reconstruction
+
+  order_utils.py:278-304 (reconstruct_positions) iterates over all symbols,
+  calling api.get_position() for each. With 50+ symbols, this could take
+  30+ seconds if the API is slow. No timeout or concurrency.
+
+(f) Silent swallowing of errors in GUI
+
+  gui.py:89-91, 99-101, 117-119 etc.:
+    except Exception:
+        pass
+
+  While the GUI should never crash, silently swallowing all exceptions makes
+  debugging impossible. At minimum, log to stderr or a debug log.
+
+
+================================================================================
+6. MEMORY MANAGEMENT
+================================================================================
+
+6.1 STRENGTHS
+-------------
+
+- Explicit gc.collect() + cuda.empty_cache(): hypersearch_v2.py:327-328 and
+  throughout the training loop. Critical on Jetson's 8GB unified memory.
+
+- SeqCache single-fold eviction: hypersearch_v2.py:276-280 frees the previous
+  fold's arrays before allocating new ones, preventing OOM.
+
+- del + gc.collect() after data loading: hypersearch_v2.py:172-173 deletes
+  intermediate data structures after vstack.
+
+- stock_loop.py:410 calls gc.collect() after prediction pass.
+
+- Chart cache eviction in GUI: gui.py:1038-1044 caps chart cache at 6 symbols
+  and evicts the oldest.
+
+
+6.2 ISSUES
+----------
+
+(a) Unbounded growth of module-level caches
+
+  sentiment.py:24 (_cache) and sentiment.py:276 (_article_cache) grow without
+  bound. Every unique cache_key adds an entry that persists for the process
+  lifetime. Over days/weeks of continuous operation:
+
+  - _cache: Each symbol gets a news entry, plus '__fng__', '__market__',
+    '__cnn_fng__'. With 50 symbols and 5-minute TTL, entries accumulate but
+    never get cleaned. Old entries beyond TTL waste memory.
+
+  - _article_cache: Every URL fetched gets cached for 30 minutes. With
+    ~200 articles per news cycle, ~50 URLs attempted per cycle, over days
+    this could grow to thousands of entries. No eviction.
+
+  FIX: Add a periodic cleanup sweep (e.g., every 10 minutes, remove entries
+  older than 2x TTL), or use cachetools.TTLCache which handles eviction
+  automatically.
+
+(b) fundamentals.py caches grow without bound
+
+  Same issue: _cache dict in fundamentals.py:16 never evicts old entries.
+  With 50+ symbols and multiple data types (fund_, fmp_, insider_, sec_,
+  filing_sum_), this accumulates hundreds of entries over weeks.
+
+(c) Large DataFrames held in trading loop scope
+
+  crypto_loop.py:269-272:
+    btc_df = fetch_bars_alpaca(api, 'BTC/USD')
+    if btc_df is not None:
+        btc_close = btc_df['Close']
+
+  btc_df (120 rows * 5 columns * 8 bytes = ~5KB) is retained in the loop
+  scope until the next cycle overwrites it. This is negligible, but for
+  stock_loop.py with 50+ symbols, the snapshots dict (line 382) holds data
+  for all symbols simultaneously. Each snapshot is small, but the pattern of
+  not explicitly deleting intermediate results could matter on Jetson.
+
+(d) predict_now.py holds model on GPU indefinitely
+
+  predict_now.py:27: device = torch.device('cuda' if ...) is set at import
+  time. However, trading_utils.py:47 always returns 'cpu' for inference.
+  The model is loaded to CPU. If someone changes choose_inference_device()
+  to return 'cuda', the model would stay on GPU across all cycles, consuming
+  VRAM continuously.
+
+(e) gui.py news cache can hold 200 articles indefinitely
+
+  gui.py:916: articles = articles[:200] caps at 200, but these are retained
+  in memory and written to disk on every 5-minute refresh cycle. With rich
+  article dicts (headline, summary, url, scores, etc.), this is ~200KB —
+  not a problem, but the disk I/O of rewriting the full cache every 5
+  minutes is unnecessary if nothing changed.
+
+
+================================================================================
+7. CONFIGURATION MANAGEMENT
+================================================================================
+
+7.1 STRENGTHS
+-------------
+
+- Centralized config files: llm_config.py manages LLM settings in a JSON
+  file with default merging. stock_config.py manages the trading universe.
+  indicator_config.py manages feature presets. This is a clean separation.
+
+- .env for secrets: API keys are stored in .env and loaded with python-dotenv.
+  Never hardcoded in source.
+
+- Pipeline CLI args: run_pipeline.py uses argparse with sensible defaults
+  (--trials 200, --retrain-day 5, --retrain-hour 2, --retrain-trials 100).
+
+
+7.2 ISSUES
+----------
+
+(a) Magic numbers scattered throughout code
+
+  crypto_loop.py has 18 configuration constants (lines 40-63), all module-level:
+    NOTIONAL_PER_SYMBOL = 1000
+    MAX_NOTIONAL_PER_SYMBOL = 3000
+    ORDER_TIMEOUT = 30
+    LOOP_INTERVAL = 30
+    COOLDOWN_MINUTES = 60
+    ATR_STOP_MULTIPLIER = 2.0
+    ATR_TRAIL_MULTIPLIER = 1.5
+    ...etc
+
+  stock_loop.py has its own overlapping set (lines 44-78). Some are identical
+  (ORDER_TIMEOUT, THERMAL_THROTTLE_TEMP), some differ (COOLDOWN_MINUTES:
+  60 vs 20). These should be in a shared config dataclass or TOML file:
+
+    @dataclass
+    class TradingConfig:
+        notional_per_symbol: int = 1000
+        max_notional_per_symbol: int = 3000
+        order_timeout: int = 30
+        loop_interval: int = 30
+        cooldown_minutes: int = 60
+        atr_stop_multiplier: float = 2.0
+        ...
+
+(b) Hardcoded paths in run_pipeline.py
+
+  run_pipeline.py:39:
+    PYTHON = '/home/kyle/miniforge3/envs/jetson/bin/python'
+
+  And the LD_LIBRARY_PATH (lines 40-48) is hardcoded. This should be read
+  from an environment variable or config file to support deployment on
+  different machines.
+
+(c) No validation of configuration values
+
+  llm_config.py:27-51 loads config and fills defaults, but never validates:
+  - Is max_llm_latency_sec > 0?
+  - Is the API key non-empty when enabled=True?
+  - Are model names valid?
+
+  pydantic.BaseSettings or a simple validate() function would catch
+  configuration errors at startup rather than at runtime.
+
+(d) Multiple config loading patterns
+
+  - llm_config.py: JSON file with default merging
+  - stock_config.py: JSON file with hardcoded fallback list
+  - indicator_config.py: JSON file with preset system (not read in audit)
+  - Trading constants: Module-level Python variables
+  - Secrets: .env file
+
+  Five different configuration mechanisms. A unified approach (e.g., all
+  non-secret config in one TOML file, parsed into Pydantic models) would be
+  more maintainable.
+
+(e) LLM veto threshold hardcoded in multiple places
+
+  The value 0.15 appears as a magic number in:
+  - crypto_loop.py:409-410 (LLM veto sell threshold)
+  - crypto_loop.py:491-492 (LLM veto buy threshold)
+  - stock_loop.py:512 (LLM veto sell threshold)
+  - stock_loop.py:608 (LLM veto buy threshold)
+  - llm_analyst.py:47 (prompt text: "0.00-0.15: VETO")
+
+  If the veto threshold changes, five locations must be updated. Should be a
+  named constant (LLM_VETO_THRESHOLD = 0.15) imported from one place.
+
+
+================================================================================
+8. TESTING
+================================================================================
+
+8.1 STRENGTHS
+-------------
+
+- Comprehensive indicator tests: test_indicators.py (13195 lines / ~250 test
+  cases) thoroughly tests RSI, MACD, ATR, BBands, Stochastic, OBV against
+  expected values. Tests both Numba and fallback paths.
+
+- Sentiment scoring tests: test_sentiment_headlines.py (21908 lines) is an
+  extensive regression test suite for headline sentiment scoring. Covers
+  positive, negative, neutral, negation handling, and edge cases.
+
+- Mock-based API tests: test_order_utils.py, test_trading_utils.py, and
+  test_fundamentals.py use unittest.mock to isolate from external APIs.
+
+- conftest.py: Shared fixtures for common test setup.
+
+- Total: 30 test files, ~3474 lines of tests.
+
+
+8.2 ISSUES
+----------
+
+(a) CRITICAL: No integration tests for trading loops
+
+  crypto_loop.py and stock_loop.py — the most critical production code — have
+  ZERO test coverage. The run_crypto_bot() and run_stock_bot() functions
+  are 400-500 lines of complex trading logic that has never been exercised
+  by automated tests.
+
+  Key untested paths:
+  - Stop-loss execution (lines 216-264 in crypto_loop.py)
+  - Position sizing with confidence * sentiment * LLM multiplier
+  - Circuit breaker activation
+  - Hot-reload behavior
+  - End-of-day flatten (stock_loop.py)
+  - Edge case: model returns None for all symbols
+  - Edge case: API returns None quote during sell
+
+  Even basic smoke tests with mocked APIs would catch regressions.
+
+(b) No tests for GUI (gui.py)
+
+  gui.py is 2000+ lines of UI code with complex data processing (tax
+  estimation, chart caching, news aggregation). The estimate_taxes function
+  (lines 1333-1395) implements MinTax lot matching — a financially critical
+  algorithm with no tests.
+
+(c) Minimal test coverage for order lifecycle
+
+  test_order_utils.py is only 59 lines. It doesn't test:
+  - manage_order_lifecycle (timeout, cancel, market fallback)
+  - emergency_flatten
+  - reconstruct_positions
+  - check_circuit_breaker
+
+  These are safety-critical functions.
+
+(d) No tests for trade_memory.py
+
+  record_trade() and get_lesson_summary() have no tests. The rolling window
+  eviction logic (keeping last N trades) is untested.
+
+(e) No performance/regression tests
+
+  No tests verify that:
+  - Indicator computation produces identical results between Numba and pandas
+    fallback paths (test_indicators.py tests one path at a time)
+  - Model inference produces deterministic results given fixed inputs
+  - The full prediction pipeline (data fetch -> features -> scale -> predict)
+    produces reasonable outputs
+
+(f) Missing edge case tests for LLM JSON parsing
+
+  test_llm_analyst.py exists but the JSON repair logic (_repair_truncated_json)
+  needs more adversarial test cases:
+  - Deeply nested JSON truncated at various depths
+  - Unicode characters in strings
+  - Escaped quotes within truncated strings
+
+
+================================================================================
+9. LOGGING
+================================================================================
+
+9.1 STRENGTHS
+-------------
+
+- Consistent print-based logging: All modules use a consistent format:
+    print(f"  [{COMPONENT}] {symbol}: {message}")
+  Examples: [STOP], [ORDER], [LIFECYCLE], [SENTIMENT], [LLM], [ATR], etc.
+
+- Pipeline output capture: run_pipeline.py redirects subprocess stdout to
+  log files (pipeline_output.log, crypto_bot_output.log, stock_bot_output.log).
+
+- GPU temp logging: Periodic (every N cycles) GPU temperature logging
+  avoids spam while providing monitoring data.
+
+
+9.2 ISSUES
+----------
+
+(a) CRITICAL: No use of the logging module
+
+  The entire codebase uses print() for all logging. This is the single
+  largest infrastructure gap. print() lacks:
+
+  - Log levels (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  - Timestamps (must be manually added)
+  - Source file/line number
+  - Configurable handlers (file, syslog, email, Slack)
+  - Log rotation (files grow forever)
+  - Structured logging (JSON format for log aggregation)
+  - Thread-safe output (print can interleave in multi-threaded code)
+
+  The standard library logging module provides all of this. Example impact:
+
+  Current (crypto_loop.py:249):
+    print(f"  [STOP] {symbol}: STOPPED OUT at ${current_price:.4f} ...")
+
+  Should be:
+    logger.warning("Stop-loss triggered", extra={
+        "symbol": symbol, "price": current_price,
+        "entry": entry_price, "reason": stop_reason})
+
+  This would enable:
+  - Filtering by severity (show only WARNING+ in production)
+  - Structured log ingestion for analysis
+  - Proper timestamps without manual formatting
+
+(b) No log rotation
+
+  run_pipeline.py opens log files in append mode ('a') and never rotates
+  them. After weeks/months of continuous operation, these files could grow
+  to hundreds of MB. logging.handlers.RotatingFileHandler solves this.
+
+(c) No alerting on critical events
+
+  Stop-loss failures, circuit breaker activations, and emergency flattens
+  are printed to stdout but never trigger any alert. A production trading
+  system should have at minimum email/SMS/Slack notifications for:
+  - Circuit breaker activation
+  - Stop-loss sell failure
+  - Emergency flatten
+  - Bot crash and restart
+  - CUDA error
+
+(d) Debug output in production paths
+
+  predict_now.py:131 prints for every prediction:
+    print(f"\n--- ANALYZING {symbol} ---")
+
+  With 50 symbols every 30 seconds, this produces ~100 lines per minute of
+  noise. This should be DEBUG level and suppressed in production.
+
+(e) Traceback printing in GUI
+
+  gui.py:974:
+    import traceback; traceback.print_exc()
+
+  This inline import + traceback print is a debugging leftover. Should use
+  proper logging with exc_info=True.
+
+
+================================================================================
+10. TYPE SAFETY
+================================================================================
+
+10.1 STRENGTHS
+--------------
+
+- Return type annotations in key functions:
+  llm_analyst.py:60: def analyze_trades(...) -> dict[str, dict]:
+  sentiment.py:1094: def sentiment_gate(...) returns documented tuple
+  gpu_lock.py:61: def get_lock_info() -> dict | None:
+
+- PEP 604 union syntax used (dict | None) in modern style.
+
+
+10.2 ISSUES
+-----------
+
+(a) Most functions lack type annotations
+
+  Of ~100 public functions across the codebase, only ~15 have return type
+  annotations and ~10 have parameter type annotations. Critical functions
+  without any type hints:
+
+  - crypto_loop.py: run_crypto_bot() — no annotations at all
+  - stock_loop.py: run_stock_bot() — no annotations at all
+  - predict_now.py: get_live_prediction() — no return type annotation
+  - order_utils.py: All functions lack annotations
+  - trading_utils.py: All functions lack annotations
+  - market_data.py: All functions lack annotations
+
+  Adding type hints would catch bugs like passing a string where a float is
+  expected, and enable mypy/pyright static analysis.
+
+(b) Dict-heavy architecture begs for TypedDict or dataclass
+
+  The codebase passes around many "shape-defined" dicts:
+
+  Quote dict (order_utils.py:38-44):
+    {'bid': float, 'ask': float, 'spread': float,
+     'midpoint': float, 'spread_pct': float}
+
+  Position dict:
+    {'qty': float, 'entry_price': float, 'high_water_mark': float,
+     'stop_order_id': str|None, 'trailing_activated': bool,
+     'entry_atr': float|None, 'take_profit_price': float|None}
+
+  LLM result dict (llm_analyst.py:337-343):
+    {'m': float, 's': float, 'r': str, 'bull': str, 'bear': str}
+
+  Sentiment result dict (sentiment.py:834-839):
+    {'sentiment_score': float, 'article_count': int,
+     'positive_ratio': float, 'negative_ratio': float}
+
+  These should be TypedDict (for dicts that get serialized to JSON) or
+  @dataclass (for internal structures). This would:
+  - Catch key typos at type-check time
+  - Provide IDE autocompletion
+  - Serve as documentation
+  - Enable mypy to verify dict access
+
+(c) Inconsistent None handling
+
+  predict_now.py:105-247 (get_live_prediction) has two different return
+  signatures depending on return_snapshot:
+
+    - return_snapshot=False: returns float | None
+    - return_snapshot=True: returns tuple[float, dict] | tuple[None, None]
+
+  This overloaded return type is confusing and error-prone. Callers must
+  know the mode to correctly unpack. Consider:
+  - Always returning a NamedTuple (PredictionResult)
+  - Using @overload decorator for type checker awareness
+
+(d) No runtime type validation on model config
+
+  predict_now.py:56-58:
+    config = joblib.load(paths['config'])
+    scaler_X = joblib.load(paths['scaler'])
+    feature_cols = joblib.load(paths['features'])
+
+  These unpickle arbitrary objects with no validation. If the pickle files are
+  corrupted or from an incompatible version, the error will surface far from
+  the cause. A simple assertion (assert 'seq_len' in config) or pydantic
+  model would catch this immediately.
+
+(e) Alpaca API returns lack type safety
+
+  The code accesses API response attributes like pos.qty, pos.avg_entry_price,
+  order.filled_avg_price, acct.equity etc. These are untyped dynamic
+  attributes that could be None, str, or float depending on the order state.
+  Many places wrap in float() without checking for None first:
+
+  stock_loop.py:483-484:
+    qty = int(float(pos.qty))
+
+  This would crash with TypeError if pos.qty is None (which can happen for
+  partially filled orders). Defensive access patterns would help:
+
+    qty = int(float(pos.qty or 0))
+
+
+================================================================================
+SUMMARY OF PRIORITIES
+================================================================================
+
+CRITICAL (should fix first):
+  1. Add logging module throughout (replace all print() calls)
+  2. Test coverage for trading loops (crypto_loop, stock_loop)
+  3. Test coverage for order lifecycle and circuit breaker
+  4. Proper error handling for stop-loss sell failures
+  5. check_circuit_breaker needs its own try/except
+
+HIGH (significant quality improvement):
+  6. Refactor trading loops using Template Method pattern
+  7. Extract god functions into focused helper functions
+  8. Add TypedDict/dataclass for Position, Quote, LLMResult, SentimentResult
+  9. Consolidate magic numbers into shared config
+  10. Add type annotations to all public functions
+
+MEDIUM (good engineering practice):
+  11. Thread-safe caches (threading.Lock or cachetools.TTLCache)
+  12. Cache eviction for sentiment.py and fundamentals.py
+  13. Consolidate JSON repair logic between llm_analyst.py and sentiment.py
+  14. Atomic file writes for trade_memory.py and trade_journal.py
+  15. Cache API quotes per cycle to avoid redundant calls
+
+LOW (nice to have):
+  16. asyncio for I/O-bound API calls (only if switching to alpaca-py SDK)
+  17. O(n) rolling min/max with monotonic deque
+  18. Package structure with proper imports (eliminate sys.path.insert hacks)
+  19. Log rotation
+  20. Alert system for critical events
+
+================================================================================
+END OF AUDIT
+================================================================================

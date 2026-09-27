@@ -156,7 +156,9 @@ def _load_cache() -> dict:
             return {}
         _cache_memo = (st.st_mtime_ns, st.st_size, parsed)
         return dict(parsed)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        # ValueError covers JSONDecodeError AND the UnicodeDecodeError a
+        # binary-garbage file raises (same guard as risk_budget.read_registry)
         return {}
 
 

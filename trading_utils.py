@@ -150,7 +150,12 @@ def cooldown_ok(last_trade_time, symbol, cooldown_minutes=30):
     """
     if symbol not in last_trade_time:
         return True
-    elapsed = (datetime.datetime.now() - last_trade_time[symbol]).total_seconds()
+    # .timestamp() differences (not naive subtraction): the loops stamp naive
+    # LOCAL wall-clock times, and a naive difference is off by one hour
+    # across a DST transition; .timestamp() honours .fold (and tz-aware
+    # values) and returns true elapsed seconds (2026-09 G2-3).
+    elapsed = (datetime.datetime.now().timestamp()
+               - last_trade_time[symbol].timestamp())
     return elapsed >= cooldown_minutes * 60
 
 

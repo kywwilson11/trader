@@ -328,6 +328,34 @@ def get_filing_summary(symbol: str) -> str:
 
 # --- Format for LLM prompt ---
 
+_NA = "n/a"  # placeholder for a present-but-non-numeric provider value
+
+
+def _safe_float(value):
+    """Coerce a provider value to a finite float, or None.
+
+    yfinance/FMP occasionally return strings ('', 'N/A', 'Infinity', '12.3')
+    where a number is expected; ``f"{value:.1f}"`` on a str raised
+    ValueError and crash-looped the stock bot 1,778 times (spring 2026).
+    Never raises: bools, non-numeric strings, NaN and +/-inf all -> None.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out != out or out in (float("inf"), float("-inf")):
+        return None
+    return out
+
+
+def _fmt_num(value, spec: str) -> str:
+    """Format ``value`` with ``spec`` if numeric, else the text placeholder."""
+    num = _safe_float(value)
+    return _NA if num is None else format(num, spec)
+
+
 def format_fundamentals_for_llm(symbol: str, fundamentals: dict,
                                  insider: dict | None = None,
                                  filing_summary: str = "") -> str:
@@ -336,15 +364,18 @@ def format_fundamentals_for_llm(symbol: str, fundamentals: dict,
 
     pe = fundamentals.get("pe_ratio")
     if pe is not None:
-        lines.append(f"P/E={pe:.1f}")
+        lines.append(f"P/E={_fmt_num(pe, '.1f')}")
 
     pb = fundamentals.get("pb_ratio")
     if pb is not None:
-        lines.append(f"P/B={pb:.1f}")
+        lines.append(f"P/B={_fmt_num(pb, '.1f')}")
 
-    mcap = fundamentals.get("market_cap")
-    if mcap is not None:
-        if mcap >= 1e12:
+    mcap_raw = fundamentals.get("market_cap")
+    if mcap_raw is not None:
+        mcap = _safe_float(mcap_raw)
+        if mcap is None:
+            lines.append(f"MktCap={_NA}")
+        elif mcap >= 1e12:
             lines.append(f"MktCap=${mcap/1e12:.1f}T")
         elif mcap >= 1e9:
             lines.append(f"MktCap=${mcap/1e9:.1f}B")
@@ -353,16 +384,19 @@ def format_fundamentals_for_llm(symbol: str, fundamentals: dict,
 
     rg = fundamentals.get("revenue_growth")
     if rg is not None:
-        lines.append(f"RevGrowth={rg:.1%}")
+        lines.append(f"RevGrowth={_fmt_num(rg, '.1%')}")
 
     eps = fundamentals.get("eps")
     if eps is not None:
-        lines.append(f"EPS={eps:.2f}")
+        lines.append(f"EPS={_fmt_num(eps, '.2f')}")
 
-    dy = fundamentals.get("dividend_yield")
-    if dy is not None:
+    dy_raw = fundamentals.get("dividend_yield")
+    if dy_raw is not None:
+        dy = _safe_float(dy_raw)
         # yfinance returns either fraction (0.0037) or percentage (0.37) inconsistently
-        if dy > 1:
+        if dy is None:
+            lines.append(f"DivYield={_NA}")
+        elif dy > 1:
             lines.append(f"DivYield={dy:.1f}%")
         else:
             lines.append(f"DivYield={dy:.2%}")
@@ -373,10 +407,10 @@ def format_fundamentals_for_llm(symbol: str, fundamentals: dict,
 
     beta = fundamentals.get("beta")
     if beta is not None:
-        lines.append(f"Beta={beta:.2f}")
+        lines.append(f"Beta={_fmt_num(beta, '.2f')}")
 
-    w52h = fundamentals.get("week52_high")
-    w52l = fundamentals.get("week52_low")
+    w52h = _safe_float(fundamentals.get("week52_high"))
+    w52l = _safe_float(fundamentals.get("week52_low"))
     if w52h is not None and w52l is not None:
         lines.append(f"52wk=${w52l:.2f}-${w52h:.2f}")
 

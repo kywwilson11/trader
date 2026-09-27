@@ -8,7 +8,9 @@
 #   1. headless    — disable the Ubuntu desktop (~800MB RAM freed). The GUI
 #                    runs fine on another machine pointed at the same keys.
 #   2. swap        — replace default zram with a 12GB NVMe swapfile,
-#                    swappiness=15. zram steals CPU and ~50% of RAM as
+#                    swappiness=15. An EXISTING /swapfile is kept as-is (never
+#                    resized) — the prod box's is a pre-existing 8GB file
+#                    (created 2026-01-13, before this script existed). zram steals CPU and ~50% of RAM as
 #                    compressed swap; an NVMe swapfile is a crash-net that
 #                    keeps the Saturday retrain from OOM-killing the bots.
 #   3. cuda-libs   — install cuDSS + cuSPARSELt system-wide (ldconfig).
@@ -20,16 +22,137 @@
 #   5. power       — print (not set) the recommended nvpmodel usage.
 #
 # Usage:  sudo bash scripts/setup_jetson_system.sh [--skip-headless] [--skip-swap]
+#         sudo TRADER_PYBIN=/path/to/python bash scripts/setup_jetson_system.sh
+#         (sudo strips the caller's env, so pass TRADER_PYBIN after `sudo`.)
+#         bash scripts/setup_jetson_system.sh --user        # NO sudo: user unit only
+#         bash scripts/setup_jetson_system.sh [--user] --print-unit   # print, touch nothing
+#         (--user / --print-unit run ONLY the unit step; see "U." below.)
 set -euo pipefail
 
 SKIP_HEADLESS=0
 SKIP_SWAP=0
+USER_MODE=0
+PRINT_UNIT=0
 for arg in "$@"; do
   case "$arg" in
     --skip-headless) SKIP_HEADLESS=1 ;;
     --skip-swap)     SKIP_SWAP=1 ;;
+    --user)          USER_MODE=1 ;;
+    --print-unit)    PRINT_UNIT=1 ;;
   esac
 done
+
+# --- U. User-level unit / render-only modes (no root, unit step only) --------
+# The prod box has no sudo, so the system unit of step 6 cannot be installed
+# there (systemd 249; the memory+pids cgroup controllers are delegated to the
+# user manager, so MemoryMax= is enforced in a --user unit too).
+#   --print-unit          print the step-6 system unit to stdout, touch nothing
+#   --user --print-unit   print the user unit to stdout, touch nothing
+#   --user                install ~/.config/systemd/user/trader.service,
+#                         daemon-reload + enable it (NOT start), print linger
+# Single source: the values (step 0 + step 6 assignments) and the unit body
+# (the step-6 heredoc) are read back from THIS file, so the system unit, the
+# printed unit and the user unit cannot drift apart. The user unit differs
+# only in: no User=, no ordering on system-only targets, WantedBy=default.target.
+# Pinned by tests/test_setup_jetson_user_unit.py.
+if [[ $USER_MODE -eq 1 || $PRINT_UNIT -eq 1 ]]; then
+  SELF="${BASH_SOURCE[0]}"
+  _vars="$(grep -E '^(PYBIN|UNIT_LD_PRELOAD|UNIT_LD_LIBRARY_PATH|TRADER_DIR|TRADER_USER)=' "$SELF")"
+  if [[ $(printf '%s\n' "$_vars" | wc -l) -ne 5 ]]; then
+    echo "[unit] FATAL: expected 5 unit variable assignments in $SELF" >&2
+    exit 3
+  fi
+  eval "$_vars"
+
+  _render_system_unit() {  # step-6 heredoc body, expanded exactly as step 6 does
+    local tpl
+    tpl="$(awk '/^UNIT$/{f=0} f{print} /^  cat > \/etc\/systemd\/system\/trader\.service <<UNIT$/{f=1}' "$SELF")"
+    if [[ -z "$tpl" ]]; then
+      echo "[unit] FATAL: step-6 trader.service heredoc not found in $SELF" >&2
+      return 3
+    fi
+    eval "cat <<UNIT
+${tpl}
+UNIT"
+  }
+
+  _render_user_unit() {
+    local txt
+    txt="$(_render_system_unit)"
+    printf '%s\n' "$txt" | awk '
+      /^User=/ {next}
+      /^After=network-online\.target/ {
+        print "# User manager: it cannot order on system units (network-online.target,"
+        print "# chrony.service) - those lines of the system unit are dropped here."
+        next }
+      /^Wants=network-online\.target$/ {next}
+      /^WantedBy=multi-user\.target$/ {print "WantedBy=default.target"; next}
+      {print}'
+  }
+
+  if [[ $PRINT_UNIT -eq 1 ]]; then
+    if [[ $USER_MODE -eq 1 ]]; then _render_user_unit; else _render_system_unit; fi
+    exit 0
+  fi
+
+  # ---- --user install ----
+  if [[ $EUID -eq 0 ]]; then
+    echo "[user-unit] FATAL: --user installs into the CALLING user's systemd manager." >&2
+    echo "            Run it WITHOUT sudo, as the trading user." >&2
+    exit 1
+  fi
+  if [[ -z "${XDG_RUNTIME_DIR:-}" ]] || ! systemctl --user show-environment >/dev/null 2>&1; then
+    echo "[user-unit] FATAL: no systemd user manager reachable ('systemctl --user' failed;" >&2
+    echo "            XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-<unset>}). Nothing was written." >&2
+    echo "            Fix: run from a real login session (ssh/console - not su, sudo or cron)," >&2
+    echo "            or export XDG_RUNTIME_DIR=/run/user/$(id -u) if that directory exists;" >&2
+    echo "            if it does not, enable linger first: loginctl enable-linger $(id -un)" >&2
+    exit 4
+  fi
+  # Same interpreter gate as step 0 (run verbatim from this file).
+  eval "$(awk '/^# --- 0\. Interpreter/{f=1} /^# --- 1\. Headless/{f=0} f' "$SELF")"
+
+  _txt="$(_render_user_unit)"
+  if ! grep -qx 'WantedBy=default.target' <<<"$_txt" || grep -q '^User=' <<<"$_txt"; then
+    echo "[user-unit] FATAL: rendered user unit failed its self-check; nothing written." >&2
+    exit 3
+  fi
+  UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  UNIT_PATH="$UNIT_DIR/trader.service"
+  if [[ -e "$UNIT_PATH" ]]; then
+    echo "[user-unit] $UNIT_PATH already exists - left untouched (move it aside and re-run to regenerate)."
+    echo "            Check it with: systemctl --user status trader"
+    exit 0
+  fi
+  mkdir -p "$UNIT_DIR"
+  _tmp="$(mktemp "$UNIT_DIR/.trader.service.XXXXXX")"
+  trap 'rm -f "$_tmp"' EXIT
+  printf '%s\n' "$_txt" > "$_tmp"
+  chmod 644 "$_tmp"
+  mv -f "$_tmp" "$UNIT_PATH"        # atomic rename: no half-written unit
+  trap - EXIT
+  if ! systemctl --user daemon-reload || ! systemctl --user enable trader.service; then
+    systemctl --user disable trader.service >/dev/null 2>&1 || true
+    rm -f "$UNIT_PATH" "$UNIT_DIR/default.target.wants/trader.service"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    echo "[user-unit] FATAL: 'systemctl --user daemon-reload/enable' failed;" >&2
+    echo "            $UNIT_PATH removed again (nothing left half-installed)." >&2
+    exit 5
+  fi
+  echo "[user-unit] Installed + ENABLED: $UNIT_PATH (NOT started)."
+  echo "            Enabled = the bots START whenever your user manager starts"
+  echo "            (next login after all sessions closed, or at boot with linger)."
+  echo "            Linger is an owner decision (keeps your user manager alive across"
+  echo "            logouts and starts it at boot, so trader runs with nobody logged in):"
+  echo "              loginctl enable-linger $(id -un)"
+  echo "            Start:   systemctl --user start trader"
+  echo "            Stop:    systemctl --user stop trader"
+  echo "            Status:  systemctl --user status trader"
+  echo "            Journal: journalctl --user -u trader -f"
+  echo "                     (volatile journal, e.g. this Jetson: journalctl --user-unit=trader -f)"
+  echo "            Do NOT also launch run_pipeline/run_bots by hand or from the GUI."
+  exit 0
+fi
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run with sudo: sudo bash $0"
@@ -37,6 +160,30 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "=== Trader Jetson system setup ==="
+
+# --- 0. Interpreter for the systemd unit (checked FIRST, before any change) --
+# MUST be the jetson conda env (= run_pipeline.PYTHON). `command -v python3`
+# under sudo resolves to /usr/bin/python3 (secure_path has no conda), which
+# lacks pyarrow/dotenv/torch: the weekly retrain then dies in
+# _needs_force_harvest before the bots stop, and systemd restarts --bot-only
+# forever (ops audit 2026-09-26, P0-1). Fail loudly rather than install that.
+PYBIN="${TRADER_PYBIN:-/home/kyle/miniforge3/envs/jetson/bin/python}"
+# Same values as run_pipeline.ENV (LD_PRELOAD: conda libstdc++ — without it
+# `import torch`/pandas then `import sqlite3` dies with CXXABI_1.3.15).
+UNIT_LD_PRELOAD=/home/kyle/miniforge3/envs/jetson/lib/libstdc++.so.6
+UNIT_LD_LIBRARY_PATH=/home/kyle/miniforge3/envs/jetson/lib:/home/kyle/miniforge3/envs/jetson/lib/python3.10/site-packages/nvidia/cusparselt/lib
+if [[ ! -x "$PYBIN" ]]; then
+  echo "[python] FATAL: interpreter not found/executable: $PYBIN" >&2
+  echo "         Set TRADER_PYBIN to the jetson env python and re-run." >&2
+  exit 2
+fi
+if ! env LD_PRELOAD="$UNIT_LD_PRELOAD" LD_LIBRARY_PATH="$UNIT_LD_LIBRARY_PATH" \
+     CUDA_VISIBLE_DEVICES= "$PYBIN" -c 'import pyarrow, dotenv, torch' ; then
+  echo "[python] FATAL: $PYBIN cannot 'import pyarrow, dotenv, torch'." >&2
+  echo "         This is not the trader (jetson) env. Set TRADER_PYBIN." >&2
+  exit 2
+fi
+echo "[python] Unit interpreter OK: $PYBIN"
 
 # --- 1. Headless ----------------------------------------------------------
 if [[ $SKIP_HEADLESS -eq 0 ]]; then
@@ -70,7 +217,8 @@ if [[ $SKIP_SWAP -eq 0 ]]; then
     fi
     echo "[swap] 12GB NVMe swap active + persisted in fstab."
   else
-    echo "[swap] $SWAPFILE already exists."
+    _swap_gb=$(( $(stat -c %s "$SWAPFILE") / 1024 / 1024 / 1024 ))
+    echo "[swap] $SWAPFILE already exists (${_swap_gb}GB) — kept as-is, NOT resized to 12GB."
   fi
   # Swap as crash-net, not working set
   sysctl -w vm.swappiness=15 >/dev/null
@@ -153,7 +301,6 @@ fi
 # just a dead one) gets killed and restarted automatically.
 TRADER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRADER_USER="${SUDO_USER:-$(whoami)}"
-PYBIN="$(command -v python3)"
 if [[ ! -f /etc/systemd/system/trader.service ]]; then
   cat > /etc/systemd/system/trader.service <<UNIT
 [Unit]
@@ -166,11 +313,24 @@ Type=notify
 NotifyAccess=all
 User=${TRADER_USER}
 WorkingDirectory=${TRADER_DIR}
-Environment=CUDA_VISIBLE_DEVICES=
 ExecStart=${PYBIN} -u run_pipeline.py --combined-bots --bot-only
+Environment=PYTHONUNBUFFERED=1
+Environment=LD_PRELOAD=${UNIT_LD_PRELOAD}
+Environment=LD_LIBRARY_PATH=${UNIT_LD_LIBRARY_PATH}
+# NO CUDA_VISIBLE_DEVICES here: training children MUST see the GPU. The bots
+# are already hidden from it by run_pipeline.BOT_ENV (run_pipeline.py:310,
+# CUDA_VISIBLE_DEVICES='') and run_bots.py:45 (setdefault ''); run_pipeline
+# also drops an inherited empty value for training (_training_env).
+# Leading '-': a missing .env is not fatal. Makes TRADER_TELEGRAM_* /
+# TRADER_HEALTHCHECK_URL visible to the PARENT (kill switch, crash alerts).
+# systemd syntax: KEY=VALUE lines, no 'export' prefix.
+EnvironmentFile=-${TRADER_DIR}/.env
 Restart=on-failure
 RestartSec=30
 WatchdogSec=900
+# An OOM-killed child must not stop the whole unit (systemd default
+# DefaultOOMPolicy=stop): let run_pipeline's phase retry / bot restart act.
+OOMPolicy=continue
 # OOM: kill the pipeline before the kernel picks a victim at random
 OOMScoreAdjust=200
 MemoryMax=6G
@@ -183,7 +343,7 @@ UNIT
   echo "          flags first, e.g. drop --bot-only to retrain on boot)."
   echo "          Enable with: sudo systemctl enable --now trader.service"
 else
-  echo "[systemd] trader.service already exists — left untouched."
+  echo "[systemd] trader.service already exists — left untouched (move it aside and re-run to regenerate)."
 fi
 
 # --- 7. State backups -------------------------------------------------------
@@ -194,12 +354,16 @@ echo "  (restic mode: export RESTIC_REPOSITORY + RESTIC_PASSWORD first)"
 # --- 8. Power-mode guidance (printed, not applied) --------------------------
 cat <<'EOF'
 
-[power] Recommended usage (JetPack >= 6.2 "Super" modes):
-  - Trading (24/7):       sudo nvpmodel -m 1     # 15W — bots are I/O-bound
-  - Saturday retrain:     sudo nvpmodel -m 2     # 25W (best perf/W) or MAXN SUPER
+[power] Recommended usage (JetPack >= 6.2 "Super" modes). Mode IDs verified
+  2026-09-26 in this Orin Nano Super's /etc/nvpmodel.conf:
+  0 = 15W, 1 = 25W, 2 = MAXN_SUPER, 3 = 7W  (confirm: sudo nvpmodel -q --verbose)
+  - Trading (24/7):       sudo nvpmodel -m 0     # 15W — bots are I/O-bound
+  - Saturday retrain:     sudo nvpmodel -m 1     # 25W (best perf/W)
+                     or:  sudo nvpmodel -m 2     # MAXN_SUPER
                           sudo jetson_clocks      # pin clocks during training
   - Check current mode:   sudo nvpmodel -q
-  run_pipeline's wait_for_cool_gpu already throttles on temperature.
+  run_pipeline._bounded_thermal_wait already gates each search phase on
+  GPU temperature (<= 70C).
 
 [kill switch] With TRADER_TELEGRAM_BOT_TOKEN/CHAT_ID set, the pipeline
   accepts /halt /resume /flatten /status from the configured chat.

@@ -14,12 +14,17 @@ CONSUMER CONTRACT: read-only over journal rows; keys read here (sizing.*,
 sizing.v2.*, skip_reason, ts, symbol) break on a producer rename — keep in
 sync with base_loop._compute_position_size and trade_journal.py.
 
-Never raises; malformed lines are skipped and counted; empty/missing
-journal dir prints a clean 'no rows' result; ALWAYS exits 0.
+Malformed lines are skipped and counted; empty/missing journal dir prints a
+clean 'no rows' result and exits 0. Exit codes (2026-09): 0 = report
+produced (or --help); 2 = bad command-line argument (argparse error — no
+longer swallowed, so wrappers can detect misuse); 1 = unexpected runtime
+failure (e.g. the --json PATH is not writable).
 
 Usage:
   python scripts/sizing_cofire_report.py --days 30 [--book crypto|stock|all]
-                                         [--journal-dir DIR] [--json]
+                                         [--journal-dir DIR] [--json [PATH]]
+  --json PATH  writes the report JSON to PATH (atomic tmp + os.replace);
+  --json       (bare, or --json -) prints the JSON object to stdout.
 """
 
 import argparse
@@ -49,24 +54,38 @@ DERISK_KEYS = ['vix_tilt', 'macro_mult', 'hmm_mult', 'dd_mult', 'corr_mult',
                'disagree_mult']
 
 
+# A naive `ts` is a legacy (pre-2026-08-20) row stamped with
+# `datetime.now().isoformat()` — the writer's LOCAL wall clock, not UTC
+# (G6-2; same reading as llm_eval / journal_stats / chart_core). None = the
+# system zone (`datetime.astimezone()`, DST-aware); tests pin a zone here.
+_LOCAL_TZ = None
+
+
 def _parse_ts(ts):
     try:
         dt = _dt.datetime.fromisoformat(str(ts))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=_dt.timezone.utc)
+            dt = (dt.replace(tzinfo=_LOCAL_TZ) if _LOCAL_TZ is not None
+                  else dt.astimezone())
         return dt
     except Exception:
         return None
 
 
+_TS_MIN = _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+
+
 def _load_rows(journal_dir, days, book):
-    """(buy_rows, skip_sizing_zero_rows, n_malformed, n_files)."""
+    """(buy_rows_with_sizing, skip_sizing_zero_rows, n_malformed, n_files,
+    n_buy_rows_without_sizing) — the last counts in-window buys that carry no
+    'sizing' dict (journals older than the sizing producer), header-only."""
     cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days)
     buys, zero_skips, malformed, n_files = [], [], 0, 0
+    n_buy_nosizing = 0
     try:
         names = sorted(os.listdir(journal_dir))
     except OSError:
-        return buys, zero_skips, malformed, n_files
+        return buys, zero_skips, malformed, n_files, n_buy_nosizing
     for name in names:
         if not name.endswith('.jsonl'):
             continue
@@ -97,9 +116,11 @@ def _load_rows(journal_dir, days, book):
             action = row.get('action')
             if action == 'buy' and isinstance(row.get('sizing'), dict):
                 buys.append(row)
+            elif action == 'buy':
+                n_buy_nosizing += 1
             elif action == 'skip' and row.get('skip_reason') == 'sizing_zero':
                 zero_skips.append(row)
-    return buys, zero_skips, malformed, n_files
+    return buys, zero_skips, malformed, n_files, n_buy_nosizing
 
 
 def _num(x):
@@ -132,10 +153,14 @@ def _median(vals):
     return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
 
 
-def build_report(buys, zero_skips, malformed, n_files, days, book):
+def build_report(buys, zero_skips, malformed, n_files, days, book,
+                 n_buy_rows_without_sizing=0):
+    # n_buy_rows = buys WITH a sizing dict (the analysed set; unchanged
+    # meaning). n_buy_rows_without_sizing is additive, for the header.
     rep = {'n_buy_rows': len(buys), 'n_files': n_files,
            'n_malformed_lines': malformed, 'days': days, 'book': book,
-           'tilt_max': TILT_MAX}
+           'tilt_max': TILT_MAX,
+           'n_buy_rows_without_sizing': int(n_buy_rows_without_sizing)}
     sizings = [r['sizing'] for r in buys]
 
     # 1. per_multiplier
@@ -234,7 +259,10 @@ def build_report(buys, zero_skips, malformed, n_files, days, book):
         # Hysteresis instrumentation: row-over-row flips of the v2 VIX tier
         # and the BTC-RV state, per day.
         flips = {'vix_tier_total': 0, 'btc_rv_state_total': 0, 'per_day': {}}
-        ordered = sorted(v2_rows, key=lambda r: str(r.get('ts')))
+        # Chronological, not lexicographic: ISO strings with different UTC
+        # offsets (DST fall-back hour) do not sort in time order as text.
+        ordered = sorted(v2_rows,
+                         key=lambda r: _parse_ts(r.get('ts')) or _TS_MIN)
         prev = {}
         for r in ordered:
             day = str(r.get('ts'))[:10]
@@ -287,12 +315,17 @@ def _print_table(title, rows, cols):
 
 
 def print_report(rep):
-    print('sizing co-fire report — last %sd, book=%s: %d buy rows '
-          '(%d files, %d malformed lines skipped)'
-          % (rep['days'], rep['book'], rep['n_buy_rows'], rep['n_files'],
-             rep['n_malformed_lines']))
+    n_nosz = int(rep.get('n_buy_rows_without_sizing') or 0)
+    print('sizing co-fire report — last %sd, book=%s: %d buy rows, %d with '
+          'sizing (%d files, %d malformed lines skipped)'
+          % (rep['days'], rep['book'], rep['n_buy_rows'] + n_nosz,
+             rep['n_buy_rows'], rep['n_files'], rep['n_malformed_lines']))
     if not rep['n_buy_rows']:
-        print('no rows — nothing to report')
+        if n_nosz:
+            print('no rows with sizing — the %d buy row(s) in the window '
+                  'pre-date the sizing producer (base_loop, 2026-07)' % n_nosz)
+        else:
+            print('no rows — nothing to report')
         return
     _print_table('per-multiplier', [
         (k, s['n_present'], s['fire_rate'], s['boost_rate'], s['mean'],
@@ -340,24 +373,42 @@ def main(argv=None):
                     default=os.path.join(_REPO, 'journals'))
     ap.add_argument('--book', choices=['crypto', 'stock', 'all'],
                     default='all')
-    ap.add_argument('--json', action='store_true',
-                    help='single JSON object to stdout (GUI-readable)')
+    ap.add_argument('--json', nargs='?', const='-', default=None,
+                    metavar='PATH',
+                    help='write the report as JSON to PATH; bare --json '
+                         '(or --json -) prints one JSON object to stdout')
     args = ap.parse_args(argv)
-    buys, zero_skips, malformed, n_files = _load_rows(
+    buys, zero_skips, malformed, n_files, n_nosz = _load_rows(
         args.journal_dir, args.days, args.book)
     rep = build_report(buys, zero_skips, malformed, n_files,
-                       args.days, args.book)
-    if args.json:
+                       args.days, args.book, n_buy_rows_without_sizing=n_nosz)
+    if args.json is None:
+        print_report(rep)
+    elif args.json == '-':
         print(json.dumps(rep, default=str))
     else:
+        tmp = '%s.%d.tmp' % (args.json, os.getpid())
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(rep, f, default=str, indent=2)
+            os.replace(tmp, args.json)
+        finally:
+            # a failed replace (e.g. PATH is a directory) must not leak tmp
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
         print_report(rep)
+        print('\n[sizing_cofire_report] wrote %s' % args.json)
 
 
 if __name__ == '__main__':
     try:
         main()
     except SystemExit:
-        pass          # argparse --help / bad args: still exit 0 below
+        raise         # argparse: --help exits 0, a bad argument exits 2
     except Exception as e:
         print('sizing_cofire_report failed: %s' % e, file=sys.stderr)
+        sys.exit(1)
     sys.exit(0)

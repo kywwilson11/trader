@@ -332,8 +332,9 @@ class TestRefitEpochBudget:
 
 def test_flags_default_off():
     import strategy_config
-    assert strategy_config.HYPERSEARCH_V3 is False
-    assert strategy_config.OBJECTIVE_V3 is False
+    # 2026-09-27: flipped True at the clean-rebuild gotcha-#2 event on the founder's instruction (strategy_config.py comment)
+    assert strategy_config.HYPERSEARCH_V3 is True
+    assert strategy_config.OBJECTIVE_V3 is True
 
 
 # ---------------------------------------------------------------------------

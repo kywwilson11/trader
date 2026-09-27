@@ -29,6 +29,25 @@ pytest.importorskip("scipy")
 import llm_eval
 
 
+@pytest.fixture(autouse=True)
+def _sandboxed_cost_ledger(monkeypatch, tmp_path):
+    """Test hygiene (INTEL W9, 2026-09-27; idiom of test_g4b_fixes_2026_09.py
+    :181-197). run_eval (via the report cost block) reaches
+    llm_client.get_daily_cost -> _maybe_reset_quota (opens <_COST_FILE>.lock
+    for writing, repo-root MOD measured) and _load_shared_cost. Every
+    ledger path derives from the single constant llm_client._COST_FILE (the
+    '.lock' in _cost_file_lock, the '.tmp' + os.replace in _save_shared_cost,
+    and the rollover's llm_cost_history.jsonl), so pointing it into tmp_path
+    keeps the repo-root llm_cost.json{,.lock,.tmp} untouched; the in-memory
+    ledger globals go through monkeypatch so they are restored afterwards."""
+    import llm_client
+    monkeypatch.setattr(llm_client, '_COST_FILE',
+                        str(tmp_path / 'llm_cost.json'))
+    monkeypatch.setattr(llm_client, '_cost_reset_date', '')
+    monkeypatch.setattr(llm_client, '_daily_cost', 0.0)
+    return tmp_path
+
+
 # --------------------------------------------------------------------------- #
 # Shared fixtures / helpers
 # --------------------------------------------------------------------------- #

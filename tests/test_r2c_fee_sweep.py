@@ -367,9 +367,9 @@ def test_main_fee_sweep_loop_and_lambda(monkeypatch, tmp_path, capsys):
     assert backtest.main() == 0
 
     assert [c['fee_mult'] for c in calls] == [1.0, 2.0, 3.0, 4.0]
-    # stage0 dump on the FIRST pass only (module default), forced off after
-    assert calls[0]['stage0_dump'] is None
-    assert all(c['stage0_dump'] is False for c in calls[1:])
+    # SIG-R2-2: NO sweep pass writes the stage0 dump (pass 1 used to keep
+    # the module default and overwrite the weekly --gate dump)
+    assert all(c['stage0_dump'] is False for c in calls)
     assert all(c['model_prefix'] is None for c in calls)
 
     out = capsys.readouterr().out

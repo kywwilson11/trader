@@ -10,7 +10,11 @@ production analyst BEFORE the owner considers flipping selection_mode to
       measure the things that break a schema-enforced gate: strict-schema
       validity %, fence-strip fallback %, latency p50/p95 vs the analyst's
       45 s budget, HTTP error mix, and 429 sustainability. Emits a per-model
-      verdict: qualified / marginal / failed.
+      verdict: qualified / marginal / failed. Calls that never answer
+      (timeout / transport failure / 5xx) count AGAINST schema validity
+      (denominator = attempts minus 429s), and a timeout enters the latency
+      sample censored at the budget — a p95 that lands on one is unknown and
+      > budget, so it fails the latency ceilings (p95_censored).
 
   --shadow — score the SAME evidence (canned fixtures, or real replay
       cycles with --replay) through the production analyst model AND each
@@ -303,6 +307,11 @@ def verdict_for(q: dict) -> str:
     p95 = q.get("p95_latency_s")
     if sv is None or p95 is None:
         return "failed"
+    if q.get("p95_censored"):
+        # the p95 lands on a call that never answered inside the transport
+        # budget: its true latency is unknown and > BUDGET_S, so neither
+        # latency ceiling can be claimed (C-1, 2026-09-26).
+        p95 = float("inf")
     if sv >= SCHEMA_VALID_MIN_PCT and p95 <= P95_MAX_S:
         return "qualified"
     if sv >= SCHEMA_MARGINAL_MIN_PCT and p95 <= P95_MARGINAL_MAX_S:
@@ -596,6 +605,7 @@ def run_qualification(candidates, config, n_calls=DEFAULT_N_CALLS,
              "rate_limit_events": 0, "consecutive_429_max": 0,
              "http_errors": {}, "sustained_429": False, "errors": []}
         latencies = []
+        n_censored = 0   # status-less failures (timeouts etc.): > budget
         n_valid = n_fallback = consecutive_429 = 0
         ledger_before = _ledger_spent()
         try:
@@ -640,17 +650,37 @@ def run_qualification(candidates, config, n_calls=DEFAULT_N_CALLS,
                     elif r["error"]:
                         q["errors"].append(
                             f"attempt {i + 1} ({fx['id']}): {r['error']}")
+                    if r["status"] is None and not (r["ok"] and r["text"]):
+                        # no answer inside the budget (timeout / transport
+                        # failure): it enters the latency distribution
+                        # censored AT the budget instead of silently
+                        # vanishing — otherwise p95 over survivors is
+                        # <= BUDGET_S == P95_MAX_S by construction.
+                        n_censored += 1
+                        latencies.append(max(float(r.get("latency_s")
+                                                   or 0.0), BUDGET_S))
                 if i + 1 < n_calls:
                     sleep_fn(spacing_s)
         except Exception as e:  # fail-open — candidate loop must not raise
             q["errors"].append(f"runner error (fail-open): {e}")
         nc = q["n_completed"]
-        q["schema_valid_pct"] = (100.0 * n_valid / nc) if nc else None
+        # Denominator = every attempt that was not rate-limited: a timeout
+        # or 5xx produced no schema-valid response, so it counts against
+        # schema validity (it used to be over completed calls only, which
+        # let a model failing 19/20 calls score 100%; C-1, 2026-09-26).
+        denom = q["n_attempts"] - q["rate_limit_events"]
+        q["schema_valid_pct"] = ((100.0 * n_valid / denom)
+                                 if nc and denom > 0 else None)
         q["parse_fallback_pct"] = (100.0 * n_fallback / nc) if nc else None
+        q["n_timeouts"] = n_censored
         ls = latency_stats(latencies)
         q["p50_latency_s"] = ls["p50"]
         q["p95_latency_s"] = ls["p95"]
         q["mean_latency_s"] = ls["mean"]
+        # censored when the p95 reaches the budget and some sample there is
+        # a no-answer (its true latency is unknown, > BUDGET_S)
+        q["p95_censored"] = bool(n_censored and ls["p95"] is not None
+                                 and ls["p95"] >= BUDGET_S)
         zero_ok, would_bill = pricing_zero(cand["model"], config)
         q["pricing_zero"] = zero_ok
         q["would_bill_per_mtok"] = would_bill

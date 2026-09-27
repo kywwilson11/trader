@@ -113,6 +113,27 @@ def install_session_timeout(session, connect_s=REST_CONNECT_TIMEOUT_S,
 
 # --- SPREAD / QUOTE HELPERS ---
 
+def _quote_max_age_sec(asset_type):
+    """Max quote age (s) before get_quote rejects it as stale.
+
+    strategy_config.CRYPTO_QUOTE_MAX_AGE_SEC (default None -> the legacy
+    literal 180, byte-identical) is read at CALL time and applies to crypto
+    only; stocks always keep 180. Never raises: a missing/None/invalid value
+    (non-numeric, bool, NaN/inf, <= 0) falls back to 180 — this runs inside
+    get_quote's staleness try-block, where a raise would skip the check."""
+    if asset_type == 'crypto':
+        try:
+            import strategy_config
+            v = getattr(strategy_config, 'CRYPTO_QUOTE_MAX_AGE_SEC', None)
+            if v is not None and not isinstance(v, bool):
+                v = float(v)
+                if math.isfinite(v) and v > 0:
+                    return v
+        except Exception:
+            pass
+    return 180
+
+
 def get_quote(api, symbol, asset_type='crypto'):
     """Get real-time bid/ask quote for any asset via Alpaca.
 
@@ -149,24 +170,60 @@ def get_quote(api, symbol, asset_type='crypto'):
         # loop happily compares positions against a price that stopped
         # updating. Reject quotes older than 3 minutes (and let callers'
         # quote-unavailable paths handle it loudly).
+        # A timestamp that is PRESENT but cannot be turned into a finite age
+        # fails CLOSED — rejected exactly like an over-age quote (ENGINE r3
+        # W10; this was `except Exception: pass`, i.e. accepted as FRESH).
+        # Probed on the legacy SDK entity: raw null/'' -> NaT -> ValueError
+        # at astimezone; raw 'garbage' -> DateParseError (a ValueError) from
+        # the getattr itself; out-of-range -> OutOfBoundsDatetime
+        # (ValueError); a non-datetime value -> AttributeError; an
+        # uncomparable age -> TypeError; a datetime near min/max ->
+        # OverflowError; a NaT that does not raise (pandas-version
+        # dependent) -> non-finite age. An ABSENT timestamp (None: no 't'
+        # key in the SDK payload / no timestamp through the shim) cannot be
+        # aged either and fails CLOSED the same way (was: check skipped).
+        raw_t_type = 'unreadable'
         try:
             qt = getattr(q, 't', None)
-            if qt is not None:
-                if hasattr(qt, 'to_pydatetime'):
+            raw_t_type = type(qt).__name__
+            if qt is None:
+                raise ValueError('quote timestamp missing')
+            if hasattr(qt, 'to_pydatetime'):
+                # pandas Timestamps carry nanoseconds; the stdlib datetime
+                # cannot, and pandas' default emits a UserWarning
+                # ("Discarding nonzero nanoseconds") on EVERY quote — one
+                # line per symbol per 30 s cycle (ENGINE r4). warn=False
+                # truncates to microseconds exactly as before, so the age
+                # and the staleness verdict are unchanged (< 1 µs).
+                try:
+                    qt = qt.to_pydatetime(warn=False)
+                except TypeError:
                     qt = qt.to_pydatetime()
-                if qt.tzinfo is None:
-                    # Alpaca timestamps are UTC by definition — a naive value
-                    # must not be read as machine-local time (astimezone would),
-                    # which skews the age by the UTC offset in either direction.
-                    qt = qt.replace(tzinfo=datetime.timezone.utc)
-                age = (datetime.datetime.now(datetime.timezone.utc)
-                       - qt.astimezone(datetime.timezone.utc)).total_seconds()
-                if age > 180:
-                    logger.warning("[QUOTE] %s: quote is %.0fs stale, ignoring",
-                                   symbol, age)
-                    return None
+            if qt.tzinfo is None:
+                # Alpaca timestamps are UTC by definition — a naive value
+                # must not be read as machine-local time (astimezone would),
+                # which skews the age by the UTC offset in either direction.
+                qt = qt.replace(tzinfo=datetime.timezone.utc)
+            age = (datetime.datetime.now(datetime.timezone.utc)
+                   - qt.astimezone(datetime.timezone.utc)).total_seconds()
+            if not math.isfinite(age):
+                raise ValueError(f'non-finite quote age {age!r}')
+            if age > _quote_max_age_sec(asset_type):
+                logger.warning("[QUOTE] %s: quote is %.0fs stale, ignoring",
+                               symbol, age)
+                return None
+        except (TypeError, ValueError, AttributeError, OverflowError) as e:
+            logger.debug("[QUOTE] %s: unparsable/missing quote timestamp (raw type %s:"
+                         " %s: %s) — rejected as stale", symbol, raw_t_type,
+                         type(e).__name__, e)
+            return None
+        # quote_t (ENGINE r5, measurement-only): the EXCHANGE quote time
+        # (epoch s) of the timestamp just parsed — derived only AFTER the
+        # staleness verdict, in its own try, so accept/reject cannot change.
+        try:
+            quote_t = float(qt.timestamp())
         except Exception:
-            pass  # unparseable timestamp — don't block on the check itself
+            quote_t = None
         spread_pct = (spread / midpoint) * 100.0
         if ask < bid:
             logger.warning("[QUOTE] %s: CROSSED quote bid=%s ask=%s "
@@ -174,7 +231,7 @@ def get_quote(api, symbol, asset_type='crypto'):
         # fetched_ts (c26 T6): decision-time stamp for slippage-vs-quote-age
         # decomposition. Additive sixth key — consumers key-access only the
         # five legacy keys; buy rows keep their own later '_fetched_ts'
-        # stamp set in _execute_buys.
+        # stamp set in _execute_buys. quote_t: additive seventh key (above).
         return {
             'bid': bid,
             'ask': ask,
@@ -182,6 +239,7 @@ def get_quote(api, symbol, asset_type='crypto'):
             'midpoint': midpoint,
             'spread_pct': spread_pct,
             'fetched_ts': time.time(),
+            'quote_t': quote_t,
         }
     except Exception as e:
         logger.warning("[QUOTE] Error fetching quote for %s: %s", symbol, e)
@@ -356,6 +414,14 @@ def _ioc_entry_fallback(api, symbol, side, qty, ioc_fallback, final_order):
 
 # --- ORDER PLACEMENT ---
 
+# Statuses after which an order can no longer fill (Alpaca order lifecycle).
+# Anything else — new, accepted, partially_filled, pending_cancel,
+# pending_replace, replaced, done_for_day, ... — may still be (or become)
+# working, so no second order for the same intent may be sent on top of it
+# (2026-09 G2-1; the known-live sibling of c26 D18's "unknown is NOT
+# zero-fill").
+_SETTLED_STATUSES = ('filled', 'canceled', 'expired', 'rejected')
+
 def _maker_rung_id(symbol: str, ladder_ts: int, rung: int) -> str:
     """Deterministic client_order_id for one maker rung (c26 D18): a
     resend of the same rung within one ladder invocation collides at
@@ -456,6 +522,20 @@ def place_maker_buy(api, symbol, notional, quote_fn, stage_timeout=25,
             logger.error("[MAKER] %s: rung %d outcome UNKNOWN (lifecycle "
                          "returned None) — aborting ladder, skipping taker "
                          "fallback", symbol, attempt + 1)
+            _journal_entry_fills(symbol, 'maker_unknown',
+                                 maker_notional, taker_notional)
+            return last, 'maker_unknown'
+        if getattr(result, 'status', None) not in _SETTLED_STATUSES:
+            # Cancel NOT confirmed (cancel raised / still pending_cancel /
+            # fetch shows it live): the rung is still a working GTC bid.
+            # Same handling as the unknown outcome above — never stack
+            # another rung or the taker fallback on top of a working order.
+            logger.error("[MAKER] %s: rung %d still working after cancel "
+                         "(status=%s) — aborting ladder, skipping taker "
+                         "fallback", symbol, attempt + 1,
+                         getattr(result, 'status', None))
+            if _filled_qty(result) >= _filled_qty(last):
+                last = result
             _journal_entry_fills(symbol, 'maker_unknown',
                                  maker_notional, taker_notional)
             return last, 'maker_unknown'
@@ -706,12 +786,14 @@ def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2,
             return order
 
     # Timeout reached — cancel
+    cancel_failed = False
     if cancel_on_timeout:
         logger.info("[LIFECYCLE] Order %s unfilled after %ss, canceling...", order_id, timeout)
         try:
             api.cancel_order(order_id)
             time.sleep(1)  # give cancel time to process
         except Exception as e:
+            cancel_failed = True
             logger.warning("[LIFECYCLE] Cancel error: %s", e)
     else:
         logger.info("[LIFECYCLE] Order %s unfilled after %ss — confirm-only"
@@ -733,6 +815,27 @@ def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2,
             pass
     except Exception:
         pass
+
+    # G2-1 (2026-09): the fallback is a SECOND order for the same intent, so
+    # it may only be sent once the original is confirmed settled. A cancel
+    # that raised, an order still pending_cancel, or a post-cancel fetch that
+    # shows it live all mean the original may still fill — return the
+    # freshest state instead (callers judge acquisition by filled_qty).
+    if fallback_to_market and cancel_on_timeout:
+        if (final_order is not None
+                and getattr(final_order, 'status', None) not in _SETTLED_STATUSES):
+            logger.error("[LIFECYCLE] %s: cancel not confirmed (status=%s) — "
+                         "order may still be working, skipping fallback",
+                         order_id, getattr(final_order, 'status', None))
+            return final_order
+        if final_order is None and cancel_failed:
+            # Cancel raised AND the state could not be fetched: unknown is
+            # NOT zero-fill (c26 D18) — no fallback on top of a possibly
+            # working order.
+            logger.error("[LIFECYCLE] %s: cancel failed and post-cancel state"
+                         " unknown (filled_qty=%s observed in-loop) — skipping"
+                         " fallback, returning None", order_id, saved_filled)
+            return None
 
     if fallback_to_market and saved_symbol and cancel_on_timeout:
         # Only chase the unfilled remainder
@@ -807,6 +910,28 @@ def manage_order_lifecycle(api, order_id, timeout=30, poll_interval=2,
 
 
 # --- POSITION VERIFICATION ---
+
+def _basis_or_zero(x) -> float:
+    """Broker cost-basis field (avg_entry_price) -> float, with a MISSING
+    basis read exactly like the paper zero-basis quirk's "0".
+
+    Byte-identical to float(x) for every input float() accepts (numeric
+    strings, floats, ints, Decimals — including '0'/0 and nan/inf). None,
+    '' and non-numeric garbage (TypeError/ValueError from float()) return
+    0.0 instead of raising, so every caller takes its EXISTING zero-basis
+    path (ENGINE r7 H5: a null basis dropped a live position from startup
+    tracking, raised after a real buy fill, and — through the alpaca-py
+    shim — turned verify_position into a false DESYNC). One debug line per
+    coercion records the raw type. Basis fields only: a bad qty or price
+    is still a bad payload and must keep failing where it fails today.
+    """
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        logger.debug("[BASIS] unusable cost-basis value (raw type %s: %r) —"
+                     " treated as 0 (basis unknown)", type(x).__name__, x)
+        return 0.0
+
 
 def verify_position(api, symbol):
     """Check actual position via API. Returns the position object, or None
@@ -1118,7 +1243,10 @@ def reconstruct_positions(api, symbols, asset_type='crypto'):
         qty = float(pos.qty)
         if qty <= 0:
             return None
-        entry_price = float(pos.avg_entry_price)
+        # A null/garbage basis reads as 0 (the paper quirk's value) so the
+        # position is KEPT with base_loop's "cost basis unknown" warning
+        # instead of dropped as a bad payload (ENGINE r7 H5).
+        entry_price = _basis_or_zero(pos.avg_entry_price)
         # current_price can be None under the alpaca-py adapter
         # (the shim passes it through) — float(None) raised and
         # silently dropped a LIVE position from startup tracking.

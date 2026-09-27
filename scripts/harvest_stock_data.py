@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import os
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -31,7 +32,7 @@ from data_sources import fetch_with_fallback
 from data_utils import (load_training_data, save_training_data,
                          append_ticker_data, validate_training_data,
                          raw_sidecar_enabled, load_raw_ohlcv, save_raw_ohlcv,
-                         merge_raw_ohlcv, find_interior_gaps,
+                         merge_raw_ohlcv, find_interior_gaps, _ensure_utc_index,
                          overlap_close_divergence, OVERLAP_DIVERGENCE_MAX)
 from market_data import fetch_historical_bars
 
@@ -129,6 +130,76 @@ def fetch_spy_close(api=None):
     return df['Close']
 
 
+# --- R4 (L7 full fix, 2026-09-26): stamp TB labels AFTER every row filter ---
+# TB_Bars_{fb} is a POSITIONAL offset in the frame compute_tb_labels walks
+# (policy_exits.py caveat), and backtest.simulate_ticker / meta_label replay
+# the exit kernel over the STORED rows. So the labels are stamped on exactly
+# the rows the store keeps (feature dropna + as-of tradability + as-of
+# membership already applied), continued — past the LAST stored row only —
+# into every real bar after it (the rows the Target_Return NaN tail drops),
+# which reproduces the old series-end behaviour. Interior bars a filter
+# removed are therefore invisible to the label walk exactly as they are to
+# the backtester (label == backtest, docs/MAP.md §6 invariant 1) and every
+# span is a valid row offset for sample_weights uniqueness. Rows whose walk
+# never crossed a removed bar keep byte-identical labels.
+
+class TBSpanError(RuntimeError):
+    """A post-stamp filter removed INTERIOR rows (TB_Bars_* spans invalid)
+    or the stamp precondition failed. Fatal: main() exits 3 before any
+    training-store write."""
+
+
+TB_SPAN_EXIT_CODE = 3
+_TB_PRICE_COLS = ('Open', 'High', 'Low', 'Close', 'ATR')
+
+# ticker -> slim OHLC+ATR frame of that ticker's real bars from its first
+# stored row on; filled by prepare_stock_data, consumed (and cleared) by
+# main()'s post-membership re-stamp. Module-level so prepare_stock_data's
+# signature (stubbed by tests) is unchanged.
+_TB_WALK_BARS = {}
+
+
+def _tb_price_frame(df):
+    """Slim copy of exactly the columns compute_tb_labels reads."""
+    return df[[c for c in _TB_PRICE_COLS if c in df.columns]].copy()
+
+
+def _stamp_tb_labels(stored, bars, asset_type='stock'):
+    """Stamp TB_Ret/Bars/Reason_{fb} onto `stored` — ONE ticker's final
+    rows (sorted, unique index) — by walking the exit kernel over those
+    rows followed by the bars in `bars` strictly AFTER the last stored
+    row. Returns a new frame; rows whose window runs off the continuation
+    get NaN (the caller drops them: suffix-only by construction)."""
+    if len(stored) == 0:
+        return stored
+    for name, ix in (('stored', stored.index), ('bars', bars.index)):
+        if not (ix.is_unique and ix.is_monotonic_increasing):
+            raise TBSpanError(f"TB stamp precondition: {name} index is not "
+                              f"sorted+unique (policy_exits caveat)")
+    cols = [c for c in _TB_PRICE_COLS
+            if c in stored.columns and c in bars.columns]
+    tail = bars.loc[bars.index > stored.index[-1], cols]
+    df = pd.concat([stored[cols], tail]) if len(tail) else stored[cols]
+    from policy_exits import compute_tb_labels
+    labels = compute_tb_labels(df, FORWARD_BARS, asset_type)
+    n = len(stored)
+    out = stored.assign(**{col: np.asarray(vals)[:n]
+                           for col, vals in labels.items()})
+    # Legacy column order: TB_* right after the last Target_Return_{fb}
+    # (where the pre-R4 stamp put them) — the store schema is unchanged.
+    rest = [c for c in out.columns if not c.startswith('TB_')]
+    tb = [c for c in out.columns if c.startswith('TB_')]
+    tr = [i for i, c in enumerate(rest) if c.startswith('Target_Return_')]
+    if tb and tr:
+        k = tr[-1] + 1
+        out = out[rest[:k] + tb + rest[k:]]
+    return out
+
+
+def _tb_cols(columns):
+    return [c for c in columns if c.startswith('TB_')]
+
+
 def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
                         start_date=None, src_totals=None, raw_out=None):
     """Fetch bars, merge with existing, compute features, add targets."""
@@ -184,6 +255,10 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     if ohlcv.empty:
         return None
 
+    # Fail loud on a mis-typed bar index (R5: a mixed-tz merge once
+    # degraded it to object Index and crashed deep inside indicators).
+    _ensure_utc_index(ohlcv, ticker)
+
     # Recompute ALL features on full history (indicators need lookback windows)
     df = compute_stock_features(ohlcv, spy_close=spy_close, symbol=ticker)
 
@@ -218,19 +293,9 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
         future_close = df['Close'].shift(-fb)
         df[f'Target_Return_{fb}'] = (future_close - df['Close']) / df['Close'] * 100
 
-    # Triple-barrier targets matched to the LIVE exit stack (ATR stop /
-    # trailing / TP / EOD flatten — the same policy_exits kernel the
-    # backtester runs). For stocks the EOD barrier fixes the structural
-    # label mismatch: raw Target_Return_12..48 spans 1.8-7.4 trading days
-    # while live stock holds are capped at ~6.5h by the 15:50 flatten.
-    from policy_exits import compute_tb_labels
-    for col, vals in compute_tb_labels(df, FORWARD_BARS, 'stock').items():
-        df[col] = vals
-    # R2C-06 (L7 guard): TB_Bars_* spans are POSITIONAL offsets in the
-    # frame AS OF this stamp (policy_exits.py caveat) — remember the
-    # stamped index so the post-filter guard below can verify removals
-    # stayed prefix/suffix-only.
-    _tb_stamp_index = df.index
+    # Triple-barrier targets (TB_*) are stamped at the END of this
+    # function, AFTER the dropna + tradability mask (R4 / L7 full fix —
+    # see _stamp_tb_labels).
 
     # FINRA daily shorting-flow features (wave 4; informed sell-side
     # pressure, day-D file maps to day-D+1 bars — point-in-time)
@@ -256,10 +321,31 @@ def prepare_stock_data(ticker, spy_close=None, api=None, existing_ohlcv=None,
     df['Target_Return'] = df[f'Target_Return_{FORWARD_BARS[0]}']
 
     df = _fill_warmup_features(df)
+    # Every real bar (walk-continuation source for the TB stamp), taken
+    # BEFORE any row filter.
+    walk_bars = _tb_price_frame(df)
+    # (1) ALL per-ticker row filters first. TB_* are not stamped yet, so
+    # this dropna keeps exactly the rows the old stamp-then-dropna kept
+    # (a TB NaN only ever sat on a Target_Return NaN tail row).
     df = df.dropna()
     df = _asof_tradability_mask(df, ticker)
-    _warn_tb_span_violation(_tb_stamp_index, df.index, ticker,
-                            'dropna/tradability')
+    # (2) Triple-barrier targets matched to the LIVE exit stack (ATR stop
+    # / trailing / TP / EOD flatten — the same policy_exits kernel the
+    # backtester runs), stamped on the FILTERED rows (R4 / L7 full fix).
+    # For stocks the EOD barrier fixes the structural label mismatch: raw
+    # Target_Return_12..48 spans 1.8-7.4 trading days while live stock
+    # holds are capped at ~6.5h by the 15:50 flatten.
+    df = _stamp_tb_labels(df, walk_bars, 'stock')
+    _tb_stamp_index = df.index
+    tb_cols = _tb_cols(df.columns)
+    if tb_cols:
+        df = df.dropna(subset=tb_cols)   # suffix-only by construction
+    if not _warn_tb_span_violation(_tb_stamp_index, df.index, ticker,
+                                   'post-stamp TB-NaN drop'):
+        raise TBSpanError(f"{ticker}: interior rows removed after the TB "
+                          f"stamp")
+    if len(df):
+        _TB_WALK_BARS[ticker] = walk_bars.loc[walk_bars.index >= df.index[0]]
     return df
 
 
@@ -274,14 +360,17 @@ from indicators import (
 
 
 # --- R2C-06 (L7) TB-span/filter-ordering guard --------------------------
-# TB_Bars_* positional spans are stamped BEFORE the dropna + as-of masks
-# (see prepare_stock_data), against policy_exits' own documented caveat:
-# a span is invalid as a row offset after ANY interior row removal.
-# Today's removals are per-ticker prefix/suffix only (offset-preserving
-# for every surviving row's forward span) — nothing enforced that until
-# now. These guards WARN LOUDLY instead of raising (a harvest must never
-# die on a measurement check); a fired warning is the trigger for the
-# deferred re-stamp-after-filtering fix (06 plan, deferred item 8).
+# policy_exits' caveat: a TB_Bars_* span is invalid as a row offset after
+# ANY interior row removal. History: R2C-06 stamped BEFORE the dropna +
+# as-of masks and only warned; the 2026-09-26 Jetson re-harvest fired it
+# on every stock name (RS_vs_SPY is NaN wherever SPY's 12-bar ROC is
+# exactly 0 -> dropna removed ~30 interior bars/name) and the crypto twin
+# carried the same defect silently (Volume_Ratio NaN on zero-volume
+# stretches). R4 (06 plan deferred item 8) now stamps AFTER every filter
+# (_stamp_tb_labels + _restamp_after_membership), so the only post-stamp
+# removal left is the suffix TB-NaN drop. These helpers still only
+# REPORT (return the ok flag); their callers turn a False into a fatal
+# TBSpanError / exit 3 with no store write — a fired guard is now a bug.
 
 def _removals_prefix_suffix_only(pre_index, post_index):
     """(ok, n_interior_gaps): ok iff post_index is ONE contiguous run of
@@ -315,10 +404,10 @@ def _warn_tb_span_violation(pre_index, post_index, ticker, stage):
     if not ok:
         print(f"  [TB-GUARD] {ticker}: {stage} removed INTERIOR rows "
               f"({n_bad} discontinuities) after TB stamping — TB_Bars_* "
-              f"positional spans are now INVALID for this name "
-              f"(policy_exits.py caveat). Re-stamp-after-filtering is "
-              f"required before trusting TB labels/sample-weight "
-              f"uniqueness (R2C-06 L7 trigger — report to owner).")
+              f"positional spans would be INVALID for this name "
+              f"(policy_exits.py caveat). R4 stamps after every row "
+              f"filter, so this is a harvest BUG — the caller aborts "
+              f"with no store write (report to owner).")
     return ok
 
 
@@ -334,6 +423,68 @@ def _tb_membership_guard(pre_tickers, post_tickers):
         ok_all &= _warn_tb_span_violation(pre_idx, post_idx, t,
                                           'as-of membership mask')
     return ok_all
+
+
+def _restamp_after_membership(final_df, pre_tickers, walk_bars):
+    """Re-stamp TB_* for every ticker the cross-sectional membership mask
+    removed rows from (R4 / L7 full fix), on its surviving member rows +
+    its real bars after the last member row (walk_bars[ticker], see
+    _TB_WALK_BARS). Tickers the mask left untouched keep their
+    prepare-time stamp (identical by construction). Prefix-only removal
+    re-stamps to identical values; suffix/interior removal is where the
+    stored-row walk changes. Rows left with a NaN TB label (window ran off
+    the continuation — not expected) are dropped; the caller's final
+    guard verifies that stayed suffix-only. Raises TBSpanError when an
+    interior-hit ticker has no walk bars to re-stamp from."""
+    tb_cols = _tb_cols(final_df.columns)
+    if not tb_cols or final_df.empty:
+        return final_df
+    tick = final_df['Ticker'].to_numpy()
+    pre_tick = pre_tickers['Ticker'].to_numpy()
+    arrays = None
+    n_interior = n_other = 0
+    for t in pd.unique(tick):
+        m = tick == t
+        post_idx = final_df.index[m]
+        pre_idx = pre_tickers.index[pre_tick == t]
+        if len(post_idx) == len(pre_idx):
+            continue           # the mask only removes rows: untouched
+        ok, n_bad = _removals_prefix_suffix_only(pre_idx, post_idx)
+        bars = walk_bars.get(t)
+        if bars is None:
+            if not ok:
+                raise TBSpanError(f"{t}: membership removed interior rows "
+                                  f"and no walk bars exist to re-stamp")
+            continue
+        if arrays is None:
+            arrays = {c: final_df[c].to_numpy(dtype=np.float64, copy=True)
+                      for c in tb_cols}
+        cols = [c for c in _TB_PRICE_COLS if c in final_df.columns]
+        stored = pd.DataFrame({c: final_df[c].to_numpy()[m] for c in cols},
+                              index=post_idx)
+        stamped = _stamp_tb_labels(stored, bars, 'stock')
+        for c in tb_cols:
+            if c in stamped.columns:
+                arrays[c][m] = stamped[c].to_numpy(dtype=np.float64)
+        if ok:
+            n_other += 1
+        else:
+            n_interior += 1
+            print(f"  [TB-RESTAMP] {t}: membership mask removed interior "
+                  f"rows ({n_bad} discontinuities) — TB_* re-stamped on "
+                  f"the member rows")
+    if arrays is None:
+        return final_df
+    for c in tb_cols:
+        final_df[c] = arrays[c]
+    nan_rows = final_df[tb_cols].isna().any(axis=1).to_numpy()
+    if nan_rows.any():
+        print(f"  [TB-RESTAMP] dropping {int(nan_rows.sum())} row(s) whose "
+              f"re-stamped window ran off the data")
+        final_df = final_df[~nan_rows]
+    print(f"[TB-RESTAMP] membership re-stamp: {n_interior} ticker(s) with "
+          f"interior removals, {n_other} with prefix/suffix-only removals")
+    return final_df
 
 
 def _asof_membership_mask(df, top_k=AS_OF_TOP_K):
@@ -452,6 +603,7 @@ def main():
     all_data = []
     src_totals = {}
     raw_out = {}
+    _TB_WALK_BARS.clear()
     for t in STOCK_TICKERS:
         # For incremental: extract this ticker's existing OHLCV
         existing_ohlcv = None
@@ -486,12 +638,17 @@ def main():
                 start = _get_incremental_start(existing, t)
                 print(f"  [INCREMENTAL] {t}: fetching from {start}")
 
-        stock_df = prepare_stock_data(t, spy_close, api=api,
-                                       existing_ohlcv=existing_ohlcv,
-                                       start_date=start,
-                                       src_totals=src_totals,
-                                       raw_out=(raw_out if use_sidecar
-                                                else None))
+        try:
+            stock_df = prepare_stock_data(t, spy_close, api=api,
+                                           existing_ohlcv=existing_ohlcv,
+                                           start_date=start,
+                                           src_totals=src_totals,
+                                           raw_out=(raw_out if use_sidecar
+                                                    else None))
+        except TBSpanError as e:
+            print(f"FATAL [TB-GUARD] {e} — aborting, NO training store "
+                  f"written")
+            sys.exit(TB_SPAN_EXIT_CODE)
         if stock_df is not None:
             stock_df['Ticker'] = t
             all_data.append(stock_df)
@@ -514,10 +671,20 @@ def main():
     # Cross-sectional as-of membership (uses _DV30 stamped per ticker)
     # R2C-06 (L7): capture index+Ticker only (cheap) so the TB-span guard
     # can verify the mask removed prefix/suffix rows only, per ticker.
+    # R4: the mask can remove interior DAYS for names near the top-K cut,
+    # so every ticker it touched is re-stamped on its member rows; the
+    # post-re-stamp index is then the reference the final guard (just
+    # before the save) checks nothing downstream removed interior rows.
     _pre_member = final_df[['Ticker']].copy()
     final_df = _asof_membership_mask(final_df)
-    _tb_membership_guard(_pre_member, final_df[['Ticker']])
-    del _pre_member
+    try:
+        final_df = _restamp_after_membership(final_df, _pre_member,
+                                             _TB_WALK_BARS)
+    except TBSpanError as e:
+        print(f"FATAL [TB-GUARD] {e} — aborting, NO training store written")
+        sys.exit(TB_SPAN_EXIT_CODE)
+    _TB_WALK_BARS.clear()
+    _pre_member = final_df[['Ticker']].copy()
 
     # Cross-sectional rank features over the surviving members (wave-3
     # flagship: selection is a RELATIVE decision — give the models each
@@ -536,21 +703,35 @@ def main():
     # day-D score leaked intraday-future news into training. Day-D bars now
     # see day D-1's COMPLETED score — exactly what live inference can know.
     try:
-        import datetime as _dt
-        from sentiment_history import fetch_stock_sentiment_history
-        start_date = str((final_df.index.min() - pd.Timedelta(days=1)).date())
+        from sentiment_history import (fetch_stock_sentiment_history,
+                                       stock_sentiment_lookup_dates)
+        start_date = str((final_df.index.min() - pd.Timedelta(days=2)).date())
         end_date = str(final_df.index.max().date())
         sentiment = fetch_stock_sentiment_history(
             STOCK_TICKERS, start_date, end_date, cached_only=True)
+        # Key = ((t - 6h).date() - 1 day): legacy articles are Chicago-dated,
+        # so a bar before 06:00 UTC (the 00:00 UTC extended-hours bar) must
+        # fall back one more day to stay strictly in the past (H audit).
         final_df['Daily_Sentiment'] = [
-            sentiment.get((ticker, str(date - _dt.timedelta(days=1))), 0.0)
-            for ticker, date in zip(final_df['Ticker'], final_df.index.date)
+            sentiment.get((ticker, key), 0.0)
+            for ticker, key in zip(final_df['Ticker'],
+                                   stock_sentiment_lookup_dates(final_df.index))
         ]
         filled = sum(1 for v in final_df['Daily_Sentiment'] if v != 0.0)
         print(f"Daily_Sentiment (lagged 1d): {filled}/{len(final_df)} bars have sentiment")
     except Exception as e:
         print(f"WARNING: Could not load stock sentiment history: {e}")
         final_df['Daily_Sentiment'] = 0.0
+
+    # R4 final TB-span guard (FAIL LOUD): per ticker, the rows about to be
+    # saved must be one contiguous run of the rows the TB labels were last
+    # stamped on — otherwise TB_Bars_* spans are invalid row offsets.
+    if not _tb_membership_guard(_pre_member, final_df[['Ticker']]):
+        print("FATAL [TB-GUARD] rows were removed from the interior of a "
+              "ticker after the TB stamp — aborting, NO training store "
+              "written")
+        sys.exit(TB_SPAN_EXIT_CODE)
+    del _pre_member
 
     # Save as Parquet + CSV
     if not save_training_data(final_df, 'stock'):

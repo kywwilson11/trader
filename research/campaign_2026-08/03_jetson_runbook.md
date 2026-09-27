@@ -22,7 +22,11 @@ this tree at ~3,376 passed / 23-name baseline (`bash scripts/ab_check.sh`).
 2. `python -c "import bidask"` — if absent, STOP before any harvest: every stamped
    `Eff_Spread_Pct` so far came from the AR fallback and installing bidask mid-stream is a
    model-facing change (see 01_state_map D04 notes).
-3. `bash scripts/ab_check.sh` on the Jetson — expect green (full-dep suite; the 23-name baseline
+   *[Annotation 2026-09-26, Jetson]* `bidask` was absent from the jetson env and was installed on
+   2026-09-26 (`pip install bidask==2.1.0`) BEFORE any harvest. Neither pre-rebuild training store (crypto
+   ended 2026-02-24, stock 2026-02-19) carried an `Eff_Spread_Pct` column — both predated the stamp — so
+   this is not a mid-stream change: the first stamp is written by the clean rebuild (Phase 3 note).
+3. `bash scripts/ab_check.sh` on the Jetson — expect the state recorded in `CLAUDE.md` § Running tests (full-dep suite; the 23-name baseline
    is dev-Mac-only and must NOT be ported).
 4. Restart the bots. Verify in logs, first hour:
    - stock predictions non-null (`grep -c "Not enough data for sequence" stock_bot_output.log`
@@ -41,7 +45,7 @@ this tree at ~3,376 passed / 23-name baseline (`bash scripts/ab_check.sh`).
      pre-campaign decision_report figures are void.
    - `python llm_eval.py --days 30` — the NEW Driscoll-Kraay estimator is the primary b2 verdict;
      `legacy_b2` prints alongside for this release. The spend ledger shows implied bps/trade vs
-     actual dollars. At n≥60 clustered timestamps this is the keep/kill-LLM-spend read.
+     actual dollars. With ≥120 distinct hourly t0 clusters and n_eff ≥ 20 (≈20+ days of LLM cycles) this is the keep/kill-LLM-spend read.
    - `backtest_report.json` → `n_eff_clustered` vs `n_trades` (the D02 one-look: a collapse to
      <n/5 means the legacy clustering, not the model, decides promotions).
 
@@ -122,6 +126,12 @@ Flip together, then delete `v2_study.db` + `stock_v2_study.db`, reset the adapti
 - Data-store event (same retrain or its own): `TRADER_RAW_SIDECAR=1` + `TRADER_YF_WINDOW_SLICE=1`
   with the sidecar absent ⇒ forced full refetch rebuilds the D39-lost head and kills the D08
   Yahoo overwrite
+  - *[Annotation 2026-09-26]* The clean rebuild of 2026-09-26 runs with `TRADER_RAW_SIDECAR=1
+    TRADER_YF_WINDOW_SLICE=1`, the `Daily_Sentiment` PIT repair
+    (`sentiment_history._migrate_fng_date_basis` + the stock `(t_utc − 6 h).date() − 1` key) and the
+    stock SIP end-clamp (`market_data._clamp_sip_end`), with every other flag at its default. The
+    Phase-3 model flags in this section were NOT flipped — owner decision pending. Record:
+    `research/campaign_2026-09_jetson/README.md`.
 - Cost flags IF pre-gates passed: `TRADER_SPREAD_FILL_V2=1`; `TRADER_CRYPTO_SPREAD_STAMP=1`
   only after the census AND the explicit kill-list ruling (KILL_LIST:90 ask);
   `TRADER_STOCK_MINUTE_EDGE=1` after confirming Basic-plan minute bars are SIP-sourced;

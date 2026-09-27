@@ -14,6 +14,8 @@ Data sources:
 """
 
 import datetime
+import logging
+import math
 import os
 import sqlite3
 import time
@@ -28,6 +30,8 @@ except ImportError:  # dev Mac: python-dotenv absent; env comes from the shell
 # ---------------------------------------------------------------------------
 # Database setup
 # ---------------------------------------------------------------------------
+
+log = logging.getLogger(__name__)
 
 _DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sentiment_cache.db')
 _db_local = threading.local()
@@ -185,6 +189,132 @@ def _fng_value_to_score(value):
     return (value - 50) / 50.0
 
 
+# fng_daily date-basis marker (H audit 2026-09-26). Rows cached before commit
+# 5e23096 were bucketed with the LOCAL timezone (America/Chicago on the
+# Jetson), so fng_daily[D] held the value alternative.me PUBLISHED at
+# (D+1) 00:00 UTC (verified 1875/1875 against the API) -- up to 24h of
+# lookahead for every crypto training bar. The UTC-bucketing fix below only
+# governs NEW inserts and cached dates are never rewritten, so a re-harvest
+# re-leaked. The one-time migration moves the legacy rows aside (delete
+# nothing) and empties fng_daily so the next fetch refills it UTC-dated.
+_FNG_BASIS_KEY = 'fng_date_basis'
+_FNG_BASIS_UTC = 'utc_publication'
+_FNG_LEGACY_TABLE = 'fng_daily_legacy_localtz'
+
+
+def _fng_is_utc(db):
+    """True once fng_daily holds UTC-publication-dated rows (marker set)."""
+    row = db.execute("SELECT value FROM state WHERE key=?",
+                     (_FNG_BASIS_KEY,)).fetchone()
+    return bool(row and row[0] == _FNG_BASIS_UTC)
+
+
+# A refill must replace at least this share of the legacy row count, or the
+# migration is refused (an API returning a truncated series must not swap
+# ~2000 leaked-but-real values for a handful of correct ones).
+_FNG_REFILL_MIN_RATIO = 0.90
+# Crypto harvest coverage floor: fewer nonzero Daily_Sentiment days than this
+# share of the requested range logs a WARNING (REVIEW M2).
+_FNG_MIN_COVERAGE = 0.90
+
+
+def _migrate_fng_date_basis(db, refill_rows=None):
+    """One-time repair of legacy local-tz-dated fng_daily rows.
+
+    Keyed on state[fng_date_basis] == 'utc_publication': once the marker is
+    set this is a no-op, so it runs at most once per DB.
+
+    `refill_rows` is the FULL UTC-publication-dated series, (date, value,
+    score) tuples, fetched BEFORE this call (REVIEW M2, 2026-09-26: the old
+    order cleared fng_daily first, so a failed refetch left it empty and the
+    crypto harvest stamped Daily_Sentiment = 0.0 into a retrain). Under one
+    BEGIN IMMEDIATE transaction it
+      (a) copies every fng_daily row into fng_daily_legacy_localtz,
+      (b) verifies the copy is complete, then clears fng_daily,
+      (c) inserts `refill_rows`,
+      (d) sets the marker.
+    Any failure rolls back and re-raises -- fng_daily is never cleared
+    without its rows safely preserved AND replaced, and never left
+    half-migrated. Legacy rows with no refill (or a refill covering fewer
+    than _FNG_REFILL_MIN_RATIO of them) raise ValueError, nothing touched.
+    A table with no legacy rows just gets the refill (if any) + the marker.
+
+    Returns the number of legacy rows moved aside (0 when already migrated
+    or the table was empty).
+    """
+    if _fng_is_utc(db):
+        return 0
+    refill_rows = list(refill_rows or ())
+    if db.in_transaction:   # settle any pending implicit txn on this conn
+        db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-check inside the write lock (another process may have migrated
+        # between the unlocked read above and BEGIN IMMEDIATE).
+        if _fng_is_utc(db):
+            db.rollback()
+            return 0
+        n_legacy = db.execute("SELECT COUNT(*) FROM fng_daily").fetchone()[0]
+        n_refill = len({r[0] for r in refill_rows})
+        if n_legacy and n_refill < _FNG_REFILL_MIN_RATIO * n_legacy:
+            raise ValueError(
+                f"fng_daily migration: refill has {n_refill} dates for "
+                f"{n_legacy} legacy rows (< {_FNG_REFILL_MIN_RATIO:.0%}) -- "
+                "refusing to clear fng_daily without a full UTC-dated refill")
+        if n_legacy:
+            db.execute(
+                f"CREATE TABLE IF NOT EXISTS {_FNG_LEGACY_TABLE} ("
+                "date TEXT PRIMARY KEY, value INTEGER NOT NULL, "
+                "score REAL NOT NULL)")
+            db.execute(
+                f"INSERT OR IGNORE INTO {_FNG_LEGACY_TABLE} (date, value, score) "
+                "SELECT date, value, score FROM fng_daily")
+            missing = db.execute(
+                f"SELECT COUNT(*) FROM fng_daily f LEFT JOIN {_FNG_LEGACY_TABLE} l "
+                "ON l.date = f.date AND l.value = f.value "
+                "WHERE l.date IS NULL").fetchone()[0]
+            if missing:
+                raise RuntimeError(
+                    f"fng_daily migration: {missing} rows not preserved in "
+                    f"{_FNG_LEGACY_TABLE} (pre-existing conflicting legacy "
+                    "rows?) -- refusing to clear fng_daily")
+            db.execute("DELETE FROM fng_daily")
+        if refill_rows:
+            db.executemany(
+                "INSERT OR REPLACE INTO fng_daily (date, value, score) "
+                "VALUES (?, ?, ?)", refill_rows)
+        db.execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
+                   (_FNG_BASIS_KEY, _FNG_BASIS_UTC))
+        db.execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
+                   (_FNG_BASIS_KEY + '_migrated_at',
+                    datetime.datetime.now(datetime.timezone.utc).isoformat()))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    if n_legacy:
+        print(f"[SENTIMENT_HIST] FnG: migrated {n_legacy} local-tz-dated rows "
+              f"to {_FNG_LEGACY_TABLE}; fng_daily refilled with {n_refill} "
+              "UTC-dated days in the same transaction")
+    return n_legacy
+
+
+def _warn_fng_coverage(result, start_date, end_date, total_days, basis):
+    """WARNING when fewer than _FNG_MIN_COVERAGE of the requested days carry
+    a nonzero score -- the crypto harvest maps missing days to 0.0 and only
+    prints a count, so a thin cache would otherwise train on zeros quietly."""
+    nonzero = sum(1 for v in result.values() if v)
+    if total_days > 0 and nonzero < _FNG_MIN_COVERAGE * total_days:
+        log.warning("[SENTIMENT_HIST] FnG coverage LOW: %d/%d days in %s..%s "
+                    "have a nonzero score (%.0f%% < %.0f%%; %s) -- the crypto "
+                    "harvest fills the rest with Daily_Sentiment=0.0",
+                    nonzero, total_days, start_date, end_date,
+                    100.0 * nonzero / total_days, 100 * _FNG_MIN_COVERAGE,
+                    basis)
+        return False
+    return True
+
+
 def fetch_crypto_sentiment_history(start_date=None, end_date=None):
     """Fetch historical Crypto Fear & Greed Index and cache in SQLite.
 
@@ -194,10 +324,20 @@ def fetch_crypto_sentiment_history(start_date=None, end_date=None):
 
     Returns:
         dict[str_date, float_score] — same score for all crypto symbols
+
+    On a DB not yet migrated to UTC dating the full series is fetched FIRST
+    and the migration (move-aside + clear + refill + marker) runs only on a
+    successful fetch; if the fetch (or the migration) fails, the legacy
+    local-tz rows are left in place, the marker is NOT set, and their
+    values are returned with a WARNING -- they carry the old 1-day
+    look-ahead leak but are not the all-zero feature a cleared table gave.
+    Never raises for a fetch failure: the harvest maps a raise to an
+    all-zero Daily_Sentiment column (scripts/harvest_crypto_data.py).
     """
     import requests
 
     db = _get_db()
+    migrated = _fng_is_utc(db)
 
     if start_date is None:
         start_date = (datetime.date.today() - datetime.timedelta(days=365)).isoformat()
@@ -218,25 +358,34 @@ def fetch_crypto_sentiment_history(start_date=None, end_date=None):
     total_days = (d_end - d_start).days + 1
     needed = total_days - len(cached_dates)
 
-    if needed <= 0:
+    if migrated and needed <= 0:
         print(f"[SENTIMENT_HIST] FnG: {len(result)} days cached, 0 to fetch")
+        _warn_fng_coverage(result, start_date, end_date, total_days,
+                           'utc_publication')
         return result
 
     # Fetch from alternative.me (1 API call, free, no key)
     print(f"[SENTIMENT_HIST] FnG: fetching {total_days} days...")
+    data = []
     try:
+        # limit=0 = the full history. alternative.me counts `limit` back
+        # from TODAY, not from end_date, so limit=total_days silently
+        # dropped the earliest days of any range ending before today.
         resp = requests.get(
-            f'https://api.alternative.me/fng/?limit={total_days}&format=json',
+            'https://api.alternative.me/fng/?limit=0&format=json',
             timeout=15,
         )
-        data = resp.json().get('data', [])
+        data = resp.json().get('data', []) or []
     except Exception as e:
         print(f"[SENTIMENT_HIST] FnG fetch error: {e}")
-        return result
 
-    inserted = 0
+    fetched = []
     for entry in data:
-        ts = int(entry['timestamp'])
+        try:
+            ts = int(entry['timestamp'])
+            value = int(entry['value'])
+        except (KeyError, TypeError, ValueError):
+            continue
         # alternative.me timestamps are midnight UTC of the day the value is
         # PUBLISHED. Bucketing with the local timezone shifted every value
         # one day (US hosts), giving training bars up to 24h of future
@@ -244,24 +393,60 @@ def fetch_crypto_sentiment_history(start_date=None, end_date=None):
         # known at D 00:00 UTC.
         date_str = datetime.datetime.fromtimestamp(
             ts, tz=datetime.timezone.utc).date().isoformat()
+        fetched.append((date_str, value, _fng_value_to_score(value)))
+
+    if not migrated:
+        # One-time UTC re-dating, ONLY after a successful fetch (REVIEW M2).
+        err = None
+        if not fetched:
+            err = 'fetch returned no rows'
+        else:
+            try:
+                _migrate_fng_date_basis(db, fetched)
+            except Exception as e:      # rolled back: fng_daily untouched
+                err = f'migration refused: {e}'
+        if err is not None:
+            log.warning("[SENTIMENT_HIST] FnG UTC re-dating NOT done (%s): "
+                        "legacy local-tz fng_daily kept, marker not set; "
+                        "serving %d LEGACY values that still carry the 1-day "
+                        "look-ahead leak (not zero) -- rerun the harvest once "
+                        "alternative.me is reachable", err, len(result))
+            _warn_fng_coverage(result, start_date, end_date, total_days,
+                               'LEGACY local-tz')
+            return result
+        rows = db.execute(
+            "SELECT date, score FROM fng_daily WHERE date >= ? AND date <= ?",
+            (start_date, end_date)).fetchall()
+        result = {r[0]: r[1] for r in rows}
+        print(f"[SENTIMENT_HIST] FnG: UTC refill {len(fetched)} days, "
+              f"{len(result)} in range")
+        _warn_fng_coverage(result, start_date, end_date, total_days,
+                           'utc_publication')
+        return result
+
+    inserted = 0
+    for date_str, value, score in fetched:
         if date_str < start_date or date_str > end_date:
             continue
         if date_str in cached_dates:
             continue
-        value = int(entry['value'])
-        score = _fng_value_to_score(value)
+        # The fetched value is known whether or not the cache write succeeds
+        # (G4-02): a failed INSERT (e.g. 'database is locked') must not drop
+        # it from the returned dict -- the harvest would stamp 0.0.
+        result[date_str] = score
         try:
             db.execute(
                 "INSERT OR IGNORE INTO fng_daily (date, value, score) VALUES (?, ?, ?)",
                 (date_str, value, score),
             )
-            result[date_str] = score
             inserted += 1
         except sqlite3.Error:
-            pass
+            pass                    # cache miss only; the next run re-inserts
 
     db.commit()
     print(f"[SENTIMENT_HIST] FnG: {inserted} new days cached, {len(result)} total")
+    _warn_fng_coverage(result, start_date, end_date, total_days,
+                       'utc_publication')
     return result
 
 
@@ -411,7 +596,13 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
                     break
                 except Exception as e:
                     if '429' in str(e):
-                        wait = 62 * (2 ** attempt)  # 62s, 124s, 248s
+                        if attempt == 2:
+                            # G4-08: no retry follows the last attempt, so a
+                            # back-off sleep here would buy nothing.
+                            print(f"[SENTIMENT_HIST] Rate limited, giving up on "
+                                  f"{ticker} {window_start}..{window_end}")
+                            break
+                        wait = 62 * (2 ** attempt)  # 62s, 124s
                         print(f"[SENTIMENT_HIST] Rate limited, waiting {wait}s...")
                         time.sleep(wait)
                     else:
@@ -424,11 +615,13 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
                 continue
 
             for a in articles:
-                headline = a.get('headline', '').strip()
+                # `or ''`: Finnhub sends present-but-None fields (G4-03), which
+                # .get(k, '') would return as None.
+                headline = (a.get('headline') or '').strip()
                 if not headline:
                     continue
-                summary = a.get('summary', '').strip()
-                url = a.get('url', '').strip()
+                summary = (a.get('summary') or '').strip()
+                url = (a.get('url') or '').strip()
 
                 # Determine article date from datetime field (UTC — local
                 # bucketing shifted dates and leaked future articles into
@@ -452,6 +645,10 @@ def fetch_stock_sentiment_history(tickers, start_date=None, end_date=None,
                 # real inserts via rowcount (0 for an ignored row).
                 ticker_articles += cur.rowcount
 
+            # G4-01: commit per window so no write transaction spans the next
+            # network call, rate-limit sleep or 429 back-off (other writers on
+            # this WAL DB would hit the busy timeout -> 'database is locked').
+            db.commit()
             window_start = window_end + datetime.timedelta(days=1)
 
         db.commit()
@@ -501,6 +698,30 @@ def get_daily_sentiment(symbol, date_str):
         (symbol, date_str),
     ).fetchone()
     return row[0] if row else 0.0
+
+
+def stock_sentiment_lookup_dates(index):
+    """daily_sentiment date key ('YYYY-MM-DD') for each stock bar timestamp.
+
+    Rule: ((t - 6h).date() - 1 day), t in UTC (a naive index is taken as
+    UTC). The legacy article cache is America/Chicago-dated, so the
+    aggregate for calendar day X includes articles published up to
+    (X+1) ~05:00-06:00 UTC. The plain D-1 rule was PIT-safe for pre-market
+    and RTH bars but NOT for the 00:00 UTC extended-hours bar, which could
+    see ~6h of later articles; the -6h shift sends every bar before 06:00
+    UTC one more day back so the looked-up bucket is strictly in the past.
+    Since t - 6h ~= Chicago wall-clock, this equals the live rule
+    (get_live_daily_sentiment: local today - 1 on the Chicago box) for
+    every bar outside 05:00-06:00 UTC in daylight time, where serve is one
+    day newer but still PIT-complete. UTC-dated articles (current insert
+    code) are strictly older under this key as well.
+    """
+    import pandas as pd
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is not None:
+        idx = idx.tz_convert('UTC')
+    shifted = (idx - pd.Timedelta(hours=6)).date
+    return [str(d - datetime.timedelta(days=1)) for d in shifted]
 
 
 _live_fng_warned = False
@@ -804,9 +1025,12 @@ def poll_and_ingest_batch(db) -> str:
         for entry in entries:
             try:
                 i = int(entry['i'])
-                s = max(-1.0, min(1.0, float(entry['s'])))
-            except (KeyError, TypeError, ValueError):
+                s = float(entry['s'])
+            except (KeyError, TypeError, ValueError, OverflowError):
                 continue
+            if not math.isfinite(s):
+                continue  # G4-07: NaN would clamp to +1.0; skip = unscored
+            s = max(-1.0, min(1.0, s))
             if 0 <= i < len(chunk_ids):
                 aid, symbol, date = chunk_ids[i]
                 db.execute(

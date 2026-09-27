@@ -351,3 +351,34 @@ def fixed_boost_rounds(best_iteration, current_iteration):
         if v > 0:
             return v
     return None
+
+
+def session_entry_mask(times, windows, tz='America/New_York',
+                       weekdays_only=True):
+    """Bool entry-eligibility per row from bar OPEN times (SIG-R2-MASK).
+
+    times: epoch SECONDS (UTC — hypersearch's all_times, i.e. a tz-aware
+    index's int64 view // 1e9). windows: [('HH:MM', 'HH:MM'), ...] in tz
+    wall-clock. A row is eligible iff its bar's open-time minute-of-day m
+    satisfies start <= m < end for some window — the EXACT comparison of
+    stock_loop._in_entry_window and backtest._entry_window_mask (seconds
+    dropped, start inclusive, end exclusive) — and, when weekdays_only,
+    it falls Mon-Fri (the stock clock is closed at weekends; the store
+    holds no weekend bars). Holidays are not modelled: a bar the store
+    contains was a traded bar. Pure numpy/pandas (Mac-testable).
+    """
+    import pandas as pd
+    t = np.asarray(times, dtype=np.int64)
+    if t.size == 0:
+        return np.zeros(0, dtype=bool)
+    local = pd.to_datetime(t, unit='s', utc=True).tz_convert(tz)
+    minutes = (np.asarray(local.hour, dtype=np.int64) * 60
+               + np.asarray(local.minute, dtype=np.int64))
+    ok = np.zeros(t.size, dtype=bool)
+    for start_s, end_s in windows:
+        sh, sm = map(int, start_s.split(':'))
+        eh, em = map(int, end_s.split(':'))
+        ok |= (sh * 60 + sm <= minutes) & (minutes < eh * 60 + em)
+    if weekdays_only:
+        ok &= np.asarray(local.weekday, dtype=np.int64) < 5
+    return ok

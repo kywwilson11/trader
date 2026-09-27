@@ -28,7 +28,7 @@ Facts have **one home**. Before restating a number or a list, check whether one 
 | `docs/GLOSSARY.md` | the vocabulary (book, champion/challenger, shadow, DM-HLN, DSR, PBO, effective-n, Stage-0, packet IDs…) |
 | `docs/README.md` | index of `docs/` + reading order for humans vs agents |
 | `archive/` | **moved, not deleted** — stale scratch/config that left the working tree keeps a row in `archive/README.md` |
-| per-directory READMEs | `research/README.md`, `research/campaign_2026-08/README.md`, `scripts/README.md`, `tests/README.md`, `.claude/README.md`, `logos/README.md`, `fonts/README.md` |
+| per-directory READMEs | `research/README.md`, `research/campaign_2026-08/README.md`, `research/campaign_2026-09_jetson/README.md`, `scripts/README.md`, `tests/README.md`, `.claude/README.md`, `logos/README.md`, `fonts/README.md` |
 
 **Nothing in this repo is deleted.** Anything that must leave its place is moved (`git mv` when
 tracked) and recorded in the receiving directory's README.
@@ -46,6 +46,12 @@ Work happens across two machines with **different installed dependencies**:
 | **NOT installed** | **torch, lightgbm, optuna, joblib, numba, sklearn, dotenv, finnhub, alpaca, alpaca_trade_api, PySide6, pyqtgraph, pyarrow, fastparquet, arch, hmmlearn** | — |
 | Can do | pure-algorithm code, synthetic-data unit tests, web research | training, harvest, Stage-0 measurement, live trading, GUI |
 | **Cannot do** | model training, data harvest, parquet round-trips, anything importing the heavy deps, run the bots/GUI | — |
+
+**Running anything on the Jetson by hand:** the jetson interpreter must be invoked with the conda
+libstdc++ preloaded (`LD_PRELOAD=/home/kyle/miniforge3/envs/jetson/lib/libstdc++.so.6`) and the
+cusparselt dir on `LD_LIBRARY_PATH`, exactly as `run_pipeline.ENV` and the systemd unit set them —
+otherwise `import torch` followed by `import sqlite3` fails with `CXXABI_1.3.15 not found`
+(verified 2026-09-26). Tests there: same wrapper, `CUDA_VISIBLE_DEVICES=''`, ~2 min for the suite.
 
 **Implication for how I plan work:** on the Mac, only build/verify things provable with
 numpy/pandas/scipy/bidask + synthetic data. Anything needing torch/lightgbm/joblib/dotenv/real
@@ -70,7 +76,8 @@ The 16 failures + 7 errors are the **23-name pre-existing missing-dependency set
 pyarrow/fastparquet (12), joblib (3), hmmlearn (3), torch (2), arch (2), dotenv (1);
 lightgbm / numba / optuna / sklearn are also absent here but cause **no** baseline name — those
 paths are guarded (`importorskip`, pure-python fallbacks, source-text-only tests). On the full Jetson stack
-the suite is green. `ab_check.sh` is hardened (launch-sanity floor ≥1500 passed, watchdog timeout,
+(verified 2026-09-26) it was 3919 passed / 5 failed — the untracked C extension, the Mac-recorded golden
+fingerprint test, untracked residue and the missing `bidask` — all addressed in the 2026-09-26 campaign. `ab_check.sh` is hardened (launch-sanity floor ≥1500 passed, watchdog timeout,
 flaky/persistent triage of NEW names, forced `PY_COLORS=0`); it judges by failure NAMES, never counts.
 This line is the **only** place a suite count is quoted — every other doc points here.
 
@@ -86,8 +93,9 @@ PY_COLORS=0 python3 -m pytest tests/ --continue-on-collection-errors -q 2>/dev/n
   | grep -E '^(FAILED|ERROR)' | sed 's/ - .*//' | sort -u
 ```
 
-That command prints only the 23 name lines — re-add the file's 3-line header by hand. The baseline
-is dev-Mac-specific (missing-dep failures only — Jetson/CI stay green).
+That command prints only the 23 name lines — re-add the file's 8-line header comment block by hand. The baseline
+is dev-Mac-specific (missing-dep failures only) and must never be ported to the Jetson or CI — their
+current state is the verified-2026-09-26 sentence in the baseline paragraph above, the only place it is quoted.
 
 **Verify a change introduced no regressions — the from-scratch method** (use when
 `tests/baseline_failures.txt` itself might be stale, or to regenerate it): A/B with `git stash` —
@@ -124,7 +132,7 @@ ones are below with their **verified** flags. **The complete CLI census (every e
 | `python scripts/hypersearch_v2.py --trials N [--prefix stock] [--data F] [--fresh] [--shadow] [--preset P] [--max-rows N] [--mode {refine,explore,initial}] [--no-status]` | Optuna TPE search (LSTM + LightGBM leg), holdout DSR gate. `--preset` defaults to `None` = whatever `load_indicator_config()` says |
 | `python backtest.py --prefix {''\|stock} --days N [--gate] [--min-sharpe X] [--min-dsr X] [--model-prefix P] [--trials N] [--no-stage0-dump] [--fee-mult X] [--fee-sweep '1.0,1.5,…']` | Policy replay (real entries/exits/fees; `''` = crypto); `--gate` rolls back to `.prev` on Sharpe/DSR fail; `--fee-sweep` reports breakeven cost headroom λ* |
 | `python decision_report.py --days N` | Per-trade gate attribution + conviction calibration (Stage-0 measurement) |
-| `python llm_eval.py --days N [--asset {crypto,stock}] [--advisor]` | LLM-gate scorecard: veto/size-tilt outcome attribution + echo-gap regression (b2 significance at n≥60 = the keep/kill-LLM-spend verdict); `--advisor` scores the shadow advisor-v2 dossiers. Measurement-only |
+| `python llm_eval.py --days N [--asset {crypto,stock}] [--advisor]` | LLM-gate scorecard: veto/size-tilt outcome attribution + echo-gap regression (b2 significance with ≥60 rows AND ≥120 distinct hourly t0 clusters AND n_eff ≥ 20 — ≈20+ days of LLM cycles — = the keep/kill-LLM-spend verdict); `--advisor` scores the shadow advisor-v2 dossiers. Measurement-only |
 | `python beta_ledger.py --days N [--lags N] [--equity-csv F] [--benchmarks-csv F] [--json F]` | Realized-beta ledger: daily equity vs SPY+BTC (lagged AKL betas, HAC alpha t-stat, up/down + trend-conditional betas). Measurement-only |
 | `python indicator_leadlag.py --data F [--preset P] [--features L] [--horizons 1,4,12,24,48] [--fdr-q Q] [--json F]` | Per-feature leading/lagging diagnostic: predictive IC vs reactive coupling at 1–48h (overlap-adjusted, FDR), redundancy clusters + exact dupes. Measurement-only |
 | `python gui.py` | PySide6 dashboard (8 tabs, 12 themes); reads `pipeline_status.json` + logs. Chart math lives in pure-numpy `chart_core.py` — testable on this Mac |
@@ -185,8 +193,9 @@ they are available, not enforcing. Detail in `docs/MAP.md`.
 **Module families** (per-module goal, API, and imported-by: `docs/MODULES.md`) — signals/features,
 execution, costs/risk, models, LLM, ops. The one worth stating here because it is easy to get
 wrong: `llm_client.py`/`llm_analyst.py` speak to **Gemini + Anthropic/Claude + OpenAI and
-OpenAI-compatible endpoints**, all schema-enforced (Gemini responseSchema, Claude forced tool use,
-OpenAI strict structured outputs), with the provider switch, per-role overrides and pricing
+OpenAI-compatible endpoints**, all schema-enforced (Gemini responseSchema, Claude forced tool use —
+auto + strict tool + client-side validation on models that reject forcing, see `docs/MODULES.md`
+§llm_client — OpenAI strict structured outputs), with the provider switch, per-role overrides and pricing
 corrections in `llm_config.json`, cross-provider fallback, `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`
 accepted from env — and the backfill role pinned to Gemini for its Batch API.
 
@@ -233,7 +242,9 @@ to publication date; borrow cost regime-dated; universe membership as-of (no sur
   **IA-1..IA-4 decision-influence implementation** (`07_decision_influences.md` → pseudo-CAPE
   deleted, dead Hurst/sentiment-gate branches and exit-path cooldown removed, seven IA-4 flags
   default OFF; every removal archived verbatim in `08_removed_code.md`; `tests/test_ia{1..4}_*.py`).
-  Do not describe any of this as shipped.
+  Do not describe any of this as shipped. *(Annotation 2026-09-26: all of the above was committed
+  2026-09-10 as `438f56a`. What is uncommitted now is the 2026-09-26 on-Jetson campaign —
+  `docs/MAP.md` §8.)*
 - **Claude Code assets** (`.claude/` is COMMITTED as of 2026-07-21 — only `settings.local.json` stays
   gitignored, so skills/workflows/hooks/settings/agents travel to the Jetson; see `.claude/README.md`):
   skills `/regression-ab`, `/decision-queue`, `/improve`, `/panel-improve`; workflows

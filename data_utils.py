@@ -36,6 +36,109 @@ def raw_sidecar_enabled() -> bool:
     return os.environ.get('TRADER_RAW_SIDECAR',
                           '0').strip().lower() in ('1', 'true', 'yes')
 
+# --- SIG-R2-X6 wick-print guard (DEFAULT OFF; model-facing, gotcha #2) ---
+# Alpaca's crypto bars carry wick-only bad prints: Open ~= Close but a Low
+# (or High) 15-87 % away that a second venue (Coinbase 1h) never printed —
+# 62 of 67 flagged bars checked on 2026-09-27 (scripts/bad_print_census.py,
+# research/campaign_2026-09_jetson SIG-R2-X6). They inflate ATR (14 bars),
+# ATR_Percentile (<=112), STOCH (<=17), the Parkinson/HAR range and fire
+# spurious TB hard stops. ON: REPAIR the wick, never drop the row (an
+# interior drop breaks TB_Bars positional offsets — R4 / TBSpanError).
+WICK_PRINT_LOW_FRAC = 0.15    # wick >= 15 % beyond Open ...
+WICK_PRINT_BODY_FRAC = 0.03   # ... on a bar whose |Close-Open|/Open < 3 %
+WICK_PRINT_MED_TR_WINDOW = 24  # PIT scale: median true range, 24 prior bars
+WICK_PRINT_MED_TR_MIN = 5
+
+
+def wick_print_filter_enabled() -> bool:
+    """SIG-R2-X6: WICK_PRINT_FILTER (default False = legacy, byte-identical).
+
+    TRADER_WICK_PRINT_FILTER env ('1'/'true'/'yes'/'on') wins over
+    strategy_config.WICK_PRINT_FILTER (read with getattr — absent = False).
+    Read at CALL time. Model-facing: flipping changes the training store's
+    High/Low, the High/Low features and the TB labels — full re-harvest +
+    study reset (CLAUDE.md gotcha #2), and the live bar path needs the same
+    repair for train/serve parity (market_data.fetch_bars_alpaca)."""
+    v = os.environ.get('TRADER_WICK_PRINT_FILTER')
+    if v not in (None, ''):
+        return v.strip().lower() in ('1', 'true', 'yes', 'on')
+    try:
+        import strategy_config as _sc
+        return bool(getattr(_sc, 'WICK_PRINT_FILTER', False))
+    except Exception:
+        return False
+
+
+def flag_wick_prints(o, h, l, c, low_frac=WICK_PRINT_LOW_FRAC,
+                     body_frac=WICK_PRINT_BODY_FRAC, high_frac=None):
+    """(low_mask, high_mask): body |C-O|/O < body_frac AND
+    Low < O*(1-low_frac) [low] / High > O*(1+high_frac) [high].
+    Same test as scripts/bad_print_census.flag_wick_prints."""
+    o = np.asarray(o, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    l = np.asarray(l, dtype=np.float64)
+    c = np.asarray(c, dtype=np.float64)
+    hf = low_frac if high_frac is None else high_frac
+    with np.errstate(invalid='ignore', divide='ignore'):
+        ok = np.isfinite(o) & (o > 0)
+        body = ok & (np.abs(c - o) / np.where(ok, o, 1.0) < body_frac)
+        low = body & (l < o * (1.0 - low_frac))
+        high = body & (h > o * (1.0 + hf))
+    return low, high
+
+
+def repair_wick_prints(ohlcv: pd.DataFrame, where: str = '',
+                       low_frac: float = WICK_PRINT_LOW_FRAC,
+                       body_frac: float = WICK_PRINT_BODY_FRAC,
+                       log=print) -> pd.DataFrame:
+    """Repair wick-only bad prints in ONE ticker's sorted OHLCV frame.
+
+    Rule (medTR_t = median true range of the WICK_PRINT_MED_TR_WINDOW bars
+    strictly BEFORE t — point-in-time, the name's normal intrabar
+    excursion; whole-series median TR when < WICK_PRINT_MED_TR_MIN exist):
+      low-side : Low  := max(Low,  min(Open, Close) - medTR_t)
+      high-side: High := min(High, max(Open, Close) + medTR_t)
+    The bar keeps a TYPICAL wick (not zero, which would bias range
+    features low), Open/Close/Volume are untouched, and NO row is dropped.
+    Each repair is logged. Returns the input object itself when nothing
+    is flagged, else a repaired copy."""
+    if ohlcv is None or len(ohlcv) == 0 or not all(
+            c in ohlcv.columns for c in ('Open', 'High', 'Low', 'Close')):
+        return ohlcv
+    lo, hi = flag_wick_prints(ohlcv['Open'], ohlcv['High'], ohlcv['Low'],
+                              ohlcv['Close'], low_frac, body_frac)
+    if not (lo.any() or hi.any()):
+        return ohlcv
+    h = ohlcv['High'].to_numpy(dtype=np.float64)
+    l = ohlcv['Low'].to_numpy(dtype=np.float64)
+    c = ohlcv['Close'].to_numpy(dtype=np.float64)
+    o = ohlcv['Open'].to_numpy(dtype=np.float64)
+    pc = np.concatenate([[np.nan], c[:-1]])
+    tr = np.fmax(h - l, np.fmax(np.abs(h - pc), np.abs(l - pc)))
+    tr[0] = h[0] - l[0]
+    med = (pd.Series(tr).shift(1)
+           .rolling(WICK_PRINT_MED_TR_WINDOW,
+                    min_periods=WICK_PRINT_MED_TR_MIN).median()
+           .fillna(float(np.nanmedian(tr))).to_numpy())
+    new_l = l.copy()
+    new_h = h.copy()
+    new_l[lo] = np.maximum(l[lo], np.minimum(o, c)[lo] - med[lo])
+    new_h[hi] = np.minimum(h[hi], np.maximum(o, c)[hi] + med[hi])
+    out = ohlcv.copy()
+    out['Low'] = new_l.astype(ohlcv['Low'].dtype, copy=False)
+    out['High'] = new_h.astype(ohlcv['High'].dtype, copy=False)
+    if log is not None:
+        for i in np.flatnonzero(lo | hi):
+            side = 'low' if lo[i] else 'high'
+            old, new = (l[i], new_l[i]) if lo[i] else (h[i], new_h[i])
+            log(f"  [WICK-GUARD] {where} {ohlcv.index[i]} {side}: "
+                f"{old:.8g} -> {new:.8g} (O {o[i]:.8g} C {c[i]:.8g} "
+                f"medTR {med[i]:.6g})")
+        log(f"  [WICK-GUARD] {where}: repaired {int(lo.sum())} low / "
+            f"{int(hi.sum())} high wick print(s)")
+    return out
+
+
 # Normal saves write the CSV seconds-to-minutes after the parquet; a CSV newer
 # than the parquet by more than this means a parquet save failed and the
 # parquet on disk is a frozen stale copy.
@@ -181,14 +284,73 @@ def save_training_data(df: pd.DataFrame, prefix: str) -> bool:
     return pq_ok or csv_ok
 
 
-def append_ticker_data(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge new OHLCV bars into existing data, dedup on index, sort chronologically."""
-    if existing_df.empty:
-        return new_df.sort_index()
-    if new_df.empty:
-        return existing_df
+def _to_utc_index(index) -> pd.DatetimeIndex:
+    """Any timestamp-like index -> tz-aware UTC DatetimeIndex (name kept).
+    Naive stamps are taken AS UTC (the repo-wide storage convention);
+    aware ones are converted. Handles the object Index pandas produces
+    when frames with DIFFERENT tzs are concatenated."""
+    if isinstance(index, pd.DatetimeIndex):
+        out = (index.tz_localize('UTC') if index.tz is None
+               else index.tz_convert('UTC'))
+    else:
+        out = pd.DatetimeIndex(pd.to_datetime(index, utc=True))
+    return out.rename(index.name)
 
-    combined = pd.concat([existing_df, new_df])
+
+def normalize_utc_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return df with a tz-aware UTC DatetimeIndex (no sort, no dedup).
+
+    The R5 root cause: market_data.fetch_historical_bars returns
+    America/New_York-stamped bars (the SDK's tz), the sidecar/feature
+    stores are UTC, and pd.concat of two DIFFERENT tzs yields an object
+    Index — which then crashed indicators.compute_features (`idx.hour`).
+    Every merge helper normalises both sides through here first."""
+    if df is None or (isinstance(df.index, pd.DatetimeIndex)
+                      and str(df.index.tz) == 'UTC'):
+        return df
+    out = df.copy(deep=False)
+    out.index = _to_utc_index(df.index)
+    return out
+
+
+def _ensure_utc_index(df: pd.DataFrame, where: str = '') -> pd.DataFrame:
+    """Fail-loud guard run right before feature computation in both
+    harvests: the bar frame must carry a tz-aware UTC, strictly increasing
+    DatetimeIndex. Raises TypeError / ValueError with a clear message
+    instead of letting a mis-typed index surface as an AttributeError deep
+    inside indicators. Returns df unchanged on success."""
+    tag = f" [{where}]" if where else ''
+    idx = df.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        kinds = sorted({type(x).__name__ for x in idx[:1000]})
+        tzs = sorted({str(getattr(x, 'tz', None)) for x in idx[:1000]})
+        raise TypeError(
+            f"bar frame{tag} index is {type(idx).__name__}(dtype={idx.dtype}),"
+            f" not a DatetimeIndex (element types {kinds}, tzs {tzs}) — a "
+            f"merge concatenated frames with mismatched timezones; route "
+            f"merges through data_utils.append_ticker_data/normalize_utc_index")
+    if idx.tz is None or str(idx.tz) != 'UTC':
+        raise ValueError(f"bar frame{tag} index tz is {idx.tz!r}, expected "
+                         f"UTC")
+    if not idx.is_monotonic_increasing or idx.has_duplicates:
+        raise ValueError(f"bar frame{tag} index is not strictly increasing "
+                         f"(sorted={idx.is_monotonic_increasing}, "
+                         f"duplicates={int(idx.duplicated().sum())})")
+    return df
+
+
+def append_ticker_data(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge new OHLCV bars into existing data, dedup on index (keep='last'
+    — fresh bars win), sort chronologically. Both sides are normalised to
+    a UTC DatetimeIndex first, so a mixed-tz merge (NY-stamped gap-repair
+    patch into a UTC store) can no longer degrade the index to object."""
+    if existing_df.empty:
+        return normalize_utc_index(new_df).sort_index()
+    if new_df.empty:
+        return normalize_utc_index(existing_df)
+
+    combined = pd.concat([normalize_utc_index(existing_df),
+                          normalize_utc_index(new_df)])
     combined = combined[~combined.index.duplicated(keep='last')]
     combined = combined.sort_index()
     return combined
@@ -215,7 +377,21 @@ def load_raw_ohlcv(prefix: str) -> pd.DataFrame:
         if not isinstance(df.index, pd.DatetimeIndex):
             if 'Datetime' in df.columns:
                 df = df.set_index('Datetime')
-                df.index = pd.to_datetime(df.index)
+        # Contract: tz-aware UTC DatetimeIndex, de-duplicated on
+        # (timestamp, Ticker) keep='last' (merge_raw_ohlcv's rule), then
+        # stably time-sorted.
+        df = normalize_utc_index(df)
+        if 'Ticker' in df.columns:
+            keys = pd.MultiIndex.from_arrays([df.index, df['Ticker']])
+            dup = keys.duplicated(keep='last')
+        else:
+            dup = df.index.duplicated(keep='last')
+        if dup.any():
+            print(f"[SIDECAR] dropped {int(dup.sum())} duplicate rows "
+                  f"(keep='last')")
+            df = df[~dup]
+        if not df.index.is_monotonic_increasing:
+            df = df.sort_index(kind='mergesort')
         print(f"[SIDECAR] Loaded {len(df)} raw rows from {path.name}")
         return df
     except Exception as e:
@@ -243,17 +419,17 @@ def merge_raw_ohlcv(raw_df: pd.DataFrame, new_df: pd.DataFrame,
                     ticker: str) -> pd.DataFrame:
     """Merge one ticker's fresh raw bars into the multi-ticker sidecar,
     keep-last on (timestamp, Ticker)."""
-    new_t = new_df.copy()
+    new_t = normalize_utc_index(new_df).copy()
     new_t['Ticker'] = ticker
     keep_cols = [c for c in RAW_OHLCV_COLS + ['Src', 'Ticker']
                  if c in new_t.columns]
     new_t = new_t[keep_cols]
     if raw_df is None or raw_df.empty:
-        return new_t.sort_index()
-    combined = pd.concat([raw_df, new_t])
+        return new_t.sort_index(kind='mergesort')
+    combined = pd.concat([normalize_utc_index(raw_df), new_t])
     keys = pd.MultiIndex.from_arrays([combined.index, combined['Ticker']])
     combined = combined[~keys.duplicated(keep='last')]
-    return combined.sort_index()
+    return combined.sort_index(kind='mergesort')
 
 
 def latest_raw_ts(raw_df: pd.DataFrame, ticker: str):

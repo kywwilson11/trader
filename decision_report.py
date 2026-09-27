@@ -35,9 +35,10 @@ details, and treat pre-2026-07 report numbers as NOT comparable):
     being silently replayed from the frame's first bar.
 
 Usage:
-    python decision_report.py --days 30
+    python decision_report.py --days 30 [--out DIR]
 Writes decision_report.json to the repo root (BASE_DIR) — the path gui.py
 and scripts/rank_gradient_report.py read; the journals live in BASE_DIR/journals.
+`--out DIR` writes it under DIR instead (stale and normal paths alike).
 """
 
 import argparse
@@ -76,6 +77,13 @@ MAX_HOLD_BARS = {'crypto': 24, 'stock': 24}   # vertical barrier for replays
 MIN_VERDICT_N = 9    # no REVIEW/OK/CHANGE verdict below this n (matches the >=9 bucketing floor)
 MIN_BUCKET_N = 10    # rank_* buckets suppressed below this n (they feed rank_gradient_verdict, which reads only mean_net_pct)
 _CRYPTO_BAR_CAP = 5000
+# Stock replay frame = the last 320 hourly bars (market_data.py
+# fetch_stock_bars_alpaca default limit=320 -> .tail(320)); at ~16 bars per
+# trading day (extended hours included) that is ~20 trading days, i.e. a
+# floor of ~26 calendar days (~30 observed). Report windows longer than this
+# have stock rows that land _out_of_window. (The 45-day fetch start is NOT
+# the binding constraint — the .tail(320) is.)
+STOCK_FRAME_MIN_DAYS = 26
 
 # Mechanical/budget/fail-closed vetoes never priced per-symbol — they only
 # appear rolled up in entry_window veto_counts. Producer keys verified
@@ -209,6 +217,28 @@ def replay_entry(bars, ts, asset_type: str,
     return gross - round_trip_cost_pct(asset_type, spread)
 
 
+
+# Journal `ts` basis. Rows since 2026-08-20 (20a41db) carry an offset-aware
+# ISO ts; OLDER rows were stamped by `datetime.datetime.now().isoformat()` —
+# naive LOCAL wall clock of the writing box (trade_journal.py documents the
+# change). A naive ts is therefore read as local time, exactly like llm_eval,
+# journal_stats and chart_core do (G6-2, 2026-09-26: reading it as UTC
+# replayed every legacy row one UTC offset early). None = the system zone
+# (`datetime.astimezone()`, DST-aware); tests pin a zone via this hook.
+_LOCAL_TZ = None
+
+
+def _naive_local_to_utc(ts):
+    """pd.Timestamp -> tz-aware UTC Timestamp. Offset-aware input is only
+    converted; naive input is interpreted in the local zone (see _LOCAL_TZ)."""
+    import pandas as pd
+    if ts.tz is not None:
+        return ts.tz_convert('UTC')
+    dt = ts.to_pydatetime(warn=False)
+    aware = dt.replace(tzinfo=_LOCAL_TZ) if _LOCAL_TZ is not None else dt.astimezone()
+    return pd.Timestamp(aware).tz_convert('UTC')
+
+
 def _dedup_first_per_day(rows: list[dict], key_fields: list[str],
                          ts_key: str = 'ts') -> list[dict]:
     """Keep only the FIRST row per (key_fields..., calendar-day) — a symbol
@@ -223,8 +253,9 @@ def _dedup_first_per_day(rows: list[dict], key_fields: list[str],
     timestamps` the instant the row list mixed naive and aware ts (any
     --days 30 window straddling the 2026-07-13 offset-aware ts change) or
     contained any missing/garbage-ts row. This rewrites the sort key as a
-    single int64 ns-since-epoch value (naive treated as UTC — the SAME
-    convention `_replay_grouped` applies), which totally orders regardless
+    single int64 ns-since-epoch value (naive read as the writer's LOCAL
+    wall clock via `_naive_local_to_utc` — the SAME convention
+    `_replay_grouped` applies; G6-2), which totally orders regardless
     of tz-awareness; unparseable/NaT rows get the max int64 sentinel so
     they sort last and bucket under day=None, never silently merged with a
     well-formed row. Sort stability preserves first-wins for equal ts, and
@@ -241,10 +272,15 @@ def _dedup_first_per_day(rows: list[dict], key_fields: list[str],
             return (_SENTINEL, None)
         if t is pd.NaT:
             return (_SENTINEL, None)
-        # int64 ns sort key: aware -> UTC epoch; naive -> treated as UTC,
-        # the SAME convention _replay_grouped applies. Day bucket stays the
-        # row's OWN wall-clock date (matches the journal file naming).
-        return (int(t.value), t.date().isoformat())
+        # int64 ns sort key: aware -> UTC epoch; naive -> LOCAL wall clock
+        # (legacy writer), the SAME convention _replay_grouped applies. Day
+        # bucket stays the row's OWN wall-clock date (matches the journal
+        # file naming).
+        try:
+            key = int(_naive_local_to_utc(t).value)
+        except (ValueError, OverflowError, OSError):
+            return (_SENTINEL, None)
+        return (key, t.date().isoformat())
 
     decorated = sorted(((_parse(r), r) for r in rows), key=lambda p: p[0][0])
     seen = set()
@@ -291,8 +327,8 @@ def _replay_grouped(rows: list[dict], api, ts_key: str = 'ts',
 
     Returns (samples, n_fetch_failed, n_horizon_pending, n_out_of_window)
     where samples is a list of (row, net) for every row that priced
-    successfully. ts parsing preserves the original offset-aware-ISO /
-    tz-localize-only-if-naive logic; a row with an unparseable ts can't be
+    successfully. ts parsing: offset-aware ISO is exact; a naive (legacy,
+    pre-2026-08-20) ts is the writer's LOCAL wall clock (G6-2); a row with an unparseable ts can't be
     replayed at all (no fetch problem, no horizon to wait on) and is
     counted as a fetch failure since there's nothing to price.
     """
@@ -344,9 +380,8 @@ def _replay_grouped(rows: list[dict], api, ts_key: str = 'ts',
                 ts = pd.Timestamp(r[ts_key])
                 if ts is pd.NaT:
                     raise ValueError('NaT ts')
-                if ts.tz is None:
-                    ts = ts.tz_localize('UTC')
-            except (ValueError, KeyError, TypeError):
+                ts = _naive_local_to_utc(ts)   # naive = legacy LOCAL ts (G6-2)
+            except (ValueError, KeyError, TypeError, OverflowError, OSError):
                 n_fetch_failed += 1
                 continue
             if ts < frame_start:
@@ -386,14 +421,181 @@ def _bootstrap_ci(values, n_boot: int = 2000, alpha: float = 0.10,
     return (round(float(lo), 3), round(float(hi), 3))
 
 
-def _bucket_stats(vals) -> dict:
+# ---------------------------------------------------------------------------
+# Day-cluster bootstrap (INTEL W17 / Scout B E3, 2026-09 — REPORT-ONLY).
+# Episode dedup removes intraday overlap but NOT same-day cross-name market
+# moves: every name vetoed on a risk-off day shares that day's shock, so the
+# iid percentile CI above treats correlated episodes as independent draws and
+# can over-issue REVIEW/OK/CHANGE verdicts (MacKinnon-Nielsen-Webb 2023: what
+# counts is the number of effectively independent clusters). Beside every
+# `ci90` the report now carries `ci90_dayclust` (resample CALENDAR DAYS with
+# replacement), `n_days`, and — where a verdict exists — `verdict_dayclust`
+# from the SAME verdict function. Nothing reads these to decide anything;
+# the existing ci90/verdict/insufficient_n keys and every pre-existing printed
+# line are unchanged. Pre-registered rule: E3_RULE below (owner decision).
+# ---------------------------------------------------------------------------
+E3_RULE = ('if ≥20% on the first post-retrain 30-day report → owner: switch '
+           'the GUI verdict source to the day-cluster CI and raise '
+           'MIN_VERDICT_N to 20')
+DAYCLUST_FEW_DAYS = 3   # n_days below this => 'dayclust_few_days' flag
+
+
+def _row_day(r: dict, ts_key: str = 'ts'):
+    """Calendar-day cluster key of a priced row: the row's OWN wall-clock
+    date as journaled — the SAME day convention as `_dedup_first_per_day`'s
+    bucket (`t.date().isoformat()` on the unconverted pd.Timestamp; naive
+    legacy ts = the writer's local wall clock, aware ts = the date in its own
+    offset, which matches the journal file naming). The UTC conversion via
+    `_naive_local_to_utc`/`_LOCAL_TZ` is used there only for the sort key,
+    never for the day bucket, so it is not applied here either. None when the
+    ts is missing/unparseable (such rows cannot be priced anyway —
+    `_replay_grouped` counts them as fetch failures)."""
+    import pandas as pd
+    try:
+        t = pd.Timestamp(r[ts_key])
+        if t is pd.NaT:
+            return None
+        return t.date().isoformat()
+    except (ValueError, KeyError, TypeError, OverflowError, OSError):
+        return None
+
+
+def _day_cluster_ci(values, days, n_boot: int = 2000, alpha: float = 0.10,
+                    seed: int = 0):
+    """Percentile CI for the mean from a CLUSTER bootstrap that resamples
+    calendar days with replacement (n_boot, alpha and the fixed seed match
+    `_bootstrap_ci`, so numbers reproduce run-to-run).
+
+    Each bootstrap replicate draws n_days days with replacement and takes
+    the pooled mean over every row of the drawn days (sum of day-sums / sum
+    of day-counts — the usual cluster-bootstrap ratio estimator). Clusters
+    keep first-appearance order, so when every row sits on its own day the
+    draws are exactly `_bootstrap_ci`'s. NaN values are dropped (with their
+    day) exactly like `_bootstrap_ci`; a row with day None is its own
+    singleton cluster (no evidence it shares a day with anything).
+
+    Returns (ci_or_None, n_days, reason_or_None). ci is None when fewer than
+    two distinct days remain — resampling one cluster has zero spread, so a
+    "CI" would be a point masquerading as an interval.
+    """
+    vals = np.asarray(values, dtype=float)
+    days = list(days)
+    if len(days) != vals.size:
+        raise ValueError(f'days ({len(days)}) and values ({vals.size}) differ in length')
+    index: dict = {}
+    sums: list = []
+    counts: list = []
+    for i, (v, d) in enumerate(zip(vals.tolist(), days)):
+        if v != v:          # NaN
+            continue
+        key = ('day', d) if d is not None else ('row', i)
+        j = index.get(key)
+        if j is None:
+            index[key] = len(sums)
+            sums.append(v)
+            counts.append(1)
+        else:
+            sums[j] += v
+            counts[j] += 1
+    n_days = len(sums)
+    if n_days == 0:
+        return None, 0, 'no priced rows'
+    if n_days == 1:
+        return None, 1, ('single distinct day — day-cluster bootstrap '
+                         'undefined (one cluster has zero resampling spread)')
+    s_arr = np.asarray(sums, dtype=float)
+    c_arr = np.asarray(counts, dtype=float)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n_days, size=(n_boot, n_days))
+    boot_means = s_arr[idx].sum(axis=1) / c_arr[idx].sum(axis=1)
+    lo, hi = np.quantile(boot_means, [alpha / 2, 1 - alpha / 2])
+    return [round(float(lo), 3), round(float(hi), 3)], n_days, None
+
+
+def _dayclust_fields(vals, days, verdict_fn=None) -> dict:
+    """The additive day-cluster keys for one ci90-bearing dict:
+    ci90_dayclust / n_days / dayclust_few_days (+ ci90_dayclust_reason when
+    the CI is null, + verdict_dayclust when `verdict_fn` — the SAME
+    _gate_verdict/_signal_exit_verdict that produced 'verdict' — is given).
+    With a null day-cluster CI at n >= MIN_VERDICT_N the honest day-cluster
+    verdict is 'cannot conclude'; below MIN_VERDICT_N the verdict function's
+    own insufficient-n refusal is used unchanged."""
+    arr = np.asarray(vals, dtype=float)
+    n = int(arr.size)
+    ci_dc, n_days, reason = _day_cluster_ci(arr, days)
+    out = {'ci90_dayclust': ci_dc, 'n_days': int(n_days),
+           'dayclust_few_days': bool(n_days < DAYCLUST_FEW_DAYS)}
+    if reason is not None:
+        out['ci90_dayclust_reason'] = reason
+    if verdict_fn is not None:
+        if ci_dc is None and n >= MIN_VERDICT_N:
+            out['verdict_dayclust'] = f'cannot conclude ({reason}) — no day-cluster verdict'
+        else:
+            out['verdict_dayclust'] = verdict_fn(
+                n, ci_dc if ci_dc is not None else (float('nan'), float('nan')))
+    return out
+
+
+def _verdict_key(v) -> str:
+    """Verdict class for disagreement counting: the leading words before
+    any ' (' / ' —' qualifier ('REVIEW', 'OK', 'CHANGE', 'NO CHANGE',
+    'cannot conclude', 'insufficient n'), so explanatory wording can never
+    count as a disagreement — only a different call can."""
+    return str(v).split(' (')[0].split(' —')[0].strip()
+
+
+def verdict_disagreement(gates: dict, sig_exit: dict) -> dict:
+    """Report-level iid-vs-day-cluster verdict disagreement (E3).
+
+    Compared set: every gate_attribution gate plus the signal-exit audit
+    whose priced n >= MIN_VERDICT_N and which carries both 'verdict' and
+    'verdict_dayclust'. rate = n_disagree / n_compared (None when nothing
+    qualifies). Report-only: nothing reads it to gate anything."""
+    items = []
+    for name, g in (gates or {}).items():
+        if str(name).startswith('_') or not isinstance(g, dict):
+            continue
+        items.append((str(name), g, g.get('vetoes_priced')))
+    if isinstance(sig_exit, dict) and 'verdict' in sig_exit:
+        items.append(('signal_exit', sig_exit, sig_exit.get('priced')))
+    compared, disagreeing = [], []
+    for name, g, n in items:
+        if not isinstance(n, int) or n < MIN_VERDICT_N:
+            continue
+        if 'verdict' not in g or 'verdict_dayclust' not in g:
+            continue
+        compared.append(name)
+        if _verdict_key(g['verdict']) != _verdict_key(g['verdict_dayclust']):
+            disagreeing.append(name)
+    rate = round(len(disagreeing) / len(compared), 3) if compared else None
+    return {'rate': rate, 'n_compared': len(compared),
+            'n_disagree': len(disagreeing), 'disagreeing': disagreeing,
+            'min_verdict_n': MIN_VERDICT_N, 'rule': E3_RULE}
+
+
+def _disagreement_line(d: dict) -> str:
+    """The ONE printed line the day-cluster addition contributes."""
+    if d.get('rate') is None:
+        head = (f"verdict_disagreement_rate (iid vs day-cluster CI): n/a "
+                f"(0 verdicts with n>={d.get('min_verdict_n', MIN_VERDICT_N)})")
+    else:
+        head = (f"verdict_disagreement_rate (iid vs day-cluster CI): "
+                f"{d['rate']:.0%} ({d['n_disagree']}/{d['n_compared']} verdicts "
+                f"with n>={d.get('min_verdict_n', MIN_VERDICT_N)})")
+    return f"{head} — pre-registered E3 rule: {d.get('rule', E3_RULE)}"
+
+
+def _bucket_stats(vals, days=None) -> dict:
     arr = np.asarray(vals, dtype=float)
     ci = _bootstrap_ci(arr)
-    return {'n': int(arr.size),
-            'mean_net_pct': round(float(arr.mean()), 3),
-            'hit_rate': round(float((arr > 0).mean()), 3),
-            'ci90': [ci[0], ci[1]],
-            'insufficient_n': bool(arr.size < MIN_VERDICT_N)}
+    out = {'n': int(arr.size),
+           'mean_net_pct': round(float(arr.mean()), 3),
+           'hit_rate': round(float((arr > 0).mean()), 3),
+           'ci90': [ci[0], ci[1]],
+           'insufficient_n': bool(arr.size < MIN_VERDICT_N)}
+    if days is not None:   # additive day-cluster keys (report-only, E3)
+        out.update(_dayclust_fields(arr, days))
+    return out
 
 
 def _gate_verdict(n: int, ci) -> str:
@@ -449,10 +651,12 @@ def gate_attribution(rows: list[dict], api, bars_cache: dict | None = None,
     samples, n_fetch_failed, n_horizon_pending, n_out_of_window = _replay_grouped(
         skips, api, bars_cache=bars_cache, crypto_limit=crypto_limit)
     per_gate: dict[str, list[float]] = defaultdict(list)
+    per_gate_days: dict[str, list] = defaultdict(list)
     cf_priced = 0
     cf_with_spread = 0
     for r, net in samples:
         per_gate[r['skip_reason']].append(net)
+        per_gate_days[r['skip_reason']].append(_row_day(r))
         if r['skip_reason'] == 'cost_floor':
             cf_priced += 1
             if r.get('spread_pct') is not None:
@@ -475,6 +679,8 @@ def gate_attribution(rows: list[dict], api, bars_cache: dict | None = None,
             'verdict': _gate_verdict(int(vals.size), ci),
             'insufficient_n': bool(vals.size < MIN_VERDICT_N),
         }
+        out[gate].update(_dayclust_fields(
+            vals, per_gate_days.get(gate, []), verdict_fn=_gate_verdict))
 
     # Gates that fired (raw journal rows exist) but priced ZERO episodes —
     # e.g. every fetch for that symbol failed. Distinct from UNPRICED_GATES
@@ -546,9 +752,10 @@ def signal_exit_audit(rows: list[dict], api, bars_cache: dict | None = None,
 
     priced, n_fetch_failed, n_horizon_pending, n_out_of_window = _replay_grouped(
         sells, api, bars_cache=bars_cache, crypto_limit=crypto_limit)
-    nets, realized = [], []
+    nets, realized, net_days = [], [], []
     for r, net in priced:
         nets.append(net)
+        net_days.append(_row_day(r))
         if isinstance(r.get('pnl_pct'), (int, float)):
             realized.append(float(r['pnl_pct']))
 
@@ -571,6 +778,8 @@ def signal_exit_audit(rows: list[dict], api, bars_cache: dict | None = None,
             'verdict': _signal_exit_verdict(int(vals.size), ci),
             'insufficient_n': bool(vals.size < MIN_VERDICT_N),
         })
+        out.update(_dayclust_fields(vals, net_days,
+                                    verdict_fn=_signal_exit_verdict))
     return out
 
 
@@ -588,16 +797,24 @@ def conviction_calibration(rows: list[dict], api, bars_cache: dict | None = None
     already, so unlike the two gate-side analyses these rows are NOT
     deduped. Rank buckets are suppressed below MIN_BUCKET_N (see
     rank_coverage / _rank_buckets_suppressed) so a single stray rank-6-7
-    trade can't drive a rank_gradient_verdict on its own."""
-    buys = [r for r in rows if r.get('action') == 'buy'
-            and r.get('pred_return') is not None and r.get('symbol')]
+    trade can't drive a rank_gradient_verdict on its own.
+
+    2026-09: buys journaled with ``pred_return: null`` (every legacy crypto
+    buy) cannot be bucketed by prediction magnitude; they are still excluded
+    from the replay but now COUNTED in ``_dropped_null_pred`` (and surfaced
+    by run_report's banner + quality block) instead of silently shrinking
+    the denominator."""
+    all_buys = [r for r in rows if r.get('action') == 'buy' and r.get('symbol')]
+    buys = [r for r in all_buys if r.get('pred_return') is not None]
+    n_null_pred = len(all_buys) - len(buys)
     if not buys:
         return {'_fetch_failed': 0, '_horizon_pending': 0,
-                '_out_of_window': 0, '_unresolved': 0}
+                '_out_of_window': 0, '_unresolved': 0,
+                '_dropped_null_pred': n_null_pred}
 
     priced, n_fetch_failed, n_horizon_pending, n_out_of_window = _replay_grouped(
         buys, api, bars_cache=bars_cache, crypto_limit=crypto_limit)
-    samples = []   # (pred, meta_prob_or_None, net, rank_or_None)
+    samples = []   # (pred, meta_prob_or_None, net, rank_or_None, day_or_None)
     n_bad_pred = 0
     n_stock_rank = n_crypto_rank = 0
     for r, net in priced:
@@ -612,7 +829,7 @@ def conviction_calibration(rows: list[dict], api, bars_cache: dict | None = None
         except (TypeError, ValueError):
             n_bad_pred += 1
             continue
-        samples.append((pv, mp, net, r.get('entry_rank')))
+        samples.append((pv, mp, net, r.get('entry_rank'), _row_day(r)))
         # per-asset rank coverage, counted HERE (post pred-validation) so
         # stock_with_rank + crypto_with_rank == n_with_rank always holds
         if r.get('entry_rank') is not None:
@@ -628,15 +845,18 @@ def conviction_calibration(rows: list[dict], api, bars_cache: dict | None = None
                 '_horizon_pending': n_horizon_pending,
                 '_out_of_window': n_out_of_window,
                 '_unresolved': n_fetch_failed + n_horizon_pending + n_out_of_window,
-                '_malformed_pred_return': n_bad_pred}
+                '_malformed_pred_return': n_bad_pred,
+                '_dropped_null_pred': n_null_pred}
 
     preds = np.array([s[0] for s in samples])
     nets = np.array([s[2] for s in samples])
+    sdays = np.array([s[4] for s in samples], dtype=object)
     out = {'n': len(samples), '_fetch_failed': n_fetch_failed,
            '_horizon_pending': n_horizon_pending,
            '_out_of_window': n_out_of_window,
            '_unresolved': n_fetch_failed + n_horizon_pending + n_out_of_window,
-           '_malformed_pred_return': n_bad_pred}
+           '_malformed_pred_return': n_bad_pred,
+           '_dropped_null_pred': n_null_pred}
 
     # Prediction-magnitude terciles: does the top third out-earn?
     qs = np.quantile(preds, [1 / 3, 2 / 3])
@@ -645,13 +865,15 @@ def conviction_calibration(rows: list[dict], api, bars_cache: dict | None = None
                'pred_high': preds > qs[1]}
     for name, mask in buckets.items():
         if mask.sum():
-            out[name] = _bucket_stats(nets[mask])
+            out[name] = _bucket_stats(nets[mask], days=sdays[mask])
 
     # Entry-rank buckets — Stage-0 experiment 1: does rank 6-7 carry
     # materially less edge than rank 1-3? (gates the concentration cap)
     # rank_coverage discloses whether ranks are even present across both
     # asset types — crypto rows historically carry no entry_rank at all.
     ranked = [(s[3], s[2]) for s in samples if s[3] is not None]
+    ranked_days = np.array([s[4] for s in samples if s[3] is not None],
+                           dtype=object)
     out['rank_coverage'] = {
         'n_total': len(samples), 'n_with_rank': len(ranked),
         'stock_with_rank': n_stock_rank,
@@ -666,7 +888,7 @@ def conviction_calibration(rows: list[dict], api, bars_cache: dict | None = None
             mask = (rk >= lo) & (rk <= hi)
             cnt = int(mask.sum())
             if cnt >= MIN_BUCKET_N:
-                out[name] = _bucket_stats(rn[mask])
+                out[name] = _bucket_stats(rn[mask], days=ranked_days[mask])
             elif cnt:
                 suppressed[name] = cnt
         if suppressed:
@@ -676,12 +898,13 @@ def conviction_calibration(rows: list[dict], api, bars_cache: dict | None = None
     if len(metas) >= 9:
         mp = np.array([m[0] for m in metas])
         mn = np.array([m[1] for m in metas])
+        md = np.array([s[4] for s in samples if s[1] is not None], dtype=object)
         for name, lo, hi in (('meta_0.30_0.45', 0.30, 0.45),
                              ('meta_0.45_0.60', 0.45, 0.60),
                              ('meta_0.60_1.00', 0.60, 1.01)):
             mask = (mp >= lo) & (mp < hi)
             if mask.sum():
-                out[name] = _bucket_stats(mn[mask])
+                out[name] = _bucket_stats(mn[mask], days=md[mask])
     return out
 
 
@@ -756,7 +979,21 @@ def _write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
-def _write_stale_report(days: int, api_available) -> dict:
+def _report_path(out_dir=None) -> Path:
+    """Where decision_report.json goes. Default (out_dir None) is the repo
+    root literal BASE_DIR / 'decision_report.json' — the path gui.py and
+    scripts/rank_gradient_report.py read, so the default is unchanged.
+    `--out DIR` (2026-09) redirects BOTH the stale and the normal write
+    under DIR (created), so an evidence run does not overwrite the
+    operator's root report."""
+    if out_dir is None:
+        return BASE_DIR / 'decision_report.json'
+    d = Path(out_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / 'decision_report.json'
+
+
+def _write_stale_report(days: int, api_available, out_dir=None) -> dict:
     """run_report ALWAYS writes decision_report.json, even when nothing
     could be priced — 2026-07 fix: previously a get_api() failure returned
     {} without touching the file, so scripts/rank_gradient_report.py could
@@ -764,17 +1001,17 @@ def _write_stale_report(days: int, api_available) -> dict:
     'stale': True lets downstream consumers refuse to trust it."""
     stale = {'generated': dt.datetime.now().astimezone().isoformat(),
              'days': days, 'api_available': api_available, 'stale': True}
-    out = BASE_DIR / 'decision_report.json'
+    out = _report_path(out_dir)
     _write_json(out, stale)
     return stale
 
 
-def run_report(days: int = 30) -> dict:
+def run_report(days: int = 30, out_dir=None) -> dict:
     days = max(0, int(days))
     rows = load_journal(days)
     if not rows:
         print("No journal entries found.")
-        return _write_stale_report(days, api_available=None)
+        return _write_stale_report(days, api_available=None, out_dir=out_dir)
     try:
         from dotenv import load_dotenv
         load_dotenv()
@@ -785,7 +1022,7 @@ def run_report(days: int = 30) -> dict:
               f"Writing a STALE decision_report.json (api_available=False) "
               f"so downstream consumers (scripts/rank_gradient_report.py) "
               f"don't silently read an empty {{}} as a live report.")
-        return _write_stale_report(days, api_available=False)
+        return _write_stale_report(days, api_available=False, out_dir=out_dir)
 
     # One bars/atr/eod fetch per symbol for the WHOLE report — a symbol
     # touched by gates + conviction + signal-exit (common: a name that was
@@ -831,22 +1068,31 @@ def run_report(days: int = 30) -> dict:
     total_out_of_window = (gates.get('_out_of_window', 0)
                            + sig_exit.get('_out_of_window', 0)
                            + conviction.get('_out_of_window', 0))
+    # 2026-09: buys dropped for pred_return=null are unpriced taken entries
+    # too — fold them into the denominator so the unpriced rate is honest.
+    dropped_null_pred = int(conviction.get('_dropped_null_pred', 0) or 0)
     total_priced = gate_priced + sig_priced + conv_priced
-    total_unpriced = gate_unpriced + sig_unpriced + conv_unpriced
+    total_unpriced = gate_unpriced + sig_unpriced + conv_unpriced + dropped_null_pred
     total_considered = total_priced + total_unpriced
     unpriced_rate = (total_unpriced / total_considered) if total_considered else 0.0
 
     if total_fetch_failed > 0 or unpriced_rate > 0.30:
         print(f"\nWARNING: {unpriced_rate:.0%} of rows unpriced "
               f"({total_fetch_failed} fetch failures, {total_out_of_window} "
-              f"out-of-window) — sections below are NOT representative")
+              f"out-of-window, {dropped_null_pred} null-pred buys) — sections "
+              f"below are NOT representative")
+    if dropped_null_pred:
+        print(f"WARNING: {dropped_null_pred} buy row(s) dropped from conviction "
+              f"calibration for pred_return=null (cannot be bucketed by "
+              f"prediction; counted as unpriced above)")
     print("methodology 2026-07b: per-episode dedup + bootstrap CIs + "
           "full-frame ATR stops + out-of-window exclusion — numbers not "
           "comparable to earlier reports")
-    if days > 42:
-        print("NOTE: stock bar frames cover ~45 calendar days (market_data "
-              "start is hardcoded) — older stock rows are counted "
-              "_out_of_window, not priced.")
+    if days > STOCK_FRAME_MIN_DAYS:
+        print(f"NOTE: stock replay frames hold only the last 320 hourly bars "
+              f"(market_data.fetch_stock_bars_alpaca .tail(320), extended "
+              f"hours included) ≈ {STOCK_FRAME_MIN_DAYS}-30 calendar days — "
+              f"older stock rows are counted _out_of_window, not priced.")
 
     if admitted_k:
         print(f"\n=== ADMITTED-K DISTRIBUTION (last {days}d) ===")
@@ -939,14 +1185,23 @@ def run_report(days: int = 30) -> dict:
               "here is an upper bound on the case for change, not proof "
               "the milder fix earns as much.")
 
+    # E3 (report-only): iid-vs-day-cluster verdict disagreement — the ONE
+    # new printed line; every line above/below is unchanged.
+    disagreement = verdict_disagreement(gates, sig_exit)
+    print(_disagreement_line(disagreement))
+
     report = {'generated': dt.datetime.now().astimezone().isoformat(),
               'days': days, 'gates': gates, 'conviction': conviction,
               'admitted_k': admitted_k, 'signal_exit': sig_exit}
+    report['verdict_disagreement_rate'] = disagreement['rate']
+    report['verdict_disagreement'] = disagreement
     report['quality'] = {
         'rows_loaded': len(rows), 'priced': total_priced,
         'unpriced': total_unpriced, 'fetch_failed': total_fetch_failed,
-        'horizon_pending': total_unpriced - total_fetch_failed - total_out_of_window,
+        'horizon_pending': (total_unpriced - total_fetch_failed
+                            - total_out_of_window - dropped_null_pred),
         'out_of_window': total_out_of_window,
+        'dropped_null_pred': dropped_null_pred,
         'unpriced_rate': round(unpriced_rate, 3),
         'representative': bool(total_priced > 0 and total_fetch_failed == 0
                                and unpriced_rate <= 0.30),
@@ -978,7 +1233,7 @@ def run_report(days: int = 30) -> dict:
         report['stale_reason'] = 'no rows priced (fetch failures / out-of-window / pending)'
         report['api_available'] = True
 
-    out = BASE_DIR / 'decision_report.json'
+    out = _report_path(out_dir)
     _write_json(out, report)
     print(f"\nReport: {out}")
     return report
@@ -987,5 +1242,9 @@ def run_report(days: int = 30) -> dict:
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='Gate attribution report')
     ap.add_argument('--days', type=int, default=30)
+    ap.add_argument('--out', metavar='DIR', default=None,
+                    help='write decision_report.json under DIR (created) '
+                         'instead of the repo root (default: repo root, '
+                         'the path gui.py reads)')
     args = ap.parse_args()
-    run_report(args.days)
+    run_report(args.days, out_dir=args.out)

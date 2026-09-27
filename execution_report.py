@@ -10,10 +10,13 @@ Sign convention: positive slippage_bps always means "worse than the
 decision price" (buys filled higher, sells filled lower).
 
 Usage:
-    python execution_report.py --days 14
+    python execution_report.py --days 14 [--out DIR]
+Writes execution_report.json to the repo root (the path gui.py reads);
+`--out DIR` writes it under DIR (created) instead.
 """
 import argparse
 import json
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -58,14 +61,38 @@ def _load(days: int):
     return rows, n_skipped
 
 
-def _write_json(report: dict) -> None:
-    out = BASE_DIR / 'execution_report.json'
-    with open(out, 'w') as f:
-        json.dump(report, f, indent=2)
+def _write_json(report: dict, out: Path | None = None) -> None:
+    """Atomic write (tmp + os.replace, same pattern as trade_journal /
+    decision_report): gui.py and chart_core read this file, so a reader must
+    never see a truncated report. pid-unique tmp so a GUI-launched run and a
+    manual run cannot os.replace each other's half-written tmp."""
+    out = out if out is not None else BASE_DIR / 'execution_report.json'
+    tmp = out.with_name(f'{out.name}.{os.getpid()}.tmp')
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(report, f, indent=2)
+        os.replace(tmp, out)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
     print(f"Report: {out}")
 
 
-def run_report(days: int = 14) -> dict:
+def _report_path(out_dir=None):
+    """None (default) -> _write_json's own root default, byte-identical to
+    the pre-2026-09 behaviour; else DIR/execution_report.json (DIR created)."""
+    if out_dir is None:
+        return None
+    d = Path(out_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / 'execution_report.json'
+
+
+def run_report(days: int = 14, out_dir=None) -> dict:
+    out = _report_path(out_dir)
     rows, n_skipped = _load(days)
     if n_skipped:
         print(f"note: {n_skipped} unparseable journal line(s) skipped")
@@ -79,7 +106,7 @@ def run_report(days: int = 14) -> dict:
     if not rows:
         print("No fills with slippage data yet — the loops journal "
               "decision_price/fill_price on every confirmed fill.")
-        _write_json(report)
+        _write_json(report, out)
         return report
 
     def crypto(sym):
@@ -119,6 +146,14 @@ def run_report(days: int = 14) -> dict:
         overall = round(float(all_bps.mean()), 2)
         report['overall_mean_bps'] = overall
         print(f"\nOverall mean shortfall: {overall:+.1f} bps per fill")
+    else:
+        # rows is non-empty (buy / llm rows without slippage — c26 T7), so
+        # the early "No fills" notice above cannot fire: say so explicitly
+        # instead of silently dropping the section (G6A-1, 2026-09-26).
+        n_buys = sum(1 for e in rows if e.get('action') == 'buy')
+        print(f"shortfall section skipped: 0/{n_buys} buys carry "
+              f"slippage_bps (no fills with decision_price/fill_price in "
+              f"window)")
 
     # Maker share of crypto entries (the maker ladder journals
     # entry_tactic per buy). Realized fee/RT = 2*taker - (taker-maker)*share
@@ -170,23 +205,39 @@ def run_report(days: int = 14) -> dict:
     # (b) Crypto maker NOTIONAL share — count-based share above overweights
     # small fills; per-rung maker_notional (T6, if/when journaled) overrides
     # the entry_tactic heuristic. Defensive: no hard dependency on T6.
-    m_not = t_not = 0.0
+    # 2026-09: a buy with NEITHER maker_notional NOR entry_tactic (legacy,
+    # pre-maker-ladder rows) is 'unknown', exactly as the count block above
+    # excludes it — it used to land in the denominator as taker, fabricating
+    # a 0.0% share on mixed-era windows.
+    m_not = t_not = u_not = 0.0
     for e in rows:
         sym = e.get('symbol', '')
         if (e.get('action') == 'buy' and isinstance(sym, str) and '/' in sym
                 and isinstance(e.get('final_notional'), (int, float))):
             fn = float(e['final_notional'])
-            t_not += fn
             mn = e.get('maker_notional')   # T6 per-rung split, if/when journaled
             if isinstance(mn, (int, float)):
+                t_not += fn
                 m_not += min(float(mn), fn)
-            elif str(e.get('entry_tactic', '')).startswith('maker'):
-                m_not += fn
+            elif e.get('entry_tactic'):
+                t_not += fn
+                if str(e['entry_tactic']).startswith('maker'):
+                    m_not += fn
+            else:
+                u_not += fn
+    if u_not > 0:
+        report['crypto_unknown_tactic_notional'] = round(u_not, 2)
     if t_not > 0:
         report['crypto_maker_notional_share'] = round(m_not / t_not, 3)
         print(f"Crypto maker NOTIONAL share: "
               f"{report['crypto_maker_notional_share']:.1%} "
-              f"of ${t_not:,.0f} entered")
+              f"of ${t_not:,.0f} entered with a known tactic"
+              + (f" (${u_not:,.0f} more with no entry_tactic excluded)"
+                 if u_not > 0 else ""))
+    elif u_not > 0:
+        print(f"Crypto maker NOTIONAL share: n/a — all ${u_not:,.0f} of "
+              f"crypto entries carry no entry_tactic/maker_notional "
+              f"(pre-maker-ladder journals)")
 
     # (c) LLM analysis-call economics (model/dedup_hit/latency_ms/cost_usd
     # journaled per call; llm_backoff rows count skipped-call cycles).
@@ -212,18 +263,23 @@ def run_report(days: int = 14) -> dict:
               f"{la['mean_latency_ms']} ms, cost ${la['total_cost_usd']}, "
               f"{la['n_backoffs']} backoff(s)")
 
-    print("Compare against the backtest's assumptions (backtest.py "
-          "SPREAD_PCT haircuts: crypto 10 bps, stock 5 bps round trip). "
-          "If realized "
-          "shortfall is persistently higher, the backtest is optimistic — "
-          "raise SPREAD_PCT in backtest.py and the entry edge floor.")
+    if fills:   # the footer compares a shortfall that was actually shown
+        print("Compare against the backtest's assumptions (backtest.py "
+              "SPREAD_PCT haircuts: crypto 10 bps, stock 5 bps round trip). "
+              "If realized "
+              "shortfall is persistently higher, the backtest is optimistic — "
+              "raise SPREAD_PCT in backtest.py and the entry edge floor.")
 
-    _write_json(report)
+    _write_json(report, out)
     return report
 
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='Realized execution-cost report')
     ap.add_argument('--days', type=int, default=14)
+    ap.add_argument('--out', metavar='DIR', default=None,
+                    help='write execution_report.json under DIR (created) '
+                         'instead of the repo root (default: repo root, '
+                         'the path gui.py reads)')
     args = ap.parse_args()
-    run_report(args.days)
+    run_report(args.days, out_dir=args.out)

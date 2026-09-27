@@ -338,7 +338,7 @@ Everything below runs on the Jetson (`run_pipeline.PYTHON` is the Jetson conda i
 `run_pipeline.py:44`); the Mac can only read it and test the pure kernels. The process tree:
 
 ```
-systemd trader.service (Type=notify, WatchdogSec=900; scripts/setup_jetson_system.sh)
+systemd trader.service (Type=notify, WatchdogSec=900; scripts/setup_jetson_system.sh — NOT installed on the prod box as of 2026-09-26)
   ExecStart: python -u run_pipeline.py --combined-bots --bot-only
   └─ run_pipeline.py  — orchestrator (one main thread + a heartbeat daemon thread)
        ├─ phase subprocesses, sequential, cwd=BASE_DIR:
@@ -379,7 +379,11 @@ two feature stores that every model, gate and backtest downstream is trained on.
    and the triple-barrier set `TB_Ret_{fb}` / `TB_Bars_{fb}` / `TB_Reason_{fb}` from
    `policy_exits.compute_tb_labels` — **the same Numba exit-stack kernel the backtester and the
    meta-labeler run** (§4f); `Daily_Sentiment` from `sentiment_history` (stock side lagged one day;
-   crypto Fear & Greed unlagged because it is stamped at 00:00 UTC of its publication day);
+   crypto Fear & Greed unlagged because it is stamped at 00:00 UTC of its publication day) —
+   *2026-09-26: until then the `fng_daily` cache was dated in host-local time, so each row held the
+   next UTC day's value (a one-day look-ahead in every store built so far); the repair
+   (`sentiment_history._migrate_fng_date_basis`, and the stock key `(t_utc − 6 h).date() − 1`) takes
+   effect at the next harvest — `docs/MODULES.md` §sentiment_history;*
 6. `data_utils.save_training_data` (parquet + CSV, atomic) → `validate_training_data`.
 
 The **feature catalogue** (63 stock columns, pinned by the golden fingerprint in
@@ -503,7 +507,8 @@ replays the **champion** while the fresh model sits in the challenger slot ungat
   by `run_pipeline` under the name `'Bots'`); `run_pipeline`'s own default is split (one process per
   book). Known consequence: `_update_per_bot_status` only checks the `'Crypto'`/`'Stock'` names, so
   in combined mode `pipeline_status.json` reports every bot as not running (GUI + Telegram `/status`
-  consumers) — owner decision, §9.
+  consumers) — owner decision, §9. *Fixed 2026-09-26: a live `'Bots'` process now ORs `_BOT_SCOPE`
+  into `crypto_bot_running`/`stock_bot_running` (`run_pipeline._update_per_bot_status`).*
 
 ### 4e. One decision cycle per bar (`base_loop._run_one_cycle`)
 
@@ -605,7 +610,7 @@ kernel — an owner-queue item, not a fix (§9). Both loops read every policy *n
 | `trade_memory.record_trade` | the Kelly sample + CUSUM + LLM lesson lines per symbol | → `trade_memory.json` |
 | `decision_report.py --days N` | which gate blocked what, at what counterfactual cost (spread-honest replay via the exit kernel), conviction calibration, the `GATE_REASONS` taxonomy; **Stage-0** = this measurement layer | journals → `decision_report.json` |
 | `beta_ledger.py` | how much of P&L is SPY/BTC exposure: lagged AKL betas, HAC alpha t-stat, up/down and trend-conditional betas — *the* alpha-vs-beta number | equity + benchmarks → stdout / JSON |
-| `llm_eval.py` | does the LLM score add signal beyond the model? `realized = a + b1·pred + b2·z_s` with Driscoll-Kraay SEs; `b2` at n ≥ 60 = keep/kill the spend | `llm_analysis` rows → `llm_eval_report.json` |
+| `llm_eval.py` | does the LLM score add signal beyond the model? `realized = a + b1·pred + b2·z_s` with Driscoll-Kraay SEs; `b2` with ≥120 distinct hourly t0 clusters and n_eff ≥ 20 (≈20+ days of LLM cycles; n ≥ 60 alone is not enough) = keep/kill the spend | `llm_analysis` rows → `llm_eval_report.json` |
 | `execution_report.py` | implementation shortfall — what execution actually costs | `buy`/`sell` rows → `execution_report.json` |
 | `scripts/sizing_cofire_report.py` | which sizing multipliers co-fire and how much each moves size | `sizing` decompositions → stdout/JSON |
 | `indicator_leadlag.py` | per-feature predictive IC vs reactive coupling at 1–48 h, FDR, redundancy clusters | training parquet → report |
@@ -708,7 +713,7 @@ purged calendar walk-forward + the `FIXED_HOLDOUT_DAYS` pin + `validation.dsr_fr
 `retrain_ledger.py` records retrain gain. In: the panels. Out: models + certificate + study DB.
 Invariant: what is certified is what is deployed (R2C-02: the blend weight and threshold are
 certificate-visible). Honest status: LIVE, but two defects sit on the default path behind
-`TRAINING_REPAIRS_V1=False` (L1 val-loss criterion, L2 regime-penalty look-ahead), and the
+`TRAINING_REPAIRS_V1` (L1 val-loss criterion, L2 regime-penalty look-ahead; **True since 2026-09-27**, with `HYPERSEARCH_V3` and `OBJECTIVE_V3`, on the founder's instruction — see `research/campaign_2026-09_jetson/README.md` §6), and the
 validation stack *in production* is DSR + the coarse fold-PBO print — `pbo_cscv`, the Lo-2002
 factor and the stationary bootstrap have no production caller (available, uncalled).
 
@@ -741,7 +746,10 @@ the VIX ladder in `types_mod`/`strategy_config` stand the book down (the VIX>25 
 stock halt — `VIX25_BLOCK_REMOVED` flag, default OFF); `_circuit_breaker_check`, cooldowns
 (un-gated from exits since IA-2), lockouts, trade budgets. Invariant: the LLM gate is fail-*open*
 (a provider error can never block a trade — `llm_client` → `None` → `{}` → prior score → `s=0.5`
-default), every other gate is fail-closed; six formerly unpriced gates now journal skip rows via
+default); so, by documented intent, is the **meta-label gate** when its artifacts are absent or fail
+to load (`meta_label._load` → `meta_probability_live` returns `None` → `base_loop._meta_gate` passes
+with a neutral 1.0 multiplier: `meta_label.py:519-544,601-603`, `base_loop.py:2064-2068`, gate 15 in
+§4e), as are the stock event checks (`events_calendar`, `edgar_events`); every other gate is fail-closed; six formerly unpriced gates now journal skip rows via
 `_journal_skip` (IA-3). Status: LIVE.
 
 **(9) Execution & broker.** `order_utils.py` owns the order lifecycle: quote sanity (`get_quote`
@@ -770,7 +778,7 @@ sizing decomposition, conviction) writes `journals/*.jsonl` — append-only, unr
 `decision_report.py` (gate attribution by `GATE_REASONS`, conviction calibration — "Stage-0"),
 `beta_ledger.py` (the alpha-vs-beta number: lagged AKL betas, HAC alpha t-stat), `journal_stats.py`,
 `monitor_drift.py` (PSI drift, `pred_history.jsonl`), `llm_eval.py` (the keep/kill-LLM-spend
-scorecard at n≥60), `scripts/sizing_cofire_report.py`, `indicator_leadlag.py`, `retrain_ledger.py`,
+scorecard; verdict needs ≥120 distinct hourly t0 clusters and n_eff ≥ 20, ≈20+ days of LLM cycles), `scripts/sizing_cofire_report.py`, `indicator_leadlag.py`, `retrain_ledger.py`,
 `scripts/ic_by_name.py` / `rank_gradient_report.py` on the stage-0 dumps. Invariant: measurement
 ships directly; every strategy decision is supposed to cite one of these. Status: MEASUREMENT —
 and the honest note: most have never been run to verdict because journals live only on the Jetson.
@@ -779,8 +787,10 @@ and the honest note: most have never been run to verdict because journals live o
 schema-enforced per provider, `resolve_provider_chain` with `selection_mode` auto|single|free-only|
 best-free, per-provider 429 cooldowns, the $1/day cap with cross-process flock in `llm_cost.json`),
 `llm_analyst.py` (the roles: entry veto, size tilt, advisor-v2 shadow dossiers, Gemini-pinned
-Batch backfill), `learned_lexicon.py` + `sentiment.py` (headline scoring: learned lexicon over the
-static one, `sentiment_cache.db`, publication-date lag), `scripts/llm_qualify.py` /
+Batch backfill), `sentiment.py` (headline scoring with the static hand-built keyword lexicon, `sentiment_cache.db`,
+publication-date lag) + `learned_lexicon.py` (offline, dark by construction: it writes
+`learned_lexicon.json`, which `sentiment.py` never reads and which does not exist on the prod box as
+of 2026-09-26), `scripts/llm_qualify.py` /
 `prompt_ab.py` / `train_lexicon.py`. Invariant: fail-open; prompt changes go through `prompt_ab.py`.
 Honest status: LIVE, but "free-first" is plumbing, not the shipped default (`selection_mode='auto'`
 prefers Anthropic; free presets are `enabled=False` until an `llm_qualify` verdict), the
@@ -798,7 +808,10 @@ share 8 GB), `hw_monitor.py`, `notify.notify` (deduped Telegram/webhook, dead-ma
 file-based kill switch), `log_config.py` (the one rotating log), `trade_memory.py`, `tax_lots.py`,
 `types_mod.py`. Invariant: bots are CPU-only three ways; training holds the GPU. Status: LIVE.
 Two ops smells recorded for the owner: importing any of 22 modules creates `logs/trader.log`
-(`get_logger` at module scope), and `journals/` grows unbounded.
+(`get_logger` at module scope), and `journals/` grows unbounded. The first no longer reaches the
+production log from tests: `TRADER_LOG_DIR` (`log_config._log_paths()`, `log_config.py:102-135`,
+read at the first `get_logger`) relocates `trader.log`, and `tests/conftest.py` sets it to a
+per-session temp dir before any repo import (2026-09-27). Unset in production → default unchanged.
 
 **(15) Research kernels & driver scripts.** The falsification shelf the 2026-08 campaign built,
 each mapped to a step of the 12-step Jetson sequence (`06_signal_model_plan.md §4`,
@@ -834,7 +847,8 @@ is what an agent must preserve.
 3. **Fail-closed live, fail-open LLM.** A missing prediction, quote, model or bar means no entry
    (`predict_now`, `order_utils.get_quote`, `_ioc_entry_fallback`); an LLM/provider error means the
    prior score or `s=0.5`, never a blocked trade (`llm_client` → `llm_analyst.analyze_trades` →
-   `base_loop`). Do not invert either.
+   `base_loop`). Do not invert either. (The optional meta-label layer is the documented exception
+   on the live side: absent artifacts ⇒ a neutral pass, not a block — §5-8.)
 4. **Default-OFF + byte-pinned.** Every model- or gate-facing change ships behind a flag whose OFF
    path is pinned by a test (`docs/FLAGS.md`); flips follow the runbook's evidence gate; flag-ON paths
    are never changed silently. Measurement-only code ships directly.
@@ -877,8 +891,10 @@ data, models and journals). What the map adds is the *importability* consequence
   hmmlearn 3, torch 2, arch 2, dotenv 1).
 - **What only the Jetson can settle:** every number that depends on data — the 12-step experiment
   sequence (§8), the IC/rank instruments, the LLM scorecard, the beta ledger, the spread census,
-  the GUI visual pass, and the two undocumented-on-device questions (`indicators_c*.so` presence;
-  the installed `pyarrow` version).
+  the GUI visual pass, and the two undocumented-on-device questions (`indicators_c*.so` presence —
+  ANSWERED 2026-09-26: it was present, untracked and auto-used; archived to `archive/c_ext/`, now opt-in
+  via `TRADER_INDICATORS_C=1`; the installed `pyarrow` version — ANSWERED 2026-09-26: `pyarrow` 23.0.1
+  in the jetson env).
 
 ---
 
@@ -888,6 +904,7 @@ data, models and journals). What the map adds is the *importability* consequence
 campaign — the defect map, literature parameters, the activation runbook, ~26 default-OFF flags,
 the measurement shelf, `tests/test_c26_*.py`.
 
+*(Annotation 2026-09-26: everything in the next paragraph was committed 2026-09-10 as `438f56a`.)*
 **Uncommitted, awaiting owner review** (do not describe as shipped): the **R2 signal-model round**
 (R2-A frontier research `05_frontier_research.md` → R2-B panel `06_signal_model_plan.md` → R2-C
 build: `serving_cache.py`, cert==deploy, `LGB_REFIT_FULL`, `TRAINER_SEED`/`TRAINING_REPAIRS_V1`,
@@ -917,6 +934,15 @@ blended-OOF persistence; X·F5 HAR sigma routing (or retire `Position.garch_sigm
 BTC-dominance data feed; GUI phases 2B–5; the `.claude/settings.json` `git stash` allowlist vs
 AGENT_CONTEXT rule 7; and the items in §9.
 
+**2026-09-26 Jetson campaign** (uncommitted, awaiting owner review — do not describe as shipped).
+The first test-and-fix pass run on the prod Jetson itself: audits A–H, then objective fixes — the C
+extension archived and made opt-in (`TRADER_INDICATORS_C`), the March-2026 residue moved to
+`archive/`, the stock SIP end-clamp, measurement-report fixes, systemd-unit/ops fixes (`TRADER_PYBIN`,
+`_training_env`, combined-mode status), GUI and LLM-transport/pricing fixes, and the model-facing
+`Daily_Sentiment` PIT repair that lands with the clean rebuild (runbook Phase 0/3 annotations). No
+Phase-2/3 model flag was flipped. Findings, fixes, evidence and owner decisions:
+`research/campaign_2026-09_jetson/README.md`.
+
 ---
 
 ## 9. Known gaps & honest verdicts
@@ -943,13 +969,13 @@ objective fix that can only be verified on the production stack.
 | 13 | "Free-first" LLM is plumbing, not the default (`selection_mode='auto'`, Anthropic first; free presets disabled until `llm_qualify` passes) | The $0 product goal is one config patch away, after qualification | MEASURE (`scripts/llm_qualify.py`) |
 | 14 | No NFP in `macro_calendar._WINDOWS` (FOMC + CPI only) | Cheap, research-recommended stand-down | OWNER |
 | 15 | `oi_archive.py` unit skews: Binance USD-notional offline vs OKX coin units live; top-trader vs all-account ratio | Train/serve skew on two features | OWNER (retrain-bundled) |
-| 16 | `journals/` unrotated by default; eight `*.log` files raw-append; importing 22 modules creates `logs/trader.log` | 8 GB device hygiene | OWNER |
+| 16 | `journals/` unrotated by default; eight `*.log` files raw-append; importing 22 modules creates `logs/trader.log` (test processes now redirected via `TRADER_LOG_DIR`, set by `tests/conftest.py`; production default unchanged) | 8 GB device hygiene | OWNER |
 | 17 | `trading_utils.py` unguarded `dotenv` import makes a third of the top layer Mac-unimportable | Dev-loop cost; guarding changes the baseline | OWNER |
 | 18 | `tests/test_c26_T2/T3` leak `sys.modules['dotenv']` — the baseline is order-dependent; fixing adds 5 names | Test honesty vs baseline churn | OWNER |
 | 19 | `hmmlearn` (`regime_detector.py`, kill-list-pending layer) and `arch` (`volatility.py`, lazy) are imported but declared nowhere | Requirements truth | OWNER |
 | 20 | `.claude/settings.json` pre-approves `git stash push/pop`; AGENT_CONTEXT rule 7 forbids it on a shared tree | Coordination policy | OWNER |
 | 21 | `logos/` = 62.7 MB, 88% of tracked bytes; the README header and the app icon load the 8.2 MB original while `logos/96/` sits unused for those two sites; `logos/salander.png` referenced but absent | Repo weight (history keeps the bytes regardless) | OWNER |
-| 22 | Combined-bots mode is what systemd runs, but `run_pipeline` defaults to split and `_update_per_bot_status` reports every bot as not running in combined mode | GUI/Telegram `/status` truth | JETSON-FIX |
+| 22 | Combined-bots mode is what systemd runs, but `run_pipeline` defaults to split and `_update_per_bot_status` reports every bot as not running in combined mode — **fixed 2026-09-26** (a live `'Bots'` process ORs `_BOT_SCOPE`; `tests/test_jetson_ops_2026_09.py`) | GUI/Telegram `/status` truth | JETSON-FIX (done) |
 | 23 | `TRADER_ORDER_STREAM` / `TRADER_USE_ALPACA_PY` accept only the literal `'1'` (`=true` is a silent no-op) while the 2026-08 family accepts `1/true/yes` | Operator foot-gun — documented in `docs/FLAGS.md` | OWNER |
 | 24 | `gui.py` is 16% of all source bytes in one un-importable file; the flat 91-module root | Maintainability; a package layout is a future owner decision (§3) | OWNER |
 | 25 | `regime_detector.py` HMM layer and the `Hurst` feature are kill-list-pending / removed-branch items; `research/funding_drift_2026-08.json` and `research/news_census_2026-08.json` are outputs of scripts not yet run | Don't rebuild; run the audits first | MEASURE |
@@ -1015,7 +1041,7 @@ chunks (a single agent response is capped at 32k output tokens).
 | the journals and their readers | `trade_journal.log_decision` → `journals/`; readers in `docs/STATE_FILES.md §4` |
 | gate attribution ("why was this skipped?") | `decision_report.GATE_REASONS`; `base_loop._journal_skip` |
 | alpha vs beta | `beta_ledger.py` (AKL lagged betas, HAC alpha t) |
-| is the LLM worth its cost? | `llm_eval.py` (b2 significance at n≥60); `scripts/llm_qualify.py` for free providers |
+| is the LLM worth its cost? | `llm_eval.py` (b2 significance; needs ≥120 distinct hourly t0 clusters and n_eff ≥ 20, ≈20+ days of LLM cycles); `scripts/llm_qualify.py` for free providers |
 | drift | `monitor_drift.py` (PSI, `pred_history.jsonl`) |
 | every flag and constant | `docs/FLAGS.md` (§2 the dead ones, §6 the SSOT exceptions) |
 | every runtime file | `docs/STATE_FILES.md` |
@@ -1029,6 +1055,7 @@ chunks (a single agent response is capped at 32k output tokens).
 | why a test writes into the repo root (it must not) | `tests/README.md` § conventions; `docs/STATE_FILES.md §9` |
 | the vocabulary | `docs/GLOSSARY.md` |
 | what happened in the 2026-09-08 cleanup | `research/cleanup_2026-09/README.md` |
+| what the 2026-09-26 on-Jetson campaign found and fixed | `research/campaign_2026-09_jetson/README.md` |
 
 ---
 
@@ -1050,6 +1077,7 @@ chunks (a single agent response is capped at 32k output tokens).
 | `research/README.md`, `waves/`, `reviews_2026-07/`, `literature/`, `campaign_2026-08/` (each with a README) | the research record: waves, the 2026-07 review corpus, literature rounds, the 2026-08 campaign docs 01–08 | agents + owner |
 | `research/module_review_2026-07.json` | the live 90-item owner decision queue (`/decision-queue`) | owner |
 | `research/cleanup_2026-09/README.md` | this pass: what moved, what was fixed, the owner list | owner |
+| `research/campaign_2026-09_jetson/README.md` | the 2026-09-26 on-Jetson test-and-fix campaign: audits, fixes, evidence, owner decisions | owner |
 | `scripts/README.md`, `tests/README.md`, `.claude/README.md`, `logos/README.md`, `fonts/README.md`, `archive/README.md` | what each directory holds, machine, flags, conventions, origin of archived items | everyone |
 | `tests/baseline_failures.txt` | the 23 dev-Mac missing-dep names (+ dep attribution in its header) | agents |
 | `.claude/skills/*/SKILL.md`, `.claude/workflows/*.js` | the reusable procedures | agents |
